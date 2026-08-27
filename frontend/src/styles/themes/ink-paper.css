@@ -1,0 +1,1874 @@
+/* Copyright (c) 2026 Weave Thinker Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* ==========================================================================
+ * 皮肤：墨韵纸间 (ink-paper)
+ * 设计源：内置皮肤实拍（墨韵纸间）
+ * 契约：docs/SKINS.md · 目录：GET /api/skins
+ *
+ * 布局范式（mockup .app/.sidebar）：贴边列式 —— 侧栏/顶栏/输入区均为 FLUSH
+ * 通栏（无卡片悬浮），1px 发丝线分割；宣纸纹理底 + 宋体标题 + 朱砂点墨。
+ * 级联规则：组件级覆写一律 html[data-skin=...] 前缀（0,2,1/0,3,1 压 scoped）。
+ * 皮肤专属线色/填充：--skin-line / --skin-line-soft / --skin-fill / --skin-onfill
+ * ========================================================================== */
+
+[data-skin="ink-paper"] {
+  --skin-line: rgba(42, 37, 33, 0.22);      /* --line */
+  --skin-line-soft: rgba(42, 37, 33, 0.12); /* --line-soft */
+  --skin-fill: #2a2521;                      /* --ink（实心填充） */
+  --skin-onfill: #f5efe3;                    /* 填充上的文字 */
+  --skin-serif: 'Noto Serif SC', 'Songti SC', 'STSong', Georgia, serif;
+
+  --color-primary: #b23b2e;
+  --color-primary-dark: #932f24;
+  --color-secondary: #c9a86a;
+  --color-accent: #c9a86a;
+  --color-bg: #f5efe3;
+  --color-bg-secondary: #f1e9d8;
+  --color-sidebar: #f2ebdc;
+  --color-code-bg: #f1e9d8;  /* A4.9-C1：行内 chip 用浅色；块级用 --code-block-bg */
+  --color-text: #2a2521;
+  --color-text-light: #6b6355; /* wave-13b：#7a7264 对白/纸底 4.3~4.4 → 5.6+（白字幕浅 #a89d87 不受影响） */
+  --color-text-primary: var(--color-text);
+  --color-text-secondary: var(--color-text-light);
+  --color-user-bubble: #efe6d2;
+  --color-white: #fbf7ec;
+  --color-border: var(--skin-line);
+  --color-hover: #f1e9d8;
+  --color-error: #a33428;
+  --color-danger: var(--color-error);
+  --color-success: #4a7a3f;
+  --color-warning: #b07a2a;
+  --color-info: #36555a;
+  /* 代码高亮调色板（mockup codeblk .kw/.st/.cm）+ 工具卡状态图标 */
+  --code-keyword: #d98c7a;
+  --code-string: #a8c69f;
+  --code-comment: #8a8071;
+  --code-number: #7fa9b0;
+  --code-function: #d6b67e;
+  --code-variable: #c98a7a;
+  --tool-icon-done: #4a7a3f;
+  --tool-icon-run: #36555a;
+  --tool-icon-wait: #a89d87;
+
+  --surface-panel-strong: #fbf7ec;
+  --surface-panel-subtle: #f1e9d8;
+  --surface-input: #fbf7ec;
+  --surface-workbench: #f5efe3;
+  --panel-border: var(--skin-line-soft);
+  --panel-border-strong: var(--skin-line);
+  --frame-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+  --panel-shadow: 0 2px 10px rgba(60, 50, 30, 0.08);
+  --glass-blur: blur(4px);
+  /* mockup body：宣纸纹理（radial 染 + 网点） */
+  --app-background:
+    radial-gradient(1200px 620px at 15% -10%, rgba(201, 168, 106, 0.10), transparent 60%),
+    radial-gradient(900px 500px at 108% 12%, rgba(54, 85, 90, 0.06), transparent 55%),
+    repeating-linear-gradient(0deg, rgba(42, 37, 33, 0.016) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(90deg, rgba(42, 37, 33, 0.012) 0 1px, transparent 1px 5px),
+    #f5efe3;
+
+  --scrollbar-thumb: #d8cdb4;
+  --scrollbar-thumb-hover: #c2b48f;
+
+  /* 贴边侧栏：无卡片、无圆角、无阴影，1px 右发丝线 */
+  --sidebar-card-bg: rgba(251, 247, 236, 0.55);
+  --sidebar-card-radius: 0px;
+  --sidebar-card-shadow: none;
+  --sidebar-card-border: none;
+  --sidebar-height: 100%;
+  --nav-pill-bg: transparent;
+  --nav-pill-radius: 0;
+  --nav-pill-padding: 0;
+  --nav-pill-gap: 0;
+  --msg-bubble-radius: 6px;
+  --msg-bubble-bl: 6px;
+  --msg-bubble-br: 2px;
+  --msg-bubble-border: 1px solid var(--skin-line);
+  --msg-bubble-shadow: 0 2px 10px rgba(60, 50, 30, 0.08);
+  --msg-user-bg: #efe6d2;
+  --msg-assistant-bg: #fbf7ec;
+  --input-container-radius: 6px;
+  --input-container-min-height: 185px;
+  --input-container-border: 1px solid var(--skin-line);
+  --input-container-shadow-focus: 0 2px 10px rgba(60, 50, 30, 0.12);
+  --code-block-bg: #2f2a25;
+  --code-block-header-bg: rgba(42, 37, 33, 0.9);
+  --code-block-text: #e8dfc8;
+  --reasoning-border-left: rgba(42, 37, 33, 0.35);
+  --chat-topbar-bg: rgba(245, 239, 227, 0.88);
+  --chat-topbar-radius: 0px;
+  --chat-topbar-border: none;
+  --chat-topbar-shadow: none;
+  --btn-hover-lift: -1px;
+  --dialog-radius: 6px;
+  --dialog-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+  /* wave-11 共享交互态（墨韵家族：发丝线 4-6px / 纸卡阴影 / 暖 scrim） */
+  --overlay-scrim: rgba(42, 37, 33, 0.30);
+  --focus-ring-color: color-mix(in srgb, var(--color-primary) 10%, transparent);
+  --menu-radius: 4px;
+  --menu-border: 1px solid var(--skin-line);
+  --menu-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+  --stack-card-radius: 6px;
+  --stack-card-shadow: 0 1px 4px rgba(60, 50, 30, 0.05), 0 6px 18px rgba(60, 50, 30, 0.09);
+  --stack-card-shadow-hover: 0 2px 6px rgba(60, 50, 30, 0.08), 0 14px 30px rgba(60, 50, 30, 0.14);
+  --stack-hover-lift: -14px;
+  --stack-overlap: -40px;
+}
+
+[data-skin="ink-paper"][data-theme="dark"] {
+  /* mockup html[data-theme=dark] 注入值 */
+  --skin-line: rgba(233, 224, 203, 0.20);
+  --skin-line-soft: rgba(233, 224, 203, 0.10);
+  --skin-fill: #e9e0cb;
+  --skin-onfill: #241f1a;
+  --skin-serif: 'Noto Serif SC', 'Songti SC', 'STSong', Georgia, serif;
+
+  --color-primary: #c9503f;
+  --color-primary-dark: #d0574a;
+  --color-secondary: #d6b67e;
+  --color-accent: #d6b67e;
+  --color-bg: #171310;
+  --color-bg-secondary: #211b14;
+  --color-sidebar: #1e1812;
+  --color-code-bg: #262018;
+  --color-text: #e9e0cb;
+  --color-text-light: #a89d87;
+  --color-text-primary: var(--color-text);
+  --color-text-secondary: var(--color-text-light);
+  --color-user-bubble: #2a231a;
+  --color-white: #211b14;
+  --color-border: var(--skin-line);
+  --color-hover: #30281c;
+  --color-error: #d0574a;
+  --color-danger: var(--color-error);
+  --color-success: #84ab5c;
+  --color-warning: #cf9a3f;
+  --color-info: #7fa9b0;
+  /* 暗色代码底 #12100c 同色板（浅色可读性足够） */
+  --code-keyword: #d98c7a;
+  --code-string: #a8c69f;
+  --code-comment: #8a8071;
+  --code-number: #7fa9b0;
+  --code-function: #d6b67e;
+  --code-variable: #c98a7a;
+  --tool-icon-done: #84ab5c;
+  --tool-icon-run: #7fa9b0;
+  --tool-icon-wait: #a89d87;
+
+  --surface-panel-strong: #211b14;
+  --surface-panel-subtle: #1e1812;
+  --surface-input: #211b14;
+  --surface-workbench: #171310;
+  --panel-border: var(--skin-line-soft);
+  --panel-border-strong: var(--skin-line);
+  --frame-shadow: 0 10px 34px rgba(0, 0, 0, 0.6);
+  --panel-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+  --glass-blur: blur(4px);
+  --app-background:
+    radial-gradient(1200px 620px at 15% -10%, rgba(214, 182, 126, 0.05), transparent 60%),
+    radial-gradient(900px 500px at 108% 12%, rgba(127, 169, 176, 0.04), transparent 55%),
+    repeating-linear-gradient(0deg, rgba(233, 224, 203, 0.012) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(90deg, rgba(233, 224, 203, 0.008) 0 1px, transparent 1px 5px),
+    #171310;
+
+  --scrollbar-thumb: #4a4030;
+  --scrollbar-thumb-hover: #5f5440;
+
+  --sidebar-card-bg: rgba(33, 27, 20, 0.55);
+  --sidebar-card-radius: 0px;
+  --sidebar-card-shadow: none;
+  --sidebar-card-border: none;
+  --sidebar-height: 100%;
+  --nav-pill-bg: transparent;
+  --nav-pill-radius: 0;
+  --nav-pill-padding: 0;
+  --nav-pill-gap: 0;
+  --msg-bubble-radius: 6px;
+  --msg-bubble-bl: 6px;
+  --msg-bubble-br: 2px;
+  --msg-bubble-border: 1px solid var(--skin-line);
+  --msg-bubble-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+  --msg-user-bg: #2a231a;
+  --msg-assistant-bg: #211b14;
+  --input-container-radius: 6px;
+  --input-container-min-height: 185px;
+  --input-container-border: 1px solid var(--skin-line);
+  --input-container-shadow-focus: 0 2px 10px rgba(0, 0, 0, 0.4);
+  --code-block-bg: #12100c;
+  --code-block-header-bg: rgba(233, 224, 203, 0.08);
+  --code-block-text: #e8dfc8;
+  --reasoning-border-left: rgba(233, 224, 203, 0.3);
+  --chat-topbar-bg: rgba(23, 19, 16, 0.88);
+  --chat-topbar-radius: 0px;
+  --chat-topbar-border: none;
+  --chat-topbar-shadow: none;
+  --btn-hover-lift: -1px;
+  --dialog-radius: 6px;
+  --dialog-shadow: 0 10px 34px rgba(0, 0, 0, 0.6);
+  /* wave-11 共享交互态（暗色） */
+  --overlay-scrim: rgba(0, 0, 0, 0.55);
+  --focus-ring-color: color-mix(in srgb, var(--color-primary) 16%, transparent);
+  --menu-shadow: 0 10px 34px rgba(0, 0, 0, 0.6);
+  --stack-card-shadow: 0 1px 4px rgba(0, 0, 0, 0.35), 0 6px 18px rgba(0, 0, 0, 0.45);
+  --stack-card-shadow-hover: 0 2px 6px rgba(0, 0, 0, 0.45), 0 14px 30px rgba(0, 0, 0, 0.6);
+}
+
+/* ==========================================================================
+ * 组件级覆写（mockup → 系统组件；FLUSH 范式）
+ * ========================================================================== */
+
+/* 布局：贴边，无卡片留白 */
+html[data-skin="ink-paper"] .chat-layout { padding: 0; gap: 0; }
+
+/* 移动端豁免：抽屉侧栏全高 */
+@media (max-width: 767px) {
+  html[data-skin="ink-paper"] .chat-layout { padding: 0; }
+  html[data-skin="ink-paper"] .sidebar {
+    --sidebar-height: 100%;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    border-right: none !important;
+  }
+}
+
+/* Sidebar：FLUSH，1px 右发丝线，宣纸半透明底（mockup .sidebar） */
+html[data-skin="ink-paper"] .sidebar {
+  margin: 0;
+  height: 100%;
+  padding: 16px 14px 0;
+  background: var(--sidebar-card-bg);
+  border: none;
+  border-right: 1px solid var(--skin-line);
+  border-radius: 0;
+  box-shadow: none;
+}
+html[data-skin="ink-paper"] .sidebar-header {
+  padding: 2px 4px 10px;
+  border-bottom: 1px solid var(--skin-line-soft);
+  margin: 0 0 12px;
+}
+/* 品牌：宋体 18 letterspacing 4（mockup .b-name） */
+html[data-skin="ink-paper"] .logo-text {
+  font-family: var(--skin-serif);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .logo-icon {
+  width: 40px; height: 40px;
+  border-radius: 5px;
+  background: linear-gradient(145deg, #c04537, #a33327);
+  box-shadow: inset 0 0 0 2px rgba(245, 239, 227, 0.45), 0 2px 8px rgba(178, 59, 46, 0.3);
+}
+
+/* 导航：1px 发丝线盒 + 墨色激活项（mockup .nav-tabs） */
+html[data-skin="ink-paper"] .sidebar-nav {
+  margin: 0;
+  display: flex;
+  border: 1px solid var(--skin-line);
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--surface-panel-strong);
+  padding: 0;
+  gap: 0;
+  border-bottom: 1px solid var(--skin-line);
+}
+html[data-skin="ink-paper"] .nav-tab {
+  flex: 1;
+  border-radius: 0;
+  padding: 7px 0;
+  font-size: 12.5px;
+  letter-spacing: 1px;
+  color: var(--color-text-light);
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--skin-line-soft);
+}
+html[data-skin="ink-paper"] .nav-tab:first-child { border-left: none; }
+html[data-skin="ink-paper"] .nav-tab:hover { color: var(--color-primary); }
+html[data-skin="ink-paper"] .nav-tab.active {
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+  font-family: var(--skin-serif);
+  letter-spacing: 2px;
+  font-weight: 400;
+}
+
+/* 新建对话：朱砂宋体钮（mockup .btn-primary.new-chat） */
+html[data-skin="ink-paper"] .action-buttons { padding: 12px 0 10px; gap: 8px; }
+html[data-skin="ink-paper"] .new-chat-btn {
+  border-radius: 4px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: var(--skin-serif);
+  letter-spacing: 2px;
+  background: var(--color-primary);
+  border: 1px solid var(--color-primary-dark);
+  color: #fdf8ec;
+  box-shadow: 0 2px 8px rgba(178, 59, 46, 0.26);
+  transition: background 0.2s ease;
+}
+html[data-skin="ink-paper"] .new-chat-btn:hover {
+  transform: translateY(var(--btn-hover-lift));
+  background: var(--color-primary-dark);
+}
+html[data-skin="ink-paper"] .new-group-btn {
+  width: 34px; height: 34px;
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  color: var(--color-text-light);
+}
+html[data-skin="ink-paper"] .new-group-btn:hover {
+  color: var(--color-primary);
+  border-color: rgba(178, 59, 46, 0.4);
+  background: var(--surface-panel-strong);
+}
+
+/* 助手下拉：1px 发丝线卡（mockup .asst）；wave-14 对齐：gap 8=上方按钮行 */
+html[data-skin="ink-paper"] .sidebar-toolbar { padding: 0 0 8px; gap: 8px; }
+html[data-skin="ink-paper"] .toolbar-assistant {
+  border-radius: 4px;
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: var(--skin-serif);
+  letter-spacing: 1px;
+  margin: 0;
+  transition: border-color 0.2s ease;
+}
+html[data-skin="ink-paper"] .toolbar-assistant:hover {
+  border-color: rgba(178, 59, 46, 0.4);
+  transform: none;
+}
+html[data-skin="ink-paper"] .toolbar-search-btn {
+  border-radius: 4px;
+  width: 34px; height: 34px;
+  margin-right: 0;
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line);
+  color: var(--color-text-light);
+}
+html[data-skin="ink-paper"] .toolbar-search-btn:hover {
+  color: var(--color-primary);
+  border-color: rgba(178, 59, 46, 0.4);
+  background: var(--surface-panel-strong);
+}
+
+/* 分组：radius 3 + 方点（mockup .grp） */
+html[data-skin="ink-paper"] .group-header,
+html[data-skin="ink-paper"] .groups-directory-header {
+  border-radius: 3px;
+  margin: 0 2px;
+  padding: 6px 8px;
+}
+html[data-skin="ink-paper"] .group-color-dot { width: 8px; height: 8px; border-radius: 2px; }
+/* wave-9 分组焦点：朱砂浅底 + 3px 朱砂内轨（与会话行 active 同语言，直角 radius 3 弯折极小） */
+html[data-skin="ink-paper"] .group-header.group-focus {
+  background: rgba(178, 59, 46, 0.07);
+  box-shadow: inset 3px 0 0 rgba(178, 59, 46, 0.45);
+  padding: 4px 8px;
+}
+html[data-skin="ink-paper"] .group-header.group-focus .group-name { color: var(--color-primary); }
+html[data-skin="ink-paper"] .zen-group-header.group-focus {
+  background: rgba(178, 59, 46, 0.07);
+  box-shadow: inset 3px 0 0 rgba(178, 59, 46, 0.45);
+}
+html[data-skin="ink-paper"] .zen-group-header.group-focus .zen-group-name { color: var(--color-primary); }
+html[data-skin="ink-paper"] .group-count,
+html[data-skin="ink-paper"] .directory-count {
+  background: none;
+  border-radius: 0;
+  padding: 0;
+  min-width: 0;
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+}
+
+/* 会话行：radius 3；active = 卡纸底 + 3px 朱砂内条（mockup .conv.active::before） */
+html[data-skin="ink-paper"] .conversation-item {
+  border-radius: 3px;
+  padding: 7px 10px 7px 16px;
+  margin: 2px 2px 2px 0;
+  font-size: 13px;
+  color: var(--color-text);
+  transition: background 0.18s ease;
+  border-left: none;
+  box-shadow: none;
+}
+html[data-skin="ink-paper"] .conversation-item:hover { background: rgba(251, 247, 236, 0.9); }
+html[data-skin="ink-paper"] .conversation-item.active {
+  background: var(--color-user-bubble);
+  color: var(--color-text);
+  box-shadow: inset 3px 0 0 var(--color-primary);
+}
+
+/* ─── 笔记面板（.np-*）：与会话行同语言，保证笔记/Agent 侧栏统一 ─── */
+html[data-skin="ink-paper"] .notes-panel-header {
+  padding: 2px 4px 0;
+  margin-top: 2px;
+}
+html[data-skin="ink-paper"] .notes-panel-title {
+  font-size: 12px;
+  color: var(--color-text-light);
+  letter-spacing: 1px;
+}
+html[data-skin="ink-paper"] .new-note-btn {
+  border-radius: 4px;
+  width: 30px; height: 30px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  color: var(--color-text-light);
+}
+html[data-skin="ink-paper"] .new-note-btn:hover {
+  color: var(--color-primary);
+  border-color: rgba(178, 59, 46, 0.4);
+  transform: none;
+}
+html[data-skin="ink-paper"] .notes-panel-list { padding: 0; }
+html[data-skin="ink-paper"] .np-notebook-row {
+  border-radius: 3px;
+  padding: 7px 10px;
+  margin: 2px 0;
+  font-size: 13px;
+  color: var(--color-text);
+  transition: background 0.18s ease;
+}
+html[data-skin="ink-paper"] .np-notebook-row:hover { background: rgba(251, 247, 236, 0.9); }
+html[data-skin="ink-paper"] .np-notebook-row.active {
+  background: var(--color-user-bubble);
+  box-shadow: inset 3px 0 0 var(--color-primary);
+}
+html[data-skin="ink-paper"] .np-chevron { color: var(--color-text-light); }
+html[data-skin="ink-paper"] .np-count {
+  font-size: 11px;
+  color: var(--color-text-light);
+  background: none;
+  border-radius: 0;
+  padding: 0;
+}
+html[data-skin="ink-paper"] .np-notes-list { padding-left: 14px; }
+html[data-skin="ink-paper"] .np-note-row {
+  border-radius: 3px;
+  padding: 6px 10px 6px 16px;
+  font-size: 12.5px;
+  color: var(--color-text-light);
+  transition: background 0.18s ease;
+}
+html[data-skin="ink-paper"] .np-note-row:hover { background: rgba(251, 247, 236, 0.9); }
+html[data-skin="ink-paper"] .np-note-row.active {
+  background: var(--color-user-bubble);
+  color: var(--color-text);
+  box-shadow: inset 3px 0 0 var(--color-primary);
+}
+html[data-skin="ink-paper"] .np-empty,
+html[data-skin="ink-paper"] .np-note-loading {
+  font-size: 12px;
+  color: var(--color-text-light);
+  padding: 6px 10px;
+}
+
+/* 用户区（mockup .user-bar：发丝顶线 + 黛青圆头像） */
+html[data-skin="ink-paper"] .user-info-wrapper {
+  margin-top: auto;
+  padding: 12px 0 2px;
+  border-top: 1px solid var(--skin-line-soft);
+}
+html[data-skin="ink-paper"] .user-info {
+  border-radius: 4px;
+  padding: 6px;
+  margin: 0;
+}
+html[data-skin="ink-paper"] .user-info:hover { background: rgba(251, 247, 236, 0.9); }
+html[data-skin="ink-paper"] .user-avatar {
+  width: 30px; height: 30px;
+  border-radius: 50%;
+  background: var(--color-info);
+  color: #f5efe3;
+  font-size: 12px;
+}
+html[data-skin="ink-paper"] .user-name { font-size: 13px; color: var(--color-text); }
+
+/* 顶栏：FLUSH 通栏 + 发丝底线 + 毛玻璃（mockup .topbar） */
+html[data-skin="ink-paper"] .chat-header {
+  background: var(--chat-topbar-bg);
+  backdrop-filter: var(--glass-blur);
+  border-radius: 0;
+  border: none;
+  border-bottom: 1px solid var(--skin-line);
+  box-shadow: none;
+  margin: 0;
+  padding: 14px 28px;
+  position: relative;
+  z-index: 1;
+}
+html[data-skin="ink-paper"] .chat-main { padding-top: 0; }
+html[data-skin="ink-paper"] .chat-title {
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  font-family: var(--skin-serif);
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .context-token-chip {
+  border-radius: 999px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  color: var(--color-text-light);
+  font-weight: 400;
+}
+html[data-skin="ink-paper"] .context-token-chip svg { opacity: 0.7; }
+
+/* 消息气泡（mockup .bubble：radius 6 / user 6 6 2 6） */
+html[data-skin="ink-paper"] .text {
+  border-radius: var(--msg-bubble-radius);
+  border: var(--msg-bubble-border);
+  box-shadow: var(--msg-bubble-shadow);
+  padding: 13px 16px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+html[data-skin="ink-paper"] .assistant .text {
+  border-bottom-left-radius: var(--msg-bubble-bl);
+  background: var(--msg-assistant-bg);
+}
+html[data-skin="ink-paper"] .user .text {
+  border-bottom-right-radius: var(--msg-bubble-br);
+  border-radius: 6px 6px 2px 6px;
+  background: var(--msg-user-bg);
+}
+html[data-skin="ink-paper"] .message-action-btn {
+  border-radius: 999px;
+  padding: 5px 13px;
+  font-size: 12px;
+}
+html[data-skin="ink-paper"] .msg-timestamp { font-size: 11px; opacity: 0.55; }
+
+/* 思考块（mockup details.think：左 3px 竖线 + 斜体） */
+html[data-skin="ink-paper"] .reasoning-block {
+  border-left: 3px solid var(--reasoning-border-left);
+  background: rgba(251, 247, 236, 0.6);
+  border-radius: 0 4px 4px 0;
+}
+html[data-skin="ink-paper"] .reasoning-text { font-style: italic; }
+
+/* 输入区：FLUSH 底栏 + 1px 发丝线卡（mockup .composer/.composer-card） */
+html[data-skin="ink-paper"] .chat-input-wrapper {
+  padding: 12px 28px 0;
+  background: rgba(245, 239, 227, 0.7);
+  border-top: 1px solid var(--skin-line);
+  justify-content: flex-end;
+  position: relative;
+  z-index: 1;
+}
+html[data-skin="ink-paper"] .chat-input-container {
+  border-radius: var(--input-container-radius);
+  border: var(--input-container-border);
+  box-shadow: var(--msg-bubble-shadow);
+  background: var(--surface-panel-strong);
+  padding: 10px 12px 6px;
+  flex: none;
+  height: 185px; /* 高度恒定：长文触发内部滚动轴，不再加高 */
+  max-height: 185px;
+  min-height: var(--input-container-min-height);
+}
+html[data-skin="ink-paper"] .chat-input-container:focus-within {
+  border-color: rgba(178, 59, 46, 0.45);
+  box-shadow: 0 2px 10px rgba(60, 50, 30, 0.12);
+}
+html[data-skin="ink-paper"] .input-text-area {
+  display: flex;
+  flex-direction: column;
+  padding: 2px 4px 0;
+}
+html[data-skin="ink-paper"] .input-text-area .chat-input {
+  flex: 1;
+  display: block;
+  min-height: 38px;
+}
+html[data-skin="ink-paper"] .chat-input {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 6px 2px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+html[data-skin="ink-paper"] .input-bottom-toolbar {
+  border-top: 1px solid var(--skin-line-soft);
+  margin-top: 9px;
+  padding: 8px 0 4px;
+}
+html[data-skin="ink-paper"] .toolbar-btn {
+  border-radius: 3px;
+  border: 1px solid var(--skin-line);
+  background: transparent;
+  color: var(--color-text-light);
+  font-size: 11.5px;
+  padding: 4px 9px;
+  height: auto;
+}
+html[data-skin="ink-paper"] .toolbar-btn:hover {
+  color: var(--color-text);
+  border-color: rgba(42, 37, 33, 0.4);
+  background: transparent;
+  transform: none;
+}
+html[data-skin="ink-paper"] .toolbar-btn.active {
+  color: var(--color-primary);
+  border-color: rgba(178, 59, 46, 0.45);
+  background: rgba(178, 59, 46, 0.06);
+}
+html[data-skin="ink-paper"] .send-btn {
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  border: 1px solid var(--color-primary-dark);
+  box-shadow: 0 2px 8px rgba(178, 59, 46, 0.3);
+  color: #fdf8ec;
+}
+html[data-skin="ink-paper"] .send-btn:hover:not(:disabled) { background: var(--color-primary-dark); }
+html[data-skin="ink-paper"] .send-btn:disabled {
+  background: var(--surface-panel-subtle);
+  color: var(--color-text-light);
+  border: 1px solid var(--skin-line-soft);
+  box-shadow: none;
+}
+html[data-skin="ink-paper"] .send-btn.stop-mode {
+  background: #fdf8ec;
+  color: var(--color-primary);
+  border: 1.5px solid var(--color-primary);
+  box-shadow: none;
+}
+html[data-skin="ink-paper"] .voice-mode-toggle-btn {
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  color: var(--color-info);
+}
+html[data-skin="ink-paper"] .voice-mode-toggle-btn:hover { border-color: rgba(54, 85, 90, 0.5); }
+
+/* 代码块（mockup .codeblk：发丝线框 + 深褐） */
+html[data-skin="ink-paper"] .code-block {
+  background: var(--code-block-bg);
+  border: 1px solid var(--skin-line);
+  border-radius: 4px;
+}
+html[data-skin="ink-paper"] .code-block-header {
+  background: var(--code-block-header-bg);
+  color: #c9bfa8;
+  border-radius: 0;
+}
+html[data-skin="ink-paper"] .code-block pre code { color: var(--code-block-text); }
+
+/* 弹窗：6px 小圆角 + 大阴影（mockup .menu/.panel；wave-11 增 .login-card / .note-picker-modal） */
+html[data-skin="ink-paper"] .system-settings-card,
+html[data-skin="ink-paper"] .assistant-modal-card,
+html[data-skin="ink-paper"] .permission-dialog-card,
+html[data-skin="ink-paper"] .note-preview-card,
+html[data-skin="ink-paper"] .confirm-card,
+html[data-skin="ink-paper"] .login-card,
+html[data-skin="ink-paper"] .note-picker-modal {
+  border-radius: var(--dialog-radius);
+  border: 1px solid var(--skin-line);
+  box-shadow: var(--dialog-shadow);
+}
+
+/* 工作台退出（mockup .zen-opt：1px 发卡 + 150px 菜单卡） */
+html[data-skin="ink-paper"] .zen-exit-dropdown { top: 8px; }
+html[data-skin="ink-paper"] .zen-exit-arrow {
+  order: -1; /* mockup：药丸恒置顶，菜单悬垂其下（DOM 中菜单在前） */
+  width: auto; height: auto;
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  color: var(--color-text-light);
+  font-size: 12.5px;
+  letter-spacing: 1px;
+  box-shadow: none;
+  transition: border-color 0.2s ease, color 0.2s ease;
+}
+html[data-skin="ink-paper"] .zen-exit-arrow svg { width: 14px; height: 14px; }
+html[data-skin="ink-paper"] .zen-exit-arrow .zen-exit-label { line-height: 1; }
+html[data-skin="ink-paper"] .zen-exit-arrow:hover {
+  color: var(--color-primary);
+  border-color: rgba(178, 59, 46, 0.4);
+  background: var(--surface-panel-strong);
+  transform: none;
+}
+html[data-skin="ink-paper"] .zen-exit-btn {
+  width: 150px;
+  margin-top: 10px;
+  padding: 5px;
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  box-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+  color: var(--color-primary);
+  font-size: 12.5px;
+  font-weight: 400;
+  gap: 8px;
+}
+html[data-skin="ink-paper"] .zen-exit-btn:hover {
+  background: var(--color-hover);
+  color: var(--color-primary);
+  transform: none;
+}
+
+/* 滚动条 */
+html[data-skin="ink-paper"] ::-webkit-scrollbar { width: 6px; height: 6px; }
+
+/* 工具调用卡片（mockup .tool：发丝线 + 4px + 低彩状态） */
+html[data-skin="ink-paper"] .tool-part-card {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+}
+html[data-skin="ink-paper"] .tool-part-card.tool-error { border-color: rgba(178, 59, 46, 0.45); background: rgba(178, 59, 46, 0.04); }
+html[data-skin="ink-paper"] .tool-part-card.tool-running { border-color: rgba(54, 85, 90, 0.45); }
+html[data-skin="ink-paper"] .tool-completed .tool-card-icon { color: var(--color-success); }
+html[data-skin="ink-paper"] .tool-error .tool-card-icon { color: var(--color-primary); }
+html[data-skin="ink-paper"] .tool-card-status {
+  background: transparent;
+  border-radius: 3px;
+  color: var(--color-text-light);
+}
+html[data-skin="ink-paper"] .tool-card-status.running { color: var(--color-info); background: rgba(54, 85, 90, 0.07); }
+html[data-skin="ink-paper"] .tool-card-status.completed { color: var(--color-success); background: rgba(74, 122, 63, 0.08); }
+html[data-skin="ink-paper"] .tool-card-status.error { color: var(--color-primary); background: rgba(178, 59, 46, 0.06); }
+/* #2 展开结果：可读底色 + 皮肤文字/链接色（修真“灰底蓝字看不见”） */
+html[data-skin="ink-paper"] .tool-card-result {
+  background: rgba(251, 247, 236, 0.5);
+  border-top: 1px solid var(--skin-line-soft);
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .tool-card-result .stream-markdown a { color: var(--color-info); text-decoration: underline; }
+html[data-skin="ink-paper"] .tool-card-result .stream-markdown code:not(.hljs) {
+  background: rgba(42, 37, 33, 0.07);
+  border: 1px solid var(--skin-line-soft);
+  border-radius: 3px;
+  color: var(--color-primary);
+}
+html[data-skin="ink-paper"] .search-results-card {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+}
+html[data-skin="ink-paper"] .search-result-item { border-radius: 3px; background: rgba(245, 239, 227, 0.6); }
+html[data-skin="ink-paper"] .search-result-item:hover { background: rgba(239, 230, 210, 0.8); }
+html[data-skin="ink-paper"] .result-index { background: var(--color-info); color: #f5efe3; border-radius: 3px; }
+html[data-skin="ink-paper"] .result-title { color: var(--color-info); }
+html[data-skin="ink-paper"] .timeline-tool-call {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: rgba(251, 247, 236, 0.6);
+  overflow: hidden;
+}
+/* 弹出菜单：发丝线 4px + 纸卡 + shadow-lg（wave-11 增 .reasoning-menu / .context-menu） */
+html[data-skin="ink-paper"] .more-dropdown-teleport,
+html[data-skin="ink-paper"] .skill-popup,
+html[data-skin="ink-paper"] .reasoning-menu,
+html[data-skin="ink-paper"] .context-menu {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  box-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+}
+html[data-skin="ink-paper"] .more-dropdown-item:hover { background: rgba(251, 247, 236, 0.9); }
+/* wave-11 思考模式菜单：宋体标题 + 发丝 item（同 skill-popup 墨韵语言） */
+html[data-skin="ink-paper"] .reasoning-menu-title {
+  font-family: var(--skin-serif);
+  letter-spacing: 2px;
+  border-bottom-color: var(--skin-line-soft);
+}
+html[data-skin="ink-paper"] .reasoning-menu-item { border-radius: 3px; }
+html[data-skin="ink-paper"] .reasoning-menu-item:hover { background: rgba(251, 247, 236, 0.9); }
+html[data-skin="ink-paper"] .reasoning-menu-item.active { background: rgba(178, 59, 46, 0.08); }
+html[data-skin="ink-paper"] .reasoning-menu-item.active .reasoning-menu-label { color: var(--color-primary); }
+html[data-skin="ink-paper"] .user-menu {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  box-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+}
+html[data-skin="ink-paper"] .user-menu-item { border-radius: 3px; }
+html[data-skin="ink-paper"] .user-menu-item:hover { background: rgba(251, 247, 236, 0.9); }
+html[data-skin="ink-paper"] .tool-running .tool-card-icon { color: var(--tool-icon-run); }
+html[data-skin="ink-paper"] .tool-pending .tool-card-icon { color: var(--tool-icon-wait); }
+
+@media (max-width: 767px) {
+  html[data-skin="ink-paper"] .chat-input-container {
+    height: 24vh;
+    min-height: 170px;
+    max-height: 40vh;
+    flex: none;
+  }
+  html[data-skin="ink-paper"] .chat-input-wrapper {
+    padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0));
+  }
+}
+
+@media (max-width: 480px) {
+  html[data-skin="ink-paper"] .chat-input-container {
+    height: 22vh;
+    min-height: 150px;
+  }
+}
+
+/* ════════ wave-7 墨韵：zen 主题化 / 对话框宋体 / 按钮小弧 / 命令条扁平 / 空态卡片 ════════
+ * 规格源：02-ink-paper/zen.html（.shell/.pane/.pane-h/.resizer/.zin/.znote-title/.ztoolbar/.empty-pane）
+ *        02-ink-paper/dialogs.html（.dialog/.dlg-h/.btn/.badge）  02-ink-paper/chat.html（.empty-state/.es-card） */
+
+/* 外壳发丝框（mockup .shell） */
+html[data-skin="ink-paper"] .zen-layout {
+  border-left: 1px solid var(--skin-line-soft);
+  border-right: 1px solid var(--skin-line-soft);
+  background: var(--color-bg);
+}
+/* 双栏透明（mockup .pane 无底），右栏顶部标题发丝线（item 7） */
+html[data-skin="ink-paper"] .zen-left-panel,
+html[data-skin="ink-paper"] .zen-right-panel {
+  background: transparent;
+  border-right: none;
+}
+/* 「工作台选项」悬浮不占空间；标题栏回归置顶（与普通模式同高 56px） */
+html[data-skin="ink-paper"] .zen-panel-header {
+  background: transparent;
+  border-bottom: 1px solid var(--skin-line-soft);
+  height: 56px;
+  padding: 0 16px;
+}
+html[data-skin="ink-paper"] .zen-panel-title {
+  font-family: var(--skin-serif);
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 6px;
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .zen-resizer {
+  background: linear-gradient(180deg, transparent, rgba(42, 37, 33, 0.18), transparent);
+}
+html[data-skin="ink-paper"] .zen-resizer:hover {
+  background: var(--color-secondary);
+}
+html[data-skin="ink-paper"] .zen-drawer-toggle {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  justify-content: center;
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  color: var(--color-text-light);
+}
+html[data-skin="ink-paper"] .zen-drawer-toggle:hover {
+  color: var(--color-primary);
+  border-color: rgba(178, 59, 46, 0.4);
+  background: var(--surface-panel-strong);
+  transform: none;
+}
+/* 左栏输入：与普通 agent 模式一致（wave-8 撤销 wave-7 压扁） */
+html[data-skin="ink-paper"] .zen-left-panel .message-list {
+  padding: 20px 22px 0;
+}
+/* 右栏笔记编辑器：标题宋体下划线 + 工具栏扁平 hairline（item 5） */
+html[data-skin="ink-paper"] .zen-title-input {
+  border: none;
+  border-bottom: 1px solid var(--skin-line-soft);
+  background: transparent;
+  font-family: var(--skin-serif);
+  font-size: 20px;
+  letter-spacing: 2px;
+  color: var(--color-text);
+  padding: 6px 2px 10px;
+}
+html[data-skin="ink-paper"] .zen-note-toolbar {
+  border-bottom: 1px solid var(--skin-line-soft);
+  padding: 8px 22px;
+  gap: 3px;
+}
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-btn {
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+}
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-btn:hover {
+  background: rgba(42, 37, 33, 0.06);
+  border-color: var(--skin-line-soft);
+  color: var(--color-text);
+  transform: none;
+}
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-btn.active {
+  background: rgba(178, 59, 46, 0.08);
+  border-color: rgba(178, 59, 46, 0.4);
+  color: var(--color-primary);
+  transform: none;
+}
+html[data-skin="ink-paper"] .zen-note-empty {
+  border: 1px solid var(--skin-line);
+  border-radius: 6px;
+  background: var(--surface-panel-strong);
+  box-shadow: var(--panel-shadow);
+  padding: 40px 20px;
+  margin: 26px auto 0;
+  width: calc(100% - 44px);
+  font-family: var(--skin-serif);
+  letter-spacing: 2px;
+}
+html[data-skin="ink-paper"] .zen-note-empty button,
+html[data-skin="ink-paper"] .zen-note-empty .btn {
+  font-family: var(--skin-serif);
+  letter-spacing: 2px;
+  border-radius: 4px;
+}
+
+/* 对话框宋体化（mockup .dialog/.dlg-h：6px 发卡 + 宋体标题 15.5 ls2，item 6） */
+html[data-skin="ink-paper"] .system-settings-card,
+html[data-skin="ink-paper"] .assistant-modal-card,
+html[data-skin="ink-paper"] .permission-dialog-card,
+html[data-skin="ink-paper"] .note-preview-card,
+html[data-skin="ink-paper"] .confirm-card {
+  border-radius: 6px;
+  border: 1px solid var(--skin-line);
+  box-shadow: var(--dialog-shadow);
+}
+html[data-skin="ink-paper"] .system-settings-title {
+  font-family: var(--skin-serif);
+  font-size: 15.5px;
+  letter-spacing: 2px;
+  color: var(--color-text);
+}
+
+/* 按钮：小弧 4px + 描边 + 软影（mockup .btn/.badge，item 8；叶子芯片除外） */
+html[data-skin="ink-paper"] .message-action-btn {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  box-shadow: 0 2px 8px rgba(60, 50, 30, 0.08);
+  font-size: 12px;
+  padding: 6px 12px;
+}
+html[data-skin="ink-paper"] .message-action-btn:hover {
+  border-color: rgba(42, 37, 33, 0.4);
+  transform: none;
+}
+html[data-skin="ink-paper"] .context-token-chip {
+  border-radius: 3px;
+}
+html[data-skin="ink-paper"] .group-count,
+html[data-skin="ink-paper"] .directory-count,
+html[data-skin="ink-paper"] .np-count {
+  background: none;
+  border-radius: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+/* 命令条（spotlight）扁平发卡（item 9） */
+html[data-skin="ink-paper"] .spotlight-modal {
+  border-radius: 6px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  box-shadow: var(--dialog-shadow);
+}
+html[data-skin="ink-paper"] .spotlight-input-wrapper,
+html[data-skin="ink-paper"] .spotlight-input {
+  border-radius: 4px;
+}
+
+/* 空态：圆角长方形卡片（mockup .empty-state 1px line 6px card，item 10） */
+html[data-skin="ink-paper"] .empty-state {
+  height: auto;
+  width: calc(100% - 48px);
+  max-width: 760px;
+  margin: 6vh auto 40px;
+  border: 1px solid var(--skin-line);
+  border-radius: 6px;
+  background: var(--surface-panel-strong);
+  box-shadow: var(--panel-shadow);
+  padding: 48px 32px 40px;
+}
+html[data-skin="ink-paper"] .empty-brand-title {
+  font-family: var(--skin-serif);
+  letter-spacing: 6px;
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .empty-lead {
+  font-family: var(--skin-serif);
+  letter-spacing: 1px;
+  color: var(--color-text-light);
+  margin-top: 10px;
+}
+html[data-skin="ink-paper"] .empty-try {
+  font-family: var(--skin-serif);
+  color: var(--color-secondary);
+  letter-spacing: 3px;
+  font-size: 11px;
+  margin-top: 18px;
+}
+html[data-skin="ink-paper"] .empty-suggest-card {
+  display: block;
+  border-radius: 5px;
+  border: 1px solid var(--skin-line);
+  background: #fffdf6;
+  box-shadow: var(--panel-shadow);
+  padding: 11px 13px;
+}
+html[data-skin="ink-paper"] .empty-suggest-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(60, 50, 30, 0.13);
+  border-color: rgba(42, 37, 33, 0.4);
+}
+html[data-skin="ink-paper"] .empty-suggest-card .es-ico {
+  width: 16px;
+  height: 16px;
+  color: var(--color-primary);
+  float: left;
+  margin: 1px 8px 0 0;
+}
+html[data-skin="ink-paper"] .empty-suggest-card .es-cat {
+  font-family: var(--skin-serif);
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: var(--color-primary);
+  margin-bottom: 4px;
+}
+html[data-skin="ink-paper"] .empty-suggest-card .es-q {
+  font-size: 12.5px;
+  color: var(--color-text);
+  line-height: 1.6;
+}
+
+/* ════════ wave-8 墨韵语音助理（mockup 02-ink-paper/voice.html） ════════
+ * .v-ic 发丝圆卡 / 暗墨 orb 七态 / 朱砂进度环 / .interrupt 朱砂描边 / .v-panel 发丝+宋体 */
+
+/* 页面底：宣纸纹 + 金晕 */
+html[data-skin="ink-paper"] .voice-page {
+  background:
+    radial-gradient(1200px 620px at 15% -10%, rgba(201, 168, 106, 0.10), transparent 60%),
+    var(--color-bg);
+}
+
+/* 顶部图标钮（mockup .v-ic：36px 发丝圆卡 + shadow；off=朱砂底） */
+html[data-skin="ink-paper"] .voice-icon-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  color: var(--color-text);
+  box-shadow: 0 2px 10px rgba(60, 50, 30, 0.08);
+}
+html[data-skin="ink-paper"] .voice-icon-btn:hover {
+  border-color: rgba(42, 37, 33, 0.4);
+  transform: none;
+}
+html[data-skin="ink-paper"] .voice-icon-btn.off {
+  color: #fdf8ec;
+  background: var(--color-primary);
+  border-color: #932f24;
+  box-shadow: 0 3px 10px rgba(178, 59, 46, 0.35);
+}
+
+/* orb 七态（mockup .mini-orb：暗墨球 + 状态色径向渐变 + 状态色外环） */
+html[data-skin="ink-paper"] .orb-idle .voice-orb-inner,
+html[data-skin="ink-paper"] .orb-connecting .voice-orb-inner {
+  background:
+    radial-gradient(circle at 34% 30%, rgba(251, 247, 236, 0.3), transparent 45%),
+    radial-gradient(circle, #4a423a, #2a2521 75%);
+  box-shadow: 0 18px 50px rgba(42, 37, 33, 0.35);
+}
+html[data-skin="ink-paper"] .orb-listen .voice-orb-inner {
+  background:
+    radial-gradient(circle at 34% 30%, rgba(251, 247, 236, 0.35), transparent 45%),
+    radial-gradient(circle, #3f6d68, #234441 75%);
+  box-shadow: 0 0 0 5px rgba(54, 85, 90, 0.18), 0 18px 50px rgba(42, 37, 33, 0.3);
+}
+html[data-skin="ink-paper"] .orb-think .voice-orb-inner {
+  background: conic-gradient(from 0deg, #6a5490, #3d2f56, #8a74b0, #6a5490);
+  box-shadow: 0 0 0 5px rgba(106, 84, 144, 0.16), 0 18px 50px rgba(42, 37, 33, 0.3);
+}
+html[data-skin="ink-paper"] .orb-speak .voice-orb-inner {
+  background:
+    radial-gradient(circle at 34% 30%, rgba(251, 247, 236, 0.35), transparent 45%),
+    radial-gradient(circle, #4a7a3f, #2a4a24 75%);
+  box-shadow: 0 0 0 5px rgba(74, 122, 63, 0.18), 0 18px 50px rgba(42, 37, 33, 0.3);
+}
+html[data-skin="ink-paper"] .orb-dual .voice-orb-inner {
+  background:
+    radial-gradient(circle at 34% 30%, rgba(251, 247, 236, 0.35), transparent 45%),
+    radial-gradient(circle, #b07a2a, #6b4716 75%);
+  box-shadow: 0 0 0 5px rgba(176, 122, 42, 0.2), 0 18px 50px rgba(42, 37, 33, 0.3);
+}
+html[data-skin="ink-paper"] .orb-error .voice-orb-inner {
+  background:
+    radial-gradient(circle at 34% 30%, rgba(251, 247, 236, 0.3), transparent 45%),
+    radial-gradient(circle, #a33327, #5c1a12 75%);
+  box-shadow: 0 0 0 5px rgba(178, 59, 46, 0.2), 0 18px 50px rgba(42, 37, 33, 0.3);
+}
+
+/* 情绪辉光（mockup .emo-orb：interested 橙 / upset 蓝 / broken 红+抖动） */
+html[data-skin="ink-paper"] .voice-orb-inner[data-emotion="interested"] {
+  box-shadow: 0 0 24px 6px rgba(230, 126, 34, 0.45);
+}
+html[data-skin="ink-paper"] .voice-orb-inner[data-emotion="excited"] {
+  box-shadow: 0 0 28px 8px rgba(230, 126, 34, 0.5);
+}
+html[data-skin="ink-paper"] .voice-orb-inner[data-emotion="upset"] {
+  box-shadow: 0 0 24px 6px rgba(74, 109, 179, 0.45);
+}
+html[data-skin="ink-paper"] .voice-orb-inner[data-emotion="broken"] {
+  box-shadow: 0 0 24px 6px rgba(178, 59, 46, 0.5);
+}
+
+/* ripple（mockup .ripple：1px 黛青/金细环） */
+html[data-skin="ink-paper"] .voice-ripple {
+  border: 1px solid rgba(54, 85, 90, 0.3);
+}
+html[data-skin="ink-paper"] .voice-ripple.delay {
+  border-color: rgba(201, 168, 106, 0.35);
+}
+html[data-skin="ink-paper"] .voice-ripple.listen-ripple {
+  border-color: rgba(54, 85, 90, 0.45);
+}
+html[data-skin="ink-paper"] .voice-ripple.listen-ripple.dual-ripple {
+  border-color: rgba(176, 122, 42, 0.5);
+}
+
+/* 播放进度环（mockup .ring：朱砂 3px） */
+html[data-skin="ink-paper"] .voice-progress-track {
+  stroke: rgba(42, 37, 33, 0.12);
+  stroke-width: 3;
+}
+html[data-skin="ink-paper"] .voice-progress-fill {
+  stroke: var(--color-primary);
+  stroke-width: 3;
+  filter: none;
+}
+html[data-skin="ink-paper"][data-theme="dark"] .voice-progress-track {
+  stroke: rgba(233, 224, 203, 0.12);
+}
+
+/* 插话胶囊（mockup .interject：card 底 999 发丝） */
+html[data-skin="ink-paper"] .interjection-overlay {
+  border-radius: 999px;
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line);
+  box-shadow: 0 2px 10px rgba(60, 50, 30, 0.08);
+  color: var(--color-text);
+}
+
+/* 打断钮（mockup .interrupt：64px 圆 1.5px 朱砂描边 card 底朱砂图标） */
+html[data-skin="ink-paper"] .voice-action-lg {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-primary);
+  background: var(--surface-panel-strong);
+  color: var(--color-primary);
+  box-shadow: 0 4px 16px rgba(178, 59, 46, 0.25);
+}
+html[data-skin="ink-paper"] .voice-action-lg:hover {
+  background: rgba(178, 59, 46, 0.06);
+  transform: none;
+}
+
+/* 错误条（mockup .disconnect：999 朱砂淡底胶囊） */
+html[data-skin="ink-paper"] .voice-error-msg {
+  border-radius: 999px;
+  background: rgba(178, 59, 46, 0.08);
+  border: 1px solid rgba(178, 59, 46, 0.45);
+  color: var(--color-primary);
+}
+
+/* 语音会话面板（mockup .v-panel：发丝左边线 + 纸底 + 宋体标题） */
+html[data-skin="ink-paper"] .session-panel {
+  border-left: 1px solid var(--skin-line);
+  background: color-mix(in srgb, var(--surface-panel-strong) 92%, transparent);
+  box-shadow: -10px 0 34px rgba(60, 50, 30, 0.14);
+}
+html[data-skin="ink-paper"] .session-panel-header {
+  border-bottom: 1px solid var(--skin-line-soft);
+}
+html[data-skin="ink-paper"] .session-panel-title {
+  font-family: var(--skin-serif);
+  font-size: 16px;
+  letter-spacing: 4px;
+  color: var(--color-text);
+}
+/* 新语音对话钮（mockup .new-voice：朱砂底 4px 宋体） */
+html[data-skin="ink-paper"] .session-new-btn {
+  border-radius: 4px;
+  background: var(--color-primary);
+  border: 1px solid #932f24;
+  color: #fdf8ec;
+  font-family: var(--skin-serif);
+  letter-spacing: 2px;
+  box-shadow: 0 2px 8px rgba(178, 59, 46, 0.26);
+}
+html[data-skin="ink-paper"] .session-new-btn:hover {
+  background: #932f24;
+  color: #fdf8ec;
+}
+/* 会话项（mockup .vs-item：4px，cur=朱砂边+淡底） */
+html[data-skin="ink-paper"] .session-item {
+  border-radius: 4px;
+  border: 1px solid transparent;
+}
+html[data-skin="ink-paper"] .session-item:hover { background: #f1e9d8; }
+html[data-skin="ink-paper"] .session-item.active {
+  border-color: rgba(178, 59, 46, 0.4);
+  background: rgba(178, 59, 46, 0.05);
+}
+html[data-skin="ink-paper"][data-theme="dark"] .session-item:hover { background: #30281c; }
+html[data-skin="ink-paper"][data-theme="dark"] .session-item.active {
+  border-color: rgba(201, 80, 63, 0.45);
+  background: rgba(201, 80, 63, 0.08);
+}
+
+/* ════════ wave-8 墨韵工作台全面绑皮（mockup 02-ink-paper/zen.html .drawer/.znote/.empty-pane） ════════ */
+
+/* 抽屉卡：纸卡 + 发丝线 + 宋体标题 */
+html[data-skin="ink-paper"] .zen-history-drawer {
+  background: var(--surface-panel-strong);
+  border-right: 1px solid var(--skin-line);
+  box-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+}
+html[data-skin="ink-paper"] .zen-notes-drawer {
+  background: var(--surface-panel-strong);
+  border-left: 1px solid var(--skin-line);
+  box-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+}
+html[data-skin="ink-paper"] .zen-history-drawer .drawer-header,
+html[data-skin="ink-paper"] .zen-notes-drawer .drawer-header {
+  border-bottom: 1px solid var(--skin-line-soft);
+}
+html[data-skin="ink-paper"] .zen-history-drawer .drawer-title,
+html[data-skin="ink-paper"] .zen-notes-drawer .drawer-title {
+  font-family: var(--skin-serif);
+  font-size: 15px;
+  letter-spacing: 2px;
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .zen-history-drawer .drawer-action-btn,
+html[data-skin="ink-paper"] .zen-history-drawer .drawer-close,
+html[data-skin="ink-paper"] .zen-notes-drawer .drawer-action-btn,
+html[data-skin="ink-paper"] .zen-notes-drawer .drawer-close {
+  border-radius: 3px;
+}
+html[data-skin="ink-paper"] .zen-history-drawer .drawer-action-btn:hover,
+html[data-skin="ink-paper"] .zen-history-drawer .drawer-close:hover,
+html[data-skin="ink-paper"] .zen-notes-drawer .drawer-action-btn:hover,
+html[data-skin="ink-paper"] .zen-notes-drawer .drawer-close:hover {
+  background: rgba(178, 59, 46, 0.08);
+  color: var(--color-primary);
+}
+html[data-skin="ink-paper"] .zen-search-input {
+  border-radius: 5px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+}
+html[data-skin="ink-paper"] .zen-search-input:focus { border-color: rgba(178, 59, 46, 0.45); }
+html[data-skin="ink-paper"] .zen-new-chat-btn { border-radius: 4px; }
+html[data-skin="ink-paper"] .zen-new-chat-btn:hover { background: #f1e9d8; }
+html[data-skin="ink-paper"] .zen-notes-drawer .notebook-header { border-radius: 4px; }
+html[data-skin="ink-paper"] .zen-notes-drawer .notebook-header:hover { background: #f1e9d8; }
+html[data-skin="ink-paper"] .zen-notes-drawer .note-item {
+  border-radius: 4px;
+  border: 1px solid transparent;
+}
+html[data-skin="ink-paper"] .zen-notes-drawer .note-item:hover { background: #f1e9d8; }
+html[data-skin="ink-paper"] .zen-notes-drawer .note-item.active {
+  border-color: rgba(178, 59, 46, 0.4);
+  background: rgba(178, 59, 46, 0.05);
+}
+html[data-skin="ink-paper"][data-theme="dark"] .zen-new-chat-btn:hover,
+html[data-skin="ink-paper"][data-theme="dark"] .zen-notes-drawer .notebook-header:hover,
+html[data-skin="ink-paper"][data-theme="dark"] .zen-notes-drawer .note-item:hover { background: #30281c; }
+html[data-skin="ink-paper"][data-theme="dark"] .zen-notes-drawer .note-item.active {
+  border-color: rgba(201, 80, 63, 0.45);
+  background: rgba(201, 80, 63, 0.08);
+}
+
+/* 笔记正文为用户内容：皮肤不得更改其任何属性（wave-8 用户红线，覆写已移除） */
+
+/* 右上操作钮：3px 发丝；保存=朱砂 4px 宋体 */
+html[data-skin="ink-paper"] .zen-note-panel .export-btn,
+html[data-skin="ink-paper"] .zen-note-panel .delete-btn {
+  border-radius: 3px;
+  border: 1px solid var(--skin-line-soft);
+  background: transparent;
+  padding: 6px;
+}
+html[data-skin="ink-paper"] .zen-note-panel .export-btn:hover {
+  background: rgba(178, 59, 46, 0.06);
+  border-color: rgba(178, 59, 46, 0.4);
+  color: var(--color-primary);
+}
+html[data-skin="ink-paper"] .zen-note-panel .delete-btn:hover {
+  background: rgba(178, 59, 46, 0.08);
+  border-color: rgba(178, 59, 46, 0.4);
+  color: var(--color-primary);
+}
+html[data-skin="ink-paper"] .zen-note-panel .save-btn {
+  border-radius: 4px;
+  background: var(--color-primary);
+  border: 1px solid #932f24;
+  color: #fdf8ec;
+  font-family: var(--skin-serif);
+  letter-spacing: 2px;
+  box-shadow: 0 2px 8px rgba(178, 59, 46, 0.26);
+}
+
+/* 左右栏体底色：透明纸底（mockup .pane 无底） */
+html[data-skin="ink-paper"] .zen-left-panel .zen-panel-body,
+html[data-skin="ink-paper"] .zen-right-panel .zen-panel-body {
+  background: transparent;
+}
+
+/* 移动端 zen */
+@media (max-width: 767px) {
+  html[data-skin="ink-paper"] .zen-history-drawer,
+  html[data-skin="ink-paper"] .zen-notes-drawer {
+    width: var(--drawer-width);
+  }
+}
+
+/* wave-8 遗留6：技能弹窗 item 态（墨韵） */
+html[data-skin="ink-paper"] .skill-popup-item { border-radius: 4px; }
+html[data-skin="ink-paper"] .skill-popup-item:hover { background: #f1e9d8; }
+html[data-skin="ink-paper"] .skill-popup-item.active {
+  background: rgba(178, 59, 46, 0.08);
+}
+html[data-skin="ink-paper"] .skill-popup-item.active .skill-item-name { color: var(--color-primary); }
+html[data-skin="ink-paper"] .skill-popup-item.system-skill .skill-item-name { color: #36555a; }
+html[data-skin="ink-paper"] .skill-source-badge {
+  background: rgba(54, 85, 90, 0.12);
+  color: #36555a;
+}
+html[data-skin="ink-paper"][data-theme="dark"] .skill-popup-item:hover { background: #30281c; }
+html[data-skin="ink-paper"][data-theme="dark"] .skill-popup-item.active { background: rgba(201, 80, 63, 0.12); }
+html[data-skin="ink-paper"][data-theme="dark"] .skill-popup-item.system-skill .skill-item-name { color: #7fa9b0; }
+
+/* wave-8：底部悬浮钮与 chat-input 容器背景一致（纸卡，active 以朱砂文字/边色区分） */
+html[data-skin="ink-paper"] .mobile-tab-bar .tab-item {
+  background: var(--surface-panel-strong);
+  border-color: var(--skin-line-soft);
+}
+html[data-skin="ink-paper"] .mobile-tab-bar .tab-item.active {
+  background: var(--surface-panel-strong);
+  color: var(--color-primary);
+  border-color: rgba(178, 59, 46, 0.4);
+}
+
+/* ════════ wave-11：登录页 / 笔记引用 / 设置面板内部 / 列表卡片（墨韵发丝线语言） ════════ */
+
+/* 登录页：宋体标题 + 4px 输入/按钮 + 去浮起 */
+html[data-skin="ink-paper"] .login-title {
+  font-family: var(--skin-serif);
+  font-size: 22px;
+  letter-spacing: 4px;
+}
+html[data-skin="ink-paper"] .login-card .form-group input {
+  border-radius: 4px;
+}
+html[data-skin="ink-paper"] .login-btn {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  box-shadow: 0 2px 8px rgba(60, 50, 30, 0.08);
+}
+html[data-skin="ink-paper"] .login-btn:hover:not(:disabled) { transform: none; }
+html[data-skin="ink-paper"] .switch-mode-btn { font-family: var(--skin-serif); letter-spacing: 1px; }
+
+/* 笔记引用对话框：宋体标题 + 4px 按钮 + 发丝 hover */
+html[data-skin="ink-paper"] .picker-title {
+  font-family: var(--skin-serif);
+  font-size: 15.5px;
+  letter-spacing: 2px;
+}
+html[data-skin="ink-paper"] .notebook-section .notebook-name { font-family: var(--skin-serif); }
+html[data-skin="ink-paper"] .note-option { border-radius: 3px; }
+html[data-skin="ink-paper"] .note-option.selected { background: rgba(178, 59, 46, 0.08); }
+html[data-skin="ink-paper"] .note-picker-modal .cancel-btn,
+html[data-skin="ink-paper"] .note-picker-modal .confirm-btn { border-radius: 4px; }
+html[data-skin="ink-paper"] .search-input { border-radius: 4px; }
+
+/* 系统设置面板内部：发丝卡 + 宋体 tab active 加粗线 */
+html[data-skin="ink-paper"] .skin-card {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  box-shadow: none;
+}
+html[data-skin="ink-paper"] .skin-card:hover { transform: none; }
+html[data-skin="ink-paper"] .mode-switch {
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+}
+html[data-skin="ink-paper"] .mode-option { border-radius: 3px; }
+html[data-skin="ink-paper"] .settings-tab {
+  font-family: var(--skin-serif);
+  letter-spacing: 1px;
+}
+html[data-skin="ink-paper"] .settings-tab.active { border-bottom-width: 2px; }
+
+/* 列表卡片（桌面 stack）：内卡 radius 随 stack 令牌（行卡 6px） */
+@media (min-width: 768px) {
+  html[data-skin="ink-paper"] .notebook-item,
+  html[data-skin="ink-paper"] .note-item {
+    border-radius: var(--stack-card-radius);
+  }
+}
+
+/* ══════════ wave-13：深色两 bug + 登录页全对象（mockup 02-ink-paper/login.html）+ logo ══════════ */
+
+/* 深色 bug：侧栏会话 hover 浅纸底 + 浅字 = 不可读（mockup dark --t-hover） */
+html[data-skin="ink-paper"][data-theme="dark"] .conversation-item:hover { background: #30281c; }
+/* 深色 bug：输入区底栏滞留浅色纸 rgba(245,239,227,.7)（mockup .composer dark --pca3） */
+html[data-skin="ink-paper"][data-theme="dark"] .chat-input-wrapper { background: rgba(32, 26, 20, 0.7); }
+
+/* logo 形象（mockup .auth-logo 静态值：奶油 tile / 墨环 / 金虚线 / 朱砂针 —— 深浅同值） */
+html[data-skin="ink-paper"] {
+  --logo-tile-1: #fbf7ec;
+  --logo-tile-2: #f0e8d8;
+  --logo-ring: #2a2521;
+  --logo-dash: #c9a86a;
+  --logo-tick-n: #2a2521;
+  --logo-tick-se: #7a7264;
+  --logo-letter: #2a2521;
+  --logo-letter-font: Georgia, serif; /* mockup .auth-logo text font-family="Georgia,serif" */
+  --logo-needle-n: #b23b2e;
+  --logo-needle-s: #2a2521;
+  --logo-dot: #b23b2e;
+  /* 登录页场景墨色（triplet，供 rgba() 内插） */
+  --ink-tnk: 122, 114, 100;
+  --ink-dq: 54, 85, 90;
+  --ink-lnk: 42, 37, 33;
+  --ink-pca: 251, 247, 236;
+}
+html[data-skin="ink-paper"][data-theme="dark"] {
+  --ink-tnk: 168, 157, 135;
+  --ink-dq: 127, 169, 176;
+  --ink-lnk: 233, 224, 203;
+  --ink-pca: 38, 30, 22;
+}
+html[data-skin="ink-paper"] .logo-svg > rect { rx: 14px; }
+html[data-skin="ink-paper"] .logo-img { box-shadow: 0 4px 14px rgba(60, 50, 30, 0.2); border-radius: 10px; }
+html[data-skin="ink-paper"][data-theme="dark"] .logo-img { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5); }
+
+/* 登录页背景：遮罗盘轮，宣纸底 + 水墨远山两层（body:has 限登录路由） */
+html[data-skin="ink-paper"] .login-page { background: var(--app-background); }
+html[data-skin="ink-paper"] .login-bg .compass { display: none; }
+html[data-skin="ink-paper"] body:has(.login-page)::before {
+  content: '';
+  position: fixed; left: 0; right: 0; bottom: 0; height: 420px;
+  z-index: 0; pointer-events: none; opacity: 0.45;
+  clip-path: polygon(0 70%, 10% 56%, 22% 68%, 34% 48%, 47% 66%, 60% 44%, 72% 62%, 85% 50%, 100% 64%, 100% 100%, 0 100%);
+  background: linear-gradient(180deg, transparent 30%, rgba(var(--ink-tnk), 0.16) 60%, rgba(var(--ink-tnk), 0.06));
+}
+html[data-skin="ink-paper"] body:has(.login-page)::after {
+  content: '';
+  position: fixed; left: 0; right: 0; bottom: 0; height: 340px;
+  z-index: 0; pointer-events: none; opacity: 0.8;
+  clip-path: polygon(0 62%, 12% 48%, 24% 60%, 36% 38%, 50% 56%, 63% 34%, 76% 52%, 88% 40%, 100% 55%, 100% 100%, 0 100%);
+  background:
+    linear-gradient(178deg, transparent 42%, rgba(var(--ink-dq), 0.10) 43%, rgba(var(--ink-dq), 0.05) 70%, transparent 100%),
+    linear-gradient(176deg, transparent 55%, rgba(var(--ink-lnk), 0.12) 56%, rgba(var(--ink-lnk), 0.05) 78%, transparent 100%);
+}
+/* 竖排诗句 ×3 + 朱印装饰（mockup .v-poem p1/p2/p3/.seal-deco） */
+html[data-skin="ink-paper"] .login-bg::before {
+  content: '路漫漫其修远兮　吾将上下而求索';
+  position: absolute; left: 9vw; top: 12vh;
+  writing-mode: vertical-rl; font-family: var(--skin-serif); letter-spacing: 12px;
+  font-size: 21px; color: rgba(var(--ink-tnk), 0.42); pointer-events: none; user-select: none;
+}
+html[data-skin="ink-paper"] .login-bg::after {
+  content: '';
+  position: absolute; left: calc(9vw + 8px); top: calc(12vh + 330px);
+  width: 30px; height: 30px; border-radius: 4px;
+  background: linear-gradient(145deg, #c04537, #a33327); opacity: 0.55;
+  box-shadow: inset 0 0 0 2px rgba(var(--ink-pca), 0.4); pointer-events: none;
+}
+html[data-skin="ink-paper"] .login-page::before {
+  content: '纸上得来终觉浅　绝知此事要躬行';
+  position: absolute; left: calc(9vw + 46px); top: 18vh;
+  writing-mode: vertical-rl; font-family: var(--skin-serif); letter-spacing: 12px;
+  font-size: 15px; color: rgba(var(--ink-tnk), 0.28); pointer-events: none; user-select: none;
+}
+html[data-skin="ink-paper"] .login-page::after {
+  content: '问渠那得清如许　为有源头活水来';
+  position: absolute; right: 9vw; bottom: 20vh;
+  writing-mode: vertical-rl; font-family: var(--skin-serif); letter-spacing: 12px;
+  font-size: 17px; color: rgba(var(--ink-tnk), 0.30); pointer-events: none; user-select: none;
+}
+
+/* 登录卡（mockup .auth-card：纸卡 + 内 6px 金调双框 + 大影） */
+html[data-skin="ink-paper"] .login-card {
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line);
+  box-shadow: var(--frame-shadow);
+  padding: 36px 34px 30px;
+}
+html[data-skin="ink-paper"] .login-card::before {
+  content: '';
+  position: absolute; inset: 6px;
+  border: 1px solid rgba(201, 168, 106, 0.35);
+  border-radius: 3px; pointer-events: none;
+}
+html[data-skin="ink-paper"][data-theme="dark"] .login-card::before { border-color: rgba(214, 182, 126, 0.30); }
+
+/* 品牌区：宋体大字 + 朱砂 seal-mini（mockup .auth-head h1/.seal-mini/.sub） */
+html[data-skin="ink-paper"] .login-title {
+  font-family: var(--skin-serif);
+  font-size: 28px;
+  letter-spacing: 8px;
+  font-weight: 700; /* mockup h1 隐式 700（A4.9-M2） */
+}
+html[data-skin="ink-paper"] .login-title::after {
+  content: 'WT';
+  writing-mode: vertical-rl;
+  display: inline-block;
+  width: 26px; height: 26px; /* mockup .seal-mini 26×26（A4.9-M1） */
+  margin-left: 10px;
+  border-radius: 4px;
+  background: linear-gradient(145deg, #c04537, #a33327);
+  color: #fdf8ec; font-family: var(--skin-serif); font-weight: 700;
+  font-size: 9px; line-height: 1.1; letter-spacing: 0; text-align: center;
+  box-shadow: inset 0 0 0 1.5px rgba(178, 59, 46, 0.45), 0 2px 6px rgba(178, 59, 46, 0.3);
+}
+html[data-skin="ink-paper"] .login-header .subtitle {
+  font-size: 11px; letter-spacing: 4px; text-transform: uppercase;
+  color: var(--color-text-light); margin-top: 6px;
+}
+
+/* 表单：宋体 label + 纸白输入 + 朱砂 focus（mockup .field/.input） */
+html[data-skin="ink-paper"] .login-card .form-group label {
+  font-family: var(--skin-serif); font-size: 12px; font-weight: 400;
+  color: var(--color-text-light); letter-spacing: 2px;
+}
+html[data-skin="ink-paper"] .login-card .form-group input {
+  border-width: 1px;
+  background: #fffdf6;
+  padding: 10px 12px;
+  font-size: 13.5px;
+}
+html[data-skin="ink-paper"] .login-card .form-group input::placeholder { color: #b0a68f; }
+html[data-skin="ink-paper"][data-theme="dark"] .login-card .form-group input { background: #262018; }
+html[data-skin="ink-paper"][data-theme="dark"] .login-card .form-group input::placeholder { color: #9c9077; }
+/* A4.9-M：短 padding 会吞掉密码框右让位 → 恢复 44px（眼钮 clearance） */
+html[data-skin="ink-paper"] .login-card .password-wrapper input { padding-right: 44px; }
+html[data-skin="ink-paper"] .login-card .form-group input:focus {
+  border-color: rgba(178, 59, 46, 0.55);
+  background: #fffdf6;
+  box-shadow: 0 0 0 3px rgba(178, 59, 46, 0.08);
+}
+html[data-skin="ink-paper"][data-theme="dark"] .login-card .form-group input:focus {
+  border-color: rgba(201, 80, 63, 0.55);
+  background: #262018;
+  box-shadow: 0 0 0 3px rgba(201, 80, 63, 0.10);
+}
+
+/* 状态条：发丝框浅染（mockup .alert.err/.warn2/.ok2） */
+/* A4.9-I2：限登录页（ChatArea 存在同名 .error-message，防越域） */
+html[data-skin="ink-paper"] .login-page .error-message {
+  background: rgba(178, 59, 46, 0.07);
+  border: 1px solid rgba(178, 59, 46, 0.35);
+  color: var(--color-primary);
+  border-radius: 4px; font-size: 12.5px; text-align: left; padding: 9px 12px;
+}
+html[data-skin="ink-paper"] .login-page .expired-message {
+  background: rgba(176, 122, 42, 0.09);
+  border: 1px solid rgba(176, 122, 42, 0.4);
+  color: #8a5a1a;
+  border-radius: 4px; font-size: 12.5px; text-align: left; padding: 9px 12px;
+}
+html[data-skin="ink-paper"] .login-page .success-message {
+  background: rgba(74, 122, 63, 0.08);
+  border: 1px solid rgba(74, 122, 63, 0.35);
+  color: #4a7a3f;
+  border-radius: 4px; font-size: 12.5px; text-align: left; padding: 9px 12px;
+}
+html[data-skin="ink-paper"][data-theme="dark"] .login-page .expired-message { color: #dcae52; background: rgba(207, 154, 63, 0.09); border-color: rgba(207, 154, 63, 0.4); }
+html[data-skin="ink-paper"][data-theme="dark"] .login-page .success-message { color: #84ab5c; background: rgba(132, 171, 92, 0.08); border-color: rgba(132, 171, 92, 0.35); }
+
+/* 按钮：朱砂实底白字宋体 ls8（mockup .btn；hover --t-cind） */
+html[data-skin="ink-paper"] .login-btn {
+  background: var(--color-primary);
+  border: 1px solid var(--color-primary-dark);
+  color: #fdf8ec;
+  font-family: var(--skin-serif);
+  letter-spacing: 8px;
+  padding: 11px 0;
+  min-height: 44px;
+  box-shadow: 0 2px 8px rgba(178, 59, 46, 0.28);
+}
+html[data-skin="ink-paper"] .login-btn:hover:not(:disabled) {
+  background: #a33428; border-color: #a33428;
+  box-shadow: 0 2px 8px rgba(178, 59, 46, 0.28); /* A4.9-I3：防 base --primary-glow 泄漏 */
+}
+html[data-skin="ink-paper"][data-theme="dark"] .login-btn:hover:not(:disabled) { background: #d0574a; border-color: #d0574a; box-shadow: 0 2px 8px rgba(201, 80, 63, 0.30); }
+html[data-skin="ink-paper"] .login-btn:active:not(:disabled) { box-shadow: 0 2px 8px rgba(178, 59, 46, 0.28); }
+
+/* 切换文案：灰墨 + 朱砂下划线（mockup .switch a 语义近似：整体按钮） */
+html[data-skin="ink-paper"] .switch-mode-btn {
+  color: var(--color-text-light);
+  border-bottom: 1px solid rgba(178, 59, 46, 0.4);
+  padding-bottom: 2px;
+}
+html[data-skin="ink-paper"] .switch-mode-btn:hover:not(:disabled) {
+  color: var(--color-primary);
+  background: none;
+}
+
+/* ══════════ wave-13b：深色用户按钮/用户菜单 hover + 开屏四卡（mockup chat.html .es-card） ══════════ */
+/* 深色 hover：浅纸 90% + 浅字 = 不可读 → mockup --t-hover dark 实色 */
+html[data-skin="ink-paper"][data-theme="dark"] .user-info:hover { background: #30281c; }
+html[data-skin="ink-paper"][data-theme="dark"] .user-menu-item:hover { background: #30281c; }
+
+/* 开屏四卡：base 组件硬编码 #ffffff（全皮肤通病）→ 按 mockup .es-card 纸卡语言 */
+html[data-skin="ink-paper"] .empty-suggest-card {
+  background: #fffdf6;
+  border: 1px solid var(--skin-line);
+  border-radius: 5px;
+  box-shadow: 0 2px 10px rgba(60, 50, 30, 0.08);
+}
+html[data-skin="ink-paper"] .empty-suggest-card:hover {
+  transform: translateY(-2px);
+  background: #fffdf6;
+  box-shadow: 0 8px 20px rgba(60, 50, 30, 0.13);
+}
+html[data-skin="ink-paper"] .empty-suggest-card .es-ico { color: var(--color-primary); }
+html[data-skin="ink-paper"][data-theme="dark"] .empty-suggest-card {
+  background: #262018;
+  border-color: rgba(233, 224, 203, 0.2);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+html[data-skin="ink-paper"][data-theme="dark"] .empty-suggest-card:hover {
+  background: #262018;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.6);
+}
+
+/* wave-13b 补全：同族浅纸 90% hover / 半透纸底在深色的整套对应（mockup dark --t-hover / 墨底） */
+html[data-skin="ink-paper"][data-theme="dark"] .np-notebook-row:hover,
+html[data-skin="ink-paper"][data-theme="dark"] .np-note-row:hover,
+html[data-skin="ink-paper"][data-theme="dark"] .more-dropdown-item:hover,
+html[data-skin="ink-paper"][data-theme="dark"] .reasoning-menu-item:hover { background: #30281c; }
+html[data-skin="ink-paper"][data-theme="dark"] .reasoning-block { background: rgba(233, 224, 203, 0.08); }
+html[data-skin="ink-paper"][data-theme="dark"] .tool-card-result { background: rgba(233, 224, 203, 0.08); }
+html[data-skin="ink-paper"][data-theme="dark"] .tool-card-result .stream-markdown code:not(.hljs) { background: rgba(233, 224, 203, 0.12); }
+html[data-skin="ink-paper"][data-theme="dark"] .search-result-item { background: rgba(233, 224, 203, 0.06); }
+html[data-skin="ink-paper"][data-theme="dark"] .search-result-item:hover { background: rgba(233, 224, 203, 0.12); }
+html[data-skin="ink-paper"][data-theme="dark"] .timeline-tool-call { background: rgba(233, 224, 203, 0.06); }
+
+/* wave-13b：开屏四卡 + 深色可读文字族（用户红线：禁浅底浅字/深底深字） */
+/* 四卡：分类名深色朱砂 #c9503f on #262018 = 3.61 → 金 #d6b67e (8.35)；浅色示例问 #7a7264 on #fffdf6 = 4.44 → #6b6355 (5.8) */
+html[data-skin="ink-paper"][data-theme="dark"] .empty-suggest-card .es-cat { color: #d6b67e; }
+html[data-skin="ink-paper"]:not([data-theme="dark"]) .empty-suggest-card .es-q { color: #6b6355; }
+/* 退出登录项：#d0574a on #211b14 = 4.18 → #e08466 (6.5) */
+html[data-skin="ink-paper"][data-theme="dark"] .user-menu-item.logout { color: #e08466; }
+/* 新建对话：白字 on 深色 #d0574a = 3.85 → #b23b2e (5.34) / hover #932f24 (5.99) */
+html[data-skin="ink-paper"][data-theme="dark"] .new-chat-btn { background: #b23b2e; border-color: #932f24; }
+html[data-skin="ink-paper"][data-theme="dark"] .new-chat-btn:hover { background: #932f24; }
+/* 用户头像：白字 on 深色 info #7fa9b0 = 2.24 → #2f4f4a (8.3) */
+html[data-skin="ink-paper"][data-theme="dark"] .user-avatar { background: #2f4f4a; }
+/* 侧栏滑动钮：白字对全部 ≥4.5（move-group #8b5cf6 4.23 / move #f59e0b 2.15 双主题修） */
+html[data-skin="ink-paper"] .swipe-action.move-group { background: #6d28d9; }
+html[data-skin="ink-paper"] .swipe-action.move { background: #b45309; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.export { background: #2f665b; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.edit { background: #5b6472; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.save-note { background: #4d6b37; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.delete { background: #a3402e; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.rename { background: #b23b2e; }
+
+/* round4：深色侧栏会话折叠头/时间分组等浅色第二族之外的漏网 —— 「试试这些：」金字 #c9a86a on #fbf7ec = 2.11 → #8a6a2f (5.29) */
+html[data-skin="ink-paper"]:not([data-theme="dark"]) .empty-try { color: #7d5f2a; }
+
+/* A4.9-R2：swipe 第 8 名（笔记本「设默认」星 10px 白字 on #84ab5c = 2.64）；empty-try 改 #7d5f2a（见上方 R4 行） */
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.default { background: #4d6b37; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.default.active { background: #3f5a30; } /* A4.9-R3：激活星与未激活星区分（white 6.9） */
+
+/* ══════════ wave-15：后台任务/死磕状态条/盘问/草稿箱/附件卡（mockup chat.html .bg-panel 5/.dm-bar/.q-card/.draft-card/.att-*） ══════════ */
+/* 后台任务面板：5px 发丝卡 + 宋体头 + 4px 任务卡 */
+html[data-skin="ink-paper"] .background-task-panel.background-task-panel {
+  margin: 10px 16px;
+  border: 1px solid var(--skin-line);
+  border-radius: 5px;
+  background: var(--surface-panel-strong);
+  box-shadow: var(--frame-shadow);
+}
+html[data-skin="ink-paper"] .btp-header { padding: 9px 14px; border-bottom: 1px solid var(--skin-line-soft); font-size: 13px; }
+html[data-skin="ink-paper"] .btp-title { font-family: var(--skin-serif); letter-spacing: 2px; }
+html[data-skin="ink-paper"] .btp-badge.btp-badge,
+html[data-skin="ink-paper"] .btp-status-badge.btp-status-badge { border-radius: 3px; padding: 1px 8px; }
+html[data-skin="ink-paper"] .btp-body { padding: 10px 14px 14px; }
+html[data-skin="ink-paper"] .btp-task.btp-task {
+  border-radius: 4px;
+  background: var(--surface-panel-subtle);
+  border: 1px solid var(--skin-line);
+  padding: 11px 13px;
+}
+html[data-skin="ink-paper"] .btp-task.btp-task.running,
+html[data-skin="ink-paper"] .btp-task.btp-task.completed,
+html[data-skin="ink-paper"] .btp-task.btp-task.failed { border-left: 1px solid var(--skin-line); }
+html[data-skin="ink-paper"] .btp-progress-bar { height: 6px; border-radius: 3px; }
+html[data-skin="ink-paper"] .btp-progress-fill { border-radius: 3px; background: linear-gradient(90deg, var(--color-primary), color-mix(in srgb, var(--color-primary) 78%, #fff)); }
+html[data-skin="ink-paper"] .btp-cancel-btn,
+html[data-skin="ink-paper"] .btp-dismiss-btn,
+html[data-skin="ink-paper"] .btp-view-btn { border-radius: 3px; padding: 3px 9px; font-size: 11px; }
+
+/* 死磕状态条（mockup .dm-bar 朱砂发丝染条 / .grill-bar 黛青盘问） */
+html[data-skin="ink-paper"] .deathmatch-status-bar.deathmatch-status-bar {
+  margin: 12px 16px;
+  border: 1px solid color-mix(in srgb, var(--color-danger) 45%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-danger) 45%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--color-danger) 6%, transparent);
+  padding: 10px 14px;
+}
+html[data-skin="ink-paper"] .deathmatch-status-bar.deathmatch-status-bar.dm-grilling {
+  border-color: color-mix(in srgb, var(--color-info) 45%, transparent);
+  background: color-mix(in srgb, var(--color-info) 7%, transparent);
+}
+html[data-skin="ink-paper"] .deathmatch-status-bar .dm-status-text { font-family: var(--skin-serif); letter-spacing: 1px; color: var(--color-danger); }
+html[data-skin="ink-paper"] .deathmatch-status-bar.dm-grilling .dm-status-text { color: var(--color-info); }
+html[data-skin="ink-paper"] .deathmatch-status-bar.dm-paused .dm-status-text,
+html[data-skin="ink-paper"] .deathmatch-status-bar.dm-human-gate .dm-status-text { color: var(--color-warning); }
+html[data-skin="ink-paper"] .deathmatch-status-bar.dm-done .dm-status-text { color: var(--color-success); }
+html[data-skin="ink-paper"] .deathmatch-status-bar .dm-status-icon,
+html[data-skin="ink-paper"] .deathmatch-status-bar .dm-continue-indicator { color: var(--color-danger); }
+
+/* 盘问（mockup .q-card 5 发丝 + .q-no 朱砂宋体序号 + .q-opt 竖排） */
+html[data-skin="ink-paper"] .grilling-round-header {
+  width: fit-content;
+  margin: 12px auto 8px;
+  font-family: var(--skin-serif);
+  font-size: 11px;
+  letter-spacing: 3px;
+  color: var(--color-warning);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 50%, transparent);
+  border-radius: 999px;
+  padding: 3px 14px;
+  background: color-mix(in srgb, var(--color-warning) 7%, transparent);
+}
+html[data-skin="ink-paper"] .grilling-bubble-content.grilling-bubble-content {
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line);
+  border-radius: 5px;
+  box-shadow: none;
+  padding: 12px 14px;
+}
+html[data-skin="ink-paper"] .grilling-bubble-answered .grilling-bubble-content.grilling-bubble-content {
+  background: color-mix(in srgb, var(--color-info) 4%, transparent);
+  border-color: color-mix(in srgb, var(--color-info) 45%, transparent);
+}
+html[data-skin="ink-paper"] .grilling-q-number {
+  width: auto;
+  height: auto;
+  background: transparent;
+  border-radius: 0;
+  color: var(--color-danger);
+  font-family: var(--skin-serif);
+  font-size: 15px;
+  font-weight: 600;
+}
+html[data-skin="ink-paper"] .grilling-bubble-answered .grilling-q-number { background: transparent; color: var(--color-success); }
+html[data-skin="ink-paper"] .grilling-option-btn {
+  border-radius: 4px;
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line);
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .grilling-option-btn:hover { background: var(--surface-panel-strong); border-color: color-mix(in srgb, var(--color-danger) 45%, transparent); }
+html[data-skin="ink-paper"] .grilling-option-btn.grilling-option-selected {
+  background: var(--surface-panel-strong);
+  color: var(--color-danger);
+  border-color: color-mix(in srgb, var(--color-danger) 45%, transparent);
+}
+html[data-skin="ink-paper"] .grilling-option-btn.grilling-option-other { border-style: dashed; }
+
+/* 草稿箱（mockup .draft-card 宋体头 + 虚线分隔条目） */
+html[data-skin="ink-paper"] .drafts-panel.drafts-panel { border-radius: 5px; border: 1px solid var(--skin-line); box-shadow: var(--frame-shadow); }
+html[data-skin="ink-paper"] .drafts-title { font-family: var(--skin-serif); letter-spacing: 1px; font-size: 13.5px; }
+html[data-skin="ink-paper"] .drafts-header { border-bottom: 1px solid var(--skin-line-soft); }
+html[data-skin="ink-paper"] .draft-item { background: transparent; border: none; border-bottom: 1px dashed var(--skin-line-soft); border-radius: 0; }
+html[data-skin="ink-paper"] .draft-item:hover { border-color: var(--skin-line-soft); border-bottom: 1px dashed var(--skin-line-soft); }
+html[data-skin="ink-paper"] .draft-ref-tag {
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-info);
+  border: 1px solid color-mix(in srgb, var(--color-info) 35%, transparent);
+}
+html[data-skin="ink-paper"] .draft-send-btn:hover:not(:disabled) { background: transparent; color: var(--color-danger); }
+
+/* 附件卡（mockup .att-img/.att-file 4 发丝 + 图标朱砂框） */
+html[data-skin="ink-paper"] .image-card.image-card { border-radius: 4px; border: 1px solid var(--skin-line); background: var(--surface-panel-strong); }
+html[data-skin="ink-paper"] .media-card,
+html[data-skin="ink-paper"] .file-card { border-radius: 4px; border: 1px solid var(--skin-line); background: var(--surface-panel-strong); }
+html[data-skin="ink-paper"] .media-icon {
+  border: 1px solid color-mix(in srgb, var(--color-danger) 25%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 8%, transparent);
+  border-radius: 4px;
+  padding: 4px 7px;
+  font-size: 14px;
+}
+
+/* wave-15 R1 修复（A4.9 I1/I2/M2/M5/C2） */
+/* 三类复合选择器（0,4,0）压过 (0,3,1) 选中覆写 → 显式补「其他答案选中」态 */
+html[data-skin="ink-paper"] .grilling-option-btn.grilling-option-other.grilling-option-selected {
+  background: var(--surface-panel-strong);
+  color: var(--color-danger);
+  border-color: color-mix(in srgb, var(--color-danger) 45%, transparent);
+}
+html[data-skin="ink-paper"] .deathmatch-status-bar.dm-partial .dm-status-text { color: var(--color-info); }
+html[data-skin="ink-paper"] .btp-progress-fill { background: linear-gradient(90deg, var(--color-primary), color-mix(in srgb, var(--color-primary) 78%, var(--surface-panel-strong))); }
+html[data-skin="ink-paper"][data-theme="dark"] .grilling-submit-btn { background: color-mix(in srgb, var(--color-info) 55%, #000); }
+html[data-skin="ink-paper"][data-theme="dark"] .grilling-submit-btn:hover:not(:disabled) { background: color-mix(in srgb, var(--color-info) 42%, #000); }
+
+/* ══════════ wave-16：公式/mermaid 卡（mockup .formula 4 发丝宋体斜体黛青/.mermaid-ph 4 虚线黛青染） ══════════ */
+html[data-skin="ink-paper"] .katex-display.katex-display {
+  border-radius: 4px;
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line-soft);
+  text-align: center;
+}
+html[data-skin="ink-paper"] .katex-display .katex {
+  font-family: var(--skin-serif);
+  font-style: italic;
+  color: var(--color-info);
+}
+html[data-skin="ink-paper"] .mermaid-block.mermaid-block {
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--color-info) 5%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--color-info) 45%, transparent);
+}
+
+/* wave-16：笔记 math/mermaid 编辑对话框（发丝 5px + 宋体头） */
+html[data-skin="ink-paper"] .math-dialog,
+html[data-skin="ink-paper"] .mermaid-dialog {
+  border-radius: 5px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+}
+html[data-skin="ink-paper"] .math-dialog-header h3,
+html[data-skin="ink-paper"] .mermaid-dialog-header h3,
+html[data-skin="ink-paper"] .math-dialog-header,
+html[data-skin="ink-paper"] .mermaid-dialog-header { font-family: var(--skin-serif); letter-spacing: 1px; }
+html[data-skin="ink-paper"] .math-edit-textarea,
+html[data-skin="ink-paper"] .mermaid-edit-textarea {
+  border-radius: 3px;
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--skin-line);
+}
+html[data-skin="ink-paper"] .math-dialog-save,
+html[data-skin="ink-paper"] .mermaid-dialog-save { border-radius: 3px; }

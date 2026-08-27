@@ -1,0 +1,14 @@
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 信任自签名证书 & 允许明文回退 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">your-server.example</domain> <!-- 部署时改为你的服务器域名/IP -->
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

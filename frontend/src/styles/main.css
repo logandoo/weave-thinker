@@ -1,0 +1,821 @@
+/* Copyright (c) 2026 Weave Thinker Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* ==========================================================================
+   设计令牌默认值 = 默认皮肤「青野平面 (verdant-flat)」
+   - 本块即注册表中的 verdant-flat：未设置 data-skin 时由此生效
+   - 其他皮肤见 styles/themes/*.css（[data-skin="<id>"] 覆盖块）
+   - 皮肤契约文档：docs/SKINS.md；目录 API：GET /api/skins
+   ========================================================================== */
+:root {
+  --color-primary: #7AA35A;
+  --color-primary-dark: #6B8F4D;
+  --color-secondary: #9ABE7A;
+  --color-accent: #7AA35A;
+  --color-bg: #f3f6f0;
+  --color-bg-secondary: #f8faf6;
+  --color-sidebar: #eef3ea;
+  --color-code-bg: #e8ece5;
+  --color-text: #2d3b24;
+  --color-text-light: #6b7d5e;
+  --color-text-primary: var(--color-text);
+  --color-text-secondary: var(--color-text-light);
+  --color-user-bubble: #e4ede0;
+  --color-white: #ffffff;
+  --color-border: #dfe7d8;
+  --color-hover: #eaf2e6;
+  --color-error: #BE5033;
+  --color-danger: var(--color-error);
+  --color-success: #5a8a3a;
+  --color-warning: #C8871C;
+  --color-info: #4E9A8F;
+
+  --surface-panel-strong: #ffffff;
+  --surface-panel-subtle: #f8faf6;
+  --surface-input: #ffffff;
+  --surface-workbench: #ffffff;
+  --panel-border: rgba(107, 141, 77, 0.15);
+  --panel-border-strong: rgba(122, 163, 90, 0.22);
+  --frame-shadow: 0 26px 54px rgba(90, 130, 60, 0.08), 0 8px 18px rgba(90, 130, 60, 0.05);
+  --panel-shadow: 0 12px 24px rgba(90, 130, 60, 0.06), 0 2px 6px rgba(90, 130, 60, 0.04);
+  --glass-blur: blur(14px);
+
+  --scrollbar-thumb: #b5c9a8;
+  --scrollbar-thumb-hover: #8da87e;
+
+  /* ==========================================================================
+     组件对齐令牌（皮肤可覆写；默认 = 系统现状）
+     对应 mockup 中可 CSS 化的组件级细节。皮肤文档：docs/SKINS.md
+     ========================================================================== */
+  /* Sidebar 卡片化 */
+  --sidebar-card-bg: var(--color-sidebar);
+  --sidebar-card-radius: 0;
+  --sidebar-card-shadow: none;
+  --sidebar-card-border: none;
+  /* 导航 pill 容器 */
+  --nav-pill-bg: transparent;
+  --nav-pill-radius: 0;
+  --nav-pill-padding: 0;
+  --nav-pill-gap: 0;
+  /* 消息气泡 */
+  --msg-bubble-radius: var(--radius-lg);
+  --msg-bubble-bl: 4px;  /* assistant 气泡左下角 */
+  --msg-bubble-br: 4px;  /* user 气泡右下角 */
+  --msg-bubble-border: none;
+  --msg-bubble-shadow: var(--shadow-sm);
+  --msg-user-bg: var(--color-user-bubble);
+  --msg-assistant-bg: var(--color-white);
+  /* 输入区 */
+  --input-container-radius: 28px;
+  --input-container-min-height: 180px;
+  --input-container-border: var(--panel-border-strong);
+  --input-container-shadow-focus: 0 0 0 4px rgba(122, 163, 90, 0.10);
+  /* 代码块 */
+  --code-block-bg: var(--color-code-bg);
+  --code-block-header-bg: color-mix(in srgb, var(--color-code-bg) 84%, var(--color-text) 6%);
+  --code-block-text: var(--color-text);
+  /* 思考块 */
+  --reasoning-border-left: var(--color-secondary);
+  /* 顶部栏卡片 */
+  --chat-topbar-bg: transparent;
+  --chat-topbar-radius: 0;
+  --chat-topbar-border: none;
+  --chat-topbar-shadow: none;
+  /* 按钮 hover 位移 */
+  --btn-hover-lift: 0;
+  /* 弹窗卡片 */
+   --dialog-radius: 24px;
+   --dialog-shadow: var(--frame-shadow), 0 20px 40px rgba(0, 0, 0, 0.15);
+   /* 滚动条（已由上方定义，此处仅为皮肤提示） */
+
+   /* 共享交互态（wave-11 六界面及弹窗/菜单/卡片家族 token 化，皮肤可覆写） */
+   --overlay-scrim: rgba(24, 18, 14, 0.35);
+   --focus-ring-color: color-mix(in srgb, var(--color-primary) 14%, transparent);
+   --primary-tint: color-mix(in srgb, var(--color-primary) 8%, transparent);
+   --primary-tint-strong: color-mix(in srgb, var(--color-primary) 12%, transparent);
+   --danger-tint: color-mix(in srgb, var(--color-error) 8%, transparent);
+   --warning-tint: color-mix(in srgb, var(--color-warning) 10%, transparent);
+   --info-tint: color-mix(in srgb, var(--color-info) 12%, transparent);
+   /* 公式/mermaid 查看卡（默认=柔和卡，皮肤逐皮覆写） */
+   --formula-bg: var(--surface-panel-subtle);
+   --formula-border: var(--panel-border);
+   --formula-radius: var(--radius-md);
+   --info-tint-strong: color-mix(in srgb, var(--color-info) 22%, transparent);
+   --success-tint: color-mix(in srgb, var(--color-success) 14%, transparent);
+   --success-tint-strong: color-mix(in srgb, var(--color-success) 24%, transparent);
+   --primary-glow: 0 8px 20px color-mix(in srgb, var(--color-primary) 25%, transparent);
+   --action-edit-bg: #6b7280;
+   --swipe-move-bg: #f59e0b;
+   --success-strong: #2e7d32;
+   /* 弹出菜单家族（reasoning-menu / more-dropdown / skill-popup / context-menu；默认皮肤=青野玻璃卡 16px） */
+   --menu-radius: 16px;
+   --menu-border: 1px solid var(--panel-border);
+   --menu-shadow: 0 4px 16px color-mix(in srgb, var(--color-text) 10%, transparent);
+   /* 笔记本/笔记桌面 wallet-stack 卡片（默认皮肤=青野浮起卡） */
+   --stack-card-radius: 18px;
+   --stack-card-shadow: 0 -2px 8px rgba(90, 130, 60, 0.08), 0 4px 14px rgba(90, 130, 60, 0.12);
+   --stack-card-shadow-hover: 0 -4px 16px rgba(90, 130, 60, 0.12), 0 18px 38px rgba(0, 0, 0, 0.22);
+   --stack-hover-lift: -18px;
+   --stack-overlap: -40px;
+
+   --font-main: 'Inter', 'Noto Sans SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  /* 代码块语法高亮调色板（light 默认；皮肤按各自代码底色覆写） */
+  --code-keyword: #d73a49;
+  --code-string: #032f62;
+  --code-comment: #6a737d;
+  --code-number: #005cc5;
+  --code-function: #6f42c1;
+  --code-variable: #e36209;
+
+  /* logo 形象令牌（LogoIcon.vue 消费；默认=青野罗盘：绿环白 tile。墨韵/黑白按 mockup login.html 覆写） */
+  --logo-tile-1: var(--color-white);
+  --logo-tile-2: var(--color-hover);
+  --logo-ring: var(--color-primary);
+  --logo-ring-sw: 3;
+  --logo-dash: var(--color-border);
+  --logo-dash-sw: 1.5;
+  --logo-tick-n: var(--color-primary);
+  --logo-tick-n-sw: 3;
+  --logo-tick-se: var(--color-secondary);
+  --logo-tick-se-sw: 2.5;
+  --logo-letter: var(--color-primary);
+  --logo-letter-font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --logo-letter-weight: 700;
+  --logo-needle-n: var(--color-danger);
+  --logo-needle-s: var(--color-text);
+  --logo-dot: var(--color-primary);
+
+  --sidebar-width: 300px;
+  --header-height: 56px;
+  --drawer-width: 85vw;
+  --breakpoint-sm: 640px;
+  --breakpoint-md: 768px;
+  --breakpoint-lg: 1024px;
+
+  --shadow-sm: 0 -1px 4px rgba(90, 130, 60, 0.06), 0 3px 10px rgba(90, 130, 60, 0.08);
+  --shadow-md: 0 -2px 8px rgba(90, 130, 60, 0.06), 0 10px 24px rgba(90, 130, 60, 0.12);
+  --shadow-lg: 0 -3px 12px rgba(90, 130, 60, 0.08), 0 18px 36px rgba(90, 130, 60, 0.14);
+
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+  --radius-pill: 18px;
+
+  --shell-frame-padding: 0px;
+  --shell-workbench-radius: 28px;
+  --shell-card-gap: 18px;
+  --mobile-tab-bar-height: 44px;
+  --mobile-tab-bar-offset: 56px; /* wave-8：hint 与底部悬浮钮间距降低（66→56） */
+
+  --transition-fast: 150ms ease;
+  --transition-normal: 250ms ease;
+  --transition-slow: 400ms ease;
+
+  --app-background:
+    linear-gradient(180deg, #ffffff 0%, #fafafa 100%);
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --color-primary: #86b45e;
+  --color-primary-dark: #86b45e;
+  --color-secondary: #a8d08a;
+  --color-accent: #86b45e;
+  --color-bg: #121412;
+  --color-bg-secondary: #161916;
+  --color-sidebar: #191c19;
+  --color-code-bg: #161916;
+  --color-text: #e9ece6;
+  --color-text-light: #a9b0a2;
+  --color-text-primary: var(--color-text);
+  --color-text-secondary: var(--color-text-light);
+  --color-user-bubble: #2a2e2a;
+  --color-white: #141414;
+  --color-border: #2c312c;
+  --color-hover: #2a2e2a;
+  --color-error: #E07B54;
+  --color-danger: var(--color-error);
+  --color-success: #8fbe5e;
+  --color-warning: #DFAF3C;
+  --color-info: #5fbeaa;
+
+  --surface-panel-strong: #1d201d;
+  --surface-panel-subtle: #161916;
+  --surface-input: #161916;
+  --surface-workbench: #121412;
+  --panel-border: #2c312c;
+  --panel-border-strong: rgba(134, 180, 94, 0.22);
+  --frame-shadow: 0 18px 36px rgba(0, 0, 0, 0.55), 0 6px 14px rgba(0, 0, 0, 0.45);
+  --panel-shadow: 0 8px 20px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.35);
+  --glass-blur: blur(14px);
+
+  --scrollbar-thumb: #4a5e40;
+  --scrollbar-thumb-hover: #6b8060;
+
+  /* 组件对齐令牌（暗色） */
+  --sidebar-card-bg: var(--color-sidebar);
+  --sidebar-card-radius: 0;
+  --sidebar-card-shadow: none;
+  --sidebar-card-border: none;
+  --nav-pill-bg: transparent;
+  --nav-pill-radius: 0;
+  --nav-pill-padding: 0;
+  --nav-pill-gap: 0;
+  --msg-bubble-radius: var(--radius-lg);
+  --msg-bubble-bl: 4px;
+  --msg-bubble-br: 4px;
+  --msg-bubble-border: none;
+  --msg-bubble-shadow: var(--shadow-sm);
+  --msg-user-bg: var(--color-user-bubble);
+  --msg-assistant-bg: var(--color-white);
+  --input-container-radius: 28px;
+  --input-container-min-height: 180px;
+  --input-container-border: var(--panel-border-strong);
+  --input-container-shadow-focus: 0 0 0 4px rgba(134, 180, 94, 0.10);
+  --code-block-bg: var(--color-code-bg);
+  --code-block-header-bg: color-mix(in srgb, var(--color-code-bg) 84%, var(--color-text) 6%);
+  --code-block-text: var(--color-text);
+  /* 代码块语法高亮调色板（dark 默认；One Dark 系，皮肤按各自代码底色覆写） */
+  --code-keyword: #c678dd;
+  --code-string: #98c379;
+  --code-comment: #7f848e;
+  --code-number: #d19a66;
+  --code-function: #61afef;
+  --code-variable: #e5c07b;
+  --reasoning-border-left: var(--color-secondary);
+  --chat-topbar-bg: transparent;
+  --chat-topbar-radius: 0;
+  --chat-topbar-border: none;
+  --chat-topbar-shadow: none;
+  --btn-hover-lift: 0;
+  --dialog-radius: 24px;
+  --dialog-shadow: var(--frame-shadow), 0 20px 40px rgba(0, 0, 0, 0.15);
+  /* 共享交互态（暗色） */
+  --overlay-scrim: rgba(0, 0, 0, 0.62);
+  --focus-ring-color: color-mix(in srgb, var(--color-primary) 22%, transparent);
+  --danger-tint: color-mix(in srgb, var(--color-error) 12%, transparent);
+  --warning-tint: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  --info-tint: color-mix(in srgb, var(--color-info) 20%, transparent);
+  --formula-bg: var(--surface-panel-subtle);
+  --formula-border: var(--panel-border);
+  --formula-radius: var(--radius-md);
+  --info-tint-strong: color-mix(in srgb, var(--color-info) 30%, transparent);
+  --success-tint: color-mix(in srgb, var(--color-success) 22%, transparent);
+  --success-tint-strong: color-mix(in srgb, var(--color-success) 32%, transparent);
+  --primary-glow: 0 8px 20px rgba(0, 0, 0, 0.4);
+  /* 弹出菜单家族（暗色） */
+  --menu-shadow: var(--shadow-md);
+  /* notebook/笔记 wallet-stack（暗色） */
+  --stack-card-shadow: 0 -2px 8px rgba(0, 0, 0, 0.35), 0 4px 14px rgba(0, 0, 0, 0.40);
+  --stack-card-shadow-hover: 0 -4px 16px rgba(0, 0, 0, 0.40), 0 18px 38px rgba(0, 0, 0, 0.55);
+
+  --shadow-sm: 0 -1px 4px rgba(0, 0, 0, 0.35), 0 3px 10px rgba(0, 0, 0, 0.40);
+  --shadow-md: 0 -2px 8px rgba(0, 0, 0, 0.40), 0 10px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 -3px 12px rgba(0, 0, 0, 0.45), 0 18px 36px rgba(0, 0, 0, 0.55);
+
+  --app-background: #121412;
+
+  color-scheme: dark;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  height: 100vh;
+  height: 100dvh;
+  width: 100%;
+  overflow: hidden;
+  overscroll-behavior-x: none;
+}
+
+body {
+  padding-bottom: 0;
+}
+
+body {
+  font-family: var(--font-main);
+  font-display: swap;
+  font-size: 14px;
+  color: var(--color-text);
+  background: var(--app-background);
+  background-color: var(--color-bg);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* View Transition API: ripple theme switch */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-old(root) {
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 9999;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-size: inherit;
+}
+
+input, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  border: none;
+  outline: none;
+  background: none;
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--color-text-light);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInRight {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity var(--transition-normal);
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.slide-enter-active,
+.slide-leave-active {
+  transition: opacity var(--transition-normal), transform var(--transition-normal);
+}
+
+.slide-enter-from {
+  opacity: 0;
+  transform: translateX(-20px);
+}
+
+.slide-leave-to {
+  opacity: 0;
+  transform: translateX(20px);
+}
+
+.page-enter-active {
+  animation: fadeInUp 0.3s ease-out;
+}
+
+.page-leave-active {
+  animation: fadeOut 0.2s ease-in;
+}
+
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+.drawer-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(2px);
+  z-index: 998;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.drawer-overlay.visible {
+  display: block;
+}
+
+@media (min-width: 768px) {
+  .hide-on-desktop {
+    display: none !important;
+  }
+}
+
+/* 输入区按钮双标签：桌面显全称（--full），移动端显简称（--short） */
+.toolbar-btn-label--short {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .hide-on-mobile {
+    display: none !important;
+  }
+
+  .toolbar-btn-label--full {
+    display: none;
+  }
+
+  .toolbar-btn-label--short {
+    display: inline;
+  }
+
+  /* 简称导致按钮变窄：笔记/思考 回补最小宽（agent 模式输入区，全皮肤） */
+  .note-ref-btn,
+  .reasoning-btn {
+    min-width: 64px;
+  }
+
+  .chat-header {
+    padding: 0 16px;
+  }
+
+  .message-bubble {
+    padding: 8px 12px;
+  }
+
+  .message-bubble .content {
+    max-width: 85%;
+  }
+
+  .streaming-message {
+    padding: 8px 12px;
+  }
+
+  .streaming-message .content {
+    max-width: 85%;
+  }
+
+  .chat-input-wrapper {
+    padding: 8px 12px 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .message-bubble .content {
+    max-width: 90%;
+  }
+
+  .message-bubble .text {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+
+  .streaming-message .text {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+}
+
+.chat-main {
+  position: relative;
+}
+
+/* Page slide transitions between Chat and Notes views */
+.page-slide-left-enter-active,
+.page-slide-right-enter-active {
+  z-index: 2;
+  transition: opacity 0.3s cubic-bezier(0.22, 1, 0.36, 1),
+              transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  overflow: hidden;
+}
+
+.page-slide-left-leave-active,
+.page-slide-right-leave-active {
+  z-index: 1;
+  transition: opacity 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+              transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  overflow: hidden;
+}
+
+.page-slide-left-enter-from {
+  opacity: 0;
+  transform: translateX(40px);
+}
+
+.page-slide-left-leave-to {
+  opacity: 0;
+  transform: translateX(-40px);
+}
+
+.page-slide-right-enter-from {
+  opacity: 0;
+  transform: translateX(-40px);
+}
+
+.page-slide-right-leave-to {
+  opacity: 0;
+  transform: translateX(40px);
+}
+
+@media (max-width: 767px) {
+  .page-slide-left-enter-active,
+  .page-slide-right-enter-active {
+    transition-duration: 0.22s;
+  }
+
+  .page-slide-left-leave-active,
+  .page-slide-right-leave-active {
+    transition-duration: 0.18s;
+  }
+
+  .page-slide-left-enter-from,
+  .page-slide-right-leave-to {
+    transform: translateX(24px);
+  }
+
+  .page-slide-left-leave-to,
+  .page-slide-right-enter-from {
+    transform: translateX(-24px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Embedded <audio>/<video> in markdown replies must never overflow their
+ * container. Browsers default media elements to 300px wide; in narrow
+ * bubbles (mobile / small windows) the reply area is < 300px and the
+ * player sticks out of the bubble (conv b848048c). Media cards rendered
+ * by FileAttachment already constrain themselves — this covers markdown-
+ * embedded and preview contexts.
+ */
+.message-bubble audio,
+.message-bubble video,
+.streaming-message audio,
+.streaming-message video,
+.stream-markdown audio,
+.stream-markdown video,
+.agent-step-markdown audio,
+.agent-step-markdown video,
+.markdown-body audio,
+.markdown-body video {
+  max-width: 100%;
+}
+
+.message-bubble video,
+.streaming-message video,
+.stream-markdown video,
+.agent-step-markdown video,
+.markdown-body video {
+  height: auto;
+}
+
+/* Embed iframes (YouTube/Bilibili official share links) must not overflow
+ * narrow bubbles either: their width/height attributes are desktop-sized. */
+.message-bubble iframe,
+.streaming-message iframe,
+.stream-markdown iframe,
+.agent-step-markdown iframe,
+.markdown-body iframe {
+  max-width: 100%;
+  border: 0;
+  border-radius: var(--radius-sm);
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+/* ------------------------------------------------------------------ */
+/* Markdown code blocks (emitted by the renderer in useMarkdown.ts as
+ * <div class="code-block"> with a header: language label + one-click copy
+ * button). Long lines soft-wrap at the box edge (word wrap) instead of
+ * overflowing horizontally; indentation and hard newlines are preserved. */
+/* ------------------------------------------------------------------ */
+.code-block {
+  position: relative;
+  margin: 8px 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background-color: var(--code-block-bg);
+  overflow: hidden;
+}
+
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 6px 4px 12px;
+  border-bottom: 1px solid var(--color-border);
+  background-color: var(--code-block-header-bg);
+}
+
+.code-block-lang {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-text-light);
+  user-select: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-block-copy-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-light);
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.code-block-copy-btn:hover {
+  background-color: var(--color-hover);
+  color: var(--color-text);
+}
+
+.code-block-copy-btn:active {
+  transform: scale(0.94);
+}
+
+.code-block-copy-btn .cb-copy-icon,
+.code-block-copy-btn .cb-check-icon {
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.code-block-copy-btn .cb-check-icon {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  opacity: 0;
+  transform: scale(0.6);
+}
+
+.code-block-copy-btn.copied {
+  color: var(--color-success);
+}
+
+.code-block-copy-btn.copied .cb-copy-icon {
+  opacity: 0;
+  transform: scale(0.6);
+}
+
+.code-block-copy-btn.copied .cb-check-icon {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.code-block pre {
+  margin: 0;
+  padding: 12px 16px;
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.code-block pre code {
+  background: none;
+  padding: 0;
+}
+
+/* ══════════ wave-16：公式 / mermaid 查看卡（v-html 内容，上下文无关全局规则；皮肤逐皮覆写 --formula-*） ══════════ */
+.katex-display {
+  padding: 14px 12px;
+  background: var(--formula-bg);
+  border: 1px solid var(--formula-border);
+  border-radius: var(--formula-radius);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.mermaid-block {
+  padding: 12px;
+  background: var(--formula-bg);
+  border: 1px solid var(--formula-border);
+  border-radius: var(--formula-radius);
+}
+.mermaid-error {
+  background: var(--danger-tint);
+}

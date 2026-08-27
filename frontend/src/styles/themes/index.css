@@ -1,0 +1,13 @@
+/* Copyright (c) 2026 Weave Thinker Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* 皮肤聚合入口：在 main.css 之后加载。
+ * 每个皮肤文件定义 [data-skin="<id>"]（light）与
+ * [data-skin="<id>"][data-theme="dark"]（dark，双属性优先级更高）两组令牌覆盖，
+ * 以及 html[data-skin="<id>"] .组件 前缀（提级至 0,2,1，稳胜 scoped [data-v] 0,2,0，与注入顺序无关）下的组件级覆写。
+ * verdant-flat（默认）与 main.css 的 :root / [data-theme="dark"] 同源，
+ * 本文件仅做显式注册与组件级对齐覆写。 */
+@import './verdant-flat.css';
+@import './ink-paper.css';
+@import './mono-brutal.css';

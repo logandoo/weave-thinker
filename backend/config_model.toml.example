@@ -1,0 +1,394 @@
+# Copyright (c) 2026 Weave Thinker Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Weave Thinker 模型配置模板（覆盖式合并到主 config.toml；文件缺失时回退主文件）。
+# 复制为 backend/config_model.toml 后填写。所有 <YOUR-*> 占位必须替换。
+
+[api]
+base_url = "https://your-endpoint.example/v1"
+api_key = "<YOUR-SECRET>"
+model_name = "deepseek-v4-flash"
+
+[defaults]
+temperature = 0.7
+top_p = 0.9
+top_k = ""
+presence_penalty = 1.5
+frequency_penalty = 0.0
+max_tokens = ""
+
+[default_assistant]
+name = "默认助手"
+system_prompt = "你是一个专业、有帮助的AI助手。请根据用户的问题，提供清晰、准确的回答。"
+temperature = 0.7
+top_p = 0.9
+top_k = ""
+presence_penalty = 1.5
+frequency_penalty = 0.0
+max_tokens = ""
+
+[asr]
+is_dashscope = true
+is_mimo = false
+api_key = "<YOUR-SECRET>"
+base_url = ""
+model = ""
+dashscope_api_key = "<YOUR-SECRET>"
+dashscope_model = "fun-asr-realtime"
+dashscope_vocabulary_url = "https://your-endpoint.example/v1"
+ffmpeg_timeout_seconds = 60
+http_timeout_seconds = 300
+ws_open_timeout = 10
+ws_ping_interval = 20
+ws_ping_timeout = 20
+ws_close_timeout = 5
+max_sentence_silence = 100
+mimo_partial_interval_seconds = 1.5
+mimo_partial_min_seconds = 0.5
+
+[voice]
+enabled = true
+provider = "default"
+model_name = "deepseek-v4-flash"
+temperature = 0.7
+max_tokens = 1024
+context_turns = 8
+disable_thinking = true
+duplex_model = ""
+intent_model = ""
+barge_in_enabled = true
+barge_in_no_interrupt_seconds = 1.2
+barge_in_cooldown_seconds = 2.0
+barge_in_onset_enabled = true
+barge_in_proximity_gate = true
+barge_in_proximity_stale_seconds = 1.0
+barge_in_onset_min_chars = 3
+eot_semantic_enabled = true
+eot_semantic_probe_seconds = 0.6
+eot_paused_probe_seconds = 0.6
+eot_semantic_timeout_seconds = 1.5
+eot_silence_seconds = 0.6
+eot_silence_incomplete_seconds = 1.6
+eot_complete_grace_seconds = 0.5
+eot_complete_max_seconds = 2.0
+fragment_merge_seconds = 1.0
+fragment_merge_max_seconds = 10.0
+noise_gate_max_chars = 3
+asr_speech_noise_threshold = 0.3
+asr_context_enabled = true
+asr_context_turns = 3
+intent_context_turns = 4
+subagent_timeout_seconds = 6.0
+llm_retry_attempts = 2
+backchannel_recall_seconds = 30.0
+interjection_enabled = true
+interjection_model = ""
+interjection_cooldown_seconds = 3.0
+interjection_max_per_turn = 3
+emotion_enabled = true
+filler_enabled = true
+filler_phrases = ["我来看看啊", "我来想想啊", "等下啊，我琢磨一下", "嗯，我想想"]
+backchannel_enabled = true
+backchannel_phrases = ["嗯", "嗯嗯", "哦", "对"]
+backchannel_pause_seconds = 0.35
+backchannel_cooldown_seconds = 8.0
+backchannel_max_per_turn = 2
+memory_recall_enabled = true
+memory_interjection_enabled = true
+memory_correct_enabled = false
+memory_interjection_max_append = 3
+memory_interjection_max_correct = 2
+memory_interjection_cooldown_seconds = 20.0
+memory_interjection_min_score = 0.5
+memory_interjection_model = ""
+bg_task_notify_enabled = true
+system_prompt = """你是一个全双工语音对话助手，正在与用户进行实时语音交流。请严格遵守以下要求：
+1. 用自然、亲切、口语化的中文回答，像朋友聊天一样，句子简短，避免长篇大论和复杂排版（不要使用标题、表格、代码块、列表符号）。
+2. 回复可以以整体风格标签开头，用于控制语音演绎风格，只能使用以下风格词：(温柔)、(平静)、(开心)、(兴奋)、(激动)、(严肃)、(无奈)、(委屈)、(冷漠)、(活泼)、(慵懒)、(俏皮)、(深沉)、(欣慰)、(感动)、(失望)、(焦急)、(惊讶)、(害怕)、(难过)、(生气)、(磁性)。风格标签只能出现在回答最开头且只出现一次。严禁在括号内写动作描写或声音词（如 温柔地笑、微笑、叹气、笑、哼、啊、嗯、思考、停顿），也不要在回答中插入任何方括号音频标签（如 [轻笑]、[叹气]、[停顿]）——这些会被语音合成读成不自然的怪声。
+3. 默认直接回答用户的问题，不要调用任何工具。只有当用户明确要求你联网搜索、查资料、执行代码、操作文件等任务时，才考虑使用工具。
+4. 你的回答会被语音合成朗读，因此绝不要在回答中包含工具调用的细节、JSON、URL、代码或任何不适合朗读的内容。
+5. 如果用户的问题很复杂、需要长时间检索或多步操作，先用一两句话口头回应，并说明这可能需要一些时间。
+6. 禁止使用任何 emoji 表情符号和颜文字。"""
+tts_enabled = true
+tts_base_url = ""
+tts_api_key = "<YOUR-SECRET>"
+tts_model = "mimo-v2.5-tts"
+tts_voice = "冰糖"
+tts_style_instruction = "用自然、亲切、口语化的语气，语速适中，像朋友聊天一样温暖。"
+
+[deathmatch]
+enabled = true
+max_turns = 9999
+max_consecutive_failures = 5
+tool_loop_max_iterations = 999
+max_wall_time_seconds = 604800
+verify_enabled = true
+verify_max_retries = 20
+stall_partial_threshold = 8
+stall_hard_threshold = 16
+verify_interval = 1
+verify_model = ""
+self_eval_username = "<YOUR-DB-USER>"
+self_eval_password = "<YOUR-SECRET>"
+plan_exploration_enabled = true
+plan_exploration_max_steps = 5
+reflection_memory_max_items = 10
+continuity_anchor_enabled = true
+[deathmatch.judge]
+base_url = ""
+api_key = "<YOUR-SECRET>"
+model_name = ""
+provider_type = "deepseek"
+
+
+[sub_agent]
+structured_output_attempts = 3
+retry_delay_seconds = 2.0
+llm_call_timeout_seconds = 90.0
+search_decision_max_tokens = 800
+search_decision_repair_max_tokens = 1200
+keyword_generation_max_tokens = 2000
+keyword_generation_repair_max_tokens = 2600
+
+[title_generation]
+structured_output_attempts = 3
+retry_delay_seconds = 1.0
+max_tokens = ""
+repair_max_tokens = ""
+
+[memory]
+enabled = true
+migration_enabled = false
+retrieval_enabled = true
+subconscious_enabled = true
+recurrence_trigger_enabled = true
+dreaming_enabled = true
+cost_governance_enabled = true
+migration_max_concurrent = 2
+migration_batch_size = 5
+migration_max_retries = 5
+migration_llm_timeout_seconds = 60
+timezone = "Asia/Shanghai"
+concept_extraction_model = "default"
+concept_extraction_temperature = 0.1
+concept_extraction_max_tokens = ""
+extraction_interval_minutes = 15
+dream_model = "default"
+dream_temperature = 0.2
+dream_max_tokens = ""
+dream_concept_window_days = 14
+consolidation_dedup_threshold = 0.08
+consolidation_trigger_threshold = 20
+consolidation_max_interval_hours = 48
+query_expansion_model = "default"
+query_expansion_temperature = 0.1
+stage0_llm_enabled = false
+clarification_model = "default"
+clarification_temperature = 0.1
+clarification_auto_apply_threshold = 0.8
+clarification_pending_threshold = 0.5
+embedding_model = "Qwen3-Embedding"
+embedding_api_base = "https://your-endpoint.example/v1"
+embedding_api_key = "<YOUR-SECRET>"
+embedding_dim = 1024
+embedding_dim_override = true
+embedding_cache_size = 100
+embedding_provider_check_on_startup = true
+rerank_enabled = true
+stage4_llm_enabled = true
+stage4_llm_trigger_score_gap = 0.1
+rerank_mode = "cross_encoder"
+rerank_model = "Qwen3-Reranker-0.6B"
+rerank_api_base = "https://your-endpoint.example/v1"
+rerank_api_key = "<YOUR-SECRET>"
+stage4_ce_skip_strong_top_sim = 0.7
+profile_sync_enabled = true
+[memory.concept]
+weight_init = 0.5
+weight_recall_boost = 0.03
+weight_evidence_boost = 0.03
+weight_max = 1.0
+trust_cap_agent_inferred = 0.7
+trust_cap_external = 0.5
+hot_forget_threshold = 0.15
+avg_weight_reset = true
+cold_resurrect_weight = 0.3
+maturation_window_days = 21
+silent_max_windows = 2
+silent_activation_threshold = 0.05
+weight_decay_writeback = true
+weight_decay_floor = 0.05
+[memory.concept.fatigue]
+cold_forget_threshold_episodic = 2
+cold_forget_threshold_semantic = 8
+episodic_stability_init_days = 7
+episodic_stability_growth_days = 4
+episodic_stability_max_days = 45
+semantic_stability_init_days = 14
+semantic_stability_growth_days = 7
+semantic_stability_max_days = 90
+procedural_skip_decay = true
+
+
+[memory.subconscious]
+recurrence_sim_threshold = 0.6
+recurrence_count_threshold = 3
+top_k_neighbors = 5
+scan_batch_size = 50
+embedding_cache_size = 200
+subconscious_retention_days = 30
+subconscious_archive_retention_days = 90
+accelerate_recurrence_threshold = 2
+
+[memory.episodic]
+description_max_tokens = 500
+merge_first_threshold = 0.85
+retrieval_k_epi = 5
+retrieval_k_concept = 10
+cross_boost_concept_weight = true
+
+[memory.multimodal]
+enabled = false
+fallback_on_cold_start = true
+provider = "default"
+snapshot_top_k = 10
+max_image_tokens = 4000
+set_of_mark = true
+fallback_first_msg_only = true
+
+[memory.cost_governance]
+calls_table = "memory_llm_calls"
+rolling_window_days = 7
+warn_multiplier = 5.0
+min_today_calls = 8
+recovery_ratio = 1.0
+degrade_steps = ["rerank_off", "profile_sync_off", "stage0_off", "dreaming_step6_off", "subconscious_off"]
+per_user_independent = true
+
+[memory.retrieval]
+bootstrap_threshold = 10
+embedding_sim_threshold = 0.3
+stage1_concept_top_k = 30
+stage1_episodic_top_k = 5
+stage1_subconscious_top_k = 10
+stage2_concept_top_k = 15
+stage2_relation_expansion_enabled = true
+stage2_relation_seed_top_k = 5
+stage2_relation_max_neighbors = 5
+stage2_relation_max_new = 10
+stage2_relation_score_decay = 0.6
+stage2_relation_min_edge_weight = 0.3
+rrf_k = 60
+rrf_weight_concept = 1.0
+rrf_weight_episodic = 1.5
+rrf_weight_subconscious = 0.5
+embedding_score_weight = 0.6
+bm25_score_weight = 0.4
+injection_max_dream = 1
+injection_max_episodic = 2
+injection_max_concept = 4
+injection_max_cluster = 3
+injection_max_subconscious = 2
+injection_max_clarification = 3
+injection_total_token_budget = 2000
+injection_min_relevance = 0.35
+injection_min_relevance_episodic = 0.3
+injection_min_relevance_subconscious = 0.3
+boost_min_relevance = 0.5
+boost_min_relevance_episodic = 0.4
+overview_max_concepts = 12
+overview_max_episodes = 5
+overview_max_chars = 800
+fusion_concept_relevance = 0.5
+fusion_concept_recency = 0.2
+fusion_concept_weight = 0.3
+fusion_episodic_relevance = 0.6
+fusion_episodic_recency = 0.4
+fusion_subconscious_relevance = 0.4
+fusion_subconscious_recency = 0.6
+recency_tau_days_concept = 14
+recency_tau_days_episodic = 21
+recency_tau_days_subconscious = 7
+total_timeout_ms = 1500
+stage0_timeout_ms = 80
+stage0_llm_timeout_ms = 1000
+stage1_timeout_ms = 80
+stage2_timeout_ms = 100
+stage3_timeout_ms = 500
+stage4_score_only_timeout_ms = 10
+stage4_llm_timeout_ms = 500
+stage4_cross_encoder_timeout_ms = 800
+bm25_k1 = 1.5
+bm25_b = 0.75
+bm25_tokenizer = "jieba"
+
+
+[providers]
+[providers.mimo]
+type = "mimo"
+base_url = "https://your-endpoint.example/v1"
+api_key = "<YOUR-SECRET>"
+model_name = "mimo-v2.5-pro-ultraspeed"
+priority = 1
+
+[providers."qwen3.8_27b"]
+type = "openai"
+base_url = "https://your-endpoint.example/v1"
+api_key = "<YOUR-SECRET>"
+model_name = "qwen3.8_27b"
+priority = 2
+
+
+[agent]
+[agent.auxiliary]
+compression_model = ""
+compression_provider = ""
+search_decision_model = ""
+title_model = ""
+
+[agent.compression]
+enabled = true
+threshold_percent = 0.65
+protect_first_n = 3
+protect_last_tokens = 20000
+min_summary_tokens = 800
+summary_ratio = 0.15
+summary_tokens_ceiling = 6000
+failure_cooldown_seconds = 300
+context_length = 1048576
+
+[agent.moa]
+enabled = false
+reference_providers = []
+aggregator_provider = "default"
+max_reference_models = 3
+timeout_seconds = 120
+reference_max_tokens = 4096
+aggregator_max_tokens = ""
+
+[agent.memory]
+summary_temperature = 0.2
+summary_max_tokens = ""
+summary_storage_limit = 4000
+dream_storage_limit = 4000
+default_importance = 0.85
+
+[agent.tool_digest]
+enabled = true
+min_digest_chars = 8000
+max_digest_chars = 6000
+max_concurrent = 5
+max_tokens = 8192
+timeout_seconds = 120
+batch_timeout_seconds = 300
+temperature = 0.3
+model = ""
+verify = true
+digest_tools = ["workspace_read", "browser", "browser_snapshot", "session_search", "grep", "diff", "memory", "notes", "context7_query_docs"]
+
+[agent.sub_agent]
+max_concurrent_subtasks = 5
+max_result_length = 8000
+max_tokens = 4000
+temperature = 0.7
+

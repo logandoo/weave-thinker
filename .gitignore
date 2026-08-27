@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+frontend/dist/
+backend/static/
+backend/Fonts/
+
+# Runtime / user data
+user_workspaces/
+backend/agent_memories/*
+!backend/agent_memories/func.md
+backend/audio_files/
+backend/output_files/
+backend/skins_custom/
+*.log
+*.pid
+
+# Secrets & certificates — never commit
+backend/config.toml
+backend/config_model.toml
+backend/key.pem
+backend/cert.pem
+*.pem
+*.keystore
+*.jks
+webview-app/keystore.jks
+webview-app/local.properties
+
+# Android
+webview-app/.gradle/
+webview-app/build/
+webview-app/app/build/
+apk/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Test evidence (local scratch only — this release ships no test files)
+tests/
+test-results*/

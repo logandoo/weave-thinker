@@ -1,0 +1,34 @@
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="alternate icon" type="image/png" href="/logo.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Weave Thinker</title>
+    <!-- UI 字体全量自托管（frontend/public/fonts/，SIL OFL 1.1，见 FONTS_LICENSE.md）：
+         变量字体按 unicode-range 分片，离线/内网无第三方 CDN 请求 -->
+    <link rel="stylesheet" href="/fonts/fonts.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      // 皮肤预引导：避免非默认皮肤首帧闪烁（FOUC）
+      (function () {
+        try {
+          var skin = localStorage.getItem('wt-skin') || 'verdant-flat';
+          var mode = localStorage.getItem('theme') || 'light';
+          var root = document.documentElement;
+          root.setAttribute('data-skin', skin);
+          if (mode === 'dark') {
+            root.setAttribute('data-theme', 'dark');
+          }
+        } catch (e) { /* localStorage 不可用时静默 */ }
+      })();
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

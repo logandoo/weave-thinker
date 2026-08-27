@@ -26,7 +26,10 @@ node -v                                     # 验收 ≥ v18
 # 可选：
 #   ffmpeg（语音/导出）   sudo apt install -y ffmpeg
 #   pgvector（24.04: postgresql-16-pgvector；22.04: 需 pgdg apt 源）
-#   PDF 导出（weasyprint 系统库）   sudo apt install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0
+#   PDF 导出（weasyprint 系统库，包名按发行版分列）：
+#     24.04:  sudo apt install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0
+#     22.04:  sudo apt install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b
+#             # libharfbuzz-subset0 是 24.04 专属包名，22.04 仓库无此包（装会报 E: Unable to locate package）
 #     （PDF 需内嵌图片时加：libgdk-pixbuf2.0-0【22.04】/ libgdk-pixbuf-2.0-0【24.04】）
 #   CJK 字体（本发行不含 backend/Fonts/，Linux 上 PDF/代码输出中文防方块）
 #     sudo apt install -y fonts-noto-cjk
@@ -89,6 +92,11 @@ sudo -u postgres psql -d weavethinker -c "CREATE EXTENSION IF NOT EXISTS vector;
 psql "postgresql://weavethinker:CHANGE_ME_strong_password@127.0.0.1:5432/weavethinker" -c "select 1"
 ```
 
+> **SQL 文件方式权限坑**：把建库语句写成文件再 `sudo -u postgres psql -f /root/wt_db_init.sql`
+> 执行会报 Permission denied——/root 目录权限 700，postgres 用户无进入权限
+> （与 SQL 文件自身的权限无关）。把文件放到 postgres 可读路径（如 /tmp）并
+> `chmod 644` 后即可执行。
+
 ## 3. 代码与 Python 环境（pip 依赖）
 
 建议部署目录 `/opt/weave-thinker`（下文沿用 `<ROOT>`）：
@@ -108,6 +116,12 @@ pip install -r backend/requirements.txt     # 31 条直接声明（31 个包，2
 ```
 
 > 依赖画像为纯 permissive（详见 ../docs/LICENSE-COMPLIANCE.md）。
+>
+> **国内机房拉取**：直连 github.com 时通时断（clone 可能整体超时失败），不要
+> 依赖箱内直连。可靠路径：本地 clone → tar 打包 → scp 上传 → 解压（含 .git，
+> 便于后续增量同步；打包注意事项见 README.md 第 0 步）。解压后先
+> `find . -name "._*" -delete` 清理 macOS tar 带入的 AppleDouble 文件，否则
+> .git 包索引会被污染。
 
 ## 4. 配置
 
@@ -141,6 +155,13 @@ name = "weavethinker"
 chmod 600 backend/config.toml backend/config_model.toml
 chown -R weavethinker:weavethinker backend/config.toml backend/config_model.toml
 ```
+
+> **生成脚本 `$VAR` 字面量泄漏坑**：用 heredoc 或引号嵌套的 python 字符串生成
+> config.toml 时，`$JWT_SECRET` 这类变量会被当**字面量**写入文件（heredoc 定界
+> 符加引号未展开 / python 字符串内 `$VAR` 未注入），导致所有实例共用同一个
+> "字面量"密钥。生成端改用 shell 展开（`<<EOF` 不带引号定界）或 python
+> `os.environ` 取值；生成后验收无泄漏：
+> `grep -n '\$' backend/config.toml backend/config_model.toml`（无输出即干净）。
 
 ## 5. TLS 证书
 

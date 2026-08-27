@@ -147,10 +147,17 @@ npm/Python 双侧各装一次，见「测试」节）。
 # 有 git 仓库：
 git clone <your-fork-url> weave-thinker && cd weave-thinker
 # 无 git 仓库 / 出网受限（源码包分发）：仓库根执行
+export COPYFILE_DISABLE=1        # macOS：禁 BSD tar 写 AppleDouble 元数据（._* 文件）
 tar -czf wt-src.tgz .
 # → scp/内网传输到目标机 → mkdir weave-thinker && tar xzf wt-src.tgz -C weave-thinker && cd weave-thinker
 # （tar 内结构即仓库根结构：backend/ frontend/ scripts/ 等；出网受限环境
 #   可经内网/远程管理通道分块传输源码包）
+# ⚠ 源码包分发的两个坑：
+# 1. 目标机直连 github.com 时通时断（CN 机房）——git clone 整体超时失败时就走
+#    本打包流程（本地 clone → tar → scp → 解压，含 .git 可增量同步）。
+# 2. macOS 打包未设 COPYFILE_DISABLE=1 时，BSD tar 会把 xattr 写成 AppleDouble
+#    的 ._* 文件，污染解压后的 .git 包索引（git 校验/命令异常）；已带入时解压端
+#    先执行 find . -name "._*" -delete 清理。
 
 # ── 1. 准备 PostgreSQL ────────────────────────────────────────────
 #    （复用已有远端 PostgreSQL 时整节跳过：第 3 步 [database] 直接填远端

@@ -13,8 +13,6 @@
 
 FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用台账 · 三层仿生记忆 · 全双工语音对话
 
-</div>
-
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" />
   <img alt="Version" src="https://img.shields.io/badge/version-v0.0.1-4c9f70.svg" />
@@ -133,7 +131,7 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 | Ubuntu / Debian                             | [requirements/ubuntu.md](requirements/ubuntu.md)             |
 | Windows / WSL2                              | [requirements/windows.md](requirements/windows.md)           |
 | 完整依赖清单（系统/pip/npm + license 摘要） | [requirements/dependencies.md](requirements/dependencies.md) |
-| 部署文档总览                                | [requirements/DEPLOYMENT.md](requirements/DEPLOYMENT.md)             |
+| 部署文档总览                                | [requirements/DEPLOYMENT.md](requirements/DEPLOYMENT.md)     |
 
 最简依赖集：**Python ≥ 3.10（推荐 3.12/3.13）· Node.js ≥ 18（推荐 20/22）· PostgreSQL ≥ 14**，
 外加（可选）Android SDK（做 APK 壳）与 Playwright Chromium（跑 E2E + 服务端浏览器工具，
@@ -149,8 +147,8 @@ git clone <your-fork-url> weave-thinker && cd weave-thinker
 # 无 git 仓库 / 出网受限（源码包分发）：仓库根执行
 tar -czf wt-src.tgz .
 # → scp/内网传输到目标机 → mkdir weave-thinker && tar xzf wt-src.tgz -C weave-thinker && cd weave-thinker
-# （tar 内结构即仓库根结构：backend/ frontend/ scripts/ 等；2026-08-27
-#   双服务器部署即此方式，Windows 侧经远程管理通道分块推送 3.5MB 包）
+# （tar 内结构即仓库根结构：backend/ frontend/ scripts/ 等；出网受限环境
+#   可经内网/远程管理通道分块传输源码包）
 
 # ── 1. 准备 PostgreSQL ────────────────────────────────────────────
 #    （复用已有远端 PostgreSQL 时整节跳过：第 3 步 [database] 直接填远端
@@ -187,7 +185,7 @@ cp backend/config_model.toml.example      backend/config_model.toml
 #   可接云端 API，或本地 vLLM/Ollama 等自托管服务）
 #   ASR/TTS（语音功能，可选）、embedding/rerank（记忆 v2，可选）
 #   ※ 未填的 <YOUR-*> 占位**不阻塞启动**：仅对应功能在真实调用时报
-#     缺配（实例实证：provider 全占位 → 服务正常、页面可登录、记忆
+#     缺配（实测：provider 全占位 → 服务正常、页面可登录、记忆
 #     子系统自动降级并在日志记录原因）；可先起栈后补 key
 
 # ── 4. TLS 证书（生产构建 & Android 壳建议）──────────────────────
@@ -212,7 +210,8 @@ cd ..
 （选择 LLM 供应商与 API 地址）后即可对话。`GET /` 会 307 到前端；
 `/docs` 是 Swagger UI。JWT 默认 7 天有效、支持滑动续期。
 
-**复用（非空/共享）远端数据库时的两条注意**（2026-08-27 双部署实例）：
+**复用（非空/共享）远端数据库时的两条注意**：
+
 1. 「**首用户即管理员**」只对**全新空库**成立——复用已有库时以库中
    既有账号为准，不要期待注册获得管理员身份。
 2. **多实例共库**：每个实例都会轮询/执行共享表上的定时任务
@@ -225,8 +224,8 @@ cd ..
   边缘对未放行的端口做 TCP 被动应答（握手成但零数据，TLS 与非 TLS 均静默）。
   部署前用 telnet 筛端口可达性；部署后以真实响应验收：
   `curl -k https://<host>:8158/docs` 返回 200。若放行安全组后仍持续 000，
-  生效层多半在供应商的 NAT/EIP 端口映射表而非安全组（对照机 55 秒即通、
-  本案 55 分钟未通的逐箱差异实证）——按 [ubuntu.md「端口排查阶梯」](requirements/ubuntu.md)
+  生效层多半在供应商的 NAT/EIP 端口映射表而非安全组（该行为存在
+  逐箱/逐端口差异，非通用规律）——按 [ubuntu.md「端口排查阶梯」](requirements/ubuntu.md)
   逐级定位；既有映射端口正常时亦可 Nginx 反代（ubuntu.md 第 7 节）。
 - **systemd（Ubuntu 示例）**：见 [requirements/ubuntu.md](requirements/ubuntu.md) 第 7 节
 - **反向代理**：Nginx 终结 TLS 后把 8158 转发到本机即可；注意 `Upgrade`/`Connection`
@@ -264,14 +263,14 @@ scripts/     构建/启停生命周期（PID 文件安全，stop 只杀记录的
 
 ## 项目结构
 
-| 路径              | 内容                                                                                                     |
-| ----------------- | -------------------------------------------------------------------------------------------------------- |
+| 路径              | 内容                                                                                                           |
+| ----------------- | -------------------------------------------------------------------------------------------------------------- |
 | `backend/`      | FastAPI 服务（`main.py` 入口；`app/` 代码；`skills/` 系统技能；`agent_memories/func.md` 系统功能文档） |
-| `frontend/`     | Vue 3 前端（`src/`；`e2e/` Playwright）                                                              |
-| `scripts/`      | `project_build.sh` / `start.sh` / `stop.sh` / `restart.sh` / `status.sh` / `apk_generate.sh` |
-| `webview-app/`  | Android WebView 壳源码（Gradle）                                                                         |
-| `requirements/` | 分平台部署与依赖文档                                                                                     |
-| `docs/`         | 产品介绍（ARCHITECTURE.md）、皮肤令牌契约（SKINS.md）                                                    |
+| `frontend/`     | Vue 3 前端（`src/`；`e2e/` Playwright）                                                                    |
+| `scripts/`      | `project_build.sh` / `start.sh` / `stop.sh` / `restart.sh` / `status.sh` / `apk_generate.sh`       |
+| `webview-app/`  | Android WebView 壳源码（Gradle）                                                                               |
+| `requirements/` | 分平台部署与依赖文档                                                                                           |
+| `docs/`         | 产品介绍（ARCHITECTURE.md）、皮肤令牌契约（SKINS.md）                                                          |
 
 ## 文档
 
@@ -291,13 +290,10 @@ npx playwright test e2e/chat.spec.ts --config playwright.prod8158.config.ts
 ```
 
 服务端「网页深读 / 浏览器 10 件套」工具依赖 **Python 侧** Playwright Chromium：
-`.venv/bin/python -m playwright install chromium`（npm 侧 `npx playwright install
-chromium` 只服务前端 E2E——两侧 playwright 版本不同、chromium 构建 revision 不一致，
+`.venv/bin/python -m playwright install chromium`（npm 侧 `npx playwright install chromium` 只服务前端 E2E——两侧 playwright 版本不同、chromium 构建 revision 不一致，
 装全功能需各装一次；不装仅该能力族受影响，部署与页面验证不受阻）。
 
 本开源发行不含后端单元测试集；后端改动的验证要求见 [CONTRIBUTING.md](CONTRIBUTING.md)「测试要求」。
-
-测试账号约定：开发/测试环境使用 `test` / `123456`（E2E 依赖该账号存在，注册即可）。
 
 ## 贡献 / How to contribute
 

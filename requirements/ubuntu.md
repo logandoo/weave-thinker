@@ -1,4 +1,5 @@
 <!-- Copyright (c) 2026 Weave Thinker Contributors -->
+
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Ubuntu / Debian 部署指南（生产推荐）
@@ -39,10 +40,9 @@ pg_lsclusters                               # 确认集群 online
 >
 > **apt Node 坑（第三方源镜像）**：若箱内 apt 源是第三方镜像，`apt install nodejs`
 > 可能装到 12.x（前端构建需 ≥18）——务必按上面的 NodeSource 方式核对
-> `node -v`。NodeSource 安装若报 `dpkg-deb: ... paste subprocess was killed
-> (Broken pipe)` / 文件冲突（`libnode-dev` 等旧 universe node 包残留），先
+> `node -v`。NodeSource 安装若报 `dpkg-deb: ... paste subprocess was killed (Broken pipe)` / 文件冲突（`libnode-dev` 等旧 universe node 包残留），先
 > `apt-get remove -y libnode-dev node-stdlib node-gyp` 再装，或
-> `dpkg -i --force-overwrite` 单包修复（2026-08-27 双服务器部署实证）。
+> `dpkg -i --force-overwrite` 单包修复。
 >
 > **端口"可通"评估口径**：telnet/nc 握手成 ≠ 数据面可通——部分云厂商边缘对
 > 未映射端口做 TCP 被动应答（握手成、零数据）。部署前可用 telnet 快速筛端口，
@@ -51,15 +51,15 @@ pg_lsclusters                               # 确认集群 online
 > 正常，走下文第 7 层 Nginx 反代（注意云边通常只转发"既有映射"端口，新建监听
 > 端口大概率同样不通）。
 >
-> **排查阶梯（2026-08-27 双服务器部署实证）**：
+> **排查阶梯（部署实测）**：
+>
 > 1. 箱内自检：`ss -ltn | grep 8158` 有监听 +
 >    `curl -k https://127.0.0.1:8158/docs` 200 → 应用层就绪，问题在边缘。
 > 2. WAN 实测：`curl -k https://<公网IP>:8158/docs`；同时用一个**非 TLS**
 >    请求（`curl http://<公网IP>:8158/`）区分"静默吞包"（000）与"连接被
->    拒绝/重置"（W/400）。两次对照机（同账号同流程的 Windows Server 2019
->    箱）8158 实测 55 秒即 200 → 边缘行为是**逐箱/逐端口**的映射配置，
+>    拒绝/重置"（W/400）。对照机同环境 8158 立即可达 → 边缘行为是**逐箱/逐端口**的映射配置，
 >    不是通用规律。
-> 3. 云控制台放行安全组后复测：若 >5 分钟仍 000（本次 25 次/55 分钟），
+> 3. 云控制台放行安全组后复测：若 >5 分钟仍 000，
 >    说明生效层不在安全组——依次怀疑：EIP/NAT 的 DNAT/端口映射表（很多
 >    VPS 供应商把"端口开放"放在映射层而不是安全组）、规则方向/协议/端口
 >    写错、或多层防火墙（云安全组 + 供应商网关）。与供应商确认"哪个面板
@@ -68,7 +68,7 @@ pg_lsclusters                               # 确认集群 online
 >    确认其数据面），nginx 反代到本机 8158（第 7 节模板），并记录进运维
 >    备注。
 >
-> **nginx 反代 + IP 直访坑（同批部署实证）**：浏览器/curl 对**纯 IP**
+> **nginx 反代 + IP 直访坑（部署实测）**：浏览器/curl 对**纯 IP**
 > 目标不发 TLS SNI → nginx 的 443 虚拟主机按 SNI 路由对 IP 访问**永远
 > 落到 default_server**，`server_name=<箱IP>` 的 443 块不会命中。要保
 > 既有域名站点又不改 443 default_server，只能给反代**独立监听端口**
@@ -94,7 +94,7 @@ psql "postgresql://weavethinker:CHANGE_ME_strong_password@127.0.0.1:5432/weaveth
 建议部署目录 `/opt/weave-thinker`（下文沿用 `<ROOT>`）：
 
 > 生产建议独立账号（下文 useradd 流程）；验证/小部署以 root 直接跑全流程
-> 亦可行（2026-08-27 双服务器部署实例即 root 执行，脚本行为一致），代价是
+> 亦可行（部署实例即以 root 执行，脚本行为一致），代价是
 > 配置与运行时目录权限放宽。
 
 ```bash
@@ -162,7 +162,7 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
 ./scripts/project_build.sh     # 内部 = cd frontend && npm install && npm run build → backend/static/
                                # 小内存机器（<8GB）跑 npm 构建前先设
                                # NODE_OPTIONS=--max-old-space-size=2048
-                               # （Node 堆受 commit 上限约束，2026-08-27 4GB 机实证）
+                               # （Node 堆受 commit 上限约束，小内存机实测）
 ```
 
 ## 7. 启动
@@ -248,4 +248,4 @@ npx playwright test e2e/chat.spec.ts --config playwright.prod8158.config.ts
 
 > 两条 install 各管一侧（chromium 构建 revision 不同、同缓存目录并存不冲突）；
 > 都要用才都要装。都不装则仅 agent 浏览器能力族与 E2E 不可用，站内其余
-> 功能正常（2026-08-27 部署实例均未装，服务与页面验证不受影响）。
+> 功能正常（未安装时服务与页面验证不受影响）。

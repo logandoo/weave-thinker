@@ -31,7 +31,7 @@
 | fastapi | 0.136.3 | MIT | Web 框架 |
 | uvicorn | 0.49.0 | BSD-3-Clause | ASGI 服务器 |
 | sqlalchemy | 2.0.50 | MIT | ORM 异步（`[asyncio]` extra 仅带 greenlet，**不含** driver） |
-| asyncpg | 0.31.0 | Apache-2.0 | PG 异步驱动（`postgresql+asyncpg` URL 后端，必需；2026-08-27 部署核查补入） |
+| asyncpg | 0.31.0 | Apache-2.0 | PG 异步驱动（`postgresql+asyncpg` URL 后端，必需；部署核查补入） |
 | alembic | 1.18.4 | MIT | 迁移工具（仓库未启用 Alembic 流程，保留依赖；schema 变更走 app/db/migrations.py） |
 | pyjwt | 2.13.0 | MIT | JWT |
 | bcrypt | 5.0.0 | Apache Software License | 口令哈希 |
@@ -68,7 +68,7 @@
 > 仅作 license 判定证据引用。
 
 > 注：`SQLAlchemy[asyncio]` **不传递** 任何 PG driver——`asyncpg` 必须显式声明（否则
-> `create_async_engine` import 即崩，2026-08-27 双服务器部署实证）。
+> `create_async_engine` import 即崩，部署实测）。
 
 ## 3. npm 生产依赖（14 个，`frontend/package.json` dependencies）
 

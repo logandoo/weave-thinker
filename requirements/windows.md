@@ -11,14 +11,14 @@
 适用：Windows 10/11 本地开发 / 小规模局域网部署；**Windows Server 2019/2022
 生产部署**可用本文原生流程（无 WSL2 环境时），差异项见下文各节标注。
 
-**Server 版两个已知环境特性（2026-08-27 部署实证）：**
+**Server 版两个已知环境特性（部署实测）：**
 
 - **无 winget**：Server 2019 不带 App Installer → 下面第 1 节按"直装 MSI/EXE"
   分支操作（官方安装包或国内 npmmirror 二进制源均可）。
 - **Windows Update + Defender 会阶段性吃满 commit**（4GB 小内存尤甚）：期间
   PowerShell 报 `Thread failed to start` / `0x800705af`、WinRM 报
   `paging file is too small` 属暂时态——等更新完成自动恢复，或授权维护窗口
-  重启（本次 4GB Server 2019 更新期 npm/V8 连续 OOM，重启后即恢复）；此期间
+  重启（4GB 小内存机更新期 npm/V8 连续 OOM，重启后即恢复）；此期间
   一切操作改走 **cmd 通道**（`cmd /c` 的 8191 字符行缓冲是硬上限，批量传
   数据按 <8000 字符分块；`python -c "带引号代码"` 的 WSMan-cmd 组合引用
   不可靠，数据经 `append.py` 式 argv 文件小工具传递更稳）。
@@ -92,13 +92,13 @@ pip install -r backend\requirements.txt
 > 国内网络：`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r backend\requirements.txt`
 > 个别 wheel 需要 MSVC 运行时（winget 的 Python 一般自带分发即可）。
 >
-> 部署实例三条实证（2026-08-27 Server 2019 远程部署）：
+> 远程部署三条实测（Server 2019）：
 > 1. **Server 镜像常只有 C: 盘**——没有 D 盘时全文改 `C:\tools\weave-thinker`
 >    （本文示例的 D:\ 主要面向桌面 Win10/11）。
 > 2. 云厂商/托管镜像**可能已预装 Python**（3.10+ 即可复用，实例复用预装
 >    3.11，跳过 winget Python）。
 > 3. 机器出网受限或无 git 仓库时，先按 README 第 0 步的"源码包分发"把源码
->    落到部署目录（实例经远程管理通道分块推送 tar 包后 `tar` 解包），再执行
+>    落到部署目录（可经远程管理通道分块推送 tar 包后 `tar` 解包），再执行
 >    本节第 4 步之后。
 
 ## 4. 配置

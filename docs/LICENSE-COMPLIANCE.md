@@ -139,7 +139,7 @@
 | pluggy | 1.6.0 | MIT License | 传递 | ✅ |  |
 | primp | 1.3.1 | MIT License | 传递 | ✅ |  |
 | protobuf | 7.35.1 | 3-Clause BSD License | 传递 | ✅ |  |
-| psycopg2-binary | 2.9.12 | GNU Library or Lesser General Public License (LGPL) | 审计 venv 实装（非 fresh 安装引入） | ⚠️ | LGPL-2.1+；C 扩展动态链接，行业通用做法。**注意：`SQLAlchemy[asyncio]` 并不传递任何 PG driver（fresh 安装的驱动是 asyncpg，见 requirements.txt，依赖要求实际实证）** |
+| psycopg2-binary | 2.9.12 | GNU Library or Lesser General Public License (LGPL) | 审计 venv 实装（非 fresh 安装引入） | ⚠️ | LGPL-2.1+；C 扩展动态链接，行业通用做法。**注意：`SQLAlchemy[asyncio]` 并不传递任何 PG driver（fresh 安装的驱动是 asyncpg，见 requirements.txt，依赖要求实测）** |
 | pyarrow | 25.0.0 | Apache-2.0 | 传递 | ✅ |  |
 | pyclipper | 1.4.0 | MIT License | 传递 | ✅ |  |
 | pycparser | 3.0 | BSD-3-Clause | 传递 | ✅ |  |
@@ -398,7 +398,7 @@
 
 - **引入方式**：仅存在于审计时主仓开发 venv（历史 pip 安装残留）；**并非** `SQLAlchemy[asyncio]`
   extra 传递——该 extra 不拉取任何 driver（fresh `pip install -r backend/requirements.txt`
-  实证 ≈84 包，PG driver 只有 asyncpg）。fresh 开源部署不会安装本包，该条目仅对
+  实测 ≈84 包，PG driver 只有 asyncpg）。fresh 开源部署不会安装本包，该条目仅对
   开发 venv 的合规记账有意义。
 - **许可事实**（依据）：<https://github.com/psycopg/psycopg2>（LGPL-2.1 起；C 扩展）。
 - **判定（本项目是否满足条款）**：**满足**。本项目以 Python import 方式使用 psycopg2-binary

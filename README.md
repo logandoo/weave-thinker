@@ -18,6 +18,8 @@ FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用�
   <img alt="Version" src="https://img.shields.io/badge/version-v0.0.1-4c9f70.svg" />
 </p>
 
+</div>
+
 ---
 
 ## 简介

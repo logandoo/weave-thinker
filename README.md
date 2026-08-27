@@ -4,6 +4,22 @@
 
 <div align="center">
 
+<img src="frontend/src/logo.png" alt="Weave Thinker Logo" width="120" />
+
+# Weave Thinker
+
+**记得住你 · 做得完事 · 句句有据**<br/>
+自托管个人 AI 智能体平台（Agent，不是聊天框）
+
+FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用台账 · 三层仿生记忆 · 全双工语音对话
+
+<p align="center">
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.0.1-4c9f70.svg" />
+</p>
+
+</div>
+
 ---
 
 ## 简介
@@ -277,7 +293,7 @@ npx playwright test e2e/chat.spec.ts --config playwright.prod8158.config.ts
 
 服务端「网页深读 / 浏览器 10 件套」工具依赖 **Python 侧** Playwright Chromium：
 `.venv/bin/python -m playwright install chromium`（npm 侧 `npx playwright install chromium` 服务前端 E2E。
-两侧 playwright 版本统一（npm `1.60.0` 与 pip `==1.60.0`），chromium 构建 revision 一致、
+两侧 playwright 精确锁定同一版本（npm `1.60.0` 与 pip `==1.60.0`），chromium 构建 revision 一致、
 浏览器缓存共享——任一侧装一次即可双侧复用；不装仅该能力族受影响，部署与页面验证不受阻）。
 
 本开源发行不含后端单元测试集；后端改动的验证要求见 [CONTRIBUTING.md](CONTRIBUTING.md)「测试要求」。

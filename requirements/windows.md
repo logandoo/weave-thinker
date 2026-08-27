@@ -201,5 +201,5 @@ cd frontend
 npx playwright install chromium
 npx playwright test e2e\chat.spec.ts --config playwright.prod8158.config.ts
 cd ..
-.venv\Scripts\python -m playwright install chromium   # 服务端 agent 浏览器工具（Python 侧）
+.venv\Scripts\python -m playwright install chromium   # 服务端 agent 浏览器工具（Python 侧；与 npm 侧同为 1.60.0、revision 一致，装一次即可）
 ```

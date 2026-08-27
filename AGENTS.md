@@ -147,6 +147,11 @@ Three layers coexist — do not conflate them:
   targets the production build served at `https://127.0.0.1:8158` (the accepted
   verification target). All specs need the backend running with the
   `test`/`123456` dev account created and Postgres up.
+- **npm/npx must run from `frontend/`** — the repo root is not a workspace (root
+  `package.json` is a stale partial copy). A stray root `node_modules/` copy
+  shadows npx resolution and intermittently yields a false
+  `did not expect test.describe() to be called here` error; if that appears,
+  remove the root `node_modules/` directory and rerun from `frontend/`.
 - **No backend unit-test suite ships** in this release; verify backend changes
   with a runnable script (curl the deployed API / `scripts/restart.sh` + smoke
   requests) plus the frontend E2E, per CONTRIBUTING.md "测试要求".

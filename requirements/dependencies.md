@@ -18,7 +18,7 @@
 | Node.js + npm | 18 | 20 / 22 | **必需（构建期）** | 前端构建（Vite） |
 | OpenSSL | 3.x | 3.x | 建议 | 生成自签证书（key.pem/cert.pem） |
 | pgvector 扩展 | PG15+ 内置 | 16 | 可选 | 记忆 v2 向量化检索；缺失时仅该功能降级 |
-| Playwright Chromium（×2 侧） | npm 侧随 lock 1.58.2 / Python 侧 1.60.0 | — | 可选（E2E + 浏览器工具） | 两侧 revision 不一致：E2E `npx playwright install chromium`；服务端工具 `python -m playwright install chromium` |
+| Playwright Chromium（×2 侧） | 1.60.0（npm/pip 两侧精确锁定同版） | — | 可选（E2E + 浏览器工具） | 两侧同版、chromium revision 一致、缓存共享：任一侧 `install chromium` 一次即可双侧复用 |
 | Android SDK + JDK 11+ | — | Studio 稳定版 | 可选 | 仅构建 `webview-app/` APK 时需要 |
 | ffmpeg | — | 6+ | 可选 | 语音音轨处理/转码（部分导出场景） |
 | Pango / HarfBuzz / GDK-PixBuf | pango ≥ 1.44 | — | 可选（PDF 导出） | weasyprint 系统库，包名见 ubuntu.md / macos.md §1 |

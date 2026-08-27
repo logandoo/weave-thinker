@@ -236,16 +236,16 @@ server {
 ## 9. E2E / 服务端浏览器工具（可选）
 
 ```bash
-# 前端 E2E（npm 侧 playwright，浏览器版本随 package-lock 锁定的 @playwright/test）：
+# 前端 E2E（npm 侧 playwright，版本随 package.json/package-lock 精确锁定的 @playwright/test）：
 cd frontend && npx playwright install chromium --with-deps   # headless 服务器加 --with-deps 装系统库
 npx playwright test e2e/chat.spec.ts --config playwright.prod8158.config.ts
 
 # 服务端 agent「网页深读/浏览器 10 件套」（Python 侧 playwright，版本随 requirements.txt；
-# 与 npm 侧的 chromium revision 不一致，只装 npx 那条时服务端工具会报
-# "Executable doesn't exist"）：
+# 与 npm 侧同为 1.60.0、chromium revision 一致，浏览器缓存共享，装一次即可双侧复用）：
 .venv/bin/python -m playwright install chromium --with-deps
 ```
 
-> 两条 install 各管一侧（chromium 构建 revision 不同、同缓存目录并存不冲突）；
-> 都要用才都要装。都不装则仅 agent 浏览器能力族与 E2E 不可用，站内其余
+> 两侧 playwright 精确锁定同一版本（npm `1.60.0` / pip `==1.60.0`），chromium 构建 revision
+> 相同、共用同一浏览器缓存目录——任一侧 `install chromium` 一次即同时满足 E2E 与服务端
+> 浏览器工具。都不装则仅 agent 浏览器能力族与 E2E 不可用，站内其余
 > 功能正常（未安装时服务与页面验证不受影响）。

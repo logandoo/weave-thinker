@@ -142,6 +142,6 @@ ANDROID_HOME=~/Library/Android/sdk ./scripts/apk_generate.sh \
 cd frontend
 npx playwright install chromium
 npx playwright test e2e/chat.spec.ts --config playwright.prod8158.config.ts
-# 服务端 agent 浏览器工具（Python 侧；与 npm 侧 chromium revision 不同，需各装）：
+# 服务端 agent 浏览器工具（Python 侧；与 npm 侧同为 1.60.0、chromium revision 一致，装一次即可）：
 .venv/bin/python -m playwright install chromium
 ```

@@ -1162,7 +1162,7 @@ function handleMenuDelete() {
 }
 
 .swipe-action.export {
-  background-color: var(--color-primary);
+  background-color: var(--swipe-rename-bg);
 }
 
 .swipe-action.edit {
@@ -1170,15 +1170,15 @@ function handleMenuDelete() {
 }
 
 .swipe-action.default {
-  background-color: var(--color-success);
+  background-color: var(--swipe-default-bg);
 }
 
 .swipe-action.default.active {
-  background-color: var(--success-strong);
+  background-color: var(--swipe-default-active-bg);
 }
 
 .swipe-action.delete {
-  background-color: var(--color-error);
+  background-color: var(--swipe-delete-bg);
 }
 
 .swipe-action:disabled {

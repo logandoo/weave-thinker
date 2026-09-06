@@ -99,19 +99,18 @@ async def _run_child_agent(
     child_start = asyncio.get_running_loop().time()
     child_id = f"subagent-{uuid.uuid4().hex[:8]}"
 
+    from app.model_gateway import factory
+
     if model:
         # P0: even an explicitly named delegation model stays on the parent
         # provider when the parent is a custom provider (never default to
         # the [api] deepseek endpoint under a custom-model assistant).
-        child_llm = LLMService(
-            custom_api_url=(parent_llm.client.base_url if parent_llm.is_custom_provider else None),
-            custom_api_key=(parent_llm.client.api_key if parent_llm.is_custom_provider else None),
-            custom_model_name=model,
+        child_llm = factory.build_llm_service(
+            factory.derive_child_endpoint(parent_llm, model_override=model)
         )
     else:
-        child_llm = LLMService(
-            custom_api_url=(parent_llm.client.base_url if parent_llm.is_custom_provider else None),
-            custom_model_name=parent_llm.custom_model_name,
+        child_llm = factory.build_llm_service(
+            factory.derive_child_endpoint(parent_llm)
         )
 
     child_system = _build_child_system_prompt(goal, context, workspace_path, role)
@@ -145,7 +144,9 @@ async def _run_child_agent(
             workspace_path=workspace_path,
             blocked_tools=blocked,
             delegation_depth=depth + 1,
-            provider_type=getattr(kwargs.get("assistant"), "provider_type", "deepseek") or "deepseek",
+            provider_type=factory.wire_provider_type(
+                child_llm, getattr(kwargs.get("assistant"), "provider_type", "deepseek") or "deepseek"
+            ),
             enable_reasoning=False,
             session_factory=AsyncSessionLocal,
         )
@@ -220,7 +221,12 @@ async def delegate_task(args: dict, **kwargs) -> str:
 
     if not parent_llm:
         from app.services.auxiliary_client import get_aux_llm_override
-        parent_llm = get_aux_llm_override() or LLMService()
+        parent_llm = get_aux_llm_override()
+        if parent_llm is None:
+            # model_gateway 收口（2026-08-30）：裸构造 ≡ main 端点。
+            from app.model_gateway import factory
+            from app.model_gateway.registry import get_model_registry
+            parent_llm = factory.build_llm_service(get_model_registry().get("main"))
 
     if depth >= MAX_DELEGATION_DEPTH:
         return json.dumps({

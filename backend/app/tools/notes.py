@@ -355,7 +355,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
                     "success": True,
                     "id": note.id,
                     "title": note.title,
-                    "message": f"笔记《{note.title or '无标题'}》已修改",
+                    "message": f"已更新笔记《{note.title or '无标题'}》",
                 },
                 ensure_ascii=False,
             )

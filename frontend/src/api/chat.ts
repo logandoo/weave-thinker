@@ -129,6 +129,26 @@ export const chatApi = {
     }
   },
 
+  /** 用户插话（2026-08-29）：向运行中的 run 提交插话文本，迭代边界注入。
+   *  返回四态：steered（已入队）/ not_running（服务端明确答复无运行中 run，
+   *  回退普通发送）/ unsupported_mode（deathmatch 会话）/ rate_limited
+   *  （无法确认入队：429 队列积压或请求失败/网络中断——提交结果不可知，
+   *  调用方一律回填稍后重发，绝不可回退普通发送：那会杀掉在途 run）。
+   *  仅服务端 200 明确答复 steered/unsupported_mode 才按其语义处理。 */
+  async interjectStream(conversationId: string, content: string): Promise<{ status: 'steered' | 'not_running' | 'unsupported_mode' | 'rate_limited' }> {
+    try {
+      const { data } = await api.post(`/chat/stream/interject/${conversationId}`, { content })
+      const status = data?.status
+      if (status === 'steered' || status === 'unsupported_mode') return { status }
+      if (status === 'not_running') return { status: 'not_running' }
+      return { status: 'not_running' }
+    } catch (e: any) {
+      // 429 与一切请求失败（网络中断/超时/5xx）同为「无法确认入队」：
+      // 回填重发，绝不回退发送（A4.9 R2 B2 + deferred #4）。
+      return { status: 'rate_limited' }
+    }
+  },
+
   async streamChat(request: ChatRequest, handlers: StreamHandlers): Promise<void> {
     const baseUrl = (import.meta as any).env?.VITE_API_BASE || ''
     const response = await fetch(`${baseUrl}/api/chat/stream`, {

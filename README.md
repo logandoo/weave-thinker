@@ -11,7 +11,7 @@
 **记得住你 · 做得完事 · 句句有据**<br/>
 自托管个人 AI 智能体平台（Agent，不是聊天框）
 
-FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用台账 · 三层仿生记忆 · 全双工语音对话
+FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用台账 · 三层仿生记忆
 
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" />
@@ -26,8 +26,8 @@ FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用�
 
 Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一个目标，它还给你一个结果：自己拆步骤、调工具、做一步验一步，直到交付，而不是"问到哪答到哪"的聊天框。
 
-- **33 个内置工具函数**：联网搜索、浏览器深读（10 件套）、代码沙箱、终端、笔记、记忆、文件工作区、
-  子代理委派、后台/定时任务、技能系统（SKILL.md）、MCP 动态扩展…（完整清单见「内置工具列表」）
+- **38 个内置工具函数**：联网搜索、浏览器深读（10 件套）、代码沙箱、终端、笔记、记忆、文件工作区、
+  子代理委派、后台/定时任务、语音转写与合成、VLM 视觉解读、技能系统（SKILL.md）、MCP 动态扩展…（完整清单见「内置工具列表」）
 - **原生富内容渲染**：公式 KaTeX、流程图 Mermaid、交互图表 ECharts、图片/视频内嵌播放，流式输出
 - **UI 字体自托管**：Inter + Noto Sans SC（SIL OFL 1.1）全量 vendored 于
   `frontend/public/fonts/`，运行时零第三方 CDN 请求，离线/内网可用
@@ -36,6 +36,8 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 - **死磕模式**：自主长线执行复杂目标——盘问澄清 → 计划-执行-验证-重规划循环，
   直到裁判判定目标完成
 - **防编造引用台账**：回答中的 `[N]` 全部对应真实检索来源，前端可点开溯源
+- **算数不靠心算**：数值计算交给真实代码执行——安全计算器（AST 白名单）或代码沙箱算出结果，模型口算的数字不作依据；写进回答的数值要有出处，查无实据的数字过不了发送前审计
+- **文件直接丢给它解析**：图片、录音、PDF、Office 文档上传后由 Agent 判断怎么读——图片走视觉模型，音频转成文字，文档按类型抽取内容；解析结果可存为笔记继续追问
 - **三层仿生长期记忆**：DB 摘要记忆 + 文件记忆 + v2 概念/情景/潜意识记忆管线（检索/巩固/做梦/成本治理）
 - **3 套皮肤 × 明暗双模式**：CSS 设计令牌体系，支持用户上传自定义皮肤（per-user，格式护栏）
 
@@ -63,7 +65,7 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 - **`[N]` 引用台账**：引用编号由系统分配，模型只能引用真实存在的来源（无中生有会被机械校验 + LLM 判定清除）；前端点角标弹出来源预览；**存笔记/导出 PDF 时自动重建「参考来源」章节**。
 - **防幻觉体系**：发送前 LLM 四态审计（accept/reject/unverifiable/needs_evidence；拒绝预算 + 有界 salvage + best-of 选优兜底）+ 遵循词 canary（长上下文「防走神」暗号，丢失即自动压缩重答）+ 假前言拦截（「我检索过了」在工具真正执行前暂存不放行）+ 协调器语义路由 + 前置工具门。
 
-**4. 仿生记忆**：三层并存 —— v1 每日摘要/dream + 文件记忆工具（AGENT/USER/func.md）+ v2 概念/潜意识/情节管线（五段混合召回：BM25+embedding → 关系扩展 → rerank → LLM 打分 → RRF 融合；复现晋升、休眠淡忘、夜间梦境整理、成本治理降级，pgvector 可选）。记忆面板可见来源/状态/权重，支持修正、遗忘与一键擦除。
+**4. 仿生记忆**：三层并存 —— v1 每日摘要/dream + 文件记忆工具（AGENT/USER/changelog.md）+ v2 概念/潜意识/情节管线（五段混合召回：BM25+embedding → 关系扩展 → rerank → LLM 打分 → RRF 融合；复现晋升、休眠淡忘、夜间梦境整理、成本治理降级，pgvector 可选）。记忆面板可见来源/状态/权重，支持修正、遗忘与一键擦除。
 
 **5. 死磕模式**：不达目的一般来说不罢休。先盘问再动手（最多 3 轮递进追问）→ PEVR 目标循环；验证器要求「拿出文件来」对抗幻影完成；停滞时反思重规划 → 部分交付 → 人工介入三级升级；状态全落库、断网/隔夜可续跑。后台任务（≤5h）关窗继续执行、完成后主动播报。
 
@@ -80,11 +82,13 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 - **语音 × 长期记忆 × 笔记**：每轮结束后异步起 v2 记忆召回（fire-and-forget，下轮生效）；强命中由仲裁 LLM 决定是否像真人一样顺口插一句（「对了，你之前说过…」，每会话有预算 + 20s 最小间隔）；语音里随口提的事自动转笔记。
 - **热词表 + 工具执行**：行话/人名可预先登记（pypinyin 同音字纠音，识别中途与最终结果处处生效）；可在语音里调搜索/代码/笔记/记忆等工具、结果读出来，后台任务完成主动开口播报；语音轮次强制关 LLM 思考（延迟等不起推理时间），全部语音子代理 6s 硬超时 + 安全回退、429 限流两轮重试。
 
-**7. 皮肤 · 技能 · 工作台**：3 套内置皮肤 × 明暗（设计令牌体系，纯 CSS 切换，自定义皮肤上传即生效，规范 [docs/SKINS.md](docs/SKINS.md)）；9 项系统技能 + 用户技能（SOP/文档即技能，可执行文件安全扫描）；多助手、笔记与对话互哺（引用 + 一键存回）、导出全家桶、SSRF/路径逃逸门控。
+**7. 皮肤 · 技能 · 工作台**：3 套内置皮肤 × 明暗（设计令牌体系，纯 CSS 切换，自定义皮肤上传即生效，规范 [docs/SKINS.md](docs/SKINS.md)）；10 项系统技能 + 用户技能（SOP/文档即技能，可执行文件安全扫描）；多助手、笔记与对话互哺（引用 + 一键存回）、导出全家桶、SSRF/路径逃逸门控。
+
+**8. 可信计算与文件解析**：数值计算交给真实代码执行——`calculate`（基于 ast 的白名单安全计算器，无 eval）或代码沙箱算出结果，模型口算的数字不作依据；关键数值发送前核对工具回执与引用台账，数值溯源闸门（NPG，默认记录、可配置强制拦截）负责逐字溯源。图片、录音、PDF、Office 文档上传后由 Agent 选择解析路径——图片走 VLM 视觉解读、音频经 ASR 转写、文档按类型交给解析技能与 Office 技能，解析结果可存为笔记继续追问。
 
 ## 内置工具列表
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 **33 个工具函数**，另有 **MCP 动态扩展**（`mcp_client.py` 运行时将外部 MCP 服务注册为工具，上不封顶）与 **9 项系统技能**（`backend/skills/`，SKILL.md 机读操作手册）。
+后端 `app/tools/` 经 `registry.register()` 静态注册 **38 个工具函数**，另有 **MCP 动态扩展**（`mcp_client.py` 运行时将外部 MCP 服务注册为工具，上不封顶）与 **10 项系统技能**（`backend/skills/`，SKILL.md 机读操作手册）。
 
 | 类别       | 工具函数                        | 说明                                                                       |
 | ---------- | ------------------------------- | -------------------------------------------------------------------------- |
@@ -101,11 +105,13 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 |            | `browser_execute_js`          | 执行自定义 JavaScript                                                      |
 |            | `browser_screenshot`          | 页面截图                                                                   |
 | 代码执行   | `execute_code`                | Python 代码沙箱（自动修复循环、中文字体内置、超时长任务自检引导）          |
+| 计算       | `calculate`                   | AST 白名单安全计算                                                         |
+| 视觉       | `vision_interpret`            | VLM 图片解读（purpose `vlm`，未配置返回友好错误）                          |
 | 终端       | `terminal`                    | 受控 shell 命令执行（敏感操作走审批）                                      |
 | 文档查询   | `context7_resolve_library_id` | 库名 → Context7 库 ID 解析（查文档前必调）                                |
 |            | `context7_query_docs`         | 查询库/框架官方文档（可指定版本）                                          |
 | 笔记       | `notes`                       | 笔记本/笔记的列表、读取、创建、修改、删除                                  |
-| 记忆       | `memory`                      | 跨会话长期记忆（agent/user 双目标，add/replace/remove）                    |
+| 记忆       | `memory`                      | 跨会话长期记忆（agent/user 双目标 + system 只读系统文档，add/replace/remove） |
 | 任务编排   | `delegate_task`               | 子代理并行委派（隔离上下文，深度 ≤2，主代理汇总验收）                     |
 |            | `background_task`             | 后台长线任务（≤5h 超时，完成后主动播报）                                  |
 |            | `schedule`                    | 定时任务（自然语言→cron；创建/列出/取消/立即触发）                        |
@@ -121,7 +127,8 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 | 技能       | `skill_view`                  | 加载技能操作手册（SKILL.md 全文）                                          |
 |            | `skill_manage`                | 创建/修改用户技能（可执行文件安全扫描）                                    |
 |            | `skill_run_script`            | 执行技能捆绑脚本                                                           |
-| 扩展       | MCP（动态）                     | 运行时注册任意外部 MCP 工具服务                                            |
+| 语音       | `asr_transcribe` / `tts_synthesize` | 系统 ASR / TTS 端点开放给 agent                                       |
+| 扩展       | MCP（动态） + `search_tools`    | 运行时注册任意外部 MCP 工具服务；`search_tools` 为渐进式发现元工具          |
 
 ## 系统要求与部署
 
@@ -190,9 +197,12 @@ cp backend/config_model.toml.example      backend/config_model.toml
 #   [security] jwt_secret_key —— 务必改成随机长串（openssl rand -hex 32）
 #   [database] host/username/password/name —— 指向你的库
 # 编辑 backend/config_model.toml：
-#   至少配置一个 LLM provider（[providers] 下，OpenAI 兼容格式；
-#   可接云端 API，或本地 vLLM/Ollama 等自托管服务）
-#   ASR/TTS（语音功能，可选）、embedding/rerank（记忆 v2，可选）
+#   至少配置一个 LLM 端点（[endpoints.*] 下按类型分区：[endpoints.main] 主对话、
+#   [endpoints.asr]/[endpoints.tts] 语音、[endpoints.embedding]/[endpoints.rerank] 记忆 v2，
+#   OpenAI 兼容格式；可接云端 API，或本地 vLLM/Ollama 等自托管服务；
+#   [routing] 把用途路由到端点别名）
+#   ASR/TTS（语音功能，可选）、embedding/rerank（记忆 v2，可选）分别配置在
+#   [endpoints.asr] / [endpoints.tts] / [endpoints.embedding] / [endpoints.rerank]
 #   ※ 未填的 <YOUR-*> 占位**不阻塞启动**：仅对应功能在真实调用时报
 #     缺配（实测：provider 全占位 → 服务正常、页面可登录、记忆
 #     子系统自动降级并在日志记录原因）；可先起栈后补 key
@@ -263,7 +273,7 @@ frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI ·
 backend/    FastAPI + async SQLAlchemy 2.0
   ├─ app/api/        20+ 路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/…）
   ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出
-  ├─ app/tools/      工具体系（33 个工具函数 + MCP 动态扩展）
+  ├─ app/tools/      工具体系（38 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）
   └─ skills/         系统技能（SKILL.md 目录，Agent 可加载执行）
 webview-app/ Android WebView 壳（可选，JS 桥 window.WeaverNoteApp）
@@ -274,7 +284,7 @@ scripts/     构建/启停生命周期（PID 文件安全，stop 只杀记录的
 
 | 路径              | 内容                                                                                                           |
 | ----------------- | -------------------------------------------------------------------------------------------------------------- |
-| `backend/`      | FastAPI 服务（`main.py` 入口；`app/` 代码；`skills/` 系统技能；`agent_memories/func.md` 系统功能文档） |
+| `backend/`      | FastAPI 服务（`main.py` 入口；`app/` 代码；`skills/` 系统技能；`agent_memories/changelog.md` 系统文档） |
 | `frontend/`     | Vue 3 前端（`src/`；`e2e/` Playwright）                                                                    |
 | `scripts/`      | `project_build.sh` / `start.sh` / `stop.sh` / `restart.sh` / `status.sh` / `apk_generate.sh`       |
 | `webview-app/`  | Android WebView 壳源码（Gradle）                                                                               |
@@ -311,7 +321,7 @@ npx playwright test e2e/chat.spec.ts --config playwright.prod8158.config.ts
 
 **本项目鼓励Fork，欢迎企业内部自行定制分支。**
 
-> Fork 后建议先改写 `backend/agent_memories/func.md`——这是 agent 做自我介绍与
+> Fork 后建议先改写 `backend/agent_memories/changelog.md`——这是 agent 做自我介绍与
 > 产品功能解答时读取的系统文档（只读，随仓分发），换成你们自己的产品文案后
 > 对话中的「我是谁 / 我能做什么」即与品牌一致。
 

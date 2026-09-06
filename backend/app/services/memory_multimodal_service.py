@@ -160,20 +160,11 @@ def render_subconscious_snapshot_png(units: list[dict], set_of_mark: bool = True
 
 async def _call_mm_llm_messages(messages: list, user_id: str, db: Optional[AsyncSession] = None) -> str:
     """调用主多模态 LLM（chat completions，含 image_url content）。返回文本。"""
-    from app.services.llm_service import LLMService
-
-    provider_name = _mm_cfg().get("provider", "default")
-    if provider_name and provider_name != "default":
-        from app.services.provider_router import get_provider_router
-        router = get_provider_router()
-        kwargs = router.get_client_kwargs(provider_name)
-        llm = LLMService(
-            custom_api_url=kwargs.get("base_url"),
-            custom_api_key=kwargs.get("api_key"),
-            custom_model_name=router.get_model_name(provider_name),
-        )
-    else:
-        llm = LLMService()
+    # model_gateway 收口（2026-08-30）：multimodal purpose → registry routing
+    # （[memory.multimodal] provider 非 default → provider 端点；否则 main）。
+    from app.model_gateway import factory
+    from app.model_gateway.registry import get_model_registry
+    llm = factory.build_llm_service(get_model_registry().resolve("multimodal"))
 
     response = await asyncio.wait_for(
         llm.complete_chat(messages, temperature=0.1),

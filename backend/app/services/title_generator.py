@@ -188,11 +188,17 @@ def _looks_like_response_format_error(exc: Exception) -> bool:
 
 class TitleGeneratorService:
     def __init__(self, custom_api_url: str = None, custom_api_key: str = None, custom_model_name: str = None, provider_type: str = "deepseek"):
-        self.llm_service = LLMService(
-            custom_api_url=custom_api_url,
-            custom_api_key=custom_api_key,
-            custom_model_name=custom_model_name
-        )
+        if custom_api_url or custom_api_key or custom_model_name:
+            self.llm_service = LLMService(
+                custom_api_url=custom_api_url,
+                custom_api_key=custom_api_key,
+                custom_model_name=custom_model_name
+            )
+        else:
+            # model_gateway 收口（2026-08-30）：裸构造 ≡ main 端点（[api] + 全局默认采样）。
+            from app.model_gateway import factory
+            from app.model_gateway.registry import get_model_registry
+            self.llm_service = factory.build_llm_service(get_model_registry().get("main"))
         self.provider_type = provider_type
         self.custom_model_name = custom_model_name
 

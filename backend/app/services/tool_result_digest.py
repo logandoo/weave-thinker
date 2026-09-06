@@ -392,22 +392,18 @@ async def digest_one_result(result: Any, config: DigestConfig, parent_llm: Any,
         return None
     tool_name = getattr(result, "name", "") or "unknown_tool"
 
-    from app.services.llm_service import LLMService
+    from app.model_gateway import factory
     from app.services.provider_router import build_thinking_extra_body
 
     try:
-        if config.model:
-            child_llm = LLMService(
-                custom_api_url=(parent_llm.client.base_url if parent_llm.is_custom_provider else None),
-                custom_api_key=(parent_llm.client.api_key if parent_llm.is_custom_provider else None),
-                custom_model_name=config.model,
+        # model_gateway 收口（2026-08-30）：digest 子模型继承父端点，
+        # config.model / 父 model 作为覆盖（与 legacy 构造语义一致）。
+        child_llm = factory.build_llm_service(
+            factory.derive_child_endpoint(
+                parent_llm,
+                model_override=config.model or getattr(parent_llm, "custom_model_name", None),
             )
-        else:
-            child_llm = LLMService(
-                custom_api_url=(parent_llm.client.base_url if parent_llm.is_custom_provider else None),
-                custom_api_key=(parent_llm.client.api_key if parent_llm.is_custom_provider else None),
-                custom_model_name=parent_llm.custom_model_name,
-            )
+        )
     except Exception as e:
         logger.warning("tool_digest: cannot build subagent LLM for %s: %s", tool_name, e)
         return None

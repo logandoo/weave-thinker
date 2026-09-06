@@ -4,7 +4,7 @@
 
 /* ==========================================================================
  * 皮肤：黑白构成 (mono-brutal)
- * 设计源：内置皮肤实拍（黑白构成）
+ * 设计源：design/mockups/04-mono-brutal/（chat.html / zen.html）
  * 契约：docs/SKINS.md · 目录：GET /api/skins
  *
  * 布局范式（mockup .shell/.sidebar）：贴边列式 —— 2-3px 硬边框 + 偏移硬阴影，
@@ -538,6 +538,39 @@ html[data-skin="mono-brutal"] .context-token-chip {
   transform: rotate(-2deg);
 }
 
+/* 顶栏「添加到笔记」按钮（P3 2026-09-05）：硬边直角 + 2px 黑框 + 硬偏移影，
+   桌面 .header-save-note-btn 与移动 .mobile-save-note-btn 同规（dark 由令牌
+   翻转自动适配，与 .context-token-chip/.message-action-btn 一族）。
+   2026-09-05 用户微调：框体收紧（桌面 40→34 / 移动 36→32）+ 与 token 徽章
+   之间留 10px 间距（徽章 3px 偏移影 + ≥7px 净距，两框绝不相抵）。 */
+html[data-skin="mono-brutal"] .header-save-note-btn,
+html[data-skin="mono-brutal"] .mobile-save-note-btn {
+  border-radius: 0;
+  border: 2px solid var(--skin-line);
+  background: var(--skin-wt);
+  color: var(--color-text);
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .header-save-note-btn {
+  width: 34px;
+  height: 34px;
+  margin-left: 10px;
+}
+html[data-skin="mono-brutal"] .mobile-save-note-btn {
+  width: 32px;
+  height: 32px;
+  margin-left: 10px;
+}
+html[data-skin="mono-brutal"] .header-save-note-btn:hover,
+html[data-skin="mono-brutal"] .mobile-save-note-btn:hover {
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+}
+html[data-skin="mono-brutal"] .header-save-note-btn:active,
+html[data-skin="mono-brutal"] .mobile-save-note-btn:active {
+  transform: none;
+}
+
 /* 消息气泡：3px 硬边直角；user = 黑底白字（mockup .bubble/.msg.user .bubble） */
 html[data-skin="mono-brutal"] .text {
   border-radius: 0;
@@ -675,11 +708,6 @@ html[data-skin="mono-brutal"] .send-btn {
 html[data-skin="mono-brutal"] .send-btn:hover:not(:disabled) {
   background: var(--skin-yl);
   color: var(--skin-line);
-}
-html[data-skin="mono-brutal"] .send-btn.stop-mode {
-  background: var(--skin-fill);
-  color: var(--color-primary);
-  border-color: var(--skin-line);
 }
 html[data-skin="mono-brutal"] .send-btn:disabled {
   background: var(--skin-lt);
@@ -1969,3 +1997,69 @@ html[data-skin="mono-brutal"] .math-dialog-save,
 html[data-skin="mono-brutal"] .mermaid-dialog-save,
 html[data-skin="mono-brutal"] .math-dialog-cancel,
 html[data-skin="mono-brutal"] .mermaid-dialog-cancel { border-radius: 0; font-weight: 800; }
+
+/* ══════════ wave-17：sidebar 二级菜单/分组编辑卡/移动端笔记页/swipe 完整色板（容器走 --menu-系列与 --dialog-系列 令牌；此处补 item 层 + 硬边卡面 + swipe 语言） ══════════ */
+/* 菜单家族 item 层：直角 + 反色 hover + 700 字重（对齐 .user-menu-item 语言） */
+html[data-skin="mono-brutal"] .menu-item,
+html[data-skin="mono-brutal"] .tools-item { border-radius: 0; font-weight: 700; }
+html[data-skin="mono-brutal"] .menu-item:hover,
+html[data-skin="mono-brutal"] .tools-item:hover { background: var(--skin-fill); color: var(--skin-onfill); }
+html[data-skin="mono-brutal"] .menu-item.delete:hover { background: var(--skin-fill); color: var(--skin-onfill); }
+html[data-skin="mono-brutal"] .menu-divider { background-color: var(--skin-line); }
+html[data-skin="mono-brutal"][data-theme="dark"] .menu-item:hover,
+html[data-skin="mono-brutal"][data-theme="dark"] .tools-item:hover { background: var(--skin-fill); color: var(--skin-onfill); }
+/* 分组编辑卡（.modal-content 家族）：3px 硬边 + 900 标题 + 直角 2px 边按钮（容器 radius/shadow 走 --dialog-* 自动） */
+html[data-skin="mono-brutal"] .modal-content { border: 3px solid var(--skin-line); border-radius: 0; }
+html[data-skin="mono-brutal"] .modal-title { font-weight: 900; letter-spacing: 0.02em; }
+html[data-skin="mono-brutal"] .modal-btn { border-radius: 0; font-weight: 700; border: 2px solid var(--skin-line); }
+html[data-skin="mono-brutal"] .modal-btn.cancel { background: var(--skin-wt, var(--surface-panel-strong)); }
+html[data-skin="mono-brutal"] .form-group input,
+html[data-skin="mono-brutal"] .modal-body input,
+html[data-skin="mono-brutal"] .form-group select.form-select { border-radius: 0; border: 2px solid var(--skin-line); background: var(--surface-input); }
+/* swipe 条：2px 硬边分隔 + 800 字重 + 完整 light 色板（dark 沿 wave-11） */
+html[data-skin="mono-brutal"] .swipe-action + .swipe-action { border-left: 2px solid var(--skin-line); }
+html[data-skin="mono-brutal"] .swipe-action { font-weight: 800; }
+html[data-skin="mono-brutal"] .swipe-action.export { background: #2f4f9e; }
+html[data-skin="mono-brutal"] .swipe-action.edit { background: #52525b; }
+html[data-skin="mono-brutal"] .swipe-action.save-note { background: #166534; }
+html[data-skin="mono-brutal"] .swipe-action.delete { background: #c2410c; }
+html[data-skin="mono-brutal"] .swipe-action.rename { background: #c2410c; }
+html[data-skin="mono-brutal"] .swipe-action.default { background: #166534; }
+html[data-skin="mono-brutal"] .swipe-action.default.active { background: #14532d; }
+html[data-skin="mono-brutal"][data-theme="dark"] .swipe-action.move-group { background: #6d28d9; }
+html[data-skin="mono-brutal"][data-theme="dark"] .swipe-action.move { background: #b45309; }
+html[data-skin="mono-brutal"][data-theme="dark"] .swipe-action.default.active { background: #176242; }
+/* np 行左划动作条（笔记侧栏，与 agent swipe 同族） */
+html[data-skin="mono-brutal"] .np-swipe-action + .np-swipe-action { border-left: 2px solid var(--skin-line); }
+html[data-skin="mono-brutal"] .np-swipe-action { font-weight: 800; }
+html[data-skin="mono-brutal"] .np-swipe-actions { border-radius: 0; }
+html[data-skin="mono-brutal"] .np-swipe-action.rename { background: #c2410c; }
+html[data-skin="mono-brutal"] .np-swipe-action.move { background: #b45309; }
+html[data-skin="mono-brutal"] .np-swipe-action.delete { background: #c2410c; }
+html[data-skin="mono-brutal"][data-theme="dark"] .np-swipe-action.rename { background: #c2410c; }
+html[data-skin="mono-brutal"][data-theme="dark"] .np-swipe-action.move { background: #b45309; }
+html[data-skin="mono-brutal"][data-theme="dark"] .np-swipe-action.delete { background: #a3402e; }
+/* 移动端笔记页：头部按钮/卡片/附属面（桌面 stack 卡语言 wave-11 已立，此段限移动媒体块内不改桌面） */
+@media (max-width: 767px) {
+  html[data-skin="mono-brutal"] .header-action-btn,
+  html[data-skin="mono-brutal"] .import-btn,
+  html[data-skin="mono-brutal"] .back-btn,
+  html[data-skin="mono-brutal"] .search-input-wrapper,
+  html[data-skin="mono-brutal"] .modal-input { border-radius: 0; border: 2px solid var(--skin-line); }
+  html[data-skin="mono-brutal"] .add-btn,
+  html[data-skin="mono-brutal"] .page-btn { border-radius: 0; border: 2px solid var(--skin-line); }
+  html[data-skin="mono-brutal"] .note-row,
+  html[data-skin="mono-brutal"] .notebook-row { border-radius: 0; border: 2px solid var(--skin-line); box-shadow: 3px 3px 0 var(--skin-line); background: var(--surface-panel-strong); }
+  html[data-skin="mono-brutal"] .note-item,
+  html[data-skin="mono-brutal"] .notebook-item { border-radius: 0; border: none; box-shadow: none; background: transparent; }
+  html[data-skin="mono-brutal"] .note-item:hover,
+  html[data-skin="mono-brutal"] .notebook-item:hover { box-shadow: none; }
+  html[data-skin="mono-brutal"] .modal-content { border: 3px solid var(--skin-line); border-radius: 0; }
+  html[data-skin="mono-brutal"] .modal-title { font-weight: 900; }
+  html[data-skin="mono-brutal"] .confirm-btn,
+  html[data-skin="mono-brutal"] .cancel-btn,
+  html[data-skin="mono-brutal"] .move-confirm-btn,
+  html[data-skin="mono-brutal"] .delete-confirm-btn,
+  html[data-skin="mono-brutal"] .export-confirm-btn,
+  html[data-skin="mono-brutal"] .create-btn { border-radius: 0; border: 2px solid var(--skin-line); font-weight: 700; }
+}

@@ -26,7 +26,7 @@ from app.services.citation_ledger import CitationLedger, normalize_url
 from app.services.deathmatch_service import DeathmatchManager, MARKER_RE
 from app.tools.skill_tools import build_skills_system_prompt, resolve_skill, is_system_skill
 from app.tools.registry import registry
-from app.services.provider_router import build_thinking_extra_body
+
 from app.services.stream_buffer import stream_buffer_manager
 from app.services.part_events import PartTranslator
 from app.services.pre_tool_gate import PreToolGate
@@ -778,7 +778,7 @@ def _strip_leading_orphan_colon(text: str) -> str:
     """Strip exactly ONE leading orphan colon (U+FF1A / ASCII ':').
 
     Defense for a rare provider glitch (1/427 msgs, conv e7d51dcb 2026-08-19:
-    qwen3.8_27b@vLLM thinking-xhigh opened the final answer with a bare '：'
+    qwen3.8@vLLM (model qwen3.8_27b) thinking-xhigh opened the final answer with a bare '：'
     after a dangling label in its thinking). NO legitimate answer starts with
     a bare colon, and no pipeline stage can introduce one — so stripping one
     leading orphan colon is total-loss-free. A bare-colon-only string is kept
@@ -1097,34 +1097,55 @@ async def chat_stream(
     if request.deathmatch_action:
         dm_mgr = DeathmatchManager(conversation)
         if request.deathmatch_action == "start":
+            # D3 (2026-08-31 autonomy wave): re-enabling deathmatch with a
+            # PARKED task (paused / human_gate / partial_complete, or a
+            # mid-grilling park) RESUMES that task instead of restarting
+            # from grilling. Only a done round or a fresh conversation
+            # proceeds to intent classification / a new grilling round.
+            if conversation.deathmatch_status in ("paused", "human_gate", "partial_complete", "grilling") and (
+                conversation.deathmatch_goal
+                or conversation.deathmatch_grilling_complete
+                or conversation.deathmatch_status == "grilling"
+            ):
+                _status_before_resume = conversation.deathmatch_status
+                if conversation.deathmatch_status == "partial_complete":
+                    dm_mgr.resume_from_partial()
+                else:
+                    dm_mgr.resume()
+                logger.info(
+                    "Deathmatch re-enabled: resumed parked task for conversation %s (status=%s)",
+                    conversation_id, _status_before_resume,
+                )
+                await db.commit()
             # If a previous deathmatch round has completed, preserve its compressed
             # summary before deciding whether to start a fresh grilling phase.
-            if conversation.deathmatch_status == "done" and not conversation.deathmatch_context_summary:
-                await dm_mgr.compress_conversation_context(db)
-            # When the user explicitly starts deathmatch after a completed round,
-            # use the sub-agent intent classifier to decide whether this is a new
-            # task (NEW_ROUND/CLARIFY) or just a discussion of the previous result
-            # (DISCUSS). This prevents re-entering grilling for messages like
-            # "你觉得写得怎么样？".
-            if (
-                conversation.deathmatch_status == "done"
-                and conversation.deathmatch_context_summary
-            ):
-                intent = await dm_mgr.classify_intent(latest_user_query, db)
-                if intent == "NEW_ROUND":
-                    await dm_mgr.compress_conversation_context(db)
-                    dm_mgr.activate_grilling()
-                elif intent == "CLARIFY":
-                    dm_mgr.activate_grilling()
-                # DISCUSS: keep deathmatch off; normal mode will carry the summary.
             else:
-                # Starting deathmatch from normal mode (or a stale state). Capture
-                # the existing conversation context first so the grilling phase can
-                # see what was discussed before the mode switch.
-                if not conversation.deathmatch_context_summary:
+                if conversation.deathmatch_status == "done" and not conversation.deathmatch_context_summary:
                     await dm_mgr.compress_conversation_context(db)
-                dm_mgr.activate_grilling()
-            await db.commit()
+                # When the user explicitly starts deathmatch after a completed round,
+                # use the sub-agent intent classifier to decide whether this is a new
+                # task (NEW_ROUND/CLARIFY) or just a discussion of the previous result
+                # (DISCUSS). This prevents re-entering grilling for messages like
+                # "你觉得写得怎么样？".
+                if (
+                    conversation.deathmatch_status == "done"
+                    and conversation.deathmatch_context_summary
+                ):
+                    intent = await dm_mgr.classify_intent(latest_user_query, db)
+                    if intent == "NEW_ROUND":
+                        await dm_mgr.compress_conversation_context(db)
+                        dm_mgr.activate_grilling()
+                    elif intent == "CLARIFY":
+                        dm_mgr.activate_grilling()
+                    # DISCUSS: keep deathmatch off; normal mode will carry the summary.
+                else:
+                    # Starting deathmatch from normal mode (or a stale state). Capture
+                    # the existing conversation context first so the grilling phase can
+                    # see what was discussed before the mode switch.
+                    if not conversation.deathmatch_context_summary:
+                        await dm_mgr.compress_conversation_context(db)
+                    dm_mgr.activate_grilling()
+                await db.commit()
         elif request.deathmatch_action == "stop":
             # Compress context before exiting deathmatch so the conversation can
             # continue in normal mode with background context.
@@ -1175,35 +1196,16 @@ async def chat_stream(
         elif conversation.deathmatch_status not in ("grilling", "active"):
             dm_mgr = DeathmatchManager(conversation)
             if conversation.deathmatch_status in ("paused", "human_gate"):
-                # "paused"/"human_gate" = the deathmatch was interrupted (stop /
-                # disconnect / discussion pause / wall-time or stall gate) but
-                # the goal is NOT achieved.
-                # Short resume commands ("继续" etc.) always resume the loop.
-                # Anything else is classified: DISCUSS questions are answered
-                # once while staying gated; NEW_ROUND/CLARIFY resumes.
-                _q = latest_user_query.strip().lower()
-                _is_resume_cmd = len(_q) <= 12 and any(
-                    h in _q for h in ("继续", "接着", "resume", "continue", "go on")
+                # D2 (2026-08-31 autonomy wave): ANY user message while
+                # paused/gated resumes the goal loop — supplemental content
+                # becomes steering input for the next turn (补充即恢复).
+                # Stopping is done via the mode toggle (stop action), not
+                # via DISCUSS gating.
+                dm_mgr.resume()
+                logger.info(
+                    "Deathmatch resumed from %s for conversation %s (any-message-resume)",
+                    conversation.deathmatch_status, conversation_id,
                 )
-                if _is_resume_cmd:
-                    dm_mgr.resume()
-                    logger.info(
-                        "Deathmatch resumed from paused for conversation %s (goal loop re-entered)",
-                        conversation_id,
-                    )
-                else:
-                    _intent = await dm_mgr.classify_intent(latest_user_query, db)
-                    if _intent == "DISCUSS":
-                        logger.info(
-                            "Deathmatch stays gated (paused/human_gate) for discussion message in conversation %s",
-                            conversation_id,
-                        )
-                    else:
-                        dm_mgr.resume()
-                        logger.info(
-                            "Deathmatch resumed from paused for conversation %s (intent=%s)",
-                            conversation_id, _intent,
-                        )
             elif conversation.deathmatch_status == "partial_complete":
                 # "partial_complete" = the goal is mostly done but stalled.
                 # User sending a message means "continue pushing toward the goal".
@@ -1248,6 +1250,14 @@ async def chat_stream(
         conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
 
     llm_service = agent_service.create_llm_service(assistant)
+
+    # 模型网关（A4.9 复审 Critical-1）：wire 层 provider_type 以解析端点
+    # 为准 —— model_alias 助手的 DB 旧列与新模型无关；legacy inline 端点
+    # 携带旧列值，行为不变。嵌套闭包（_ensure_title 等）共享此值。
+    from app.model_gateway.factory import wire_provider_type
+    _wire_provider_type = wire_provider_type(
+        llm_service, getattr(assistant, "provider_type", "deepseek") or "deepseek"
+    )
 
     # P0 (2026-08-21, user requirement): coordinator/audit/aux LLM calls
     # inherit the assistant's model settings. Custom-model assistants get
@@ -1315,7 +1325,7 @@ async def chat_stream(
             # the title LLM must not fall back to global deepseek.
             title_generator = TitleGeneratorService(
                 **agent_service.title_generator_kwargs(assistant, llm_service),
-                provider_type=getattr(assistant, "provider_type", "deepseek") or "deepseek",
+                provider_type=_wire_provider_type,
             )
             _title_query = search_query or latest_user_query or ""
             generated_title: str | None = None
@@ -1489,7 +1499,7 @@ async def chat_stream(
                         if conv_row.title == "新对话":
                             title_generator = TitleGeneratorService(
                                 **agent_service.title_generator_kwargs(_cap_assistant, _cap_llm_service),
-                                provider_type=getattr(_cap_assistant, "provider_type", "deepseek") or "deepseek",
+                                provider_type=wire_provider_type(_cap_llm_service, getattr(_cap_assistant, "provider_type", "deepseek") or "deepseek"),
                             )
                             _tq = _cap_search_query or _cap_latest_user_query or ""
                             gt = None
@@ -1689,15 +1699,15 @@ async def chat_stream(
 
             # Qwen3.8(Local): per-mode sampling param sets from the assistant
             # (thinking vs non-thinking), NULL fields fall back to the
-            # model-card defaults (modelscope.cn/models/Qwen/Qwen3.8-27B-FP8).
-            from app.services.provider_router import (
-                QWEN38_VLLM_THINKING_DEFAULTS,
-                QWEN38_VLLM_NON_THINKING_DEFAULTS,
-            )
+            # model-card defaults（wave-7：预设单一事实源在 thinking profile）。
+            from app.model_gateway.profiles import get_thinking_profile
+            _q38_profile = get_thinking_profile("qwen3.8_vllm")
+            QWEN38_VLLM_THINKING_DEFAULTS = _q38_profile.sampling_defaults(True)
+            QWEN38_VLLM_NON_THINKING_DEFAULTS = _q38_profile.sampling_defaults(False)
             _thinking_sampling: dict = {}
             _non_thinking_sampling: dict = {}
             _preserve_thinking: bool | None = None
-            if (getattr(assistant, "provider_type", "") or "") == "qwen3.8_vllm":
+            if _wire_provider_type == "qwen3.8_vllm":
                 _thinking_sampling = {
                     k: getattr(assistant, f"thinking_{k}", None)
                     for k in QWEN38_VLLM_THINKING_DEFAULTS
@@ -1726,7 +1736,7 @@ async def chat_stream(
                 tool_schemas=None,
                 max_iterations=_config.agent_tool_loop_max_iterations,
                 workspace_path="",  # gather 后回填（workspace 未就绪；run 前必被覆盖）
-                provider_type=getattr(assistant, "provider_type", "deepseek") or "deepseek",
+                provider_type=_wire_provider_type,
                 enable_reasoning=request.enable_reasoning,
                 reasoning_effort=request.reasoning_effort,
                 thinking_budget=request.thinking_budget,
@@ -1930,7 +1940,7 @@ async def chat_stream(
                 try:
                     tg = TitleGeneratorService(
                         **agent_service.title_generator_kwargs(_cap_assistant, _cap_llm_service),
-                        provider_type=getattr(_cap_assistant, "provider_type", "deepseek") or "deepseek",
+                        provider_type=wire_provider_type(_cap_llm_service, getattr(_cap_assistant, "provider_type", "deepseek") or "deepseek"),
                     )
                     try:
                         generated_title = await tg.generate_title(
@@ -2123,6 +2133,7 @@ async def chat_stream(
                     reasoning: str | None,
                     tr_json_str: str | None,
                     tc_json: str | None,
+                    ctx_info: dict | None = None,
                 ) -> str | None:
                     """conv 3b58af5b (R4, 2026-08-23): single-writer producer-
                     side persistence for the final answer. Runs BEFORE the
@@ -2144,6 +2155,9 @@ async def chat_stream(
                                 reasoning_content=reasoning or None,
                                 tool_results=tr_json_str,
                                 tool_calls=tc_json,
+                                context_info=(
+                                    json.dumps(ctx_info, ensure_ascii=False) if ctx_info else None
+                                ),
                             )
                             db.add(msg)
                             conv_row.updated_at = datetime.utcnow()
@@ -2294,6 +2308,7 @@ async def chat_stream(
                             conversation=task_conversation,
                             assistant=_cap_assistant,
                             precomputed_coord=coord_result,
+                            interjection_queue=_agent_state.interjection_queue,
                         ):
                             if "coord_done" in event:
                                 _ttft_t2 = time.monotonic()
@@ -2425,6 +2440,44 @@ async def chat_stream(
 
                             elif "iteration" in event:
                                 await _put({"iteration": event["iteration"]})
+
+                            elif "interjection_committed" in event:
+                                # 插话 commit-echo（2026-08-29）：loop 在迭代边界
+                                # 把用户插话注入了消息列表 —— 此处落库为真实
+                                # role=user 消息并广播，前端据此确认乐观气泡。
+                                _ij_content = str((event["interjection_committed"] or {}).get("content") or "")
+                                _ij_msg_id = None
+                                _ij_created = None
+                                try:
+                                    async with AsyncSessionLocal() as _ij_db:
+                                        _ij_conv = (await _ij_db.execute(
+                                            select(Conversation).where(Conversation.id == conversation_id)
+                                        )).scalar_one_or_none()
+                                        if _ij_conv is not None:
+                                            _ij_msg = Message(
+                                                conversation_id=conversation_id,
+                                                role="user",
+                                                content=_ij_content,
+                                            )
+                                            _ij_db.add(_ij_msg)
+                                            _ij_conv.updated_at = datetime.utcnow()
+                                            await _ij_db.commit()
+                                            _ij_msg_id = str(_ij_msg.id)
+                                            _ij_created = (
+                                                _ij_msg.created_at.isoformat()
+                                                if _ij_msg.created_at else None
+                                            )
+                                except Exception:
+                                    logger.exception(
+                                        "Interjection persistence failed for conversation %s",
+                                        conversation_id,
+                                    )
+                                await _put({"interjection_committed": {
+                                    "id": _ij_msg_id,
+                                    "conversation_id": conversation_id,
+                                    "content": _ij_content,
+                                    "created_at": _ij_created,
+                                }})
 
                             elif "context_info" in event:
                                 # 紧急压缩 recovery（LLM 错误/final-thinking）路径
@@ -2581,6 +2634,16 @@ async def chat_stream(
                                 _canary_tail = ""
                                 _reasoning_canary_tail = ""
                                 _pre_tool_gate.reset()
+                                # conv 827a6f78 turn-B (2026-09-03): sync the
+                                # CLIENT on the silent QC reset — without this
+                                # the frontend's s.content kept every rejected
+                                # draft and the done-time answer bubble
+                                # contained the whole mess (refresh restored
+                                # the clean DB row). The buffer resets its own
+                                # accumulator on this event (resume replay
+                                # parity); the SSE generator forwards it as a
+                                # frame for the client-side timeline surgery.
+                                await _put({"audit_reset": True})
 
                             elif "agent_step" in event:
                                 await _put({"agent_step": event["agent_step"]})
@@ -3021,6 +3084,10 @@ async def chat_stream(
                             reasoning=full_reasoning_local,
                             tr_json_str=tr_json,
                             tc_json=tool_calls_json_local,
+                            # P2 (2026-09-05): 落账本轮最新 token 快照
+                            # （buffer 持有 context_info 事件的最新值），
+                            # 跨设备加载会话时前端可播种徽章。
+                            ctx_info=getattr(_stream_buf, "context_info", None),
                         )
                         if producer_message_id:
                             try:
@@ -3240,6 +3307,12 @@ async def chat_stream(
                                             content=_stop_content,
                                             reasoning_content=_stop_reasoning,
                                             tool_results=_stop_tool_results,
+                                            # P2 (A4.9 R1 M4): 停止保存路径
+                                            # 同样落账 token 快照（常规可见路径）。
+                                            context_info=(
+                                                json.dumps(_stream_buf.context_info, ensure_ascii=False)
+                                                if getattr(_stream_buf, "context_info", None) else None
+                                            ),
                                         )
                                         _stop_db.add(_stop_msg)
                                         _stop_conv.updated_at = datetime.utcnow()
@@ -3647,11 +3720,28 @@ async def chat_stream(
                     elif "ping" in event:
                         yield {"event": "ping", "data": json.dumps({"ping": True})}
 
+                    elif "audit_reset" in event:
+                        # Silent-QC reset sync (conv 827a6f78 turn-B): not a
+                        # rendered item — the client uses it to drop the
+                        # rejected draft text from its timeline/accumulators.
+                        yield {"event": "audit_reset", "data": json.dumps({"audit_reset": True})}
+
                     elif "agent_step" in event:
                         yield {"event": "message", "data": json.dumps({"agent_step": event["agent_step"], "done": False})}
 
                     elif "context_info" in event:
                         yield {"event": "message", "data": json.dumps({"context_info": event["context_info"], "done": False})}
+
+                    elif "interjection_committed" in event:
+                        # 插话 commit-echo：loop 迭代边界注入用户插话后由
+                        # producer 落库并转发至此 —— 前端据此确认乐观气泡。
+                        yield {
+                            "event": "message",
+                            "data": json.dumps({
+                                "interjection_committed": event["interjection_committed"],
+                                "done": False,
+                            }),
+                        }
 
                     elif "error" in event:
                         yield {"event": "error", "data": json.dumps({"error": event["error"]})}
@@ -4449,6 +4539,60 @@ async def stop_agent_stream(
     # distrust before returning it); marking it complete here would delete a
     # live run's recovery row and transiently permit a second concurrent run.
     return {"status": "not_running", "conversation_id": conversation_id}
+
+
+@router.post("/stream/interject/{conversation_id}")
+async def interject_agent_stream(
+    conversation_id: str,
+    request_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Submit a user interjection into a RUNNING agent turn.
+
+    Iteration-boundary steering (codex pending-input / deepseek-harness
+    next-step inbox): the text is queued on the conversation's active agent
+    state and injected as a real user message at the next tool-loop iteration
+    boundary — the in-flight LLM stream is never aborted. The loop emits an
+    ``interjection_committed`` SSE event when the message enters the model
+    context, and the producer persists it as a normal ``role=user`` message
+    (commit-time persistence — a queued-but-never-consumed interjection is
+    never written to the DB, so no orphaned unanswered rows can appear).
+
+    Tri-state response: ``steered`` (queued into the live run) ·
+    ``not_running`` (no live run — the client should fall back to a normal
+    send) · ``unsupported_mode`` (deathmatch conversations have their own
+    human-gate interaction semantics).
+    """
+    # 归属校验先于内容校验（第四波 ④）：非属主探测一律 404，不泄漏端点
+    # 内容规则（authz-first）。
+    result = await db.execute(
+        select(Conversation).where(Conversation.id == conversation_id)
+    )
+    conversation = result.scalar_one_or_none()
+    if conversation is None or conversation.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    content = str((request_data or {}).get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="插话内容不能为空")
+    if len(content) > 8000:
+        raise HTTPException(status_code=400, detail="插话内容过长（上限 8000 字符）")
+    if (conversation.deathmatch_status or "") in ("grilling", "active", "paused"):
+        return {"status": "unsupported_mode", "conversation_id": conversation_id}
+    state = _agent_registry.get_local(conversation_id)
+    if state is None or not state.is_running:
+        return {"status": "not_running", "conversation_id": conversation_id}
+    if state.interjection_queue.qsize() >= 10:
+        # 待注入积压上限（A4.9 M3）：全部会在下一迭代边界进入模型上下文，
+        # 无上限是上下文/成本放大面。客户端收到 429 将文本回填输入框稍后
+        # 重发（rate_limited，绝不回退普通发送——那会杀掉在途 run）。
+        raise HTTPException(status_code=429, detail="插话队列已满，请等待当前插话被接收")
+    state.interjection_queue.put_nowait(content)
+    logger.info(
+        "Interjection queued for conversation %s (%d chars, user=%s)",
+        conversation_id, len(content), current_user.id,
+    )
+    return {"status": "steered", "conversation_id": conversation_id}
 
 
 @router.post("/permission/respond")

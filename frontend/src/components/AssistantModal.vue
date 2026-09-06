@@ -60,512 +60,27 @@
 
           <div class="divider"></div>
 
-          <div class="section-title">LLM 参数配置</div>
-
-          <template v-if="formData.provider_type !== 'qwen3.8_vllm'">
-          <div class="param-group">
-            <label class="param-label">
-              Temperature
-              <span class="param-value">{{ formData.temperature ?? '默认' }}</span>
-            </label>
-            <input
-              type="range"
-              v-model.number="formData.temperature"
-              min="0"
-              max="2"
-              step="0.1"
-              class="param-slider"
-            />
-            <div class="param-hint">控制随机性，较高的值会产生更随机的输出</div>
-          </div>
+          <div class="section-title">模型</div>
 
           <div class="param-group">
-            <label class="param-label">
-              Top P
-              <span class="param-value">{{ formData.top_p ?? '默认' }}</span>
-            </label>
-            <input
-              type="range"
-              v-model.number="formData.top_p"
-              min="0"
-              max="1"
-              step="0.05"
-              class="param-slider"
-            />
-            <div class="param-hint">核采样，较低的值会限制候选词范围</div>
-          </div>
-
-          <div class="param-group">
-            <label class="param-label">
-              Top K
-              <span class="param-value">{{ formData.top_k ?? '默认' }}</span>
-            </label>
-            <input
-              type="number"
-              v-model.number="formData.top_k"
-              min="1"
-              max="100"
-              placeholder="默认"
-              class="param-input"
-            />
-            <div class="param-hint">限制每一步考虑的候选词数量</div>
-          </div>
-
-          <div class="param-group">
-            <label class="param-label">
-              Presence Penalty
-              <span class="param-value">{{ formData.presence_penalty ?? '默认' }}</span>
-            </label>
-            <input
-              type="range"
-              v-model.number="formData.presence_penalty"
-              min="-2"
-              max="2"
-              step="0.1"
-              class="param-slider"
-            />
-            <div class="param-hint">正值会惩罚已出现的词，鼓励谈论新话题</div>
-          </div>
-
-          <div class="param-group">
-            <label class="param-label">
-              Frequency Penalty
-              <span class="param-value">{{ formData.frequency_penalty ?? '默认' }}</span>
-            </label>
-            <input
-              type="range"
-              v-model.number="formData.frequency_penalty"
-              min="-2"
-              max="2"
-              step="0.1"
-              class="param-slider"
-            />
-            <div class="param-hint">正值会惩罚高频词，减少重复</div>
-          </div>
-
-          <div class="param-group">
-            <label class="param-label">
-              Max Tokens
-              <span class="param-value">{{ formData.max_tokens ?? '默认' }}</span>
-            </label>
-            <input
-              type="number"
-              v-model.number="formData.max_tokens"
-              min="1"
-              max="4096"
-              placeholder="默认"
-              class="param-input"
-            />
-            <div class="param-hint">限制单次回复的最大 token 数</div>
-          </div>
-
-          <div class="param-group">
-            <label class="param-label">
-              Thinking Budget
-              <span class="param-value">{{ formData.thinking_budget ?? '默认' }}</span>
-            </label>
-            <input
-              type="number"
-              v-model.number="formData.thinking_budget"
-              min="0"
-              step="100"
-              placeholder="默认"
-              class="param-input"
-            />
-            <div class="param-hint">限制思考阶段最大 token 数，0 表示不限制</div>
-          </div>
-          </template>
-
-          <template v-if="formData.provider_type === 'qwen3.8_vllm'">
-            <div class="section-title">思考模式采样参数</div>
-            <div class="param-hint qwen38-section-hint">思考模式默认：temperature 1.0 · top_p 0.95 · top_k 20 · min_p 0.0 · presence_penalty 0.0 · repetition_penalty 1.0（模型卡推荐）</div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Temperature（思考）
-                <span class="param-value">{{ formData.thinking_temperature ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.thinking_temperature"
-                min="0"
-                max="2"
-                step="0.1"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Top P（思考）
-                <span class="param-value">{{ formData.thinking_top_p ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.thinking_top_p"
-                min="0"
-                max="1"
-                step="0.05"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Top K（思考）
-                <span class="param-value">{{ formData.thinking_top_k ?? '默认' }}</span>
-              </label>
-              <input
-                type="number"
-                v-model.number="formData.thinking_top_k"
-                min="1"
-                max="100"
-                placeholder="默认"
-                class="param-input"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Min P（思考）
-                <span class="param-value">{{ formData.thinking_min_p ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.thinking_min_p"
-                min="0"
-                max="1"
-                step="0.05"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Presence Penalty（思考）
-                <span class="param-value">{{ formData.thinking_presence_penalty ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.thinking_presence_penalty"
-                min="-2"
-                max="2"
-                step="0.1"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Repetition Penalty（思考）
-                <span class="param-value">{{ formData.thinking_repetition_penalty ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.thinking_repetition_penalty"
-                min="0"
-                max="2"
-                step="0.05"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="divider"></div>
-
-            <div class="section-title">非思考模式采样参数</div>
-            <div class="param-hint qwen38-section-hint">非思考模式默认：temperature 0.7 · top_p 0.80 · top_k 20 · min_p 0.0 · presence_penalty 1.5 · repetition_penalty 1.0（模型卡推荐）</div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Temperature（非思考）
-                <span class="param-value">{{ formData.temperature ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.temperature"
-                min="0"
-                max="2"
-                step="0.1"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Top P（非思考）
-                <span class="param-value">{{ formData.top_p ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.top_p"
-                min="0"
-                max="1"
-                step="0.05"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Top K（非思考）
-                <span class="param-value">{{ formData.top_k ?? '默认' }}</span>
-              </label>
-              <input
-                type="number"
-                v-model.number="formData.top_k"
-                min="1"
-                max="100"
-                placeholder="默认"
-                class="param-input"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Min P（非思考）
-                <span class="param-value">{{ formData.min_p ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.min_p"
-                min="0"
-                max="1"
-                step="0.05"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Presence Penalty（非思考）
-                <span class="param-value">{{ formData.presence_penalty ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.presence_penalty"
-                min="-2"
-                max="2"
-                step="0.1"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">
-                Repetition Penalty（非思考）
-                <span class="param-value">{{ formData.repetition_penalty ?? '默认' }}</span>
-              </label>
-              <input
-                type="range"
-                v-model.number="formData.repetition_penalty"
-                min="0"
-                max="2"
-                step="0.05"
-                class="param-slider"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-checkbox">
-                <input type="checkbox" v-model="formData.preserve_thinking" />
-                <span>preserve_thinking（保留历史思考链）</span>
-              </label>
-              <div class="param-hint">保留并利用历史消息中的思考过程（chat_template_kwargs.preserve_thinking），默认开启</div>
-            </div>
-          </template>
-
-          <div class="divider"></div>
-
-          <div class="section-title">供应商</div>
-
-          <div class="param-group">
-            <label class="param-label">供应商类型</label>
-            <select v-model="formData.provider_type" class="param-input" @change="onProviderChange">
-              <option value="deepseek">DeepSeek</option>
-              <option value="qwen3.8_vllm">Qwen3.8(Local)</option>
-              <option value="mimo">MiMo (Xiaomi)</option>
-              <option value="custom">自定义</option>
+            <label class="param-label">主模型</label>
+            <select v-model="formData.model_alias" class="param-input" :disabled="!llmAliases.length">
+              <option v-if="!llmAliases.length" :value="formData.model_alias">默认模型</option>
+              <option v-if="!formData.model_alias" value="">系统默认（旧配置）</option>
+              <option v-else-if="!llmAliases.some(a => a.alias === formData.model_alias)" :value="formData.model_alias">{{ formData.model_alias }}（旧配置）</option>
+              <option v-for="a in llmAliases" :key="a.alias" :value="a.alias">{{ a.display_name }}（{{ a.alias }}）</option>
             </select>
-            <div class="param-hint">不同供应商使用不同的 Thinking 模式参数格式</div>
+            <div class="param-hint">可选模型由服务器统一管理（逻辑别名）；思考/推理强度可在输入区按消息调整</div>
           </div>
-
-          <div class="divider"></div>
-
-          <div class="section-title">模型配置</div>
-
-          <template v-if="formData.provider_type === 'custom'">
-            <div class="param-group">
-              <label class="param-label">API 地址</label>
-              <input
-                v-model="formData.custom_api_url"
-                type="text"
-                placeholder="https://api.example.com/v1"
-                class="param-input"
-              />
-              <div class="param-hint">OpenAI 兼容的 API 地址</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">API Key</label>
-              <input
-                v-model="formData.custom_api_key"
-                type="password"
-                placeholder="sk-..."
-                class="param-input"
-              />
-              <div class="param-hint">API 密钥（可选），自部署模型可留空</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">模型名称</label>
-              <input
-                v-model="formData.custom_model_name"
-                type="text"
-                placeholder="gpt-4o / deepseek-reasoner"
-                class="param-input"
-              />
-              <div class="param-hint">要使用的模型名称</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">Extra Body (JSON)</label>
-              <textarea
-                v-model="formData.extra_body"
-                placeholder='{"thinking": {"type": "enabled"}}'
-                class="form-textarea"
-                rows="3"
-              ></textarea>
-              <div class="param-hint">直接输入 extra_body 的完整 JSON，将原样传递给 LLM API</div>
-            </div>
-          </template>
-
-          <template v-else-if="formData.provider_type !== 'qwen3.8_vllm'">
-            <div class="param-group">
-              <label class="param-label">API Key</label>
-              <input
-                v-model="formData.custom_api_key"
-                type="password"
-                :placeholder="apiKeyPlaceholder"
-                class="param-input"
-              />
-              <div class="param-hint">{{ apiKeyHint }}</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">模型名称</label>
-              <input
-                v-model="formData.custom_model_name"
-                type="text"
-                :placeholder="modelNamePlaceholder"
-                class="param-input"
-              />
-              <div class="param-hint">{{ modelNameHint }}</div>
-            </div>
-          </template>
-
-          <template v-if="formData.provider_type === 'qwen3.8_vllm'">
-            <div class="param-group">
-              <label class="param-label">API 地址</label>
-              <input
-                v-model="formData.custom_api_url"
-                type="text"
-                :placeholder="qwen38ApiUrlPlaceholder"
-                class="param-input"
-              />
-              <div class="param-hint">vLLM 服务地址（OpenAI 兼容，modelscope 部署指南格式），留空使用服务器配置</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">API Key</label>
-              <input
-                v-model="formData.custom_api_key"
-                type="password"
-                placeholder="无需密钥（本地 vLLM 服务）"
-                class="param-input"
-              />
-              <div class="param-hint">自部署 vLLM 服务通常无需鉴权，留空即可</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">模型名称</label>
-              <input
-                v-model="formData.custom_model_name"
-                type="text"
-                :placeholder="modelNamePlaceholder"
-                class="param-input"
-              />
-              <div class="param-hint">vLLM 服务的模型名（如 qwen3.8_27b），留空使用服务器配置</div>
-            </div>
-          </template>
-
-          <div class="divider"></div>
-
-          <div class="section-title">Subagent 任务模型</div>
 
           <div class="param-group">
-            <label class="param-checkbox">
-              <input type="checkbox" v-model="formData.use_subtask_model" />
-              <span>启用 subagent 任务模型</span>
-            </label>
-            <div class="param-hint">为子任务（工具迭代、搜索决策、关键词生成等）使用独立的轻量模型；不勾选时复用主模型并自动关闭 thinking</div>
+            <label class="param-label">Subagent 任务模型</label>
+            <select v-model="formData.subtask_model_alias" class="param-input" :disabled="!llmAliases.length">
+              <option value="">跟随主模型</option>
+              <option v-for="a in llmAliases" :key="a.alias" :value="a.alias">{{ a.display_name }}（{{ a.alias }}）</option>
+            </select>
+            <div class="param-hint">为子任务（工具迭代、搜索决策等）使用独立模型；不选时复用主模型并自动关闭 thinking</div>
           </div>
-
-          <template v-if="formData.use_subtask_model">
-            <div class="param-group">
-              <label class="param-label">供应商类型</label>
-              <select v-model="formData.subtask_provider_type" class="param-input">
-                <option :value="null">跟随主模型</option>
-                <option value="deepseek">DeepSeek</option>
-                <option value="qwen3.8_vllm">Qwen3.8(Local)</option>
-                <option value="mimo">MiMo (Xiaomi)</option>
-                <option value="custom">自定义</option>
-              </select>
-              <div class="param-hint">用于决定 thinking 参数格式</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">API 地址</label>
-              <input
-                v-model="formData.subtask_custom_api_url"
-                type="text"
-                placeholder="https://api.example.com/v1"
-                class="param-input"
-              />
-              <div class="param-hint">OpenAI 兼容的 API 地址</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">API Key</label>
-              <input
-                v-model="formData.subtask_custom_api_key"
-                type="password"
-                placeholder="sk-..."
-                class="param-input"
-              />
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">模型名称</label>
-              <input
-                v-model="formData.subtask_custom_model_name"
-                type="text"
-                placeholder="例如 deepseek-chat"
-                class="param-input"
-              />
-              <div class="param-hint">建议选择一个不带思考链的轻量模型</div>
-            </div>
-
-            <div class="param-group">
-              <label class="param-label">Extra Body (JSON)</label>
-              <textarea
-                v-model="formData.subtask_extra_body"
-                placeholder='{"enable_thinking": false}'
-                class="form-textarea"
-                rows="3"
-              ></textarea>
-              <div class="param-hint">原样传递给 subagent LLM 调用</div>
-            </div>
-          </template>
         </div>
 
         <div class="modal-footer">
@@ -581,8 +96,8 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import type { Assistant, AssistantFormData } from '@/types'
-import { configApi, type ProviderConfig } from '@/api/config'
+import type { Assistant, AssistantFormData, ModelAlias } from '@/types'
+import { modelsApi } from '@/api/models'
 
 const props = defineProps<{
   visible: boolean
@@ -596,212 +111,49 @@ const emit = defineEmits<{
   'batch-delete': []
 }>()
 
-const providerConfigs = ref<Record<string, ProviderConfig>>({})
+const aliases = ref<ModelAlias[]>([])
+const defaultAlias = ref('')
 
-// Qwen3.8-27B-FP8 model-card defaults (modelscope.cn/models/Qwen/Qwen3.8-27B-FP8)
-const QWEN38_THINKING_DEFAULTS = {
-  thinking_temperature: 1.0,
-  thinking_top_p: 0.95,
-  thinking_top_k: 20,
-  thinking_min_p: 0.0,
-  thinking_presence_penalty: 0.0,
-  thinking_repetition_penalty: 1.0,
-} as const
-
-const QWEN38_NON_THINKING_DEFAULTS = {
-  temperature: 0.7,
-  top_p: 0.8,
-  top_k: 20,
-  min_p: 0.0,
-  presence_penalty: 1.5,
-  repetition_penalty: 1.0,
-} as const
+const llmAliases = computed(() => aliases.value.filter(a => a.kind === 'llm'))
 
 const defaultFormData: AssistantFormData = {
   name: '',
   system_prompt: '',
-  temperature: null,
-  top_p: null,
-  top_k: null,
-  presence_penalty: null,
-  frequency_penalty: null,
-  max_tokens: null,
-  use_custom_model: false,
-  custom_api_url: null,
-  custom_api_key: null,
-  custom_model_name: null,
-  provider_type: 'deepseek',
-  extra_body: null,
-  use_subtask_model: false,
-  subtask_custom_api_url: null,
-  subtask_custom_api_key: null,
-  subtask_custom_model_name: null,
-  subtask_provider_type: null,
-  subtask_extra_body: null,
-  thinking_budget: null,
-  min_p: null,
-  repetition_penalty: null,
-  thinking_temperature: null,
-  thinking_top_p: null,
-  thinking_top_k: null,
-  thinking_min_p: null,
-  thinking_presence_penalty: null,
-  thinking_repetition_penalty: null,
-  preserve_thinking: true,
+  model_alias: '',
+  subtask_model_alias: '',
 }
 
 const formData = ref<AssistantFormData>({ ...defaultFormData })
 
 const isEdit = computed(() => !!props.assistant)
 
-const apiKeyPlaceholder = computed(() => {
-  if (formData.value.provider_type === 'deepseek') return '使用系统默认密钥（可选）'
-  if (formData.value.provider_type === 'qwen3.8_vllm') return '无需密钥（本地 vLLM 服务）'
-  return '请输入 API Key'
-})
-
-const apiKeyHint = computed(() => {
-  if (formData.value.provider_type === 'deepseek') {
-    return '留空则使用系统默认的 DeepSeek API Key'
-  }
-  if (formData.value.provider_type === 'qwen3.8_vllm') {
-    return '自部署 vLLM 服务通常无需鉴权，留空即可'
-  }
-  return '请输入您的 API Key'
-})
-
-const modelNamePlaceholder = computed(() => {
-  const pt = formData.value.provider_type || 'deepseek'
-  const cfg = providerConfigs.value[pt] || providerConfigs.value['qwen3.8_27b']
-  if (cfg?.model_name) return cfg.model_name
-  return '请输入模型名称'
-})
-
-const qwen38ApiUrlPlaceholder = computed(() => {
-  return providerConfigs.value['qwen3.8_27b']?.base_url || 'http://127.0.0.1:8000/v1'
-})
-
-const modelNameHint = computed(() => {
-  if (formData.value.provider_type === 'deepseek') {
-    return '留空则使用系统默认模型名称'
-  }
-  if (formData.value.provider_type === 'qwen3.8_vllm') {
-    return '留空则使用服务器配置的模型名称'
-  }
-  return '请输入模型名称'
-})
-
 onMounted(async () => {
   try {
-    const res = await configApi.getProviderConfigs()
-    providerConfigs.value = res.providers
+    const res = await modelsApi.getModels()
+    aliases.value = res.aliases
+    defaultAlias.value = res.default_alias || ''
+    defaultFormData.model_alias = defaultAlias.value
+    if (!formData.value.model_alias) formData.value.model_alias = defaultAlias.value
   } catch (e) {
-    console.error('Failed to load provider configs:', e)
+    console.error('Failed to load model aliases:', e)
   }
 })
-
-function applyQwen38Defaults() {
-  // Fill only NULL fields so saved values survive editing; defaults follow
-  // the modelscope model card. preserve_thinking defaults to ON. The vLLM
-  // address/model prefill from the server provider config ([providers."qwen3.8_27b"])
-  // so the dialog is usable out of the box yet fully overridable.
-  if (formData.value.preserve_thinking == null) formData.value.preserve_thinking = true
-  const fd = formData.value
-  for (const [k, v] of Object.entries(QWEN38_THINKING_DEFAULTS)) {
-    if (fd[k as keyof AssistantFormData] == null) {
-      ;(fd as any)[k] = v
-    }
-  }
-  for (const [k, v] of Object.entries(QWEN38_NON_THINKING_DEFAULTS)) {
-    if (fd[k as keyof AssistantFormData] == null) {
-      ;(fd as any)[k] = v
-    }
-  }
-  const q38 = providerConfigs.value['qwen3.8_27b']
-  if (!fd.custom_api_url && q38?.base_url) fd.custom_api_url = q38.base_url
-  if (!fd.custom_model_name && q38?.model_name) fd.custom_model_name = q38.model_name
-}
-
-function applyProviderDefaults() {
-  const pt = formData.value.provider_type || 'deepseek'
-  const cfg = providerConfigs.value[pt]
-  if (pt === 'qwen3.8_vllm') {
-    applyQwen38Defaults()
-    return
-  }
-  if (!cfg) return
-
-  if (pt === 'deepseek') {
-    // For deepseek, pre-fill model name from config if empty
-    if (!formData.value.custom_model_name && cfg.model_name) {
-      formData.value.custom_model_name = cfg.model_name
-    }
-  } else if (pt === 'mimo') {
-    // For MiMo, pre-fill base URL and model name from config if empty
-    if (!formData.value.custom_model_name && cfg.model_name) {
-      formData.value.custom_model_name = cfg.model_name
-    }
-  } else if (pt === 'custom') {
-    // For custom, clear built-in defaults
-    if (!formData.value.custom_api_url) {
-      formData.value.custom_api_url = ''
-    }
-  }
-}
-
-function onProviderChange() {
-  // Clear fields when switching providers to avoid confusion
-  formData.value.custom_api_url = null
-  formData.value.custom_api_key = null
-  formData.value.custom_model_name = null
-  formData.value.extra_body = null
-  applyProviderDefaults()
-}
 
 watch(() => props.visible, (newVal) => {
   if (newVal && props.assistant) {
     formData.value = {
       name: props.assistant.name,
       system_prompt: props.assistant.system_prompt,
-      temperature: props.assistant.temperature ?? null,
-      top_p: props.assistant.top_p ?? null,
-      top_k: props.assistant.top_k ?? null,
-      presence_penalty: props.assistant.presence_penalty ?? null,
-      frequency_penalty: props.assistant.frequency_penalty ?? null,
-      max_tokens: props.assistant.max_tokens ?? null,
-      use_custom_model: props.assistant.use_custom_model ?? false,
-      custom_api_url: props.assistant.custom_api_url ?? null,
-      custom_api_key: props.assistant.custom_api_key ?? null,
-      custom_model_name: props.assistant.custom_model_name ?? null,
-      provider_type: props.assistant.provider_type ?? 'deepseek',
-      extra_body: props.assistant.extra_body ?? null,
-      use_subtask_model: props.assistant.use_subtask_model ?? false,
-      subtask_custom_api_url: props.assistant.subtask_custom_api_url ?? null,
-      subtask_custom_api_key: props.assistant.subtask_custom_api_key ?? null,
-      subtask_custom_model_name: props.assistant.subtask_custom_model_name ?? null,
-      subtask_provider_type: props.assistant.subtask_provider_type ?? null,
-      subtask_extra_body: props.assistant.subtask_extra_body ?? null,
-      thinking_budget: props.assistant.thinking_budget ?? null,
-      min_p: props.assistant.min_p ?? null,
-      repetition_penalty: props.assistant.repetition_penalty ?? null,
-      thinking_temperature: props.assistant.thinking_temperature ?? null,
-      thinking_top_p: props.assistant.thinking_top_p ?? null,
-      thinking_top_k: props.assistant.thinking_top_k ?? null,
-      thinking_min_p: props.assistant.thinking_min_p ?? null,
-      thinking_presence_penalty: props.assistant.thinking_presence_penalty ?? null,
-      thinking_repetition_penalty: props.assistant.thinking_repetition_penalty ?? null,
-      preserve_thinking: props.assistant.preserve_thinking ?? true,
+      model_alias: props.assistant.model_alias || defaultAlias.value,
+      subtask_model_alias: props.assistant.subtask_model_alias || '',
     }
-    if (formData.value.provider_type === 'qwen3.8_vllm') applyQwen38Defaults()
   } else if (newVal && !props.assistant) {
     formData.value = { ...defaultFormData }
-    applyProviderDefaults()
   }
 })
 
 function handleReset() {
   formData.value = { ...defaultFormData }
-  applyProviderDefaults()
 }
 
 function handleClose() {
@@ -810,26 +162,7 @@ function handleClose() {
 
 function handleSave() {
   if (!formData.value.name.trim()) return
-  // Clean up empty strings to null
-  const data = { ...formData.value }
-  if (data.custom_api_url === '') data.custom_api_url = null
-  if (data.custom_api_key === '') data.custom_api_key = null
-  if (data.custom_model_name === '') data.custom_model_name = null
-  if (data.extra_body === '') data.extra_body = null
-  if (data.subtask_custom_api_url === '') data.subtask_custom_api_url = null
-  if (data.subtask_custom_api_key === '') data.subtask_custom_api_key = null
-  if (data.subtask_custom_model_name === '') data.subtask_custom_model_name = null
-  if (data.subtask_extra_body === '') data.subtask_extra_body = null
-  if (!data.use_subtask_model) {
-    // Persist empty subtask fields when the toggle is off so old configs
-    // don't accidentally re-enable themselves later.
-    data.subtask_custom_api_url = null
-    data.subtask_custom_api_key = null
-    data.subtask_custom_model_name = null
-    data.subtask_provider_type = null
-    data.subtask_extra_body = null
-  }
-  emit('save', data)
+  emit('save', { ...formData.value })
 }
 </script>
 

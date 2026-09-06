@@ -281,11 +281,12 @@ class AgentWorker:
 
             max_iterations = task.iterations_max or config.agent_tool_loop_max_iterations
 
+            from app.model_gateway.factory import wire_provider_type as _wire_pt
             agent_loop = AgentLoop(
                 llm=llm,
                 max_iterations=max_iterations,
                 workspace_path=str(workspace.root_path),
-                provider_type=getattr(assistant, "provider_type", "deepseek") or "deepseek",
+                provider_type=_wire_pt(llm, getattr(assistant, "provider_type", "deepseek") or "deepseek"),
                 enable_reasoning=False,
                 enable_compression=config.agent_compression_enabled,
                 permission_callback=_make_background_permission_callback(),
@@ -479,7 +480,7 @@ class AgentWorker:
                     from app.services.agent_service import AgentService as _AgentService
                     title_gen = TitleGeneratorService(
                         **_AgentService().title_generator_kwargs(assistant, llm),
-                        provider_type=getattr(assistant, "provider_type", "deepseek") or "deepseek",
+                        provider_type=_wire_pt(llm, getattr(assistant, "provider_type", "deepseek") or "deepseek"),
                     )
                     generated_title = await title_gen.generate_title(
                         user_query=task.goal or "",

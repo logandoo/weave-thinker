@@ -31,58 +31,70 @@ class TTSService:
     def enabled(self) -> bool:
         return bool(self.config.voice_tts_enabled)
 
-    def _resolve_base_url(self) -> str:
-        if self.config.voice_tts_base_url:
-            return self.config.voice_tts_base_url.rstrip("/")
-        # Fall back to the configured mimo provider base_url.
+    def _endpoint(self):
+        """model_gateway 收口（2026-08-30）：TTS 端点统一来自 registry
+        （合成链 voice.tts_* → mimo provider → [api]，与 legacy 一致）。"""
+        from app.model_gateway.registry import get_model_registry
         try:
-            from app.services.provider_router import get_provider_router
-
-            router = get_provider_router()
-            adapter = router.get_provider("mimo")
-            if adapter and getattr(adapter, "config", None) and adapter.config.base_url:
-                return adapter.config.base_url.rstrip("/")
+            return get_model_registry().get("tts")
         except Exception:
-            pass
+            return None
+
+    def _resolve_base_url(self) -> str:
+        ep = self._endpoint()
+        if ep is not None and ep.base_url:
+            return ep.base_url.rstrip("/")
         return self.config.api_base_url.rstrip("/")
 
     def _resolve_api_key(self) -> str:
-        if self.config.voice_tts_api_key:
-            return self.config.voice_tts_api_key
-        try:
-            from app.services.provider_router import get_provider_router
-
-            router = get_provider_router()
-            adapter = router.get_provider("mimo")
-            if adapter and getattr(adapter, "config", None) and adapter.config.api_key:
-                return adapter.config.api_key
-        except Exception:
-            pass
+        ep = self._endpoint()
+        if ep is not None:
+            # 空键守卫（2026-09-01）：显式端点空键 → "no-key" 占位，不回落 main key
+            return ep.api_key or ("no-key" if ep.base_url else self.config.api_key or "")
         return self.config.api_key or ""
 
     @property
     def model(self) -> str:
+        ep = self._endpoint()
+        if ep is not None and ep.model_name:
+            return ep.model_name
         return self.config.voice_tts_model or "mimo-v2.5-tts"
 
     @property
     def voice(self) -> str:
+        ep = self._endpoint()
+        if ep is not None and ep.extra.get("voice"):
+            return ep.extra["voice"]
         return self.config.voice_tts_voice or "冰糖"
 
     def is_configured(self) -> bool:
         return self.enabled and bool(self._resolve_base_url()) and bool(self._resolve_api_key())
 
     # --- streaming ---------------------------------------------------------
+    def _resolve_style(self, explicit: Optional[str]) -> str:
+        """风格指令解析链（2026-08-31 端点池化）：显式参数 > 端点
+        extra.style_instruction > [voice] tts_style_instruction（legacy）。"""
+        if explicit:
+            return explicit
+        ep = self._endpoint()
+        if ep is not None and ep.extra.get("style_instruction"):
+            return ep.extra["style_instruction"]
+        return self.config.voice_tts_style_instruction or ""
+
     async def stream_tts(
         self,
         text: str,
         style_instruction: Optional[str] = None,
         timeout: float = 60.0,
+        voice: Optional[str] = None,
     ) -> AsyncIterator[bytes]:
         """Stream PCM16 audio chunks for a single text segment.
 
         ``style_instruction`` is a natural-language style directive placed in the
         ``user`` message (consistent across segments). ``text`` is placed in the
         ``assistant`` message and may carry inline ``(风格)`` / ``[音频标签]``.
+        ``voice`` overrides the endpoint's configured voice per-call（agent
+        tts_synthesize 工具用）。
         """
         if not text or not text.strip():
             return
@@ -92,7 +104,7 @@ class TTSService:
         if not base_url or not api_key:
             raise RuntimeError("TTS is not configured (missing base_url or api_key)")
 
-        user_content = style_instruction or self.config.voice_tts_style_instruction or ""
+        user_content = self._resolve_style(style_instruction)
         messages = [
             {"role": "user", "content": user_content},
             {"role": "assistant", "content": text},
@@ -100,7 +112,7 @@ class TTSService:
         payload = {
             "model": self.model,
             "messages": messages,
-            "audio": {"format": "pcm16", "voice": self.voice},
+            "audio": {"format": "pcm16", "voice": voice or self.voice},
             "stream": True,
         }
 

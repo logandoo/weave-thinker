@@ -26,7 +26,7 @@ backend/Fonts/
 # Runtime / user data
 user_workspaces/
 backend/agent_memories/*
-!backend/agent_memories/func.md
+!backend/agent_memories/changelog.md
 backend/audio_files/
 backend/output_files/
 backend/skins_custom/

@@ -51,6 +51,52 @@ export function pickStreamText({ live, snapshot }: StreamTextAccumulator): strin
   return live.length >= snapshot.length ? live : snapshot
 }
 
+/** Live reasoning tail-window (conv 827a6f78 turn-B, 2026-09-03).
+ *
+ *  A 113k-char reasoning stream made StreamMarkdown's 80ms whole-tree v-html
+ *  re-render explode in cost — the live view froze on a reasoning frame and
+ *  the user saw "answer = only the thinking text" (DB stayed clean; refresh
+ *  recovered). While a reasoning block is the ACTIVELY-streaming last item,
+ *  render only its tail: bounded re-render cost + the streaming tail is what
+ *  the user wants to watch anyway. Completed blocks and the persisted message
+ *  render full content (non-string defense per the ingest contract). */
+export const LIVE_REASONING_TAIL_CHARS = 6000
+
+export function liveReasoningTail(
+  content: unknown,
+  isStreamingLast: boolean,
+  cap: number = LIVE_REASONING_TAIL_CHARS,
+): string {
+  const c = typeof content === 'string' ? content : ''
+  if (!isStreamingLast || c.length <= cap) return c
+  return `…（思考已生成 ${c.length} 字，实时显示尾部，完成后展开全文）\n\n` + c.slice(-cap)
+}
+
+/** audit_reset client-side timeline surgery (conv 827a6f78 turn-B, 2026-09-03).
+ *
+ *  The backend's silent QC rejects the streamed draft and resets ITS
+ *  accumulators; until now the client never heard about it, so s.content
+ *  kept every rejected draft and the done-time answer bubble contained the
+ *  whole mess (the clean DB row only appeared after a refresh). Contract:
+ *  drop the draft TEXT items after the LAST tool card — tool cards and
+ *  reasoning items are preserved (A4 parity: the backend keeps reasoning and
+ *  tools on reset, only the rejected draft text goes). With no tool card at
+ *  all, every text item is draft. */
+export function dropDraftTextAfterLastTool(seq: Array<{ type?: string }> | null | undefined): {
+  kept: Array<{ type?: string }>
+  changed: boolean
+} {
+  const items = Array.isArray(seq) ? seq : []
+  let lastTool = -1
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i] && items[i].type === 'tool_call') { lastTool = i; break }
+  }
+  const kept = lastTool >= 0
+    ? items.filter((it, i) => i <= lastTool || it?.type !== 'text')
+    : items.filter(it => it?.type !== 'text')
+  return { kept, changed: kept.length !== items.length }
+}
+
 /** Field-level superset merge for a text-ish part present in both the live
  *  timeline and the snapshot: take the LONGER content. For delta-accumulated
  *  parts both values are prefixes of the same underlying text, so the longer

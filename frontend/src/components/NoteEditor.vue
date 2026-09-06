@@ -1059,6 +1059,25 @@ let asrInsertPos = 0
 let asrPreviousLen = 0
 let asrNeedNewline = false
 
+function scrollNoteEditorToBottom() {
+  // v-html 重渲染是异步的（watch→renderedContent→下一拍 DOM），等渲染帧后再滚
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      const el = wysiwygEditorRef.value?.editorRef
+      if (el) {
+        el.scrollTop = el.scrollHeight
+      }
+    })
+  })
+}
+
+function scrollAsrContentIntoView() {
+  // 仅当转写插入点在内容末尾时跟随滚动（中途插入不拽动用户视角）
+  if (asrInsertPos + asrPreviousLen >= noteContent.value.length) {
+    scrollNoteEditorToBottom()
+  }
+}
+
 const asrStreaming = useAsrStreaming({
   customHotwords: () => asrHotwords.value,
   onPartial(payload) {
@@ -1070,6 +1089,7 @@ const asrStreaming = useAsrStreaming({
     noteContent.value = before + fullText + after
     asrPreviousLen = fullText.length
     hasChanges.value = true
+    scrollAsrContentIntoView()
   },
   onError(message) {
     showToast(message, 'error')
@@ -2426,6 +2446,7 @@ async function stopRecording() {
         const after = noteContent.value.substring(asrInsertPos + asrPreviousLen)
         noteContent.value = before + fullText + after
         asrPreviousLen = fullText.length
+        scrollAsrContentIntoView()
       }
       hasChanges.value = true
       asrPreviousLen = 0
@@ -2444,6 +2465,7 @@ async function stopRecording() {
       noteContent.value = noteContent.value.substring(0, cursorPos) + transcript + noteContent.value.substring(cursorPos)
     }
     hasChanges.value = true
+    scrollNoteEditorToBottom()
   } catch (error) {
     asrPreviousLen = 0
     console.error('ASR failed:', error)
@@ -3045,12 +3067,16 @@ async function stopRecording() {
 }
 
 .preview-content :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
 .preview-content :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .preview-content :deep(blockquote) {

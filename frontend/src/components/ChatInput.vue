@@ -72,7 +72,7 @@
             <div class="draft-meta">{{ formatDraftDate(draft.updatedAt) }}</div>
           </div>
           <div class="draft-actions">
-            <button class="draft-send-btn" @click="sendDraftNow(draft.id)" :disabled="chatStore.isStreaming" title="立即发送到当前对话">
+            <button class="draft-send-btn" @click="sendDraftNow(draft.id)" :disabled="chatStore.isStreamingCurrentConversation" title="立即发送到当前对话">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="22" y1="2" x2="11" y2="13"/>
                 <polygon points="22 2 15 22 11 13 2 9 22 2"/>
@@ -104,7 +104,7 @@
       v-if="isMobile && isMobileVoiceMode"
       type="button"
       class="voice-mode-toggle-btn voice-mode-toggle-btn--float"
-      :disabled="chatStore.isStreaming"
+      :disabled="chatStore.isStreamingCurrentConversation"
       @click="onVoiceToggleClick"
       aria-label="切换文字输入"
     >
@@ -202,10 +202,10 @@
               <span class="toolbar-btn-label toolbar-btn-label--full">思考模式</span>
               <span class="toolbar-btn-label toolbar-btn-label--short">思考</span>
             </button>
-            <!-- Reasoning effort popup menu (DeepSeek: Max/High/Low/关闭; Qwen3.8(Local): xhigh/medium/low/关闭) -->
+            <!-- Reasoning effort popup menu（档位由模型别名 capabilities 驱动） -->
             <Teleport to="body">
               <div
-                v-if="showReasoningMenu && (isDeepSeekProvider || isQwen38Provider)"
+                v-if="showReasoningMenu && supportsReasoningMenu"
                 class="reasoning-menu-overlay"
                 @click="closeReasoningMenu"
               >
@@ -215,30 +215,15 @@
                   @click.stop
                 >
                   <div class="reasoning-menu-title">思考模式</div>
-                  <template v-if="isDeepSeekProvider">
                   <button
+                    v-for="effort in reasoningEfforts"
+                    :key="effort"
                     class="reasoning-menu-item"
-                    :class="{ active: chatStore.enableReasoning && chatStore.reasoningEffort === 'max' }"
-                    @click="selectReasoningEffort('max')"
+                    :class="{ active: chatStore.enableReasoning && (chatStore.reasoningEffort === effort || (!chatStore.reasoningEffort && effort === defaultEffort)) }"
+                    @click="selectReasoningEffort(effort)"
                   >
-                    <span class="reasoning-menu-label">Max</span>
-                    <span class="reasoning-menu-desc">最大深度思考</span>
-                  </button>
-                  <button
-                    class="reasoning-menu-item"
-                    :class="{ active: chatStore.enableReasoning && (chatStore.reasoningEffort === 'high' || !chatStore.reasoningEffort) }"
-                    @click="selectReasoningEffort('high')"
-                  >
-                    <span class="reasoning-menu-label">High</span>
-                    <span class="reasoning-menu-desc">标准深度思考</span>
-                  </button>
-                  <button
-                    class="reasoning-menu-item"
-                    :class="{ active: chatStore.enableReasoning && chatStore.reasoningEffort === 'low' }"
-                    @click="selectReasoningEffort('low')"
-                  >
-                    <span class="reasoning-menu-label">Low</span>
-                    <span class="reasoning-menu-desc">轻量快速推理</span>
+                    <span class="reasoning-menu-label">{{ effortLabel(effort) }}</span>
+                    <span class="reasoning-menu-desc">{{ effortDesc(effort) }}</span>
                   </button>
                   <button
                     class="reasoning-menu-item"
@@ -248,41 +233,6 @@
                     <span class="reasoning-menu-label">关闭</span>
                     <span class="reasoning-menu-desc">不使用深度思考</span>
                   </button>
-                  </template>
-                  <template v-if="isQwen38Provider">
-                  <button
-                    class="reasoning-menu-item"
-                    :class="{ active: chatStore.enableReasoning && chatStore.reasoningEffort === 'xhigh' }"
-                    @click="selectReasoningEffort('xhigh')"
-                  >
-                    <span class="reasoning-menu-label">xhigh</span>
-                    <span class="reasoning-menu-desc">最强推理深度</span>
-                  </button>
-                  <button
-                    class="reasoning-menu-item"
-                    :class="{ active: chatStore.enableReasoning && chatStore.reasoningEffort === 'medium' }"
-                    @click="selectReasoningEffort('medium')"
-                  >
-                    <span class="reasoning-menu-label">medium</span>
-                    <span class="reasoning-menu-desc">均衡速度与深度</span>
-                  </button>
-                  <button
-                    class="reasoning-menu-item"
-                    :class="{ active: chatStore.enableReasoning && chatStore.reasoningEffort === 'low' }"
-                    @click="selectReasoningEffort('low')"
-                  >
-                    <span class="reasoning-menu-label">low</span>
-                    <span class="reasoning-menu-desc">轻量快速推理</span>
-                  </button>
-                  <button
-                    class="reasoning-menu-item"
-                    :class="{ active: !chatStore.enableReasoning }"
-                    @click="disableReasoning()"
-                  >
-                    <span class="reasoning-menu-label">关闭</span>
-                    <span class="reasoning-menu-desc">不使用深度思考</span>
-                  </button>
-                  </template>
                 </div>
               </div>
             </Teleport>
@@ -358,10 +308,21 @@
             </div>
           </Teleport>
           <button
+            v-if="chatStore.isStreamingCurrentConversation"
+            class="voice-mode-toggle-btn stop-generating-btn"
+            @click="handleStopStreaming"
+            aria-label="停止生成"
+            title="停止生成"
+          >
+            <svg class="toggle-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="6" y="6" width="12" height="12" rx="2"/>
+            </svg>
+          </button>
+          <button
+          v-else
           v-show="isMobile || (!isRecording && !isProcessing)"
           class="voice-mode-toggle-btn"
           :class="{ active: isMobile && isMobileVoiceMode }"
-          :disabled="chatStore.isStreaming"
           @click="onVoiceToggleClick"
           aria-label="语音输入"
         >
@@ -374,17 +335,15 @@
     </button>
           <button
             class="send-btn"
-            :class="{ 'stop-mode': chatStore.isStreaming }"
-            :disabled="!chatStore.isStreaming && !inputText.trim() && uploadedFiles.length === 0"
-            @click="chatStore.isStreaming ? handleStopStreaming() : handleSend()"
-            :aria-label="chatStore.isStreaming ? '停止生成' : '发送'"
+            :class="{ 'interject-mode': canInterject }"
+            :disabled="sendBtnDisabled"
+            @click="handleSend()"
+            :aria-label="canInterject ? '插话发送' : '发送'"
+            :title="sendBtnTitle"
           >
-            <svg class="send-icon" :class="{ hidden: chatStore.isStreaming }" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg class="send-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <line x1="22" y1="2" x2="11" y2="13"/>
               <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-            </svg>
-            <svg class="stop-icon" :class="{ hidden: !chatStore.isStreaming }" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="6" y="6" width="12" height="12" rx="2"/>
             </svg>
           </button>
         </div>
@@ -414,7 +373,8 @@
 
     </div>
     <div class="input-hint">
-      <span v-if="isMobile">点击发送按钮发送，Enter 换行</span>
+      <span v-if="canInterject">{{ isMobile ? '生成中：发送=插话，⏹=停止' : '回答生成中：发送即插话，左侧 ⏹ 停止当前回答' }}</span>
+      <span v-else-if="isMobile">点击发送按钮发送，Enter 换行</span>
       <span v-else>按 Enter 发送，Shift + Enter 换行</span>
     </div>
   </div>
@@ -442,13 +402,25 @@ const assistantStore = useAssistantStore()
 const draftsStore = useDraftsStore()
 const { show: showToast } = useToast()
 const { hotwords: asrHotwords } = useAsrHotwords()
+// 语音录入时保留录音前已手动输入的文字：partial/final 都写成 base+转写。
+let asrBaseText = ''
+
+function scrollInputToBottom() {
+  const area = inputAreaRef.value
+  if (area) {
+    area.scrollTop = area.scrollHeight
+  }
+}
+
 const asrStreaming = useAsrStreaming({
   customHotwords: () => asrHotwords.value,
   onPartial(payload) {
     if (!payload.text) return
-    inputText.value = payload.text
+    inputText.value = asrBaseText + payload.text
     editorHasContent.value = !!inputText.value.length
-    if (editorRef.value) editorRef.value.textContent = payload.text
+    if (editorRef.value) editorRef.value.textContent = asrBaseText + payload.text
+    // 编程式写 textContent 不触发 @input——手动让可视范围跟随内容增长
+    scrollInputToBottom()
   },
 })
 
@@ -456,6 +428,22 @@ const inputText = ref('')
 const editorRef = ref<HTMLDivElement | null>(null)
 const isComposing = ref(false)
 const editorHasContent = ref(false)
+// 当前会话生成中（非 deathmatch）→ 发送即插话；停止按钮占用语音槽位。
+const canInterject = computed(() => chatStore.isStreamingCurrentConversation && !chatStore.deathmatchMode)
+const sendBtnDisabled = computed(() => {
+  if (chatStore.isStreamingCurrentConversation) {
+    if (chatStore.deathmatchMode) return true  // deathmatch 生成中保持阻断（自有交互机制）
+    return !inputText.value.trim() || uploadedFiles.value.length > 0  // 插话 v1 纯文本
+  }
+  return !inputText.value.trim() && uploadedFiles.value.length === 0
+})
+const sendBtnTitle = computed(() => {
+  if (canInterject.value) {
+    if (uploadedFiles.value.length > 0) return '插话暂不支持附件，请先停止生成或移除附件'
+    return '发送插话（注入当前回答）'
+  }
+  return '发送'
+})
 const DRAFT_KEY = 'chatllm_draft_input'
 
 // Note reference tags
@@ -504,19 +492,43 @@ const showDrafts = ref(false)
 const showFileUpload = ref(false)
 const uploadedFiles = ref<FileParseResult[]>([])
 
-const isDeepSeekProvider = computed(() => {
+const currentCapabilities = computed(() => {
   const assistantId = assistantStore.currentAssistantId
-  if (!assistantId) return true
-  const assistant = assistantStore.getAssistantById(assistantId)
-  return !assistant?.provider_type || assistant.provider_type === 'deepseek'
+  const assistant = assistantId ? assistantStore.getAssistantById(assistantId) : null
+  return chatStore.capabilitiesForAlias(assistant?.model_alias || chatStore.modelsDefaultAlias)
 })
 
-const isQwen38Provider = computed(() => {
-  const assistantId = assistantStore.currentAssistantId
-  if (!assistantId) return false
-  const assistant = assistantStore.getAssistantById(assistantId)
-  return assistant?.provider_type === 'qwen3.8_vllm'
+// 思考/推理强度菜单由所选模型别名的 capabilities 驱动（模型配置解耦）：
+// supports_reasoning=false 或无档位 → 直接切换开关（legacy 非菜单供应商行为）。
+// 档位显示序 = capabilities.reasoning_efforts 数组序（模型层配置）；
+// label/desc/default 优先取 capabilities.effort_meta（模型层显式配置项）。
+const reasoningEfforts = computed<string[]>(() => {
+  const caps = currentCapabilities.value
+  if (!caps?.supports_reasoning) return []
+  return (caps.reasoning_efforts as string[]) || []
 })
+const supportsReasoningMenu = computed(() => reasoningEfforts.value.length > 0)
+const effortMetaMap = computed<Record<string, { label?: string; desc?: string; default?: boolean }>>(() => {
+  return ((currentCapabilities.value?.effort_meta as Record<string, any>) || {})
+})
+// 默认高亮档：effort_meta 中 default=true 者；无配置时回落 legacy DeepSeek High
+const defaultEffort = computed(() => {
+  for (const [k, m] of Object.entries(effortMetaMap.value)) {
+    if (m?.default) return k
+  }
+  return reasoningEfforts.value.includes('high') ? 'high' : null
+})
+
+// 通用兜底（toml 端点未配 effort_meta 时）
+const EFFORT_META: Record<string, { label: string; desc: string }> = {
+  max: { label: 'Max', desc: '最大深度思考' },
+  high: { label: 'High', desc: '标准深度思考' },
+  low: { label: 'Low', desc: '轻量快速推理' },
+  xhigh: { label: 'xhigh', desc: '最强推理深度' },
+  medium: { label: 'medium', desc: '均衡速度与深度' },
+}
+function effortLabel(e: string) { return effortMetaMap.value[e]?.label ?? EFFORT_META[e]?.label ?? e }
+function effortDesc(e: string) { return effortMetaMap.value[e]?.desc ?? EFFORT_META[e]?.desc ?? '推理深度档位' }
 
 const showReasoningMenu = ref(false)
 const reasoningGroupRef = ref<HTMLDivElement | null>(null)
@@ -632,7 +644,7 @@ function handleSkillPopupKeydown(e: KeyboardEvent) {
 }
 
 function handleReasoningClick() {
-  if (isQwen38Provider.value || isDeepSeekProvider.value) {
+  if (supportsReasoningMenu.value) {
     openReasoningMenu()
     return
   }
@@ -690,6 +702,17 @@ watch(() => assistantStore.currentAssistantId, () => {
   showReasoningMenu.value = false
 })
 
+// 未确认插话的回填通道（stop 主动停止 / run 错误终止 / 429 队列积压）：
+// store 把文本放到 interjectionRestoreText，此处回填编辑器（绝不隐式另起新 turn）。
+watch(() => chatStore.interjectionRestoreText, (text) => {
+  if (!text) return
+  inputText.value = text
+  if (editorRef.value) editorRef.value.textContent = text
+  editorHasContent.value = true
+  chatStore.interjectionRestoreText = ''
+  nextTick(() => editorRef.value?.focus())
+})
+
 async function handleKeyDown(e: KeyboardEvent) {
   if (showSkillPopup.value) {
     handleSkillPopupKeydown(e)
@@ -720,9 +743,10 @@ async function stopRecording(cancel: boolean = false) {
       return
     }
 
-    inputText.value = transcript
-    editorHasContent.value = !!transcript.length
-    if (editorRef.value) editorRef.value.textContent = transcript
+    inputText.value = asrBaseText + transcript
+    editorHasContent.value = !!inputText.value.length
+    if (editorRef.value) editorRef.value.textContent = asrBaseText + transcript
+    scrollInputToBottom()
     nextTick(() => editorRef.value?.focus())
   } catch (error) {
     if (error instanceof Error && error.message === '录音已取消') {
@@ -875,7 +899,8 @@ function onEditorClick(e: MouseEvent) {
 }
 
 async function onMicClick() {
-  if (isProcessing.value || chatStore.isStreaming) return
+  if (isProcessing.value || chatStore.isStreamingCurrentConversation) return
+  asrBaseText = getEditorText()
   try {
     await asrStreaming.start({ chunk_size_sec: 0.5 })
   } catch (error) {
@@ -964,7 +989,8 @@ function onRecordTouchStart(e: Event) {
 
 async function startMobileRecording(e: Event) {
   e.preventDefault()
-  if (isProcessing.value || chatStore.isStreaming) return
+  if (isProcessing.value || chatStore.isStreamingCurrentConversation) return
+  asrBaseText = getEditorText()
   try {
     await asrStreaming.start({ chunk_size_sec: 0.5 })
   } catch (err) {
@@ -986,9 +1012,9 @@ async function stopMobileRecording(e?: Event) {
     const result = await asrStreaming.stop()
     const transcript = result?.text?.trim()
     if (transcript) {
-      inputText.value = transcript
-      editorHasContent.value = !!transcript.length
-      if (editorRef.value) editorRef.value.textContent = transcript
+      inputText.value = asrBaseText + transcript
+      editorHasContent.value = !!inputText.value.length
+      if (editorRef.value) editorRef.value.textContent = asrBaseText + transcript
       await handleSend()
     }
   } catch (error) {
@@ -1017,7 +1043,15 @@ async function handleSend() {
   // POST /api/chat/stream fired).
   syncInputText()
   const text = inputText.value.trim()
-  if ((!text && uploadedFiles.value.length === 0) || chatStore.isStreaming) return
+  // 当前会话生成中：发送即插话（迭代边界注入，不打断在途生成）。
+  // deathmatch 会话不支持插话（有自有暂停/讨论机制），保持阻断。
+  if (chatStore.isStreamingCurrentConversation) {
+    if (!text || chatStore.deathmatchMode) return
+    if (uploadedFiles.value.length > 0) return  // 插话 v1 不支持附件
+    await handleInterject(text)
+    return
+  }
+  if (!text && uploadedFiles.value.length === 0) return
 
   let fullContent = ''
   if (referencedNotes.value.length > 0) {
@@ -1064,6 +1098,15 @@ async function handleSend() {
   } else {
     await chatStore.sendMessage(fullContent, assistantStore.currentAssistantId)
   }
+  emit('sent')
+}
+
+async function handleInterject(text: string) {
+  inputText.value = ''
+  if (editorRef.value) editorRef.value.textContent = ''
+  editorHasContent.value = false
+  sessionStorage.removeItem(DRAFT_KEY)
+  await chatStore.sendInterjection(text, assistantStore.currentAssistantId)
   emit('sent')
 }
 
@@ -1123,7 +1166,7 @@ function loadDraftIntoInput(draftId: string) {
 
 async function sendDraftNow(draftId: string) {
   const draft = draftsStore.getDraft(draftId)
-  if (!draft || chatStore.isStreaming) return
+  if (!draft || chatStore.isStreamingCurrentConversation) return
   let fullContent = ''
   for (const noteRef of draft.references) {
     fullContent += `[note-ref:${noteRef.id}|${noteRef.title}]\n${noteRef.content}\n[/note-ref]\n\n`
@@ -1151,12 +1194,42 @@ function formatDraftDate(iso: string): string {
   }
 }
 
+// contenteditable 换行提取：手机 Enter 与桌面粘贴（execCommand insertText）在
+// 编辑器里产生 <div>/<p> 块边界和 <br>，而非字面 '\n' 文本节点；游离克隆的
+// innerText 会退化为 textContent，把这些边界整体丢弃 → 发送的 query 丢失换行
+// （2026-09-02 实测复现）。因此先把克隆内的块边界与 <br> 归一化为 '\n' 再取
+// textContent；纯空白结果视为空（对齐旧行为的占位符判断），连续 3+ 换行折叠
+// 为段落分隔（与 markdown 渲染及 Shift+Enter 字面 '\n' 的最终视觉一致）。
+function extractEditorText(source: HTMLElement): string {
+  const clone = source.cloneNode(true) as HTMLElement
+  clone.querySelectorAll('.note-tag').forEach(el => el.remove())
+  const BLOCK_TAGS = new Set(['DIV', 'P'])
+  let out = ''
+  const walk = (node: Node) => {
+    node.childNodes.forEach((child) => {
+      if (child.nodeType === Node.TEXT_NODE) {
+        out += child.textContent
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        const el = child as HTMLElement
+        if (el.tagName === 'BR') {
+          out += '\n'
+        } else if (BLOCK_TAGS.has(el.tagName)) {
+          out += '\n'
+          walk(el)
+        } else {
+          walk(el)
+        }
+      }
+    })
+  }
+  walk(clone)
+  const text = out.replace(/\u200B/g, '').replace(/\n{3,}/g, '\n\n')
+  return text.trim() ? text : ''
+}
+
 function syncInputText() {
   if (editorRef.value) {
-    const clone = editorRef.value.cloneNode(true) as HTMLElement
-    clone.querySelectorAll('.note-tag').forEach(el => el.remove())
-    // Strip zero-width spaces used for cursor anchoring
-    inputText.value = (clone.innerText || '').replace(/\u200B/g, '')
+    inputText.value = extractEditorText(editorRef.value)
     // Placeholder visibility must track the DOM synchronously: `inputText`
     // is debounced (80ms), so binding the `.empty` class to it makes the
     // "输入消息..." placeholder linger next to freshly typed English text
@@ -1177,9 +1250,7 @@ function syncInputText() {
 
 function getEditorText(): string {
   if (!editorRef.value) return inputText.value
-  const clone = editorRef.value.cloneNode(true) as HTMLElement
-  clone.querySelectorAll('.note-tag').forEach(el => el.remove())
-  return (clone.innerText || '').replace(/\u200B/g, '')
+  return extractEditorText(editorRef.value)
 }
 
 let _syncInputDebounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -1297,6 +1368,7 @@ function onEditorEscape() {
 onMounted(() => {
   document.addEventListener('keydown', handleKeyDown)
     document.addEventListener('click', handleOutsideClick)
+  chatStore.loadModels() // 模型别名能力表（思考菜单驱动），懒加载一次
   if (editorRef.value && inputText.value) {
     editorRef.value.textContent = inputText.value
     // Draft restored into the DOM — the placeholder class binds to
@@ -1633,16 +1705,14 @@ defineExpose({ setEditContent })
   transform: scale(0.96);
 }
 
-.send-btn .send-icon,
-.send-btn .stop-icon {
+.send-btn .send-icon {
   position: absolute;
   inset: 0;
   margin: auto;
   transition: opacity 0.2s cubic-bezier(0.2, 0, 0, 1), transform 0.2s cubic-bezier(0.2, 0, 0, 1), filter 0.2s cubic-bezier(0.2, 0, 0, 1);
 }
 
-.send-btn .send-icon.hidden,
-.send-btn .stop-icon.hidden {
+.send-btn .send-icon.hidden {
   opacity: 0;
   transform: scale(0.25);
   filter: blur(4px);
@@ -1651,15 +1721,6 @@ defineExpose({ setEditContent })
 
 .send-btn:hover:not(:disabled) {
   background-color: var(--color-primary-dark);
-}
-
-.send-btn.stop-mode {
-  background-color: var(--color-error);
-}
-
-.send-btn.stop-mode:hover:not(:disabled) {
-  background-color: var(--color-error);
-  opacity: 0.92;
 }
 
 .send-btn:disabled {
@@ -2118,12 +2179,16 @@ defineExpose({ setEditContent })
 }
 
 .note-preview-body :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
 .note-preview-body :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .note-preview-body :deep(blockquote) {
@@ -2466,6 +2531,18 @@ defineExpose({ setEditContent })
   background-color: var(--color-primary);
 }
 
+/* 生成中占用语音槽位的停止按钮：同尺寸同位置，换用 error 令牌色以资识别。 */
+.stop-generating-btn {
+  background-color: var(--color-error);
+}
+
+.stop-generating-btn:hover:not(:disabled) {
+  background-color: var(--color-error);
+  filter: brightness(1.08);
+}
+
+/* 插话模式的发送按钮保持原色，仅以 title/aria 提示语义（零布局位移）。 */
+
 .voice-mode-toggle-btn:disabled {
   cursor: not-allowed;
   opacity: 0.6;
@@ -2709,14 +2786,6 @@ defineExpose({ setEditContent })
 
 .send-btn:active:not(:disabled) {
   transform: scale(0.96);
-}
-
-.send-btn.stop-mode {
-  background: var(--color-error);
-}
-
-.send-btn.stop-mode:hover:not(:disabled) {
-  opacity: 0.9;
 }
 
 .send-btn:disabled {

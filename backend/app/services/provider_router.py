@@ -114,25 +114,8 @@ _ADAPTER_REGISTRY = {
     "mimo": MiMoAdapter,
 }
 
-# Qwen3.8-27B-FP8 model-card defaults (modelscope.cn/models/Qwen/Qwen3.8-27B-FP8).
-# Used when the assistant leaves a sampling field NULL.
-QWEN38_VLLM_THINKING_DEFAULTS = {
-    "temperature": 1.0,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0.0,
-    "presence_penalty": 0.0,
-    "repetition_penalty": 1.0,
-}
-QWEN38_VLLM_NON_THINKING_DEFAULTS = {
-    "temperature": 0.7,
-    "top_p": 0.80,
-    "top_k": 20,
-    "min_p": 0.0,
-    "presence_penalty": 1.5,
-    "repetition_penalty": 1.0,
-}
-QWEN38_VLLM_REASONING_EFFORTS = ("xhigh", "medium", "low")
+# Qwen3.8-27B-FP8 模型卡常量已收口至 model_gateway.profiles.qwen3_8_vllm
+# （Qwen38VllmProfile.SAMPLING_THINKING / SAMPLING_NON_THINKING / efforts）。
 
 
 def build_thinking_extra_body(
@@ -143,34 +126,20 @@ def build_thinking_extra_body(
     thinking_budget: int | None = None,
     preserve_thinking: bool | None = None,
 ) -> dict:
-    """Build the extra_body dict for enabling/disabling thinking mode"""
+    """Build the extra_body dict for enabling/disabling thinking mode.
 
-    thinking_params: dict = {}
-    if provider_type in ("zhipu", "deepseek"):
-        thinking_params = {"thinking": {"type": "enabled" if enable_reasoning else "disabled"}}
-        if provider_type == "deepseek" and enable_reasoning and reasoning_effort in ("low", "high", "max"):
-            thinking_params["reasoning_effort"] = reasoning_effort
-    elif provider_type == "qwen":
-        thinking_params = {"enable_thinking": enable_reasoning}
-    elif provider_type == "qwen3.8_vllm":
-        # Qwen3.8 on vLLM: thinking toggles, reasoning depth and
-        # preserve_thinking all live in chat_template_kwargs (modelscope
-        # model card / Qwen docs). llm_service passes extra_body verbatim
-        # for custom providers, so build the final shape here.
-        ctk: dict = {"enable_thinking": enable_reasoning}
-        if enable_reasoning and reasoning_effort in QWEN38_VLLM_REASONING_EFFORTS:
-            ctk["reasoning_effort"] = reasoning_effort
-        if preserve_thinking is not None:
-            ctk["preserve_thinking"] = preserve_thinking
-        thinking_params = {"chat_template_kwargs": ctk}
-    else:
-        thinking_params = {"thinking": {"type": "enabled" if enable_reasoning else "disabled"}}
+    门面（签名保留）：vendor 形状/规则已收口至 model_gateway.profiles
+    （LiteLLM 范式——层级是逻辑不是数据，profile 类承载）；此处仅保留
+    custom_extra_body 的 JSON 合并与向后兼容。
+    """
+    from app.model_gateway.profiles import get_thinking_profile
 
-    if thinking_budget is not None and enable_reasoning:
-        if provider_type == "qwen3.8_vllm":
-            thinking_params["chat_template_kwargs"]["thinking_budget"] = thinking_budget
-        else:
-            thinking_params["thinking_budget"] = thinking_budget
+    profile = get_thinking_profile(provider_type)
+    thinking_params = (
+        profile.enable(effort=reasoning_effort, budget=thinking_budget, preserve=preserve_thinking)
+        if enable_reasoning
+        else profile.disable(preserve=preserve_thinking)
+    )
 
     if provider_type == "custom" and custom_extra_body:
         try:
@@ -181,12 +150,6 @@ def build_thinking_extra_body(
                 return merged
         except json.JSONDecodeError:
             pass
-        return thinking_params
-
-    if provider_type in ("zhipu", "deepseek"):
-        return thinking_params
-
-    if provider_type == "qwen":
         return thinking_params
 
     return thinking_params

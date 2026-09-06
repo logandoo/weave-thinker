@@ -100,7 +100,7 @@ async def _should_consolidate(db: AsyncSession, user_id: str, state: dict) -> bo
     if last is None:
         return True
 
-    # “新增/修改”按创建或新证据（last_recurrence_at）计——召回 boost 会 bump updated_at，
+    # “新增/更新”按创建或新证据（last_recurrence_at）计——召回 boost 会 bump updated_at，
     # 用 updated_at 会被召回路径污染导致恒触发（A4.9 审查 #8）
     result = await db.execute(
         text("""SELECT COUNT(*) FROM memory_concepts

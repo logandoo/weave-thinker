@@ -98,50 +98,108 @@
           :key="nb.id"
         >
           <div
-            class="np-notebook-row"
-            :class="{ active: isActivePanelNotebook(nb.id) }"
-            @click="toggleNotesPanelNotebook(nb.id)"
-            @dblclick="openNotebookInPanel(nb.id)"
+            class="np-swipe-wrap np-swipe-wrap--nb"
+            :class="{ 'np-swipe-open': npSwipedKey === 'nb:' + nb.id }"
+            @touchstart="npHandleTouchStart($event, 'nb:' + nb.id)"
+            @touchend="npHandleTouchEnd()"
+            @touchcancel="npHandleTouchEnd()"
+            @touchmove="npHandleTouchMove($event, 'nb:' + nb.id)"
           >
-            <svg class="np-chevron" :class="{ expanded: !!notesPanelExpanded[nb.id] }" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="9 6 15 12 9 18"/>
-            </svg>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-            </svg>
-            <span class="np-nb-name">{{ nb.name }}</span>
-            <span class="np-count">{{ nb.note_count }}</span>
-            <button
-              class="np-menu-btn"
-              :class="{ active: npMenuId === 'nb:' + nb.id }"
-              @click.stop="openNpNotebookMenu(nb, $event)"
-              title="更多操作"
+            <div class="np-swipe-actions np-swipe-actions--nb">
+              <button class="np-swipe-action rename" @click.stop="npSwipeRenameNotebook(nb)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                </svg>
+                <span>重命名</span>
+              </button>
+              <button class="np-swipe-action delete" @click.stop="npSwipeDeleteNotebook(nb)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3 6 5 6 21 6"/>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                </svg>
+                <span>删除</span>
+              </button>
+            </div>
+            <div
+              class="np-notebook-row"
+              :class="{ active: isActivePanelNotebook(nb.id) }"
+              :style="npRowStyle('nb:' + nb.id)"
+              @click="npRowClick('nb:' + nb.id, () => toggleNotesPanelNotebook(nb.id))"
+              @dblclick="openNotebookInPanel(nb.id)"
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
-            </button>
+              <svg class="np-chevron" :class="{ expanded: !!notesPanelExpanded[nb.id] }" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="9 6 15 12 9 18"/>
+              </svg>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+              <span class="np-nb-name">{{ nb.name }}</span>
+              <span class="np-count">{{ nb.note_count }}</span>
+              <button
+                class="np-menu-btn hide-on-mobile"
+                :class="{ active: npMenuId === 'nb:' + nb.id }"
+                @click.stop="openNpNotebookMenu(nb, $event)"
+                title="更多操作"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+              </button>
+            </div>
           </div>
           <div class="np-notes-list" v-show="!!notesPanelExpanded[nb.id]">
             <div
               v-for="note in notesStore.notes[nb.id] || []"
               :key="note.id"
-              class="np-note-row"
-              :class="{ active: isActivePanelNote(nb.id, note.id) }"
-              @click="openNoteInPanel(nb.id, note.id)"
+              class="np-swipe-wrap np-swipe-wrap--note"
+              :class="{ 'np-swipe-open': npSwipedKey === 'note:' + note.id }"
+              @touchstart="npHandleTouchStart($event, 'note:' + note.id)"
+              @touchend="npHandleTouchEnd()"
+              @touchcancel="npHandleTouchEnd()"
+              @touchmove="npHandleTouchMove($event, 'note:' + note.id)"
             >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                <polyline points="14 2 14 8 20 8"/>
-              </svg>
-              <span class="np-note-title">{{ note.title || '无标题' }}</span>
-              <button
-                class="np-menu-btn"
-                :class="{ active: npMenuId === 'note:' + note.id }"
-                @click.stop="openNpNoteMenu(note, $event)"
-                title="更多操作"
+              <div class="np-swipe-actions np-swipe-actions--note">
+                <button class="np-swipe-action rename" @click.stop="npSwipeRenameNote(note)">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                  </svg>
+                  <span>重命名</span>
+                </button>
+                <button class="np-swipe-action move" @click.stop="npSwipeMoveNote(note)">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M5 12h14M12 5l7 7-7 7"/>
+                  </svg>
+                  <span>移动</span>
+                </button>
+                <button class="np-swipe-action delete" @click.stop="npSwipeDeleteNote(note)">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"/>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  </svg>
+                  <span>删除</span>
+                </button>
+              </div>
+              <div
+                class="np-note-row"
+                :class="{ active: isActivePanelNote(nb.id, note.id) }"
+                :style="npRowStyle('note:' + note.id)"
+                @click="npRowClick('note:' + note.id, () => openNoteInPanel(nb.id, note.id))"
               >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
-              </button>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span class="np-note-title">{{ note.title || '无标题' }}</span>
+                <button
+                  class="np-menu-btn hide-on-mobile"
+                  :class="{ active: npMenuId === 'note:' + note.id }"
+                  @click.stop="openNpNoteMenu(note, $event)"
+                  title="更多操作"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+                </button>
+              </div>
             </div>
             <div v-if="!!notesPanelNotebookLoading[nb.id]" class="np-note-loading">加载中…</div>
             <div v-else-if="!(notesStore.notes[nb.id] || []).length" class="np-empty">暂无笔记</div>
@@ -1260,6 +1318,129 @@ const isSwipeDragging = ref(false)
 const SWIPE_ACTION_WIDTH = 250
 let suppressConversationClickUntil = 0
 
+// ── notes-panel 行左划（移动端；与 agent 端会话卡交互一致） ──
+const NP_SWIPE_WIDTH_NB = 120
+const NP_SWIPE_WIDTH_NOTE = 168
+let suppressNpClickUntil = 0
+const npSwipedKey = ref<string | null>(null)
+const npSwipeOffset = ref(0)
+const npSwipeTrackingKey = ref<string | null>(null)
+const npSwipeStartX = ref(0)
+const npSwipeStartY = ref(0)
+const npSwipeStartOffset = ref(0)
+const npSwipeDragging = ref(false)
+
+function npSwipeWidth(key: string): number {
+  return key.startsWith('nb:') ? NP_SWIPE_WIDTH_NB : NP_SWIPE_WIDTH_NOTE
+}
+
+function npRowStyle(key: string): Record<string, string> {
+  if (npSwipedKey.value === key) {
+    return { transform: `translateX(${npSwipeOffset.value}px)` }
+  }
+  return {}
+}
+
+function closeNpSwipe() {
+  npSwipedKey.value = null
+  npSwipeOffset.value = 0
+  npSwipeTrackingKey.value = null
+  npSwipeDragging.value = false
+}
+
+function npHandleTouchStart(e: TouchEvent, key: string) {
+  if (e.touches.length !== 1) return
+  const touch = e.touches[0]
+  npSwipeTrackingKey.value = key
+  npSwipeStartX.value = touch.clientX
+  npSwipeStartY.value = touch.clientY
+  npSwipeStartOffset.value = npSwipedKey.value === key ? npSwipeOffset.value : 0
+  npSwipeDragging.value = false
+  if (npSwipedKey.value && npSwipedKey.value !== key) {
+    closeNpSwipe()
+  }
+}
+
+function npHandleTouchEnd() {
+  if (!npSwipeTrackingKey.value) return
+  if (npSwipeDragging.value) {
+    suppressNpClickUntil = Date.now() + 300
+    const width = npSwipeTrackingKey.value ? npSwipeWidth(npSwipeTrackingKey.value) : 0
+    if (npSwipeOffset.value <= -width / 2 && npSwipeTrackingKey.value) {
+      npSwipedKey.value = npSwipeTrackingKey.value
+      npSwipeOffset.value = -width
+    } else {
+      closeNpSwipe()
+      return
+    }
+  }
+  npSwipeTrackingKey.value = null
+  npSwipeDragging.value = false
+}
+
+function npHandleTouchMove(e: TouchEvent, key: string) {
+  if (!npSwipeTrackingKey.value || npSwipeTrackingKey.value !== key || e.touches.length !== 1) {
+    return
+  }
+  const touch = e.touches[0]
+  const deltaX = touch.clientX - npSwipeStartX.value
+  const deltaY = touch.clientY - npSwipeStartY.value
+  if (!npSwipeDragging.value) {
+    if (Math.abs(deltaY) > 10 && Math.abs(deltaY) > Math.abs(deltaX)) {
+      npSwipeTrackingKey.value = null
+      return
+    }
+    if (Math.abs(deltaX) < 10) return
+    if (deltaX > 0 && npSwipeStartOffset.value === 0) {
+      npSwipeTrackingKey.value = null
+      return
+    }
+    npSwipeDragging.value = true
+  }
+  e.preventDefault()
+  npSwipedKey.value = key
+  npSwipeOffset.value = Math.max(-npSwipeWidth(key), Math.min(0, npSwipeStartOffset.value + deltaX))
+}
+
+function npRowClick(key: string, fn: () => void) {
+  if (Date.now() < suppressNpClickUntil) return
+  if (npSwipedKey.value === key) {
+    closeNpSwipe()
+    return
+  }
+  fn()
+}
+
+function npSwipeRenameNotebook(nb: { id: string; name: string }) {
+  closeNpSwipe()
+  npMenuTarget.value = { kind: 'notebook', id: nb.id, title: nb.name }
+  handleNpRenameNotebook()
+}
+
+function npSwipeDeleteNotebook(nb: { id: string; name: string }) {
+  closeNpSwipe()
+  npMenuTarget.value = { kind: 'notebook', id: nb.id, title: nb.name }
+  handleNpDeleteNotebook()
+}
+
+function npSwipeRenameNote(note: { id: string; title: string; notebook_id: string }) {
+  closeNpSwipe()
+  npMenuTarget.value = { kind: 'note', id: note.id, title: note.title || '', notebookId: note.notebook_id }
+  handleNpRenameNote()
+}
+
+function npSwipeMoveNote(note: { id: string; title: string; notebook_id: string }) {
+  closeNpSwipe()
+  npMenuTarget.value = { kind: 'note', id: note.id, title: note.title || '', notebookId: note.notebook_id }
+  handleNpMoveNote()
+}
+
+function npSwipeDeleteNote(note: { id: string; title: string; notebook_id: string }) {
+  closeNpSwipe()
+  npMenuTarget.value = { kind: 'note', id: note.id, title: note.title || '', notebookId: note.notebook_id }
+  handleNpDeleteNote()
+}
+
 function formatDate(dateStr: string): string {
   if (!dateStr) return ''
   const normalized = dateStr.endsWith('Z') || dateStr.includes('+') || dateStr.includes('-', 10) ? dateStr : dateStr + 'Z'
@@ -2312,7 +2493,7 @@ async function saveGroup() {
 
   try {
     if (editingGroup.value) {
-      // 先修改名称/颜色，再移动助手——移动失败时分组不会从当前视图消失。
+      // 先更新名称/颜色，再移动助手——移动失败时分组不会从当前视图消失。
       await groupStore.updateGroup(editingGroup.value.id, {
         name,
         color: newGroupColor.value
@@ -3661,9 +3842,9 @@ const emit = defineEmits<{
 .tools-dropdown {
   margin: 0 12px 8px;
   background-color: var(--surface-panel-strong);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--panel-shadow);
+  border: var(--menu-border);
+  border-radius: var(--menu-radius);
+  box-shadow: var(--menu-shadow);
   max-height: 320px;
   overflow-y: auto;
 }
@@ -3893,10 +4074,10 @@ const emit = defineEmits<{
 
 .conversation-menu {
   position: fixed;
-  background-color: var(--color-white);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
+  background-color: var(--surface-panel-strong);
+  border: var(--menu-border);
+  border-radius: var(--menu-radius);
+  box-shadow: var(--menu-shadow);
   z-index: 1000;
   min-width: 140px;
   padding: 4px 0;
@@ -3915,7 +4096,7 @@ const emit = defineEmits<{
 }
 
 .menu-item:hover {
-  background-color: var(--color-hover);
+  background-color: var(--primary-tint);
 }
 
 .menu-item.delete {
@@ -3923,7 +4104,7 @@ const emit = defineEmits<{
 }
 
 .menu-item.delete:hover {
-  background-color: rgba(229, 62, 62, 0.08);
+  background-color: var(--danger-tint);
 }
 
 .empty-state {
@@ -4478,6 +4659,56 @@ const emit = defineEmits<{
   font-weight: 600;
 }
 
+/* ── notes-panel 行左划（移动端；桌面零变化） ─────────────────── */
+.np-swipe-wrap {
+  position: relative;
+}
+.np-swipe-wrap--nb { margin: 0 8px; }
+.np-swipe-wrap--note { margin: 5px 8px; }
+.np-swipe-wrap .np-notebook-row,
+.np-swipe-wrap .np-note-row { margin: 0; position: relative; z-index: 1; }
+
+.np-swipe-actions {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  clip-path: inset(0 100% 0 0);
+  pointer-events: none;
+  transition: clip-path 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  border-radius: var(--shell-workbench-radius);
+  overflow: hidden;
+}
+.np-swipe-actions--nb { width: 120px; }
+.np-swipe-actions--note { width: 168px; }
+.np-swipe-wrap.np-swipe-open .np-swipe-actions {
+  clip-path: inset(0 0 0 0);
+  pointer-events: auto;
+}
+
+.np-swipe-action {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.15s ease, filter 0.15s ease;
+}
+.np-swipe-action:active {
+  transform: scale(0.94);
+  filter: brightness(0.85);
+}
+.np-swipe-action.rename { background-color: var(--swipe-rename-bg); }
+.np-swipe-action.move { background-color: var(--swipe-move-bg); }
+.np-swipe-action.delete { background-color: var(--swipe-delete-bg); }
+
 .np-note-title {
   font-size: 13px;
   color: var(--color-text);
@@ -4519,10 +4750,10 @@ const emit = defineEmits<{
 
 .np-context-menu {
   position: fixed;
-  background-color: var(--color-white);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
+  background-color: var(--surface-panel-strong);
+  border: var(--menu-border);
+  border-radius: var(--menu-radius);
+  box-shadow: var(--menu-shadow);
   z-index: 1000;
   min-width: 140px;
   padding: 4px 0;
@@ -4929,7 +5160,7 @@ const emit = defineEmits<{
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.5);
+  background-color: var(--overlay-scrim);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4938,9 +5169,10 @@ const emit = defineEmits<{
 }
 
 .modal-content {
-  background-color: var(--color-white);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
+  background-color: var(--surface-panel-strong);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--dialog-radius);
+  box-shadow: var(--dialog-shadow);
   min-width: 320px;
   max-width: 400px;
   width: 100%;
@@ -5001,7 +5233,7 @@ const emit = defineEmits<{
 }
 
 .modal-btn.delete:hover {
-  background-color: #a02c2c;
+  background-color: color-mix(in srgb, var(--color-error) 85%, black);
 }
 
 .form-group {
@@ -5024,7 +5256,7 @@ const emit = defineEmits<{
   border-radius: var(--radius-md);
   font-size: 14px;
   color: var(--color-text);
-  background: var(--color-white);
+  background: var(--surface-input);
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
@@ -5032,7 +5264,7 @@ const emit = defineEmits<{
 .modal-body input:focus {
   outline: none;
   border-color: var(--color-primary);
-  box-shadow: var(--input-container-shadow-focus, 0 0 0 3px rgba(122, 163, 90, 0.15));
+  box-shadow: 0 0 0 3px var(--focus-ring-color);
 }
 
 .form-group select.form-select {
@@ -5042,7 +5274,7 @@ const emit = defineEmits<{
   border-radius: var(--radius-md);
   font-size: 14px;
   color: var(--color-text);
-  background: var(--color-white);
+  background: var(--surface-input);
   transition: border-color var(--transition-fast);
   appearance: auto;
 }

@@ -71,6 +71,8 @@ async def get_system_capabilities(
         },
         "deathmatch": {
             "enabled": True,
+            # 2026-08-31 autonomy wave: 0 = unlimited (no automatic human gate).
+            "autonomy_enabled": config.deathmatch_autonomy_enabled,
             "max_turns": config.deathmatch_max_turns,
             "tool_loop_max_iterations": config.deathmatch_tool_loop_max_iterations,
             "max_wall_time_seconds": config.deathmatch_max_wall_time_seconds,

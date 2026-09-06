@@ -27,12 +27,13 @@ class Config:
 
         self.config_path = Path(config_path).resolve()
         self._config = toml.load(config_path)
-        # Model config split: every model-related setting (LLM / ASR / TTS /
-        # embedding / rerank / judge / verifier / subagent / validator /
-        # memory / title / providers) lives in config_model.toml, merged
-        # OVER the main file so config.toml stays a pure infra file. When the
-        # model file is absent (legacy deployments) the main file's sections
-        # remain authoritative — every property below is unchanged.
+        # Model config split (2026-09-01 归位重构, wave2): config.toml (tracked)
+        # carries infra + ALL pure-behavior sections + provider keys in
+        # [secrets] (user decision). config_model.toml (gitignored) holds the
+        # model endpoints pool + purpose routing + sampling defaults ONLY —
+        # merged OVER the main file per _MODEL_SECTIONS. When the model file
+        # is absent (legacy deployments) the main file's sections remain
+        # authoritative — every property below is unchanged.
         self.model_config_path = self._resolve_model_config_path(config_path)
         self._config = self._merge_model_config(self._config)
 
@@ -45,29 +46,21 @@ class Config:
         candidate = main.parent / "config_model.toml"
         return candidate if candidate.exists() else None
 
-    # Sections that belong to config_model.toml. Whole-section moves:
+    # Sections that belong to config_model.toml. Whole-section moves.
+    # 2026-09-01 归位重构：纯行为段（asr/voice/deathmatch/sub_agent/
+    # title_generation/memory + agent.* 子段）迁回 config.toml——切分轴 =
+    # 端点/路由/采样默认/密钥 vs 行为/基础设施，历史"一大勺"清单退役。
     _MODEL_SECTIONS = {
-        "api",               # legacy main LLM endpoint
+        "endpoints",         # model endpoints (alias → url/key/model/params/capabilities)
+        "routing",           # purpose → alias routing
         "defaults",          # default LLM sampling params
         "default_assistant", # assistant-scoped sampling params
-        "asr",               # speech recognition models
-        "voice",             # voice LLM / TTS / ASR tuning
-        "providers",         # multi-provider LLM routing
-        "deathmatch",        # judge / verifier models + goal-loop budgets
-        "sub_agent",         # subagent LLM params
-        "title_generation",  # title LLM params
-        "memory",            # memory LLM / embedding / rerank / cost models
+        "secrets",           # web_search / context7 keys — canonical home config.toml (wave2);
+                             # whitelist kept so a legacy model-file [secrets] still merges
     }
-    # [agent] stays in the main file for harness tuning, but its MODEL
-    # sub-sections move. Only these keys are taken from the model file.
-    _MODEL_AGENT_SUBSECTIONS = {
-        "auxiliary",      # per-task auxiliary models (coordinator/classifier/title/…)
-        "compression",    # context-compression model params
-        "moa",            # mixture-of-agents models
-        "memory",         # daily summary / dream models
-        "tool_digest",    # subagent tool-result digest model
-        "sub_agent",      # subagent model params
-    }
+    # [agent] harness tuning stays in the main file. No agent sub-sections are
+    # taken from the model file any more (2026-09-01 归位重构).
+    _MODEL_AGENT_SUBSECTIONS: set = set()
 
     def _merge_model_config(self, base: dict) -> dict:
         if self.model_config_path is None:
@@ -86,6 +79,17 @@ class Config:
             )
             return base
         merged = dict(base)
+        # 2026-09-01 归位重构守卫：model 文件里出现白名单之外的段 = 部署残留
+        # （如未合并的 legacy [api]/[providers]/[memory]）——这些段会被静默
+        # 忽略，必须喊出来，否则回滚网失效零信号（A4.9 评审 Important-2）。
+        ignored = [s for s in model_cfg if s not in self._MODEL_SECTIONS and s != "agent"]
+        if ignored:
+            logger.warning(
+                "config_model.toml contains sections outside the merge "
+                "whitelist and they are IGNORED: %s (legacy endpoint keys? "
+                "run scripts/consolidate_model_config.py --apply or migrate "
+                "to [endpoints.*]/[routing])", ignored,
+            )
         for section in self._MODEL_SECTIONS:
             if section in model_cfg:
                 if section in merged:
@@ -140,14 +144,29 @@ class Config:
     def database_pool_timeout(self) -> int:
         return int(self._config.get("database", {}).get("pool_timeout", 30))
 
+    def _main_endpoint_attr(self, attr: str) -> str:
+        """[api] 缺失（两文件合并 2026-08-31）时回落主端点属性——保护裸构造
+        路径（llm_service is_custom=false 分支）不静默指向 api.openai.com。
+        懒导入 registry 避免模块级循环（registry 反向懒导入 config）。"""
+        try:
+            from app.model_gateway.registry import get_model_registry
+            return str(getattr(get_model_registry().get("main"), attr, "") or "")
+        except Exception:
+            return ""
+
     @property
     def api_base_url(self) -> str:
-        return self._config.get("api", {}).get("base_url", "https://api.openai.com/v1")
+        v = str(self._config.get("api", {}).get("base_url", "") or "")
+        if v:
+            return v
+        return self._main_endpoint_attr("base_url")
 
     @property
     def api_key(self) -> Optional[str]:
         key = self._config.get("api", {}).get("api_key", "")
-        return key if key else None
+        if key:
+            return key
+        return self._main_endpoint_attr("api_key") or None
 
     @property
     def security(self) -> dict:
@@ -191,7 +210,10 @@ class Config:
 
     @property
     def model_name(self) -> Optional[str]:
-        return self._config.get("api", {}).get("model_name") or None
+        v = self._config.get("api", {}).get("model_name")
+        if v:
+            return v
+        return self._main_endpoint_attr("model_name") or None
 
     @property
     def server_host(self) -> str:
@@ -297,6 +319,13 @@ class Config:
     @property
     def asr(self) -> dict:
         return self._config.get("asr", {})
+
+    @property
+    def asr_provider(self) -> str:
+        """[asr] legacy 兜底 provider 选择（2026-08-31 U1）：新配置应在
+        [endpoints.asr] 的 provider_type 声明；本属性仅作为无端点/旧文件的
+        回退链一环（endpoint → asr_provider → 布尔 → dashscope）。"""
+        return str(self.asr.get("asr_provider", "") or "")
 
     @property
     def asr_base_url(self) -> str:
@@ -743,8 +772,13 @@ class Config:
     @property
     def voice_filler_phrases(self) -> list:
         """Candidate filler phrases; one is picked at random per turn (never
-        the same as the previous pick when alternatives exist)."""
-        default = ["我来看看啊", "我来想想啊", "等下啊，我琢磨一下", "嗯，我想想"]
+        the same as recent picks when alternatives exist — 2026-09-05 P5
+        recent-window exclusion). Defaults keep register variety: 全"我想想"
+        近义池会让用户听感恒为同一句。"""
+        default = [
+            "我来看看啊", "我来想想啊", "等下啊，我琢磨一下", "嗯，我想想",
+            "让我捋一捋哈", "稍等，我查查看", "好，我这就看", "嗯，我看下哈",
+        ]
         val = self.voice.get("filler_phrases")
         if isinstance(val, list) and any(isinstance(p, str) and p.strip() for p in val):
             return [p for p in val if isinstance(p, str) and p.strip()] or default
@@ -777,7 +811,7 @@ class Config:
         """Candidate backchannel phrases (must stay ~1-2 chars: a long phrase
         would stretch its audible window into the flush region and its
         mic-echo could pass the short-noise gate; runtime enforces <=4 chars)."""
-        default = ["嗯", "嗯嗯", "哦", "对"]
+        default = ["嗯", "嗯嗯", "哦", "对", "嗯哼", "对啊", "好", "明白"]
         val = self.voice.get("backchannel_phrases")
         if isinstance(val, list) and any(isinstance(p, str) and p.strip() for p in val):
             return [p for p in val if isinstance(p, str) and p.strip()] or default
@@ -874,6 +908,20 @@ class Config:
     @property
     def agent(self) -> dict:
         return self._config.get("agent", {})
+
+    @property
+    def llm(self) -> dict:
+        """[llm] 段：模型供应商 wire 级行为开关（与端点信息解耦——端点在
+        config_model.toml [endpoints.*]，这里只放纯行为）。"""
+        return self._config.get("llm", {})
+
+    @property
+    def llm_stream_include_usage(self) -> bool:
+        """流式请求是否携带 stream_options.include_usage（P4 徽章真值，
+        2026-09-02）。True（默认）：OpenAI 兼容末块回传 usage.prompt_tokens，
+        AgentLoop 以实测值刷新前端 context_info（measured=true）并记入日志；
+        供应商不支持时自动去掉该参数重试一次。"""
+        return bool(self.llm.get("stream_include_usage", True))
 
     @property
     def agent_name(self) -> str:
@@ -999,26 +1047,31 @@ class Config:
         value = self.web_search.get("api_url", "")
         return value or None
 
+    def _secret(self, name: str) -> str:
+        """[secrets] 查询（canonical 位置 = config.toml；历史部署若留在
+        config_model.toml 也兼容——两文件合并后同键即生效）。"""
+        return str(self._config.get("secrets", {}).get(name, "") or "").strip()
+
     @property
     def web_search_api_key(self) -> Optional[str]:
-        value = self.web_search.get("api_key", "")
+        value = self.web_search.get("api_key", "") or self._secret("tavily_api_key")
         return value or None
 
     @property
     def web_search_bocha_api_key(self) -> Optional[str]:
-        value = self.web_search.get("bocha_api_key", "")
+        value = self.web_search.get("bocha_api_key", "") or self._secret("bocha_api_key")
         return value or None
 
     @property
     def web_search_firecrawl_api_key(self) -> Optional[str]:
-        value = self.web_search.get("firecrawl_api_key", "")
+        value = self.web_search.get("firecrawl_api_key", "") or self._secret("firecrawl_api_key")
         return value or None
 
     @property
     def web_search_exa_api_key(self) -> Optional[str]:
         """Exa's own key slot — distinct from the shared `api_key` (Tavily/Serper)
         so a Tavily key is never forwarded to mcp.exa.ai."""
-        value = self.web_search.get("exa_api_key", "")
+        value = self.web_search.get("exa_api_key", "") or self._secret("exa_api_key")
         return value or None
 
     @property
@@ -1043,12 +1096,29 @@ class Config:
 
     @property
     def context7_api_key(self) -> Optional[str]:
-        value = self._config.get("context7", {}).get("api_key", "")
+        value = self._config.get("context7", {}).get("api_key", "") or self._secret("context7_api_key")
         return value or None
 
     @property
     def scheduler(self) -> dict:
         return self._config.get("scheduler", {})
+
+    # [mcp] MCP server registry. Loaded once at startup by
+    # app/tools/mcp_client.load_mcp_servers_from_config(). Each entry under
+    # [mcp.servers.<name>] selects its transport by shape:
+    #   stdio: command = "npx" (str) or ["npx", "-y", "pkg"] (list),
+    #          optional args = [...], env = {VAR: "value"} (merged over
+    #          os.environ). The subprocess speaks newline-delimited JSON-RPC
+    #          on stdin/stdout (MCP 2024-11-05 stdio binding); the process is
+    #          reused across tool calls, reaped after 300s idle, and respawned
+    #          if it dies or if used from a different event loop.
+    #   http:  url = "https://…/mcp", optional api_key (Bearer). Streamable
+    #          HTTP POST transport with the session cache (unchanged).
+    # Registered tools are exposed to the agent as mcp_<name>_<tool> in the
+    # "mcp-<name>" toolset regardless of transport.
+    @property
+    def mcp(self) -> dict:
+        return self._config.get("mcp", {})
 
     @property
     def scheduler_enabled(self) -> bool:
@@ -1249,15 +1319,72 @@ class Config:
         """Per-turn memory-read dedup (conv dfc40619 2026-08-09): the
         coordinator turn-focus directive persists across all iterations and
         the mandatory_tool_use system rule forces fresh tool calls, so the
-        model re-issues the SAME ``memory read`` every iteration (35KB func.md
+        model re-issues the SAME ``memory read`` every iteration (35KB changelog.md
         re-injected per read). When enabled, a second identical read of the
         same target within one turn returns a short "already read" note
         instead of re-reading the file. Default: True."""
         return bool(self.agent_tool_loop.get("memory_read_dedup", True))
 
     @property
+    def agent_tool_loop_answer_conflict_arbitration(self) -> bool:
+        """Answer/tool conflict arbitration (conv a8290d37 2026-08-28): when a
+        response carries BOTH an answer-sized content AND tool calls that are
+        ALL objectively redundant (exact duplicate of a call that already
+        succeeded this turn, or a non-paginated browser fetch whose URLs were
+        all fetched this turn), the redundant calls are dropped and the
+        content proceeds down the normal final-answer path (pre-send audit
+        included) — the decision layer wins over the action layer. The old
+        rule "tool calls present → content is transient pre-tool prose"
+        silently discarded 11 complete answers while the loop re-fetched
+        already-fetched pages. Default: True."""
+        return bool(self.agent_tool_loop.get("answer_conflict_arbitration", True))
+
+    @property
+    def agent_tool_loop_answer_conflict_min_chars(self) -> int:
+        """Minimum content length for the answer/tool conflict arbitration to
+        consider the co-emitted content an answer candidate. The system
+        prompt requires pre-tool transitional prose to be short and clearly
+        unlike a final answer, so ≥800 chars is definitionally answer-like.
+        Default: 800."""
+        return int(self.agent_tool_loop.get("answer_conflict_min_chars", 800))
+
+    @property
+    def agent_tool_loop_doom_force_final(self) -> bool:
+        """Doom-loop circuit breaker (conv a8290d37 2026-08-28): when the
+        windowed doom detector (same tool+args ≥3× in the last 6 calls)
+        triggers, also set force_final_answer so the next iteration offers
+        execute_code only and the model must answer with what it has. The old
+        abort-and-continue verdict was toothless — the model re-issued the
+        identical call 4 more times after the error. Deathmatch mode is
+        exempt (its own judge governs). Default: True."""
+        return bool(self.agent_tool_loop.get("doom_force_final", True))
+
+    @property
     def agent_tool_loop_tool_call_timeout(self) -> float:
         return float(self.agent_tool_loop.get("tool_call_timeout_seconds", 60))
+
+    @property
+    def agent_tool_loop_tool_timeout_overrides(self) -> dict:
+        """Per-tool hard wall-clock caps (tool_name → seconds), overriding
+        ``tool_call_timeout_seconds`` for that tool only (2026-09-03:
+        vision_interpret large-image VLM calls need hours, not minutes)."""
+        raw = self.agent_tool_loop.get("tool_call_timeout_overrides", {}) or {}
+        return {str(k): float(v) for k, v in raw.items()}
+
+    @property
+    def agent_tool_loop_stall_timeout_overrides(self) -> dict:
+        """Per-tool STALL thresholds (tool_name → seconds, 0=disabled).
+        Opt-in per ADR D-2: uninstrumented tools have no honest liveness
+        signal, so a global stall threshold would false-kill them. A tool
+        with a stall override must report progress via
+        ``app.services.tool_progress.report_tool_progress``."""
+        raw = self.agent_tool_loop.get("tool_call_stall_timeout_overrides", {}) or {}
+        return {str(k): float(v) for k, v in raw.items()}
+
+    @property
+    def agent_tool_loop_progress_check_interval_seconds(self) -> float:
+        """Poll interval for the tool liveness watchdog (seconds)."""
+        return float(self.agent_tool_loop.get("tool_call_progress_check_interval_seconds", 10))
 
     @property
     def agent_tool_loop_judge_timeout(self) -> float:
@@ -1330,7 +1457,10 @@ class Config:
 
     @property
     def deathmatch_max_turns(self) -> int:
-        return int(self.deathmatch.get("max_turns", 30))
+        """Autonomous goal-loop turn budget before the human gate.
+        0 = unlimited (default since the 2026-08-31 autonomy wave): the loop
+        runs until the judge says done or the user stops the round."""
+        return int(self.deathmatch.get("max_turns", 0))
 
     @property
     def deathmatch_max_consecutive_failures(self) -> int:
@@ -1344,7 +1474,23 @@ class Config:
 
     @property
     def deathmatch_max_wall_time_seconds(self) -> int:
-        return int(self.deathmatch.get("max_wall_time_seconds", 3600))
+        """Wall-clock budget (seconds) for the goal loop. 0 = unlimited
+        (default since the 2026-08-31 autonomy wave). Parked time (pause /
+        WAIT / gates) never counts against the budget."""
+        return int(self.deathmatch.get("max_wall_time_seconds", 0))
+
+    @property
+    def deathmatch_autonomy_enabled(self) -> bool:
+        """Autonomy mode (default ON, 2026-08-31): the goal loop never
+        auto-interrupts for human intervention — wall/turn budgets default
+        to unlimited, stall tiers auto-replan and continue, the spin guard
+        and inactivity cycles keep pushing, judge WAIT becomes a bounded
+        in-loop backoff. Only an explicit user stop, a judge infra/parse
+        failure streak, or a done verdict ends the loop. Set false to
+        restore the legacy stall-tier gates (partial_complete/human_gate);
+        note the wall/turn gates independently require POSITIVE configured
+        max_turns / max_wall_time_seconds (both default 0 = unlimited)."""
+        return bool(self.deathmatch.get("autonomy_enabled", True))
 
     @property
     def deathmatch_verify_enabled(self) -> bool:
@@ -1432,6 +1578,30 @@ class Config:
         return self.deathmatch.get("judge", {})
 
     @property
+    def deathmatch_judge_evidence_enabled(self) -> bool:
+        """B1 (AJ-Bench 2604.18240): share the verifier's environment evidence
+        (workspace snapshot / settled steps / last verification / tool trace)
+        with the completion judge. Default on — judge+evidence beats a blind
+        judge on the same base model."""
+        return bool(self.deathmatch.get("judge_evidence_enabled", True))
+
+    @property
+    def deathmatch_visual_critic_enabled(self) -> bool:
+        """B4c (AutoDesign visual critic): let the verifier run a VLM layout
+        check on visual deliverables (.html/.svg) when a multimodal endpoint
+        is configured (config_model.toml `[endpoints.vlm]`, purpose "vlm"). Default OFF —
+        admin/developer opt-in."""
+        return bool(self.deathmatch.get("visual_critic_enabled", False))
+
+    @property
+    def deathmatch_rubric_compression_enabled(self) -> bool:
+        """P2-11 (SELFCOMPACT light): when enabled, the judge's compact=yes
+        signal lets the deathmatch forced compression fire early (len>40)
+        instead of only at the fixed len>80 message rule. Default OFF —
+        premature compression has a real token/fidelity cost."""
+        return bool(self.deathmatch.get("rubric_compression_enabled", False))
+
+    @property
     def agent_auxiliary(self) -> dict:
         return self.agent.get("auxiliary", {})
 
@@ -1488,6 +1658,14 @@ class Config:
         Used by ContextCompressor to calculate compression thresholds."""
         return int(self.agent_compression.get("context_length", 65536))
 
+    @property
+    def agent_compression_spike_guard_ratio(self) -> float:
+        """P0-2 (round-4 eval): pre-iteration spike guard. When the rough
+        token estimate of the next request exceeds ratio × context_length,
+        the agent loop compresses BEFORE the iteration instead of waiting
+        for the provider 400. 0 disables. Default 0.75."""
+        return float(self.agent_compression.get("spike_guard_ratio", 0.75))
+
     # ---- Canary marker (遵循词) ----
 
     @property
@@ -1540,6 +1718,22 @@ class Config:
         return bool(self.agent_audit.get("numeric_gate_enabled", True))
 
     @property
+    def agent_audit_numeric_provenance_mode(self) -> str:
+        """NPG（2026-09-02，conv 83d97ede 容积事故）：写手侧数值溯源闸门。
+        确定性、零 LLM——草稿高风险推导数值必须可引用（台账/用户消息，单位族
+        感知）或有回执（本轮 execute_code/terminal 输出 + 参数溯源，
+        print(40000) 裸字面量不构成回执）。shadow=只记录不拦截（默认，
+        B10 灰度）；enforce=无回执推导值打回 needs_evidence（软拒计数，
+        不烧 reject 预算）；off=关闭。"""
+        return str(self.agent_audit.get("numeric_provenance_gate_mode", "shadow"))
+
+    @property
+    def agent_audit_numeric_gate_tolerance(self) -> float:
+        """NPG 数值接地相对容差（0.01=1%——回执四舍五入匹配，如
+        186466.6mm³ ≈ 186.5ml）。"""
+        return float(self.agent_audit.get("numeric_gate_tolerance", 0.01))
+
+    @property
     def agent_audit_retry_reasoning_keep_chars(self) -> int:
         """A2 (2026-08-21): char cap of the rejected draft's reasoning_content
         re-attached on audit-retry for preserve-thinking providers.
@@ -1552,6 +1746,16 @@ class Config:
         False（默认）= 打回后的修正轮 thinking 关闭（更快、上游挂死面更小）；
         True = 显式保持思考（操作者可覆写）。"""
         return bool(self.agent_audit.get("revision_thinking_enabled", False))
+
+    @property
+    def agent_audit_salvage_thinking_enabled(self) -> bool:
+        """salvage/best-of selection 兜底生成阶段是否保持思考（conv 3a216a51,
+        2026-09-02）。False（默认）= 关思考——生产实证 salvage 以 xhigh
+        全量缓冲生成 ~120s（SSE 零事件，用户观感=卡死后取消 SSE）；关思考
+        后与打回修正轮（revision_thinking_enabled=false，2026-08-21 用户
+        决定）同口径，~12-13s 量级出稿。True = 显式保持思考（240s
+        salvage_timeout 上限仍生效）。"""
+        return bool(self.agent_audit.get("salvage_thinking_enabled", False))
 
     @property
     def agent_audit_call_timeout_seconds(self) -> float:
@@ -1670,6 +1874,17 @@ class Config:
         per-turn prefill tokens and tool-catalog attention dilution.
         """
         return list(self.agent_tools.get("visible_tools", []) or [])
+
+    @property
+    def agent_tools_mcp_progressive_enabled(self) -> bool:
+        """MCP 工具渐进发现（progressive discovery, 2026-09-02）。
+
+        True（默认）：MCP server（[mcp.servers.*]，toolset 前缀 "mcp-"）的工具
+        schema 不进入每轮 LLM 请求；模型用常驻元工具 search_tools 按需检索，
+        AgentLoop 把命中的 schema 追加进后续迭代（只增不减），跨轮粘性由会话
+        历史预载承担。设为 False 恢复旧行为（全量 schema 注入）。单个 server
+        可用 [mcp.servers.<name>] eager = true 逃生（schema 常驻）。"""
+        return bool(self.agent_tools.get("mcp_progressive_enabled", True))
 
     # ---- Synthetic system directives (4.8) ----
 
@@ -1868,6 +2083,18 @@ class Config:
     @property
     def memory(self) -> dict:
         return self._config.get("memory", {})
+
+    @property
+    def memory_interest_extract_timeout_seconds(self) -> float:
+        """兴趣画像提取（proactive_learning extract_interests → judge_json
+        interest_extract）的 LLM 判定超时秒数。默认 40：DeepSeek 拥塞时
+        prefill 11-33s 波动（TTFT 诊断），25s 预算贴线导致画像降级为纯结构
+        统计（60 服务器 2026-09-02 两次实测超时）。超时兜底=topics/preferences
+        空壳+结构计数保留，下一轮画像构建自愈。"""
+        try:
+            return float(self.memory.get("interest_extract_timeout_seconds", 40.0))
+        except (TypeError, ValueError):
+            return 40.0
 
     @property
     def memory_concept(self) -> dict:

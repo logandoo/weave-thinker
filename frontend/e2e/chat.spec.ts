@@ -121,7 +121,10 @@ test.describe('Weave Thinker E2E Tests', () => {
     await input.fill('请从 1 数到 200，并且每一项都写成完整句子，不要使用代码块。');
     await sendButton.click();
 
-    await expect(sendButton).toHaveClass(/stop-mode/, { timeout: 10000 });
+    // 新契约（2026-08-29 并行/插话特性）：停止按钮移到语音槽位
+    // .stop-generating-btn，发送按钮不再有 stop-mode（生成中发送=插话）。
+    const stopButton = page.locator('button.stop-generating-btn');
+    await expect(stopButton).toBeVisible({ timeout: 10000 });
 
     // Model may spend time in reasoning before emitting text — accept either.
     // F1-1 part-protocol renders live text as .timeline-text inside
@@ -135,9 +138,9 @@ test.describe('Weave Thinker E2E Tests', () => {
       return text.length + reasoning.length;
     }, { timeout: 180000 }).toBeGreaterThan(20);
 
-    await sendButton.click();
+    await stopButton.click();
 
-    await expect(sendButton).not.toHaveClass(/stop-mode/, { timeout: 20000 });
+    await expect(stopButton).toHaveCount(0, { timeout: 20000 });
     await expect.poll(async () => {
       return await page.locator('.message-bubble.assistant').count();
     }, { timeout: 20000 }).toBeGreaterThan(0);

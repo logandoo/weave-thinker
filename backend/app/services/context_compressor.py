@@ -426,9 +426,13 @@ Target ~{summary_budget} tokens. Be CONCRETE."""
             content = None
             try:
                 import asyncio
-                from app.services.llm_service import LLMService
                 from app.services.auxiliary_client import get_aux_llm_override
-                llm = self._llm or get_aux_llm_override() or LLMService()
+                llm = self._llm or get_aux_llm_override()
+                if llm is None:
+                    # model_gateway 收口（2026-08-30）：裸构造 ≡ main 端点。
+                    from app.model_gateway import factory
+                    from app.model_gateway.registry import get_model_registry
+                    llm = factory.build_llm_service(get_model_registry().get("main"))
                 content = await llm.complete_chat(
                     [{"role": "user", "content": prompt}],
                     max_tokens=int(summary_budget * 1.3),

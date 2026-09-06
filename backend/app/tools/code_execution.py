@@ -349,7 +349,15 @@ async def generate_and_execute_code(args: dict, **kwargs) -> str:
         )
 
     from app.services.auxiliary_client import get_aux_llm_override
-    llm = get_aux_llm_override() or LLMService()
+    llm = get_aux_llm_override()
+    if llm is None:
+        # model_gateway 收口（2026-08-30）：裸构造 ≡ main 端点。
+        from app.model_gateway import factory
+        from app.model_gateway.registry import get_model_registry
+        llm = factory.build_llm_service(get_model_registry().get("main"))
+    # 模型网关（A4.9 复审 R2）：wire provider_type 以解析端点为准
+    from app.model_gateway.factory import wire_provider_type
+    provider_type = wire_provider_type(llm, provider_type)
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": task},
@@ -464,7 +472,9 @@ registry.register(
             "or statistical charts (use ```echarts JSON fences — rendered natively).\n"
             "Runs in a sandboxed workspace. Available libraries: python-pptx, openpyxl, "
             "reportlab, matplotlib, numpy, pandas, Pillow. "
-            "Sandbox blocks subprocess/os.system — use the terminal tool for external commands."
+            "Sandbox blocks subprocess/os.system — use the terminal tool for external commands. "
+            "Long computations MUST print progress periodically (e.g. per-batch/per-epoch): "
+            "a script with no output for several minutes is treated as hung and killed."
         ),
         "parameters": {
             "type": "object",

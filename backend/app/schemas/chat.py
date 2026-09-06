@@ -128,6 +128,7 @@ class MessageResponse(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[str] = None
     tool_results: Optional[str] = None
+    context_info: Optional[str] = None
     created_at: str
 
 

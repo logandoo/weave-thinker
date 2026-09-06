@@ -157,7 +157,7 @@ PR 中**每一个** commit 都必须有合法的 sign-off（文本中 `Signed-of
   grep versionName webview-app/app/build.gradle
   ```
 - **发布动作**：tag 一律 `v<X.Y.Z>`；Release notes 直接采用
-  `backend/agent_memories/func.md` 第 6 章「版本更新记录」的产品视角增量
+  `backend/agent_memories/changelog.md` 第 6 章「版本更新记录」的产品视角增量
   （该章按「与上一版差异」维护，即现成素材）。
 - 不维护独立 CHANGELOG.md（避免与 Release body 双账本）；UI 不显示版本号
   （支持排障以 `/docs` 展示值为准）。

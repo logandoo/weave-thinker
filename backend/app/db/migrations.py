@@ -22,6 +22,10 @@ STARTUP_MIGRATIONS = [
     # paired with tool_results to enable structured replay so the model
     # sees prior actions instead of fuzzy narrative text.
     ("messages_tool_calls", "ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_calls TEXT"),
+    # P2 (2026-09-05): persist the turn's latest context_info (token usage
+    # snapshot) so the badge survives cross-device loads (mobile-sent turns
+    # previously had no token info anywhere except the sender's localStorage).
+    ("messages_context_info", "ALTER TABLE messages ADD COLUMN IF NOT EXISTS context_info TEXT"),
     # PHASE 3: per-assistant override of the LLM used for tool-calling
     # iterations. When NULL the main client is reused with thinking forced
     # off; when populated, iterations get a separate cheaper client so the
@@ -130,7 +134,11 @@ $$"""),
     ("conversations_deathmatch_goal", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_goal TEXT"),
     ("conversations_deathmatch_status", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_status VARCHAR(20) DEFAULT 'inactive'"),
     ("conversations_deathmatch_turns", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_turns INTEGER DEFAULT 0"),
-    ("conversations_deathmatch_max_turns", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_max_turns INTEGER DEFAULT 30"),
+    ("conversations_deathmatch_max_turns", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_max_turns INTEGER DEFAULT 0"),  # 0=unlimited (autonomy wave 2026-08-31; applied rows keep their snapshot)
+    # Heal pre-autonomy rows: 9999 was the pre-2026-08-31 default snapshot —
+    # a fake budget that renders "共9999轮". Normalize to 0 (unlimited), the
+    # current config default (user directive 2026-09-04).
+    ("conversations_deathmatch_max_turns_legacy_unlimited", "UPDATE conversations SET deathmatch_max_turns = 0 WHERE deathmatch_max_turns >= 9999"),
     ("conversations_deathmatch_consecutive_failures", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_consecutive_failures INTEGER DEFAULT 0"),
     ("conversations_deathmatch_verdict", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_verdict TEXT"),
     ("conversations_deathmatch_reason", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_reason TEXT"),
@@ -149,7 +157,7 @@ $$"""),
     ("conversations_deathmatch_plan_version", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_plan_version INTEGER DEFAULT 0"),
     ("conversations_deathmatch_reflections", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_reflections JSONB DEFAULT '[]'::jsonb"),
     ("conversations_deathmatch_wall_time_started_at", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_wall_time_started_at TIMESTAMP DEFAULT NULL"),
-    ("conversations_deathmatch_max_wall_time_seconds", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_max_wall_time_seconds INTEGER DEFAULT 3600"),
+    ("conversations_deathmatch_max_wall_time_seconds", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_max_wall_time_seconds INTEGER DEFAULT 0"),  # 0=unlimited (autonomy wave 2026-08-31; applied rows keep their snapshot)
     ("conversations_deathmatch_last_verification_result", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_last_verification_result JSONB DEFAULT NULL"),
     ("conversations_deathmatch_verify_failures", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_verify_failures INTEGER DEFAULT 0"),
     ("conversations_deathmatch_human_gate", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_human_gate TEXT"),
@@ -262,7 +270,76 @@ $$"""),
     ("idx_wsr_query", "CREATE INDEX IF NOT EXISTS idx_wsr_query ON web_search_results(query)"),
     ("idx_wsr_created_at", "CREATE INDEX IF NOT EXISTS idx_wsr_created_at ON web_search_results(created_at DESC)"),
     ("idx_wsr_user_ts", "CREATE INDEX IF NOT EXISTS idx_wsr_user_ts ON web_search_results(user_id, created_at DESC)"),
+    # ---- 模型网关解耦（2026-08-30）：助手模型选择改为逻辑别名 ----
+    # 只加列不删列（回滚安全）；旧 custom_* 字段后端保留 legacy 读取。
+    ("assistants_model_alias", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS model_alias VARCHAR(64)"),
+    ("assistants_subtask_model_alias", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS subtask_model_alias VARCHAR(64)"),
+    # 存量回填（幂等，仅 NULL 行）：无任何行级覆盖的默认助手 → 对应别名；
+    # 带行级覆盖（custom_*）的行保持 NULL → legacy inline 端点继续生效。
+    ("assistants_backfill_model_alias_default", """UPDATE assistants SET model_alias = 'deepseek'
+        WHERE model_alias IS NULL
+          AND (provider_type IS NULL OR provider_type = '' OR provider_type = 'deepseek')
+          AND COALESCE(use_custom_model, FALSE) = FALSE
+          AND COALESCE(custom_api_url, '') = ''
+          AND COALESCE(custom_api_key, '') = ''
+          AND COALESCE(custom_model_name, '') = ''"""),
+    ("assistants_backfill_model_alias_qwen38", """UPDATE assistants SET model_alias = 'qwen3.8_27b'
+        WHERE model_alias IS NULL
+          AND provider_type = 'qwen3.8_vllm'
+          AND COALESCE(custom_api_url, '') = ''
+          AND COALESCE(custom_api_key, '') = ''
+          AND COALESCE(custom_model_name, '') = ''"""),
+    ("assistants_backfill_model_alias_providers", """UPDATE assistants SET model_alias = provider_type
+        WHERE model_alias IS NULL
+          AND provider_type IS NOT NULL
+          AND provider_type NOT IN ('', 'custom', 'qwen3.8_vllm', 'deepseek')
+          AND COALESCE(use_custom_model, FALSE) = FALSE
+          AND COALESCE(custom_api_url, '') = ''
+          AND COALESCE(custom_api_key, '') = ''
+          AND COALESCE(custom_model_name, '') = ''"""),
+    # 两文件合并（2026-08-31）：qwen3.8_vllm 镜像别名退役——无行级覆盖的 legacy
+    # qwen 行迁到规范别名 qwen3.8_27b（endpoint 池只保留一个 Qwen3.8(Local)）。
+    # 带行级覆盖的行保持 NULL（inline 路径用行值，不依赖 [providers]）。
+    ("assistants_backfill_model_alias_qwen38_canonical", """UPDATE assistants SET model_alias = 'qwen3.8_27b'
+        WHERE model_alias IS NULL
+          AND provider_type = 'qwen3.8_vllm'
+          AND COALESCE(use_custom_model, FALSE) = FALSE
+          AND COALESCE(custom_api_url, '') = ''
+          AND COALESCE(custom_api_key, '') = ''
+          AND COALESCE(custom_model_name, '') = ''"""),
+    # 别名去点规范化（2026-09-01 wave2）：endpoint 池别名 qwen3.8_27b → qwen3.8
+    # （TOML 裸键友好；wire model_name 仍为 qwen3.8_27b，仅注册表键改名）。
+    ("assistants_rename_model_alias_qwen38", """UPDATE assistants SET model_alias = 'qwen3.8'
+        WHERE model_alias = 'qwen3.8_27b'"""),
+    ("assistants_rename_subtask_model_alias_qwen38", """UPDATE assistants SET subtask_model_alias = 'qwen3.8'
+        WHERE subtask_model_alias = 'qwen3.8_27b'"""),
     # ---- Memory & Dreaming v2: pgvector + schema（以下块依赖 pgvector，缺失时整体跳过）----
+    # P1-5 (2026-08-30): per-goal settled-verdict ledger — step completions and
+    # reconcile overturns are persisted so the judge/verifier cannot flip-flop
+    # a settled verdict without new evidence (普通模式审计链同构移植).
+    ("conversations_deathmatch_settled_ledger", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_settled_ledger JSONB"),
+    # C3 (2026-08-30, JIT-Agent harness bank): per-goal deathmatch harness
+    # archive — terminal goal-loop states with config snapshot + outcome
+    # metrics; the data facility for harness A/B acceptance gates.
+    ("create_deathmatch_harness_runs", """CREATE TABLE IF NOT EXISTS deathmatch_harness_runs (
+        id VARCHAR(36) PRIMARY KEY,
+        conversation_id VARCHAR(36) NOT NULL,
+        final_status VARCHAR(32) NOT NULL,
+        goal TEXT,
+        turns INTEGER DEFAULT 0,
+        wall_time_used_seconds INTEGER DEFAULT 0,
+        verify_failures INTEGER DEFAULT 0,
+        plan_steps INTEGER DEFAULT 0,
+        plan_done INTEGER DEFAULT 0,
+        judge_model VARCHAR(200),
+        verify_model VARCHAR(200),
+        config_json TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("create_deathmatch_harness_runs_conv_idx", "CREATE INDEX IF NOT EXISTS idx_deathmatch_harness_runs_conv ON deathmatch_harness_runs (conversation_id)"),
+    # B4 复发轴（A4.9 W2-I1）：归档行携带末次 verify issues（JSON 数组文本），
+    # 供 deathmatch_harness_report 的复发问题类聚合；无此列时该轴空转。
+    ("deathmatch_harness_runs_issues_json", "ALTER TABLE deathmatch_harness_runs ADD COLUMN IF NOT EXISTS issues_json TEXT"),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (
@@ -290,7 +367,7 @@ $$"""),
         valid_from TIMESTAMP DEFAULT NOW(),
         valid_to TIMESTAMP,
         superseded_by VARCHAR(36),
-        embedding vector(1536),
+        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         embedding_updated_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -307,7 +384,7 @@ $$"""),
         name VARCHAR(255) NOT NULL,
         summary TEXT,
         weight FLOAT NOT NULL DEFAULT 0.5,
-        embedding vector(1536),
+        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         member_count INTEGER NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -359,7 +436,7 @@ $$"""),
         unit_kind VARCHAR(20) NOT NULL DEFAULT 'message',
         raw_text TEXT NOT NULL,
         source_ids TEXT NOT NULL,
-        embedding vector(1536),
+        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         promoted BOOLEAN NOT NULL DEFAULT FALSE,
         promoted_at TIMESTAMP,
         recurrence_count INTEGER NOT NULL DEFAULT 0,
@@ -386,7 +463,7 @@ $$"""),
         valid_from TIMESTAMP DEFAULT NOW(),
         valid_to TIMESTAMP,
         superseded_by VARCHAR(36),
-        embedding vector(1536),
+        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         merged_from VARCHAR(36),
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -420,7 +497,7 @@ $$"""),
 ]
 
 
-# §9.5 pgvector 缺失降级：启动探测结果（run_startup_migrations 期间写入）。
+# §9.5 pgvector 缺失降级：启动探测结果（run_startup_migrations 期间更新）。
 # False 时 memory v2 迁移整体跳过、init_db 的 create_all 排除 memory 表、
 # main.py 强制 memory.enabled=false —— 服务继续以旧记忆方案运行，不崩溃。
 PGVECTOR_AVAILABLE = True
@@ -461,16 +538,58 @@ async def probe_pgvector(conn, extension: str = "vector") -> bool:
     return r.scalar() is not None
 
 
+def _expected_embedding_dim(conf: dict) -> int:
+    """期望 embedding 维度（2026-08-31 Wave D）：[endpoints.embedding].extra.dim
+    （端点池 doctrine 源）→ legacy [memory].embedding_dim → **0 = 未知**。
+
+    0 时对账必须跳过——绝不默认 1536：Wave C 曾因默认值把三个正常 1024 表
+    判成 mismatch（cast 失败被吞，险些改坏）。"""
+    try:
+        from app.model_gateway.registry import get_model_registry
+        ep = get_model_registry().get("embedding")
+        v = int((ep.extra or {}).get("dim", 0) or 0)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    try:
+        v = int((conf.get("memory", {}) or {}).get("embedding_dim", 0) or 0)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return 0
+
+
 async def _reconcile_vector_dims(conn) -> None:
-    """检测 DB 中 vector 列维度是否与配置 embedding_dim 一致，不一致则 ALTER 重建。
+    """检测 DB 中 vector 列维度是否与配置 embedding 维度一致，不一致则 ALTER 重建。
 
     典型场景：旧迁移创建 vector(1536)，用户切换 embedding 模型后配置改为 1024。
-    """
+    期望维度来自 [endpoints.embedding].extra.dim（legacy [memory].embedding_dim
+    兜底）；未知时整体跳过。跨维度旧向量先置 NULL（维度不匹配的向量本就无法
+    被当前模型检索，且写入早已失败——见 memory_clusters 1536 事故）。"""
     try:
         from app.core.config import get_config
-        cfg = get_config()
-        expected = int(cfg.memory.get("embedding_dim", 1536))
+        conf = get_config()._config or {}
     except Exception:
+        return
+    # memory v2 关闭时表可能不存在/不需对账（R2 Minor：先于 dim-unknown 判定，
+    # 避免 disabled 部署收到无关的"声明 extra.dim"大警告）
+    try:
+        _mem_enabled = bool((conf.get("memory", {}) or {}).get("enabled", True))
+    except Exception:
+        _mem_enabled = True
+    if not _mem_enabled:
+        logger.info("vector dim reconcile skipped: [memory] enabled=false")
+        return
+    expected = _expected_embedding_dim(conf)
+    if not expected:
+        logger.warning(
+            "vector dim reconcile SKIPPED: expected dim unknown — declare "
+            "[endpoints.embedding].extra.dim (= model output dims) so the "
+            "reconcile can align vector columns; 0-unknown never guesses "
+            "(A4.9 W-D: no 1536 default)"
+        )
         return
 
     for table, col, idx_name in _VECTOR_TABLES:
@@ -495,6 +614,20 @@ async def _reconcile_vector_dims(conn) -> None:
                 )
                 if idx_name:
                     await conn.execute(text(f"DROP INDEX IF EXISTS {idx_name}"))
+                # 跨维度旧向量先清空（否则 ALTER 需要未定义的跨维 cast）。
+                # I1（A4.9 W-D）：行数必须留痕——这是破坏性操作，静默清空
+                # 数千条向量 = 数据丢失事故而非"对账"。
+                _null_res = await conn.execute(text(
+                    f"UPDATE {table} SET {col} = NULL "
+                    f"WHERE {col} IS NOT NULL AND vector_dims({col}) <> {expected}"
+                ))
+                if _null_res.rowcount:
+                    logger.warning(
+                        "vector dim reconcile: nulled %d mismatched %s.%s rows "
+                        "(old-dim vectors are unretrievable under the %d-dim model; "
+                        "re-embeddable from retained text)",
+                        _null_res.rowcount, table, col, expected,
+                    )
                 await conn.execute(text(
                     f"ALTER TABLE {table} ALTER COLUMN {col} TYPE vector({expected})"
                 ))

@@ -78,6 +78,10 @@ export interface StreamHandlers {
   onDeathmatchVerdict?: (verdict: any) => void
   onPermissionRequest?: (request: { request_id: string; tool_name: string; description: string; details: Record<string, any> }) => void
   onPing?: () => void
+  /** 静默质检（audit_reset）同步：后端打回了已流式展示的草稿并重置其累加器，
+   *  客户端据此丢弃草稿文本（时间线清创+content 重置），否则 done 气泡会包含
+   *  全部被拒草稿（conv 827a6f78 turn-B）。 */
+  onAuditReset?: () => void
   onPartStarted?: (part: PartStartedEvent) => void
   onPartDelta?: (part: PartDeltaEvent) => void
   onPartUpdated?: (part: PartUpdatedEvent) => void
@@ -89,6 +93,9 @@ export interface StreamHandlers {
    *  in its setup phase. The stream must end silently (no error bubble) and
    *  resync from the DB — the newer run owns the answer. */
   onConversationSuperseded?: () => void
+  /** 插话 commit-echo：后端在迭代边界把用户插话注入消息列表并落库后广播。
+   *  前端据此把乐观插话气泡替换为服务器确认的用户消息。 */
+  onInterjectionCommitted?: (payload: { id: string | null; conversation_id: string; content: string; created_at: string | null }) => void
 }
 
 export interface ResumeHandlers extends StreamHandlers {
@@ -96,6 +103,17 @@ export interface ResumeHandlers extends StreamHandlers {
 }
 
 /** Shared SSE payload dispatch. Returns true when the stream must terminate. */
+
+/** Coerce an SSE text channel to string. conv 827a6f78 (2026-09-03): the
+ *  live streaming view degraded to the literal text "true" — any non-string
+ *  slipping into a `content`/`delta` channel is concatenated by the
+ *  accumulators (`'' + true === "true"`), while the DB answer stays clean.
+ *  Single choke point: boolean/null/object values are dropped here so the
+ *  whole class dies at ingest. */
+function asText(v: unknown): string {
+  return typeof v === 'string' ? v : ''
+}
+
 export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
   if (data.error) {
     if (data.code === 'conversation_busy' && h.onConversationBusy) {
@@ -106,13 +124,23 @@ export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
       h.onConversationSuperseded()
       return true
     }
-    h.onError(data.error)
+    h.onError(typeof data.error === 'string' ? data.error : '未知错误')
     return true
   }
 
   if (data.part_started && h.onPartStarted) h.onPartStarted(data.part_started)
-  if (data.part_delta && h.onPartDelta) h.onPartDelta(data.part_delta)
-  if (data.part_updated && h.onPartUpdated) h.onPartUpdated(data.part_updated)
+  if (data.part_delta && h.onPartDelta) {
+    // conv 827a6f78: delta channels are string-typed at the wire contract;
+    // a boolean/null delta would render "true"/"null" via string concat.
+    const pd = data.part_delta
+    if (typeof pd.delta === 'string') h.onPartDelta(pd)
+  }
+  if (data.part_updated && h.onPartUpdated) {
+    const pu = data.part_updated
+    if (pu.content !== undefined && pu.content !== null && typeof pu.content !== 'string') delete pu.content
+    if (pu.result !== undefined && pu.result !== null && typeof pu.result !== 'string') delete pu.result
+    h.onPartUpdated(pu)
+  }
 
   if (data.search_progress && h.onSearchProgress) h.onSearchProgress(data.search_progress)
   if (data.search_failed && h.onSearchFailed) h.onSearchFailed(data.search_failed)
@@ -122,11 +150,14 @@ export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
   if (data.sub_agent_thinking && h.onSubAgentThinking) h.onSubAgentThinking(data.sub_agent_thinking)
   if (data.attachments && h.onFileAttachment) h.onFileAttachment(data.attachments)
   if (data.task_progress && h.onTaskProgress) h.onTaskProgress(data.task_progress)
-  if (data.sub_agent_chunk && h.onSubAgentChunk) h.onSubAgentChunk(data.sub_agent_chunk)
+  if (data.sub_agent_chunk && h.onSubAgentChunk) {
+    const sc = data.sub_agent_chunk
+    if (typeof sc.delta === 'string') h.onSubAgentChunk(sc)
+  }
   if (data.title_update && h.onTitleUpdate) h.onTitleUpdate(data.title_update.conversation_id, data.title_update.title)
 
-  if (data.reasoning_content !== undefined && h.onReasoning) h.onReasoning(data.reasoning_content)
-  if (data.content !== undefined) h.onMessage(data.content)
+  if (data.reasoning_content !== undefined && h.onReasoning) h.onReasoning(asText(data.reasoning_content))
+  if (data.content !== undefined) h.onMessage(asText(data.content))
 
   if (data.done) {
     h.onDone(data.conversation_id, data.message_id, data.title, data.tool_results, data.search_failed, !!data.task_submitted)
@@ -142,9 +173,17 @@ export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
   if (data.current !== undefined && data.max !== undefined && h.onIteration) {
     h.onIteration(data as IterationEvent)
   }
-  if (data.segment_content !== undefined && h.onContentSegment) h.onContentSegment(data.segment_content)
+  if (data.segment_content !== undefined && h.onContentSegment) h.onContentSegment(asText(data.segment_content))
   if (data.deathmatch_verdict && h.onDeathmatchVerdict) h.onDeathmatchVerdict(data.deathmatch_verdict)
   if (data.permission_request && h.onPermissionRequest) h.onPermissionRequest(data.permission_request)
+  if (data.interjection_committed && h.onInterjectionCommitted) h.onInterjectionCommitted(data.interjection_committed)
+
+  if (data.audit_reset && h.onAuditReset) {
+    // Silent-QC reset sync (conv 827a6f78 turn-B): the backend rejected the
+    // streamed draft and reset its accumulators — the client drops the draft
+    // text from its timeline/accumulators (handler-side surgery).
+    h.onAuditReset()
+  }
 
   if (data.ping) {
     // Keepalive: lets the store's stall watchdog distinguish a healthy

@@ -4,7 +4,7 @@
 
 /* ==========================================================================
  * 皮肤：青野平面 (verdant-flat) —— 默认皮肤
- * 设计源：内置皮肤实拍（青野平面）
+ * 设计源：design/mockups/01-verdant-flat/（chat.html / zen.html / notes.html）
  * 契约：docs/SKINS.md · 目录：GET /api/skins
  *
  * 布局范式（mockup .layout）：浮动玻璃卡片 —— 侧栏/顶栏/输入区均为圆角卡片，
@@ -234,7 +234,7 @@ html[data-skin="verdant-flat"] .chat-layout {
   gap: 12px;
 }
 
-/* 移动端豁免：抽屉侧栏无留白、全高、恢复 fixed 离屏（皮肤桌面 position:relative 会压默认皮肤 fixed） */
+/* 移动端豁免：抽屉侧栏无留白、全高、恢复 fixed 离屏（皮肤桌面 position:relative 会压基线 fixed） */
 @media (max-width: 767px) {
   html[data-skin="verdant-flat"] .chat-layout { padding: 0; gap: 0; }
   html[data-skin="verdant-flat"] .sidebar {
@@ -376,7 +376,7 @@ html[data-skin="verdant-flat"][data-theme="dark"] .group-header.group-focus .gro
 html[data-skin="verdant-flat"][data-theme="dark"] .zen-group-header.group-focus { background: rgba(134, 180, 94, 0.16); box-shadow: inset 0 0 0 1px rgba(134, 180, 94, 0.35); }
 html[data-skin="verdant-flat"][data-theme="dark"] .zen-group-header.group-focus .zen-group-name { color: #a9d17d; }
 
-/* 会话行 — 去掉月牙状 inset 左轨（border-radius 弯曲 + 默认皮肤 inset shadow 的复合弧形），
+/* wave-9: 会话行 — 去掉月牙状 inset 左轨（border-radius 弯曲 + 基线 inset shadow 的复合弧形），
    改为独立平直加粗竖线 ::before（端头平直，不随 radius 弯折）；激活色整体加深 */
 html[data-skin="verdant-flat"] .conversation-item {
   border-radius: 12px;
@@ -824,7 +824,7 @@ html[data-skin="verdant-flat"] .tool-pending .tool-card-icon { color: var(--tool
     padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0));
   }
   html[data-skin="verdant-flat"] .input-bottom-toolbar .toolbar-btn {
-    height: 29px; /* 28px 基准 +1px */
+    height: 29px; /* wave-10：基线 28px +1px */
     border-radius: 10px; /* wave-10：圆角矩形，非纯圆弧 */
   }
 }
@@ -1550,19 +1550,10 @@ html[data-skin="verdant-flat"][data-theme="dark"] .voice-state-error .voice-acti
   border-color: #a8442e;
   color: #ffffff;
 }
-/* A4.9-I5：停止钮（stop-mode）深色 white-on-#E07B54 2.95:1 → #b0503a 5.18:1。
-   ⚠ 级联陷阱：组件 scoped `.send-btn.stop-mode[data-v]:hover:not(:disabled)`=(0,5,0)
-   压过皮肤 (0,4,1)（鼠标划过/刚点击即 hover）→ 重复类名提特异度覆写：
-   基态 (0,5,1) / :hover:not(:disabled) (0,7,1) 均胜组件同族。 */
-html[data-skin="verdant-flat"][data-theme="dark"] .send-btn.send-btn.stop-mode,
-html[data-skin="verdant-flat"][data-theme="dark"] .send-btn.send-btn.stop-mode:hover,
-html[data-skin="verdant-flat"][data-theme="dark"] .send-btn.send-btn.stop-mode:hover:not(:disabled),
-html[data-skin="verdant-flat"][data-theme="dark"] .send-btn.send-btn.stop-mode:active:not(:disabled) {
-  background: #b0503a;
-}
-/* 发送钮 hover：base `.send-btn:hover:not(:disabled)[data-v]`=(0,4,0) 压 (0,2,1) → #7AA35A 白字 2.91:1 违规
-   （:not(.stop-mode)：流式中停止钮保持红色语义色，base 浅色 #BE5033 白字 4.79:1 合格） */
-html[data-skin="verdant-flat"] .send-btn.send-btn:not(.stop-mode):hover:not(:disabled) { background-color: #4e6b38; }
+/* 发送钮 hover：base `.send-btn:hover:not(:disabled)[data-v]`=(0,4,0) 压 (0,2,1) → #7AA35A 白字 2.91:1 违规 → #4e6b38 4.75:1。
+   （原停止态排除条件随第四波 ③ 停止态类移除而恒真，去除条件语义不变）
+   （原 A4.9-I5 停止钮深色对比度规则随该类移除一并删除） */
+html[data-skin="verdant-flat"] .send-btn.send-btn:hover:not(:disabled) { background-color: #4e6b38; }
 /* 导航 tab hover 保持比对通过：#55684a 的 hover 加深（否则 :not(.active) (0,4,1) 吞掉 hover 反馈） */
 html[data-skin="verdant-flat"]:not([data-theme="dark"]) .nav-tab:not(.active):hover { color: #4e6b38; }
 
@@ -1734,3 +1725,21 @@ html[data-skin="verdant-flat"] .mermaid-block.mermaid-block {
   background: var(--surface-panel-subtle);
   border: 1.5px dashed var(--panel-border-strong);
 }
+
+/* ══════════ wave-17：sidebar 二级菜单/分组编辑卡/swipe 色板补全（容器走 --menu-系列与 --dialog-系列 令牌自动适配；此处仅补 item 层与缺口色板） ══════════ */
+/* swipe 色板缺口（light .delete 曾漏、default.active 两态补齐） */
+html[data-skin="verdant-flat"] .swipe-action.delete { background: #b0503a; }
+html[data-skin="verdant-flat"] .swipe-action.default.active { background: #47613a; }
+html[data-skin="verdant-flat"][data-theme="dark"] .swipe-action.default.active { background: #3f5a30; }
+/* 菜单项 dark hover 对（wave-12 红线 7：浅底浅字防护；基线 --primary-tint 随皮自动，补 dark 对比值） */
+html[data-skin="verdant-flat"][data-theme="dark"] .menu-item:hover,
+html[data-skin="verdant-flat"][data-theme="dark"] .tools-item:hover { background: #262b26; }
+/* 分组编辑卡：容器走 --dialog-* 令牌；标题/按钮家族语言 */
+html[data-skin="verdant-flat"] .modal-title { color: var(--color-text); }
+/* np 行左划动作条（与 agent swipe 同色板） */
+html[data-skin="verdant-flat"] .np-swipe-action.rename { background: #5d7c44; }
+html[data-skin="verdant-flat"] .np-swipe-action.move { background: #b45309; }
+html[data-skin="verdant-flat"] .np-swipe-action.delete { background: #b0503a; }
+html[data-skin="verdant-flat"][data-theme="dark"] .np-swipe-action.rename { background: #4d6b37; }
+html[data-skin="verdant-flat"][data-theme="dark"] .np-swipe-action.move { background: #b45309; }
+html[data-skin="verdant-flat"][data-theme="dark"] .np-swipe-action.delete { background: #b0503a; }

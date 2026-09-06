@@ -434,6 +434,34 @@ class ConversationBuffer:
                 self.done_data = dict(event)
                 delta = {"seq": self._next_seq, "type": "done", "data": event}
 
+            elif "audit_reset" in event:
+                # Silent-QC sync (conv 827a6f78 turn-B, 2026-09-03): the agent
+                # loop rejected the streamed draft and reset ITS accumulators
+                # (chat.py clears assistant_content) — the buffer must reset
+                # too, or a resume replay resurrects every rejected draft and
+                # the done-time client state replays the whole mess. Mirror of
+                # the producer's reset: content cleared; reasoning preserved
+                # (A4 parity — the producer keeps reasoning too); tool cards
+                # and pre-tool text kept; only the draft TEXT items after the
+                # last tool card go.
+                self.content = ""
+                self._rendered_content_len = 0
+                last_tool = -1
+                for i, it in enumerate(self.display_sequence):
+                    if isinstance(it, dict) and it.get("type") == "tool_call":
+                        last_tool = i
+                kept = [
+                    it for i, it in enumerate(self.display_sequence)
+                    if i <= last_tool or (isinstance(it, dict) and it.get("type") != "text")
+                ] if last_tool >= 0 else [
+                    it for it in self.display_sequence
+                    if not (isinstance(it, dict) and it.get("type") == "text")
+                ]
+                if len(kept) != len(self.display_sequence):
+                    self.display_sequence = kept
+                    self._rebuild_part_index()
+                delta = {"seq": self._next_seq, "type": "audit_reset", "data": {"content_reset": True}}
+
             elif "error" in event:
                 self.error = event.get("error", str(event))
                 self.is_running = False

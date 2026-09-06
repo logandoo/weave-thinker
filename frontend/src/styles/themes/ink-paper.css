@@ -4,7 +4,7 @@
 
 /* ==========================================================================
  * 皮肤：墨韵纸间 (ink-paper)
- * 设计源：内置皮肤实拍（墨韵纸间）
+ * 设计源：design/mockups/02-ink-paper/（chat.html / zen.html）
  * 契约：docs/SKINS.md · 目录：GET /api/skins
  *
  * 布局范式（mockup .app/.sidebar）：贴边列式 —— 侧栏/顶栏/输入区均为 FLUSH
@@ -636,12 +636,6 @@ html[data-skin="ink-paper"] .send-btn:disabled {
   background: var(--surface-panel-subtle);
   color: var(--color-text-light);
   border: 1px solid var(--skin-line-soft);
-  box-shadow: none;
-}
-html[data-skin="ink-paper"] .send-btn.stop-mode {
-  background: #fdf8ec;
-  color: var(--color-primary);
-  border: 1.5px solid var(--color-primary);
   box-shadow: none;
 }
 html[data-skin="ink-paper"] .voice-mode-toggle-btn {
@@ -1872,3 +1866,69 @@ html[data-skin="ink-paper"] .mermaid-edit-textarea {
 }
 html[data-skin="ink-paper"] .math-dialog-save,
 html[data-skin="ink-paper"] .mermaid-dialog-save { border-radius: 3px; }
+
+/* ══════════ wave-17：sidebar 二级菜单/分组编辑卡/移动端笔记页/swipe 完整色板（容器走 --menu-系列与 --dialog-系列 令牌；此处补 item 层 + 卡面 + swipe 语言） ══════════ */
+/* 菜单家族 item 层：纸色 hover + 朱砂淡底 active（对齐 .user-menu-item 语言） */
+html[data-skin="ink-paper"] .menu-item,
+html[data-skin="ink-paper"] .tools-item { border-radius: 3px; }
+html[data-skin="ink-paper"] .menu-item:hover,
+html[data-skin="ink-paper"] .tools-item:hover { background: rgba(251, 247, 236, 0.9); }
+html[data-skin="ink-paper"] .menu-item.delete:hover { background: rgba(178, 59, 46, 0.08); }
+html[data-skin="ink-paper"] .move-group-menu .menu-item.active { background: rgba(178, 59, 46, 0.08); color: var(--color-primary); }
+html[data-skin="ink-paper"] .tools-item.active { background: rgba(178, 59, 46, 0.08); }
+html[data-skin="ink-paper"][data-theme="dark"] .move-group-menu .menu-item.active { background: rgba(178, 59, 46, 0.16); color: var(--color-primary); }
+html[data-skin="ink-paper"][data-theme="dark"] .tools-item.active { background: rgba(178, 59, 46, 0.16); }
+html[data-skin="ink-paper"] .tools-section-title { font-family: var(--skin-serif); letter-spacing: 0.12em; }
+html[data-skin="ink-paper"][data-theme="dark"] .menu-item:hover,
+html[data-skin="ink-paper"][data-theme="dark"] .tools-item:hover { background: #30281c; }
+html[data-skin="ink-paper"][data-theme="dark"] .menu-item.delete:hover { background: rgba(178, 59, 46, 0.16); }
+/* 分组编辑卡（.modal-content 家族）：宋体标题 + 直角按钮微调（容器 radius/border/shadow 走 --dialog-* 自动） */
+html[data-skin="ink-paper"] .modal-title { font-family: var(--skin-serif); letter-spacing: 0.06em; }
+html[data-skin="ink-paper"] .modal-btn { border-radius: 3px; }
+/* swipe 条：1px 发丝分隔 + 完整 light 色板（dark 沿 wave-11） */
+html[data-skin="ink-paper"] .swipe-action + .swipe-action { border-left: 1px solid rgba(42, 37, 33, 0.18); }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action + .swipe-action { border-left: 1px solid rgba(255, 255, 255, 0.14); }
+html[data-skin="ink-paper"] .swipe-action.export { background: #37705f; }
+html[data-skin="ink-paper"] .swipe-action.edit { background: #6b7280; }
+html[data-skin="ink-paper"] .swipe-action.save-note { background: #55743d; }
+html[data-skin="ink-paper"] .swipe-action.delete { background: #b0503a; }
+html[data-skin="ink-paper"] .swipe-action.rename { background: #b23b2e; }
+html[data-skin="ink-paper"] .swipe-action.default { background: #55743d; }
+html[data-skin="ink-paper"] .swipe-action.default.active { background: #47613a; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.move-group { background: #6d28d9; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.move { background: #b45309; }
+html[data-skin="ink-paper"][data-theme="dark"] .swipe-action.default.active { background: #3f5a30; }
+/* np 行左划动作条（笔记侧栏，与 agent swipe 同族） */
+html[data-skin="ink-paper"] .np-swipe-action + .np-swipe-action { border-left: 1px solid rgba(42, 37, 33, 0.18); }
+html[data-skin="ink-paper"][data-theme="dark"] .np-swipe-action + .np-swipe-action { border-left: 1px solid rgba(255, 255, 255, 0.14); }
+html[data-skin="ink-paper"] .np-swipe-actions { border-radius: 0; }
+html[data-skin="ink-paper"] .np-swipe-action.rename { background: #b23b2e; }
+html[data-skin="ink-paper"] .np-swipe-action.move { background: #b45309; }
+html[data-skin="ink-paper"] .np-swipe-action.delete { background: #b0503a; }
+html[data-skin="ink-paper"][data-theme="dark"] .np-swipe-action.rename { background: #b23b2e; }
+html[data-skin="ink-paper"][data-theme="dark"] .np-swipe-action.move { background: #b45309; }
+html[data-skin="ink-paper"][data-theme="dark"] .np-swipe-action.delete { background: #a3402e; }
+/* 移动端笔记页：头部按钮/卡片/附属面（桌面 stack 卡语言 wave-11 已立，此段限移动媒体块内不改桌面） */
+@media (max-width: 767px) {
+  html[data-skin="ink-paper"] .header-action-btn,
+  html[data-skin="ink-paper"] .import-btn,
+  html[data-skin="ink-paper"] .back-btn,
+  html[data-skin="ink-paper"] .add-btn,
+  html[data-skin="ink-paper"] .page-btn,
+  html[data-skin="ink-paper"] .selection-cancel-btn,
+  html[data-skin="ink-paper"] .search-input-wrapper,
+  html[data-skin="ink-paper"] .modal-input { border-radius: 4px; }
+  html[data-skin="ink-paper"] .note-row,
+  html[data-skin="ink-paper"] .notebook-row { border-radius: 0; }
+  html[data-skin="ink-paper"] .notebook-item,
+  html[data-skin="ink-paper"] .note-item { border-radius: 0; }
+  html[data-skin="ink-paper"] .notebook-item:hover,
+  html[data-skin="ink-paper"] .note-item:hover { box-shadow: 0 1px 6px rgba(60, 50, 30, 0.10); }
+  html[data-skin="ink-paper"] .modal-content { border-radius: var(--dialog-radius); }
+  html[data-skin="ink-paper"] .modal-title { font-family: var(--skin-serif); }
+  html[data-skin="ink-paper"] .confirm-btn,
+  html[data-skin="ink-paper"] .cancel-btn,
+  html[data-skin="ink-paper"] .move-confirm-btn,
+  html[data-skin="ink-paper"] .delete-confirm-btn,
+  html[data-skin="ink-paper"] .export-confirm-btn { border-radius: 3px; }
+}

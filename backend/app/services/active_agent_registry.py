@@ -50,6 +50,12 @@ class ActiveAgentState:
     provisional: bool = False
     reserved_at: float = 0.0
 
+    # 插话队列（2026-08-29）：interject 端点把运行中 run 的用户插话投入此
+    # 队列；chat.py 在 agent_loop.run() 时把它传给 loop，loop 在迭代边界
+    # drain。生命周期随本 state（unregister 即弃），跨 worker 不恢复
+    # （与 stop 端点的内存语义一致）。
+    interjection_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+
     _subscribers: List[asyncio.Queue] = field(default_factory=list)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _created_at: float = field(default_factory=time.time)

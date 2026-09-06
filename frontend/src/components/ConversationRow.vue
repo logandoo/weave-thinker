@@ -89,6 +89,12 @@
         </div>
       </template>
       <template v-else>
+        <span
+          v-if="chatStore.activeStreamingConversationIds.has(conv.id)"
+          class="streaming-dot"
+          title="回答生成中"
+          aria-label="回答生成中"
+        ></span>
         <span class="conversation-title">{{ conv.title || '新对话' }}</span>
         <button
           v-if="!selectionModeActive"
@@ -110,6 +116,9 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick, watch } from 'vue'
 import type { Conversation } from '@/types'
+import { useChatStore } from '@/stores/chat'
+
+const chatStore = useChatStore()
 
 const props = defineProps<{
   conv: Conversation
@@ -222,23 +231,23 @@ watch(() => props.editingTitleId, (newId) => {
 }
 
 .swipe-action.export {
-  background-color: var(--color-info);
+  background-color: var(--swipe-export-bg);
 }
 
 .swipe-action.edit {
-  background-color: var(--color-text-light);
+  background-color: var(--action-edit-bg);
 }
 
 .swipe-action.delete {
-  background-color: var(--color-error);
+  background-color: var(--swipe-delete-bg);
 }
 
 .swipe-action.save-note {
-  background-color: var(--color-success);
+  background-color: var(--swipe-save-note-bg);
 }
 
 .swipe-action.move-group {
-  background-color: #8b5cf6;
+  background-color: var(--swipe-move-group-bg);
 }
 
 .conversation-item {
@@ -271,6 +280,27 @@ watch(() => props.editingTitleId, (newId) => {
   white-space: nowrap;
   font-size: 13px;
   cursor: text;
+}
+
+/* 流式指示：正在生成的会话行标题左侧脉冲点（并行/插话特性，2026-08-29）。 */
+.streaming-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  animation: wt-stream-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes wt-stream-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .streaming-dot {
+    animation: none;
+  }
 }
 
 .title-input {
@@ -360,13 +390,14 @@ watch(() => props.editingTitleId, (newId) => {
 
   .swipe-action {
     width: 50px;
-    font-size: 10px;
-    gap: 4px;
+    font-size: 9px;
+    gap: 2px;
+    padding: 2px 0;
   }
 
   .swipe-action svg {
-    width: 16px;
-    height: 16px;
+    width: 13px;
+    height: 13px;
   }
 }
 </style>

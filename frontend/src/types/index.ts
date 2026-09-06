@@ -9,6 +9,8 @@ export interface Message {
   reasoning_content?: string | null
   tool_calls?: string | null
   tool_results?: string | null
+  /** 本轮 token 用量快照（JSON 字符串，2026-09-05 P2 起持久化；跨设备播种徽章）。 */
+  context_info?: string | null
   created_at: string
 }
 
@@ -74,6 +76,9 @@ export interface ContextInfo {
   context_length: number
   /** True when this snapshot follows a context compression. */
   compressed?: boolean
+  /** True when tokens come from the provider's measured usage
+   *  (stream_options.include_usage) instead of the rough estimator. */
+  measured?: boolean
 }
 
 export interface DisplaySequenceItem {
@@ -250,12 +255,6 @@ export interface ChatRequest {
   regenerate_from_message_id?: string | null
   edit_message_id?: string | null
   force_search_results?: string | null
-  temperature?: number | null
-  top_p?: number | null
-  top_k?: number | null
-  presence_penalty?: number | null
-  frequency_penalty?: number | null
-  max_tokens?: number | null
   enable_reasoning?: boolean
   reasoning_effort?: string | null
   thinking_budget?: number | null
@@ -306,34 +305,10 @@ export interface Assistant {
   user_id: string
   name: string
   system_prompt: string
-  temperature?: number | null
-  top_p?: number | null
-  top_k?: number | null
-  presence_penalty?: number | null
-  frequency_penalty?: number | null
-  max_tokens?: number | null
-  use_custom_model?: boolean
-  custom_api_url?: string | null
-  custom_api_key?: string | null
-  custom_model_name?: string | null
-  provider_type?: string
-  extra_body?: string | null
-  use_subtask_model?: boolean
-  subtask_custom_api_url?: string | null
-  subtask_custom_api_key?: string | null
-  subtask_custom_model_name?: string | null
-  subtask_provider_type?: string | null
-  subtask_extra_body?: string | null
-  thinking_budget?: number | null
-  min_p?: number | null
-  repetition_penalty?: number | null
-  thinking_temperature?: number | null
-  thinking_top_p?: number | null
-  thinking_top_k?: number | null
-  thinking_min_p?: number | null
-  thinking_presence_penalty?: number | null
-  thinking_repetition_penalty?: number | null
-  preserve_thinking?: boolean
+  // 模型配置解耦（2026-08-30）：助手只见逻辑别名；供应商 url/key/模型名/采样参数
+  // 统一由后端 config_model.toml 管理，不再经接口暴露。
+  model_alias: string
+  subtask_model_alias: string
   created_at: string
   updated_at: string
 }
@@ -341,34 +316,25 @@ export interface Assistant {
 export interface AssistantFormData {
   name: string
   system_prompt: string
-  temperature?: number | null
-  top_p?: number | null
-  top_k?: number | null
-  presence_penalty?: number | null
-  frequency_penalty?: number | null
-  max_tokens?: number | null
-  use_custom_model?: boolean
-  custom_api_url?: string | null
-  custom_api_key?: string | null
-  custom_model_name?: string | null
-  provider_type?: string
-  extra_body?: string | null
-  use_subtask_model?: boolean
-  subtask_custom_api_url?: string | null
-  subtask_custom_api_key?: string | null
-  subtask_custom_model_name?: string | null
-  subtask_provider_type?: string | null
-  subtask_extra_body?: string | null
-  thinking_budget?: number | null
-  min_p?: number | null
-  repetition_penalty?: number | null
-  thinking_temperature?: number | null
-  thinking_top_p?: number | null
-  thinking_top_k?: number | null
-  thinking_min_p?: number | null
-  thinking_presence_penalty?: number | null
-  thinking_repetition_penalty?: number | null
-  preserve_thinking?: boolean
+  model_alias: string
+  subtask_model_alias: string
+}
+
+// GET /api/models 的别名条目（只含别名与能力，绝无 url/key/真实模型名）
+export interface ModelAlias {
+  alias: string
+  kind: 'llm' | 'embedding' | 'rerank' | 'asr' | 'tts'
+  display_name: string
+  capabilities: {
+    supports_reasoning?: boolean
+    reasoning_efforts?: string[]
+    [key: string]: unknown
+  }
+}
+
+export interface ModelsResponse {
+  aliases: ModelAlias[]
+  default_alias: string
 }
 
 export interface User {

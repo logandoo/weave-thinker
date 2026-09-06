@@ -217,7 +217,7 @@ async def generate_user_agent_memory(db: AsyncSession, user_id: str, *, force: b
             select(AgentDream).where(
                 AgentDream.agent_state_id == state.id,
                 AgentDream.generated_for_date == today_key,
-                # 只改写 v1 nightly 行——防 runtime 中途
+                # A4.9 复审 Minor：只更新 v1 nightly 行——防 runtime 中途
                 # active→disabled（SIGHUP 重探测失败）把当日 consolidation 行
                 # 改写为 nightly + v1 metadata
                 AgentDream.dream_type == "nightly",

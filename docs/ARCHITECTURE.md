@@ -24,7 +24,7 @@ Weave Thinker 是一个**具备长期记忆、工具调用、多模态语音交�
 
 - **Agent 对话**：协调器语义路由 → ReAct 工具循环（≤50 轮）→ LLM 发送前审计 → 流式 SSE 渲染
 - **33 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务等
-- **三层记忆**：v1 DB 摘要记忆、文件记忆工具（AGENT.md/USER.md/func.md）、v2 概念/潜意识/情节子系统
+- **三层记忆**：v1 DB 摘要记忆、文件记忆工具（AGENT.md/USER.md/changelog.md）、v2 概念/潜意识/情节子系统
 - **死磕模式**：盘问 → 目标循环（PEVR + judge/verifier 双 LLM 门 + 三级停滞升级）的自主长线任务模式
 - **双工语音**：一条 WebSocket 实现全双工对话（流式 ASR + 语义 EoT + barge-in 打断 + 流式 TTS）
 - **引用信息**：`[N]` 编号引用台账，防编造、防跨轮错配
@@ -52,14 +52,14 @@ flowchart TD
         LOOP["agent_loop.py（核心）<br/>协调器 _coordinate() 语义路由 → ReAct 工具循环 ≤50 迭代<br/>发送前审计（四态 + salvage + best-of）· 引用台账 · canary · 压缩"]
         DM["deathmatch_service.py<br/>盘问 → PEVR 目标循环（judge/verifier 双 LLM 门）"]
         VS["voice_service.py<br/>ASR FunASR · TTS MiMo · 语义判端 · 应声接话"]
-        MEM["三层记忆<br/>v1 memory_service（摘要/dream）· 文件记忆 tools/memory.py（func.md 系统档）<br/>v2 memory_* ~21 模块（概念/潜意识/情节）"]
+        MEM["三层记忆<br/>v1 memory_service（摘要/dream）· 文件记忆 tools/memory.py（changelog.md 系统档）<br/>v2 memory_* ~21 模块（概念/潜意识/情节）"]
         BK["后台循环（轮询 DB，独立于 HTTP）<br/>agent_worker（agent_tasks）· agent_scheduler（scheduled_tasks）<br/>memory_scheduler · export_worker"]
     end
     subgraph P["工具与持久化"]
         TL["app/tools/ 33 工具函数 + MCP 动态扩展<br/>9 项系统技能（backend/skills/）· 浏览器套件驱动 Python 侧 playwright Chromium"]
         LLM["provider_router.py — LLM 供应商（config_model.toml [providers]）<br/>主模型/judge/verifier/子代理同一路由"]
         DB[("PostgreSQL（~30 表）<br/>database.py + STARTUP_MIGRATIONS 幂等迁移（无 Alembic）")]
-        FS["agent_memories/（文件记忆 · func.md）<br/>user_workspaces/（沙箱 · 媒体本地化）· output_files/"]
+        FS["agent_memories/（文件记忆 · changelog.md）<br/>user_workspaces/（沙箱 · 媒体本地化）· output_files/"]
     end
     AND --> WEB
     WEB -- "REST + SSE" --> GW
@@ -98,7 +98,7 @@ weave-thinker/
 │  ├─ scripts/                         # 数据库维修/审计小工具（python -m scripts.<name>，默认 dry-run）
 │  ├─ config.toml.example              # 随仓模板（真实 config.toml 由部署者自建，gitignored）
 │  ├─ config_model.toml.example        # 模型配置模板（同上）
-│  └─ agent_memories/func.md           # 随仓系统功能文档（memory 工具 system target 只读；fork 改写）
+│  └─ agent_memories/changelog.md         # 随仓系统文档（能力自述 + 版本记录）（memory 工具 system target 只读；fork 改写）
 │      # 运行时自动创建（gitignored，勿手工提交）：audio_files/ · output_files/ · static/（前端构建产物）
 ├─ frontend/
 │  ├─ index.html                       # SPA 入口（引用自托管字体，零第三方 CDN）
@@ -178,7 +178,7 @@ weave-thinker/
 | browser / browser_navigate…execute_js / browser_screenshot | 一次性抓取 / 交互式会话全套操作 |
 | execute_code | 代码沙箱执行（Python/Node），子代理修复循环，生成文件自动收集为下载卡片 |
 | terminal | workspace 内终端命令（路径逃逸校验、超时、输出上限） |
-| memory | 文件记忆读写（AGENT.md/USER.md/func.md，read/add/replace/remove） |
+| memory | 文件记忆读写（AGENT.md/USER.md/changelog.md，read/add/replace/remove） |
 | notes | 笔记读写（list/get/create/update/delete） |
 | workspace_read / workspace_glob / grep / diff / word_count | workspace 文件操作族 |
 | provide_file | 把 workspace 文件显式挂成下载卡片 |
@@ -286,7 +286,7 @@ sequenceDiagram
 ### 5.2 记忆系统（三层并存，勿混淆）
 
 1. **v1 DB 摘要记忆**（`memory_service.py`）：每用户每（服务器本地）日 `memory_summary` + `dream_summary`（`agent_memories` / `agent_dreams` 表），注入系统提示词（共享长期记忆 / 近期 dream / 可参考的记忆条目，`memory_max_items=12`）；调度器每 15 分钟 tick（**v2 runtime 启用时调度器跳过此每日生成**，改由 v2 提取管线 `memory_scheduler.py` 承担，见下）
-2. **文件记忆工具**（`tools/memory.py`）：`agent_memories/{user_id}/{AGENT,USER}.md`（`\n§\n` 分隔），target=system 映射到**只读的 `func.md`**（系统功能自述，注入扫描 + 不可见 Unicode 防护 + 异步锁）；读操作无磁盘副作用。**func.md 第 6 章为版本记录**：以「与上一版的差异增量」形式保存、用产品视角描述（不含 commit 号/内部工程细节），更早历史不保留——每出一个新版本即以新增量整体替换该章
+2. **文件记忆工具**（`tools/memory.py`）：`agent_memories/{user_id}/{AGENT,USER}.md`（`\n§\n` 分隔），target=system 映射到**只读的 `changelog.md`**（系统文档：能力自述 + 版本记录，2026-09-06 由 func.md 更名，注入扫描 + 不可见 Unicode 防护 + 异步锁）；读操作无磁盘副作用。**changelog.md 第 6 章为版本记录**：以产品视角描述各版本增量（不含 commit 号/内部工程细节），采用累积式记录（每次更新新增一节，2026-09-06 起不再整体替换）
 3. **v2 子系统**（~21 个 `memory_*` 模块，`config_model.toml [memory.*]`）：概念提取/衰减（weight+importance+stability+source_trust）、潜意识日志（复发检测 sim≥0.6 ×3 晋升）、情节记忆（merge_first_threshold 0.85）、多阶段检索（stage0-4：BM25+embedding → 关系扩展 → CE rerank → LLM 打分 → RRF 融合注入，预算 2000 token）、合并（20 概念/48h）、梦境、聚类、澄清（置信度≥0.8 自动应用）、多模态冷启动（Set-of-Mark OCR）、成本治理（计费 + 降级阶梯）、v1→v2 迁移管理
 
 ### 5.3 后台任务 / 定时任务

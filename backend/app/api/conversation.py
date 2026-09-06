@@ -887,6 +887,7 @@ async def get_conversation(
                 reasoning_content=m.reasoning_content,
                 tool_calls=m.tool_calls,
                 tool_results=m.tool_results,
+                context_info=m.context_info,
                 created_at=_utc_iso(m.created_at)
             )
             for m in messages
@@ -1059,6 +1060,7 @@ async def get_messages(
             reasoning_content=m.reasoning_content,
             tool_calls=m.tool_calls,
             tool_results=m.tool_results,
+            context_info=m.context_info,
             created_at=_utc_iso(m.created_at)
         )
         for m in messages

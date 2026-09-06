@@ -116,7 +116,7 @@ Three layers coexist — do not conflate them:
 2. **File-backed `memory` tool**: episodic notes as Markdown at
    `{backend_root}/agent_memories/{user_id}/{AGENT,USER}.md` (`app/tools/memory.py`).
    Entries delimited by `\n§\n`; content scanned for prompt injection before write.
-   The system target reads `backend/agent_memories/func.md` (read-only product /
+   The system target reads `backend/agent_memories/changelog.md` (read-only product /
    capability doc the agent quotes for self-introduction & feature questions) —
    shipped in this repo; fork/port it to your own product copy.
 3. **v2 memory subsystem**: `app/services/memory_*_service.py` (~20 modules:

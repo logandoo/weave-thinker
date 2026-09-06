@@ -7,7 +7,7 @@
  * （tests/api/test_skin_api.py 与 frontend/e2e/skin_system.spec.ts 双向断言）。
  *
  * 皮肤令牌契约与社区接入指南：docs/SKINS.md
- * - verdant-flat：默认，令牌源头为 main.css :root / [data-theme="dark"]
+ * - verdant-flat：main.css :root / [data-theme="dark"] 基线（默认）
  * - ink-paper / mono-brutal：styles/themes/*.css 覆盖块
  */
 

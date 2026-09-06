@@ -86,7 +86,7 @@ def _get_memory_path(target: str, user_id: str, ensure_dir: bool = True) -> Path
     if target not in valid:
         raise ValueError(f"Invalid target '{target}'. Must be one of: {', '.join(sorted(valid))}")
     if target == "system":
-        return _get_memory_dir() / "func.md"
+        return _get_memory_dir() / "changelog.md"
     if ensure_dir:
         return _ensure_memory_dir(user_id) / f"{target.upper()}.md"
     return _get_memory_dir() / user_id / f"{target.upper()}.md"
@@ -151,7 +151,7 @@ async def memory(args: dict, **kwargs) -> str:
         if action != "read":
             return json.dumps({"error": "system target is read-only, only action='read' is allowed"}, ensure_ascii=False)
         if not await asyncio.to_thread(path.exists):
-            return json.dumps({"error": "system document (func.md) not found"}, ensure_ascii=False)
+            return json.dumps({"error": "system document (changelog.md) not found"}, ensure_ascii=False)
         text = await asyncio.to_thread(path.read_text, encoding="utf-8")
         return json.dumps({
             "action": "read",
@@ -290,8 +290,8 @@ registry.register(
             "Persistent cross-session memory. Three targets: "
             "agent (your notes/observations, incl. a user-given name/nickname), "
             "user (user profile/preferences), "
-            "system (read-only product features doc func.md — read first when asked "
-            "about system features or version updates).\n"
+            "system (read-only system doc changelog.md — read first when asked "
+            "about system features, capabilities or version updates).\n"
             "Actions: read (list entries / full system doc), add (new entry), "
             "replace (substring old→content), remove (substring key).\n"
             "Save durable facts (preferences, conventions, corrections). "

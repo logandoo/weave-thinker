@@ -1104,7 +1104,7 @@ function formatDate(dateStr: string): string {
 
 .add-btn {
   padding: 8px;
-  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-dark) 100%);
+  background: var(--color-primary);
   color: white;
   border-radius: var(--radius-sm);
 }
@@ -1201,7 +1201,7 @@ function formatDate(dateStr: string): string {
 .move-confirm-btn {
   flex: 1;
   padding: 8px 12px;
-  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-dark) 100%);
+  background: var(--color-primary);
   color: white;
   border-radius: var(--radius-sm);
   font-size: 13px;
@@ -1333,7 +1333,7 @@ function formatDate(dateStr: string): string {
 }
 
 .swipe-action.rename {
-  background-color: var(--color-primary);
+  background-color: var(--swipe-rename-bg);
 }
 
 .swipe-action.move {
@@ -1341,11 +1341,11 @@ function formatDate(dateStr: string): string {
 }
 
 .swipe-action.export {
-  background-color: var(--color-success);
+  background-color: var(--swipe-save-note-bg);
 }
 
 .swipe-action.delete {
-  background-color: var(--color-error);
+  background-color: var(--swipe-delete-bg);
 }
 
 .note-item {
@@ -1440,7 +1440,7 @@ function formatDate(dateStr: string): string {
 }
 
 .title-edit-btn.save {
-  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-dark) 100%);
+  background: var(--color-primary);
   color: white;
 }
 
@@ -1462,7 +1462,7 @@ function formatDate(dateStr: string): string {
 
 .create-btn {
   padding: 10px 24px;
-  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-dark) 100%);
+  background: var(--color-primary);
   color: white;
   border-radius: var(--radius-md);
   font-weight: 500;

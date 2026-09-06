@@ -50,13 +50,13 @@ for row in ws.iter_rows(min_row=1, max_row=10, min_col=1, max_col=5):
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 cell = ws["A1"]
-cell.font = Font(name="SimHei", bold=True, size=12, color="FFFFFF")
-cell.fill = PatternFill("solid", fgColor="4472C4")          # 表头蓝
+cell.font = Font(name="SimHei", bold=True, size=12, color="000000")   # 标题/表头默认黑字
 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 thin = Side(style="thin", color="000000")
 cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 cell.number_format = "¥#,##0.00"        # 货币；百分比用 "0.00%"；日期用 "YYYY-MM-DD"
 ```
+**标题一律默认黑色**：大标题行、表头文字默认 `color="000000"`。彩色填充（如 `PatternFill("solid", fgColor="4472C4")` 蓝底 + 白字）仅在用户明确要求配色或指定品牌样式时使用——默认交付黑字表头。
 
 ### 4. 行列操作
 ```python
@@ -121,6 +121,68 @@ with pd.ExcelWriter("report.xlsx", engine="openpyxl") as writer:
 ```
 超过几百行时优先 pandas / `ws.append` 逐行追加，避免逐单元格赋值。
 
+### 11. Markdown 表格映射（对话中的表格 → xlsx，必须完整还原）
+你在对话里输出的 markdown 管道表，转成工作表时必须逐格完整映射：
+表头加粗+黑色、对齐（`:---` 左 / `:---:` 中 / `---:` 右）、单元格内换行（`<br>`）、
+转义竖线（`\|`）、数字单元格转为数值类型（保持公式/数字可参与计算）。配方：
+
+```python
+import re
+from openpyxl.styles import Font, Alignment
+
+def md_table_to_rows(md_text):
+    rows, aligns = [], []
+    for ln in [l.strip() for l in md_text.strip().splitlines() if l.strip()]:
+        cells = [c.strip().replace('\\|', '|').replace('<br>', '\n')
+                 for c in re.split(r'(?<!\\)\|', ln.strip('|'))]
+        if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
+            aligns = ['center' if c.startswith(':') and c.endswith(':')
+                      else 'right' if c.endswith(':') else 'left' for c in cells]
+            continue
+        rows.append(cells)
+    return rows, aligns
+
+def write_md_table(ws, md_text, start_row=1):
+    rows, aligns = md_table_to_rows(md_text)
+    amap = {'left': 'left', 'center': 'center', 'right': 'right'}
+    for i, row in enumerate(rows):
+        for j, text in enumerate(row):
+            cell = ws.cell(row=start_row + i, column=1 + j)
+            value = text
+            if i > 0:                       # 表头不做数字转换
+                try:
+                    value = int(text)
+                except ValueError:
+                    try:
+                        value = float(text)
+                    except ValueError:
+                        pass                # 文本/公式串（=开头）原样写入
+            cell.value = value
+            cell.alignment = Alignment(
+                horizontal=amap[aligns[j]] if aligns and j < len(aligns) else 'left',
+                vertical='center', wrap_text=True)
+            if i == 0:
+                cell.font = Font(name="SimHei", bold=True, size=12, color="000000")
+    return start_row + len(rows)
+
+# 用法：next_row = write_md_table(ws, md_text)
+```
+
+**反向映射**（读取用户表格 → 在对话里展示 markdown 表）：
+```python
+def sheet_to_md(ws, max_rows=50):
+    lines = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i >= max_rows:
+            lines.append(f"…（共 {ws.max_row} 行，已截断）")
+            break
+        cells = [("" if v is None else str(v)).replace("\n", "<br>").replace("|", "\\|") for v in row]
+        lines.append("| " + " | ".join(cells) + " |")
+        if i == 0:
+            lines.append("|" + "---|" * len(cells))
+    return "\n".join(lines)
+```
+
 ## 生成后校验（必做）
 保存后重新打开文件做一次校验，再向用户交付：
 ```python
@@ -137,8 +199,9 @@ for row in ws.iter_rows():
 
 ## 规则
 1. 最终交付文件必须写入**工作区根目录**（绝对路径），返回路径供前端展示下载卡片；草稿/中间数据写 scratch 临时目录即可。
-2. 中文表格字体规范：标题用 SimHei（黑体）、正文用 SimSun（宋体）。xlsx 中字体名只是字符串，由用户端 Excel 解析，直接设置即可。
+2. 中文表格字体规范：标题用 SimHei（黑体）、正文用 SimSun（宋体）；**标题/表头一律默认黑字**（`color="000000"`），蓝底白字等配色仅在用户明确要求时使用。xlsx 中字体名只是字符串，由用户端 Excel 解析，直接设置即可。
 3. 修改用户上传的文件：先 `load_workbook("uploads/xxx.xlsx")` 读取，另存为工作区根目录新文件（如 `xxx_修改.xlsx`），不要覆盖 uploads 原文件。
 4. 不要用代码生成 PDF——PDF 导出使用 `pdf_export` 工具。
 5. 公式保持为公式（`=` 开头字符串），禁止把计算结果硬编码为常量。
 6. 生成含公式的文件后必须执行"生成后校验"步骤并如实报告结果。
+7. 对话中的 markdown 表格转 xlsx 必须使用「Markdown 表格映射」节（11）的配方逐格完整还原（对齐/转义/换行/表头加粗黑色/数字类型），禁止丢列、丢行或静默省略单元格。

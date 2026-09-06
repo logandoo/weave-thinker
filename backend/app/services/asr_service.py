@@ -24,6 +24,21 @@ from app.services.http_client import get_shared_async_client
 logger = logging.getLogger(__name__)
 
 
+def _compose_funasr_final_text(finalized_segments: list, pending_tail: str) -> str:
+    """Compose the final transcript for a Fun-ASR task.
+
+    ``finalized_segments`` holds sentences that reached ``sentence_end``;
+    ``pending_tail`` is the latest in-progress sentence (empty when the last
+    result was finalized). The pending tail is always appended so the final
+    text never truncates what the user saw as partial text — including the
+    verbatim-repetition case where the tail is an exact suffix of the join.
+    """
+    final_text = "".join(finalized_segments)
+    if pending_tail:
+        final_text += pending_tail
+    return final_text
+
+
 def _hotword_text(item) -> str:
     if item is None:
         return ""
@@ -101,31 +116,88 @@ class ASRService:
         return get_config().asr
 
     @property
+    def _endpoint(self):
+        """model_gateway 收口（2026-08-30）：ASR 端点统一来自 registry
+        （url/key/model + dashscope/mimo 协议细节入 extra）；超时等
+        行为调参键仍读 [asr] config。"""
+        from app.model_gateway.registry import get_model_registry
+        try:
+            return get_model_registry().get("asr")
+        except Exception:
+            return None
+
+    @property
     def base_url(self) -> str:
+        ep = self._endpoint
+        if ep is not None:
+            return ep.base_url
         return self._asr_config.get("base_url", "")
 
     @property
     def model(self) -> str:
-        return self._asr_config.get("model", "qwen3-asr")
+        ep = self._endpoint
+        if ep is not None and ep.model_name:
+            return ep.model_name
+        # 2026-09-01 用户纠正：早期方案遗留默认 qwen3-asr 已废弃——
+        # MiMo 默认 mimo-v2.5-asr，通用模式默认 paraformer-zh（按 provider 区分）。
+        default = "mimo-v2.5-asr" if self.provider == "mimo" else "paraformer-zh"
+        return self._asr_config.get("model", default)
+
+    @property
+    def provider(self) -> str:
+        """ASR 引擎选择（2026-08-31 端点池化，U1）：单一 provider 字段取代
+        is_dashscope/is_mimo 布尔对。解析链：endpoint.provider_type →
+        [asr].asr_provider（新键）→ legacy 布尔 → 缺省 dashscope。"""
+        ep = self._endpoint
+        if ep is not None:
+            pt = str(ep.provider_type or "").strip().lower()
+            if pt in ("dashscope", "mimo", "general"):
+                return pt
+            if pt == "" and (ep.base_url or ""):
+                # 显式端点带 base_url 而未声明 provider = 通用 HTTP 模式
+                return "general"
+        raw = str(self._asr_config.get("asr_provider", "") or "").strip().lower()
+        if raw in ("dashscope", "mimo", "general"):
+            return raw
+        if bool(self._asr_config.get("is_mimo", False)):
+            return "mimo"
+        if bool(self._asr_config.get("is_dashscope", False)):
+            return "dashscope"
+        if str(self._asr_config.get("base_url", "") or ""):
+            # legacy 通用模式（旧文件三模式之 3）：base_url 有值且未开流式布尔
+            return "general"
+        return "dashscope"
 
     @property
     def is_dashscope(self) -> bool:
-        return bool(self._asr_config.get("is_dashscope", False))
+        return self.provider == "dashscope"
 
     @property
     def dashscope_api_key(self) -> str:
+        ep = self._endpoint
+        if ep is not None:
+            # 单一密钥原则（2026-08-31）：顶层 api_key 即当前 provider 的密钥；
+            # 旧显式端点（密钥在 extra.dashscope_api_key）仍兜底。
+            return str(ep.api_key or "") or str(ep.extra.get("dashscope_api_key", "") or "")
         return self._asr_config.get("dashscope_api_key", "")
 
     @property
     def dashscope_model(self) -> str:
+        ep = self._endpoint
+        if ep is not None:
+            # 单一模型名原则：顶层 model_name 即当前 provider 的模型
+            return str(ep.model_name or "") or str(ep.extra.get("dashscope_model", "") or "") or "qwen3-asr-flash-realtime-2026-02-10"
         return self._asr_config.get("dashscope_model", "qwen3-asr-flash-realtime-2026-02-10")
 
     @property
     def is_mimo(self) -> bool:
-        return bool(self._asr_config.get("is_mimo", False))
+        return self.provider == "mimo"
 
     @property
     def api_key(self) -> str:
+        ep = self._endpoint
+        if ep is not None:
+            return ep.api_key
         return self._asr_config.get("api_key", "")
 
     @property
@@ -384,6 +456,137 @@ class ASRService:
     def _is_funasr_model(self) -> bool:
         model = self.dashscope_model.lower()
         return model.startswith("fun-asr") or model.startswith("paraformer")
+
+    async def transcribe_file(self, audio_data: bytes, filename: str = "audio.wav", language: str = "auto") -> dict:
+        """一次性整段转写（agent 工具 asr_transcribe 入口，2026-08-31）。
+
+        按 provider 分派：mimo → 既有非流式 POST；dashscope → Fun-ASR WS
+        一次性（语音通道只有流式代理实现，此处补齐单段转写）；general →
+        既有 POST {base_url}/transcribe。"""
+        if not self.enabled:
+            raise RuntimeError("ASR service is not configured")
+        if self.is_mimo:
+            return await self._transcribe_mimo(audio_data, filename, language)
+        if self.is_dashscope:
+            return await self._transcribe_dashscope_oneshot(audio_data, filename, language)
+        return await self.transcribe(audio_data, filename)
+
+    async def _transcribe_dashscope_oneshot(self, audio_data: bytes, filename: str = "audio.wav", language: str = "auto") -> dict:
+        """DashScope Fun-ASR WebSocket 一次性转写：run-task → 送整段 pcm16 →
+        finish-task → 收集 sentence_end 句子直到 task-finished。
+        （general 路径的 language 由 self-hosted 服务端自行处理，POST 契约不带该字段。）"""
+        import websockets
+
+        if not self.dashscope_api_key:
+            raise RuntimeError("Dashscope API key is not configured")
+
+        pcm = await asyncio.to_thread(
+            self._convert_audio_to_raw_pcm16, audio_data, filename
+        )
+        if not pcm:
+            raise RuntimeError("Audio conversion produced empty PCM")
+
+        task_id = uuid.uuid4().hex[:32]
+        headers = {"Authorization": f"bearer {self.dashscope_api_key}"}
+        upstream = await websockets.connect(
+            "wss://dashscope.aliyuncs.com/api-ws/v1/inference/",
+            proxy=None,
+            additional_headers=headers,
+            max_size=None,
+            open_timeout=int(self._asr_config.get("ws_open_timeout", 10)),
+            ping_interval=int(self._asr_config.get("ws_ping_interval", 20)),
+            ping_timeout=int(self._asr_config.get("ws_ping_timeout", 20)),
+            close_timeout=int(self._asr_config.get("ws_close_timeout", 5)),
+        )
+        try:
+            async with upstream:
+                parameters: dict = {"sample_rate": 16000, "format": "pcm"}
+                if language and language != "auto":
+                    parameters["language_hints"] = [language]
+                run_task = {
+                    "header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
+                    "payload": {
+                        "task_group": "audio", "task": "asr", "function": "recognition",
+                        "model": self.dashscope_model,
+                        "parameters": parameters, "input": {},
+                    },
+                }
+                await upstream.send(json.dumps(run_task))
+                # 等 task-started
+                while True:
+                    raw = await upstream.recv()
+                    msg = json.loads(raw) if isinstance(raw, str) else {}
+                    if msg.get("header", {}).get("event") == "task-started":
+                        break
+                    if msg.get("header", {}).get("event") == "task-failed":
+                        raise RuntimeError(str(msg.get("header", {}).get("error_message", "task failed")))
+                # 送整段 pcm（32KB 帧序贯发送）+ finish-task
+                chunk_size = 32000
+                for i in range(0, len(pcm), chunk_size):
+                    await upstream.send(pcm[i:i + chunk_size])
+                await upstream.send(json.dumps({
+                    "header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
+                    "payload": {"input": {}},
+                }))
+                finalized: list[str] = []
+                pending_tail = ""
+                while True:
+                    raw = await upstream.recv()
+                    if isinstance(raw, bytes):
+                        continue
+                    msg = json.loads(raw)
+                    event = msg.get("header", {}).get("event", "")
+                    if event == "result-generated":
+                        sentence = (msg.get("payload", {}).get("output", {}) or {}).get("sentence", {}) or {}
+                        text_val = str(sentence.get("text", "") or "")
+                        if text_val:
+                            if sentence.get("sentence_end", False):
+                                finalized.append(text_val)
+                                pending_tail = ""
+                            else:
+                                pending_tail = text_val
+                    elif event == "task-finished":
+                        final_text = _compose_funasr_final_text(finalized, pending_tail)
+                        # 注：一次性通道暂不注入用户热词（热词属 per-user 上下文，
+                        # 工具层未传；与流式通道的 vocabulary_id/inline 热词不同）。
+                        return {
+                            "text": final_text, "language": None if language == "auto" else language,
+                            "timestamps": [], "segments": [
+                                {"text": t} for t in finalized
+                            ], "hotwords_used": [], "speaker_mode": "disabled", "duration": None,
+                        }
+                    elif event == "task-failed":
+                        raise RuntimeError(str(msg.get("header", {}).get("error_message", "task failed")))
+        except Exception as exc:
+            logger.error("dashscope one-shot transcribe failed: %s", exc)
+            raise
+
+    def _convert_audio_to_raw_pcm16(self, audio_data: bytes, filename: str = "audio.wav") -> bytes:
+        """ffmpeg → 16kHz 单声道 s16le 裸 PCM（Fun-ASR WS 需要 headerless pcm）。"""
+        import subprocess
+        detected_name, _detected_type = self._detect_audio_type(audio_data)
+        audio_dir = self.get_audio_files_dir()
+        timestamp = int(time.time() * 1000)
+        unique_id = uuid.uuid4().hex[:8]
+        original_file = audio_dir / f"{timestamp}_{unique_id}_{detected_name}"
+        pcm_file = audio_dir / f"{timestamp}_{unique_id}_oneshot.pcm"
+        try:
+            original_file.write_bytes(audio_data)
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(original_file), "-ar", "16000", "-ac", "1",
+                 "-f", "s16le", str(pcm_file)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=int(self._asr_config.get("ffmpeg_timeout_seconds", 60)),
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"ffmpeg conversion failed: {proc.stderr.decode(errors='ignore')[:200]}")
+            return pcm_file.read_bytes()
+        finally:
+            for f in (original_file, pcm_file):
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     async def transcribe(self, audio_data: bytes, filename: str = "audio.wav", custom_hotwords: Optional[list[dict]] = None) -> dict:
         if not self.enabled:
@@ -1043,6 +1246,7 @@ class ASRService:
 
             async def relay_from_funasr():
                 nonlocal finalized_segments
+                pending_tail = ""
                 while True:
                     try:
                         raw = await upstream.recv()
@@ -1089,8 +1293,10 @@ class ASRService:
                             # the accumulated text recognized so far.
                             if sentence_end:
                                 finalized_segments.append(text_val)
+                                pending_tail = ""
                                 accumulated = "".join(finalized_segments)
                             else:
+                                pending_tail = text_val
                                 accumulated = "".join(finalized_segments) + text_val
 
                             if self.hotword_phonetic_correction:
@@ -1108,7 +1314,7 @@ class ASRService:
                                 })
 
                     elif event_type == "task-finished":
-                        final_text = "".join(finalized_segments)
+                        final_text = _compose_funasr_final_text(finalized_segments, pending_tail)
                         if self.hotword_phonetic_correction:
                             final_text = apply_hotword_phonetic_correction(final_text, default_hotwords)
                         logger.info(f"Fun-ASR task finished, final text: {final_text}")

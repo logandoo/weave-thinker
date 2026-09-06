@@ -318,7 +318,7 @@ async def _regenerate_embedding_if_stale(db: AsyncSession, concept_id: str) -> N
         vec = await embed_text(text_in)
         if vec:
             # savepoint 隔离：regen UPDATE 失败（如维度不匹配）只回滚 regen，
-            # 不毒化调用方（召回路径）事务中已完成的 resurrect 写入
+            # 不毒化调用方（召回路径）事务中已完成的 resurrect 更新
             async with db.begin_nested():
                 await db.execute(
                     text("UPDATE memory_concepts SET embedding = CAST(:emb AS vector), "

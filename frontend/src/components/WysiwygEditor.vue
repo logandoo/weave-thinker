@@ -1902,6 +1902,7 @@ watch(() => props.modelValue, async (newValue) => {
       renderedContent.value = renderMarkdownToHtml(newValue || '')
       await nextTick()
       if (editorRef.value) {
+        normalizeEmptyListItems(editorRef.value)
         await renderMermaidBlocks(editorRef.value)
         await renderEchartsBlocks(editorRef.value)
         await processImagesInEditor()
@@ -2270,6 +2271,115 @@ function findCurrentListItem(): HTMLLIElement | null {
   return null
 }
 
+// True when the collapsed caret sits at the first text position of the li's
+// own content: the fragment between the li's start and the caret is empty
+// (zero-length text, no nested list content).
+function isCaretAtLiFirstText(li: HTMLLIElement, sel: Selection): boolean {
+  const range = sel.getRangeAt(0)
+  if (!li.contains(range.startContainer)) return false
+  const pre = document.createRange()
+  pre.selectNodeContents(li)
+  try {
+    pre.setEnd(range.startContainer, range.startOffset)
+  } catch {
+    return false
+  }
+  const frag = pre.cloneContents()
+  if (frag.querySelector('ol, ul')) return false
+  return (frag.textContent || '').length === 0
+}
+
+// Shared post-mutation serialization for indent-style operations (margin,
+// unwrap): emit markdown without a model re-render, then re-push undo state.
+function emitIndentChange() {
+  nextTick(() => {
+    if (!editorRef.value) return
+    skipNextModelRender = true
+    const md = htmlToMarkdown(getCleanHtml())
+    lastEmittedMarkdown = md
+    hasEverEmittedMarkdown = true
+    emit('update:modelValue', md)
+    emit('change')
+    nextTick(() => {
+      skipNextModelRender = false
+      pushCurrentState()
+    })
+  })
+}
+
+// Remove the list membership of a top-level li: its inline content becomes a
+// paragraph at the item's position, nested lists (if any) become sibling
+// blocks, and any items after it continue in a same-kind list. Content is
+// fully preserved; the marker simply disappears.
+function unwrapListItem(li: HTMLLIElement) {
+  const list = li.parentElement
+  if (!list || !editorRef.value || (list.tagName !== 'OL' && list.tagName !== 'UL')) return
+  pushUndoState(true)
+
+  const inlineNodes: Node[] = []
+  const nestedLists: HTMLElement[] = []
+  Array.from(li.childNodes).forEach(n => {
+    const el = n.nodeType === Node.ELEMENT_NODE ? (n as HTMLElement) : null
+    if (el && (el.tagName === 'OL' || el.tagName === 'UL')) nestedLists.push(el)
+    else inlineNodes.push(n)
+  })
+
+  let p: HTMLElement
+  const only = inlineNodes.length === 1 && inlineNodes[0].nodeType === Node.ELEMENT_NODE
+    ? (inlineNodes[0] as HTMLElement)
+    : null
+  if (only && only.tagName === 'P') {
+    p = only
+  } else {
+    p = document.createElement('p')
+    inlineNodes.forEach(n => p.appendChild(n))
+  }
+  if (!p.firstChild) p.appendChild(document.createElement('br'))
+
+  const following: Element[] = []
+  let sib = li.nextElementSibling
+  while (sib) {
+    const nx = sib.nextElementSibling
+    following.push(sib)
+    sib = nx
+  }
+  let continuation: HTMLElement | null = null
+  if (following.length) {
+    continuation = document.createElement(list.tagName)
+    following.forEach(el => continuation!.appendChild(el))
+  }
+
+  const parent = list.parentNode
+  if (!parent) return
+  const anchor = list.nextSibling
+  li.remove()
+  const listEmpty = !list.querySelector('li')
+  if (listEmpty) {
+    parent.removeChild(list)
+  } else if (list.tagName === 'OL') {
+    updateOlNumbering(list as HTMLOListElement)
+  }
+
+  const ref: Node | null = listEmpty ? anchor : list.nextSibling
+  parent.insertBefore(p, ref)
+  nestedLists.forEach(nl => parent.insertBefore(nl, ref))
+  if (continuation) {
+    parent.insertBefore(continuation, ref)
+    if (continuation.tagName === 'OL') updateOlNumbering(continuation as HTMLOListElement)
+  }
+
+  const sel = window.getSelection()
+  if (sel) {
+    const range = document.createRange()
+    range.setStart(p, 0)
+    range.collapse(true)
+    sel.removeAllRanges()
+    sel.addRange(range)
+  }
+  emitIndentChange()
+}
+
+
 function indentListItem(li: HTMLLIElement) {
   const list = li.parentElement
   if (!list || !editorRef.value) return
@@ -2297,10 +2407,15 @@ function indentListItem(li: HTMLLIElement) {
 
   pushUndoState(true)
 
-  const sel = window.getSelection()
-  const saved = sel && sel.rangeCount > 0 ? saveSelection(editorRef.value) : null
+  // Anchor the caret to its text offset inside the li: the tree shifts when
+  // the item is moved, so path-based selection restore lands on the WRONG
+  // element afterwards.
+  const caretOffset = caretTextOffsetIn(li)
 
   const listTag = list.tagName.toLowerCase()
+  // Actually nesting: drop any stale margin-based indent so Tab/Shift+Tab
+  // stay reversible (margin is only used when nesting is impossible).
+  li.style.marginLeft = ''
   let subList = prevLi.querySelector(`:scope > ${listTag}`) as HTMLElement | null
   if (!subList) {
     subList = document.createElement(listTag)
@@ -2313,11 +2428,12 @@ function indentListItem(li: HTMLLIElement) {
     updateOlNumbering(subList as HTMLOListElement)
   }
 
-  if (saved) {
+  if (caretOffset !== null) {
     nextTick(() => {
-      if (editorRef.value) restoreSelection(editorRef.value, saved)
+      if (editorRef.value) setCaretAtTextOffset(li, caretOffset)
     })
   }
+
   nextTick(() => {
     if (editorRef.value) {
       skipNextModelRender = true
@@ -2332,6 +2448,132 @@ function indentListItem(li: HTMLLIElement) {
       pushCurrentState()
     })
   })
+}
+
+// Caret position measured as the number of characters preceding it inside
+// root (null when the caret is outside root).
+function caretTextOffsetIn(root: Node): number | null {
+  const sel = window.getSelection()
+  if (!sel || !sel.rangeCount || !root.contains(sel.getRangeAt(0).startContainer)) return null
+  const r = sel.getRangeAt(0)
+  const pre = document.createRange()
+  pre.selectNodeContents(root)
+  try {
+    pre.setEnd(r.startContainer, r.startOffset)
+  } catch {
+    return null
+  }
+  return pre.toString().length
+}
+
+// Place the collapsed caret at the given character offset within root's text.
+// Falls back to the root's element start when root carries no text nodes
+// (e.g. an empty <li>) so the caret never silently stays where the browser
+// remapped it after a DOM move.
+function setCaretAtTextOffset(root: Node, offset: number) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  let node: Node | null
+  let acc = 0
+  while ((node = walker.nextNode())) {
+    const len = (node.textContent || '').length
+    if (acc + len >= offset) {
+      const range = document.createRange()
+      range.setStart(node, offset - acc)
+      range.collapse(true)
+      const sel = window.getSelection()
+      if (sel) {
+        sel.removeAllRanges()
+        sel.addRange(range)
+      }
+      return
+    }
+    acc += len
+  }
+  const range = document.createRange()
+  range.selectNodeContents(root)
+  range.collapse(true)
+  const sel = window.getSelection()
+  if (sel) {
+    sel.removeAllRanges()
+    sel.addRange(range)
+  }
+}
+
+// marked emits `<li></li>` for empty items ("2. " with no text): a
+// zero-height box that is impossible to click or place a caret in, yet its
+// absolutely-positioned ::before marker still paints a ghost number. Give
+// every empty item a line box so it behaves like an empty paragraph line.
+function normalizeEmptyListItems(root: HTMLElement) {
+  root.querySelectorAll('li').forEach(li => {
+    if (li.querySelector('br')) return
+    const hasEmbed = li.querySelector('img,video,audio,iframe,math,hr,pre,ol,ul')
+    if (hasEmbed) return
+    if (!li.textContent?.trim()) {
+      li.appendChild(document.createElement('br'))
+    }
+  })
+}
+
+// Remove an empty list item entirely (Backspace on an empty line merges it
+// into the previous line = the item just disappears), caret to the end of
+// the previous li / block.
+function removeEmptyListItem(li: HTMLLIElement) {
+  const list = li.parentElement
+  if (!list || !editorRef.value || (list.tagName !== 'OL' && list.tagName !== 'UL')) return
+  pushUndoState(true)
+
+  let caretTarget: Element | null = li.previousElementSibling
+  while (caretTarget && caretTarget.tagName !== 'LI') {
+    caretTarget = caretTarget.previousElementSibling
+  }
+  if (!caretTarget) {
+    if (list.parentElement && list.parentElement.tagName === 'LI') {
+      // First sub-item: its previous line is the parent li's own content.
+      caretTarget = list.parentElement
+    } else {
+      let sib: Node | null = list.previousSibling
+      while (sib && sib.nodeType === Node.TEXT_NODE && !(sib.textContent || '').trim()) {
+        sib = sib.previousSibling
+      }
+      caretTarget = sib && sib.nodeType === Node.ELEMENT_NODE ? (sib as Element) : null
+    }
+  }
+
+  const parentLiEl = list.parentElement && list.parentElement.tagName === 'LI'
+    ? (list.parentElement as HTMLLIElement)
+    : null
+
+  li.remove()
+  if (!list.querySelector('li')) {
+    list.remove()
+  } else if (list.tagName === 'OL') {
+    updateOlNumbering(list as HTMLOListElement)
+  }
+
+  // A parent li whose only content was the removed item/list is now an empty
+  // ghost itself — drop it recursively (it performs its own caret + emit).
+  if (parentLiEl && !parentLiEl.textContent?.trim() && !parentLiEl.querySelector('img,video,audio,iframe,math,hr,pre,ol,ul')) {
+    removeEmptyListItem(parentLiEl)
+    return
+  }
+
+  const sel = window.getSelection()
+  if (sel) {
+    const range = document.createRange()
+    if (caretTarget) {
+      range.selectNodeContents(caretTarget)
+      range.collapse(false)
+    } else if (editorRef.value) {
+      // First block in the editor: place the caret at the editor start.
+      range.setStart(editorRef.value, 0)
+      range.collapse(true)
+    } else {
+      return
+    }
+    sel.removeAllRanges()
+    sel.addRange(range)
+  }
+  emitIndentChange()
 }
 
 function outdentListItem(li: HTMLLIElement) {
@@ -2361,13 +2603,29 @@ function outdentListItem(li: HTMLLIElement) {
     }
     return
   }
+  // Nested item still carrying a margin-based indent: Shift+Tab first walks
+  // the margin back (reversible pairing with Tab's margin branch); the tree
+  // restructure happens only once the margin is exhausted.
+  const nestedMargin = parseInt(li.style.marginLeft || '0', 10)
+  if (nestedMargin > 0) {
+    pushUndoState(true)
+    const nv = Math.max(0, nestedMargin - 40)
+    li.style.marginLeft = nv > 0 ? `${nv}px` : ''
+    emitIndentChange()
+    return
+  }
   const outerList = parentLi.parentElement
   if (!outerList) return
 
   pushUndoState(true)
 
+  const caretOffset = caretTextOffsetIn(li)
   const sel = window.getSelection()
   const saved = sel && sel.rangeCount > 0 ? saveSelection(editorRef.value) : null
+
+  // Moving up a level: drop any stale margin-based indent so the item lands
+  // flush at its new level (Tab/Shift+Tab stay reversible).
+  li.style.marginLeft = ''
 
   const refNode = parentLi.nextElementSibling
   if (refNode) {
@@ -2390,7 +2648,11 @@ function outdentListItem(li: HTMLLIElement) {
     updateOlNumbering(nestedList as HTMLOListElement)
   }
 
-  if (saved) {
+  if (caretOffset !== null) {
+    nextTick(() => {
+      if (editorRef.value) setCaretAtTextOffset(li, caretOffset)
+    })
+  } else if (saved) {
     nextTick(() => {
       if (editorRef.value) restoreSelection(editorRef.value, saved)
     })
@@ -2495,6 +2757,50 @@ function onKeydown(e: KeyboardEvent) {
           const allOls = editorRef.value.querySelectorAll('ol')
           allOls.forEach(ol => updateOlNumbering(ol as HTMLOListElement))
         }, 0)
+      }
+    }
+  }
+
+  // Backspace at the very start of a list item's first line: controlled
+  // unwrap/outdent instead of the native contenteditable behavior, which
+  // merges the item into the previous block (e.g. swallows it into a
+  // heading) or destroys text. Mirrors mainstream block editors: nested
+  // item → outdent one level; margin-indented item → reduce margin;
+  // top-level item → unwrap to a paragraph (list marker removed, content
+  // fully preserved).
+  if (e.key === 'Backspace' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+    const sel = window.getSelection()
+    if (sel && sel.rangeCount === 1 && sel.isCollapsed && !tableSelection.value.table) {
+      const li = findCurrentListItem()
+      if (li && isCaretAtLiFirstText(li, sel)) {
+        // Empty item: Backspace deletes the whole item (an empty line merges
+        // into the previous line — nothing to unwrap, no ghost left behind).
+        if (!li.textContent?.trim() && !li.querySelector('img,video,audio,iframe,math,hr,pre')) {
+          e.preventDefault()
+          removeEmptyListItem(li)
+          return
+        }
+        const list = li.parentElement
+        const parentLi = list && list.parentElement && list.parentElement.tagName === 'LI'
+          ? list.parentElement
+          : null
+        if (parentLi) {
+          e.preventDefault()
+          outdentListItem(li)
+          return
+        }
+        const currentMargin = parseInt(li.style.marginLeft || '0', 10)
+        if (currentMargin > 0) {
+          e.preventDefault()
+          pushUndoState(true)
+          const nv = Math.max(0, currentMargin - 40)
+          li.style.marginLeft = nv > 0 ? `${nv}px` : ''
+          emitIndentChange()
+          return
+        }
+        e.preventDefault()
+        unwrapListItem(li)
+        return
       }
     }
   }
@@ -3260,6 +3566,12 @@ defineExpose({
   line-height: 1.6;
 }
 
+/* Insurance for paths that bypass render normalization (e.g. paste): an
+   empty li must still be a clickable, caret-targetable line. */
+.wysiwyg-editor :deep(li:empty) {
+  min-height: 1.6em;
+}
+
 .wysiwyg-editor :deep(ul) {
   list-style-type: disc;
 }
@@ -3270,12 +3582,21 @@ defineExpose({
 }
 
 .wysiwyg-editor :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
+/* Marker hangs in the left gutter (right-aligned) instead of flowing inline:
+   an inline ::before before a block-level first child (<p> in loose list
+   items) otherwise forms its own line and pushes the number onto the line
+   ABOVE the text. Absolute positioning keeps number and first text line on
+   the same row, matching tight items and ul disc markers. */
 .wysiwyg-editor :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .wysiwyg-editor :deep(ul ul) {

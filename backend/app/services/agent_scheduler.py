@@ -425,11 +425,12 @@ class AgentScheduler:
                 messages.extend(setup_scalars["history_messages"])
                 messages.append({"role": "user", "content": setup_scalars["user_prompt"]})
 
+                from app.model_gateway.factory import wire_provider_type as _wire_pt
                 loop = AgentLoop(
                     llm=llm,
                     max_iterations=cfg.agent_tool_loop_max_iterations,
                     workspace_path=str(workspace.root_path),
-                    provider_type=setup_scalars["assistant_provider_type"],
+                    provider_type=_wire_pt(llm, setup_scalars["assistant_provider_type"]),
                     enable_reasoning=False,
                     enable_compression=cfg.agent_compression_enabled,
                     session_factory=AsyncSessionLocal,

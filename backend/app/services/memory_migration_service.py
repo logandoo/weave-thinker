@@ -73,7 +73,7 @@ def _new_progress() -> dict:
 
 
 async def _load_progress(db: AsyncSession, user_id: str) -> tuple[dict, dict]:
-    # FOR UPDATE：与 cost_governance _save_level 串行化 metadata_json 读-改-写（防互丢写入）
+    # FOR UPDATE：与 cost_governance _save_level 串行化 metadata_json 读-改-写（防互丢更新）
     result = await db.execute(
         text("SELECT metadata_json FROM user_agent_states WHERE user_id = :uid FOR UPDATE"),
         {"uid": user_id},
@@ -398,7 +398,7 @@ async def _migrate_agent_memories(db: AsyncSession, user_id: str, state: dict, p
 
         last = rows[-1]
         cursor = [last[2].isoformat() if last[2] else datetime.utcnow().isoformat(), last[0]]
-        # §8.5.3：每批事务提交后立即推进 cursor
+        # §8.5.3：每批事务提交后立即更新 cursor
         step.update({"status": "running", "cursor": cursor, "done": done,
                      "total": total, "skipped": skipped})
         await _save_progress(db, user_id, (await _load_progress(db, user_id))[0], progress)

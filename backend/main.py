@@ -16,7 +16,7 @@ logging.basicConfig(
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
 )
 
-from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, config as config_api, skills, voice, system, memory as memory_api, skins as skins_api
+from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api
 from app.db.database import init_db, AsyncSessionLocal
 from app.core.config import get_config, clear_config_cache
 from app.services.agent_scheduler import agent_scheduler
@@ -77,7 +77,7 @@ app.include_router(agent_tasks.router)
 app.include_router(export_tasks.router)
 app.include_router(file_upload.router)
 app.include_router(image_upload.router)
-app.include_router(config_api.router)
+app.include_router(models_api.router)
 app.include_router(skills.router)
 app.include_router(voice.router)
 app.include_router(system.router)

@@ -67,13 +67,20 @@ async def _heartbeat_wrapped(anext, interval: float = _STREAM_HEARTBEAT_INTERVAL
                 pass
 
 
-PRESERVE_THINKING_PROVIDERS = ("qwen3.8_vllm", "deepseek", "mimo")
+# PRESERVE_THINKING_PROVIDERS —— 派生自 model_gateway.profiles（单一事实源在
+# 各 profile 的 preserve_thinking 标志；保留此常量仅为向后兼容的导入面）。
+from app.model_gateway.profiles import preserve_thinking_provider_types as _pt_types
+
+PRESERVE_THINKING_PROVIDERS = _pt_types()
 
 
 class LLMService:
-    def __init__(self, custom_api_url: str = None, custom_api_key: str = None, custom_model_name: str = None, preserve_reasoning: bool = False):
+    def __init__(self, custom_api_url: str = None, custom_api_key: str = None, custom_model_name: str = None, preserve_reasoning: bool = False, endpoint=None):
         self.config = get_config()
         self.is_custom_provider = bool(custom_api_url)
+        # model_gateway 注入的端点元数据（alias/provider_type/capabilities）；
+        # 仅作描述，不改变任何构造行为（解耦重构 W2）。
+        self.endpoint = endpoint
         # P0/PHASE 1B (2026-08-21): providers with preserve-thinking semantics
         # (qwen3.8_vllm chat_template_kwargs.preserve_thinking / deepseek
         # reasoning_content round-trip / mimo 思考链) keep the CURRENT turn's
@@ -91,6 +98,19 @@ class LLMService:
 
     def _build_params(self, messages: list, **kwargs) -> dict:
         model = kwargs.get("model") or self.custom_model_name or self.config.model_name or "gpt-3.5-turbo"
+        # 模型网关：custom 端点的 toml params 作为每端点默认采样（kwargs 优先；
+        # 非 custom 端点走下方 [defaults] 全局默认，行为与 legacy 一致）。
+        _ep = getattr(self, "endpoint", None)
+        _ep_params = dict((_ep.params if (_ep is not None and self.is_custom_provider) else {}) or {})
+        # A4.9 R3 Minor①修复：max_tokens 前置归一化——0/""/"0" 与 kwargs 同义
+        # （视为未设置），从端点参数中剔除使其自然回落 [defaults]。
+        # 2026-08-31 W-2 Imp-3：同样的归一化扩展到 extra_body 扩展参数——
+        # main 自包含化（is_custom=true）后 params.top_k="" 会在每次主链路
+        # 调用的 wire 上携带 extra_body={"top_k": ""}，类型严格的 backend
+        # （vLLM）会 400。
+        for _norm_key in ("max_tokens", "top_k", "min_p", "repetition_penalty"):
+            if _ep_params.get(_norm_key) in (None, "", 0, "0"):
+                _ep_params.pop(_norm_key, None)
         # PHASE 1B (A2, 2026-08-21): preserve-thinking providers keep the
         # CURRENT turn's assistant reasoning_content (everything after the
         # last real user message — audit-retry drafts, tool-chain turns) so
@@ -168,24 +188,32 @@ class LLMService:
         temperature = kwargs.get("temperature")
         if temperature is not None:
             params["temperature"] = temperature
+        elif _ep_params.get("temperature") is not None:
+            params["temperature"] = _ep_params["temperature"]
         elif use_defaults and self.config.default_temperature is not None:
             params["temperature"] = self.config.default_temperature
 
         top_p = kwargs.get("top_p")
         if top_p is not None:
             params["top_p"] = top_p
+        elif _ep_params.get("top_p") is not None:
+            params["top_p"] = _ep_params["top_p"]
         elif use_defaults and self.config.default_top_p is not None:
             params["top_p"] = self.config.default_top_p
 
         presence_penalty = kwargs.get("presence_penalty")
         if presence_penalty is not None:
             params["presence_penalty"] = presence_penalty
+        elif _ep_params.get("presence_penalty") is not None:
+            params["presence_penalty"] = _ep_params["presence_penalty"]
         elif use_defaults and self.config.default_presence_penalty is not None:
             params["presence_penalty"] = self.config.default_presence_penalty
 
         frequency_penalty = kwargs.get("frequency_penalty")
         if frequency_penalty is not None:
             params["frequency_penalty"] = frequency_penalty
+        elif _ep_params.get("frequency_penalty") is not None:
+            params["frequency_penalty"] = _ep_params["frequency_penalty"]
         elif use_defaults and self.config.default_frequency_penalty is not None:
             params["frequency_penalty"] = self.config.default_frequency_penalty
 
@@ -194,23 +222,35 @@ class LLMService:
         # create() kwargs — they must travel inside extra_body, which the SDK
         # merges into the JSON body verbatim.
         _sdk_extra: Dict[str, Any] = {}
+        # 2026-08-31 Wave D（A4.9 W-2 deferred）：kwargs 侧与端点侧同款归一化——
+        # 空串/0 视为未设置，防止 kwargs top_k="" 之类把空值送上 wire。
+        # 注意元组成员用 == 判定：0/0.0/False 都会被吞（语义上均为 no-op/非法），
+        # 真中性值 repetition_penalty=1.0 不受影响。
         top_k = kwargs.get("top_k")
-        if top_k is not None:
+        if top_k in (None, "", 0, "0"):
+            top_k = _ep_params.get("top_k")
+        if top_k not in (None, "", 0, "0"):
             _sdk_extra["top_k"] = top_k
         min_p = kwargs.get("min_p")
-        if min_p is not None:
+        if min_p in (None, "", 0, "0"):
+            min_p = _ep_params.get("min_p")
+        if min_p not in (None, "", 0, "0"):
             _sdk_extra["min_p"] = min_p
         repetition_penalty = kwargs.get("repetition_penalty")
-        if repetition_penalty is not None:
+        if repetition_penalty in (None, "", 0, "0"):
+            repetition_penalty = _ep_params.get("repetition_penalty")
+        if repetition_penalty not in (None, "", 0, "0"):
             _sdk_extra["repetition_penalty"] = repetition_penalty
 
         max_tokens = kwargs.get("max_tokens")
-        # 用户原则（2026-08-18）：不设置 == 默认最大输出长度。""/0/None 一律
+        # 用户原则（2026-08-18）：不设置 == 默认最大输出长度。""/0/"0"/None 一律
         # 视为不设置——只有显式正整数才会下发 max_tokens。
-        if max_tokens in (None, "", 0):
+        if max_tokens in (None, "", 0, "0"):
             max_tokens = None
         if max_tokens is not None:
             params["max_tokens"] = max_tokens
+        elif _ep_params.get("max_tokens") is not None:
+            params["max_tokens"] = _ep_params["max_tokens"]
         elif use_defaults and self.config.default_max_tokens is not None:
             params["max_tokens"] = self.config.default_max_tokens
 
@@ -227,40 +267,14 @@ class LLMService:
         extra_body = kwargs.get("extra_body")
         if extra_body is not None:
             if self.is_custom_provider:
-                extra_body = dict(extra_body)
-                base_url = str(self.client.base_url).lower() if self.client.base_url else ""
-                is_dashscope = "dashscope" in base_url or "aliyuncs" in base_url
-                if "enable_thinking" in extra_body and not is_dashscope:
-                    et_val = extra_body.pop("enable_thinking")
-                    existing_ctk = extra_body.get("chat_template_kwargs", {})
-                    if isinstance(existing_ctk, dict):
-                        existing_ctk["enable_thinking"] = et_val
-                        extra_body["chat_template_kwargs"] = existing_ctk
-                    else:
-                        extra_body["chat_template_kwargs"] = {"enable_thinking": et_val}
-                # Qwen models on OpenAI-compatible custom endpoints (vLLM)
-                # ignore the OpenAI-style `thinking` param entirely — translate
-                # it (and thinking_budget) into chat_template_kwargs, otherwise
-                # "disable thinking" silently does nothing and the model burns
-                # the token budget on hidden reasoning (title generation broke
-                # this way: empty content, 200 tokens of reasoning).
-                if not is_dashscope and "qwen" in (self.custom_model_name or "").lower():
-                    thinking_cfg = extra_body.get("thinking")
-                    if isinstance(thinking_cfg, dict) and "type" in thinking_cfg:
-                        existing_ctk = extra_body.get("chat_template_kwargs", {})
-                        if not isinstance(existing_ctk, dict):
-                            existing_ctk = {}
-                        existing_ctk.setdefault(
-                            "enable_thinking", thinking_cfg["type"] == "enabled"
-                        )
-                        extra_body["chat_template_kwargs"] = existing_ctk
-                        extra_body.pop("thinking", None)
-                    if "thinking_budget" in extra_body:
-                        existing_ctk = extra_body.get("chat_template_kwargs", {})
-                        if not isinstance(existing_ctk, dict):
-                            existing_ctk = {}
-                        existing_ctk["thinking_budget"] = extra_body.pop("thinking_budget")
-                        extra_body["chat_template_kwargs"] = existing_ctk
+                # model_gateway.profiles 收口（wave-7）：vendor 归一化单点化为
+                # sniff_thinking_profile（dashscope URL→qwen 透传 · qwen 模型名
+                # →chat_template_kwargs 翻译 · 其他→enable_thinking 迁 ctk）。
+                from app.model_gateway.profiles import sniff_thinking_profile
+                _profile = sniff_thinking_profile(
+                    str(self.client.base_url or ""), self.custom_model_name or ""
+                )
+                extra_body = _profile.normalize_user_extra_body(dict(extra_body))
                 extra_body.update(_sdk_extra)
                 params["extra_body"] = extra_body
             else:
@@ -353,15 +367,13 @@ class LLMService:
         return False
 
     def _thinking_off_extra_body(self) -> dict:
+        # model_gateway.profiles 收口（wave-7）：关思考的 wire 形状由 sniff 的
+        # profile 统一给出（dashscope→enable_thinking False · qwen→ctk ·
+        # 其他→thinking{type:disabled}）。
+        from app.model_gateway.profiles import sniff_thinking_profile
         model = self.custom_model_name or self.config.model_name or ""
-        base_url = str(self.client.base_url or "").lower()
-        if "dashscope" in base_url or "aliyuncs" in base_url:
-            return {"enable_thinking": False}
-        if "qwen" in model.lower():
-            # vLLM Qwen3 ignores top-level enable_thinking — only
-            # chat_template_kwargs works (verified live 2026-08-04).
-            return {"chat_template_kwargs": {"enable_thinking": False}}
-        return {"thinking": {"type": "disabled"}}
+        base_url = str(self.client.base_url or "")
+        return sniff_thinking_profile(base_url, model).disable()
 
     async def stream_chat(self, messages: list, **kwargs) -> AsyncIterator[str]:
         logger.info("stream_chat called: model=%s, base_url=%s, is_custom=%s",
@@ -387,16 +399,46 @@ class LLMService:
     ) -> AsyncIterator[Dict[str, Any]]:
         params = self._build_params(messages, **kwargs)
         params["stream"] = True
+        # P4 徽章真值（2026-09-02）：请求 usage 回传（OpenAI 兼容 stream_options），
+        # 供应商不识别时在下方 create 处自动降级重试。flag=[llm] stream_include_usage。
+        _include_usage = bool(getattr(self.config, "llm_stream_include_usage", True))
+        if _include_usage:
+            params["stream_options"] = {"include_usage": True}
         tools = kwargs.get("tools")
         if tools is not None:
             params["tools"] = tools
 
         try:
-            response = await self.client.chat.completions.create(**params)
+            try:
+                response = await self.client.chat.completions.create(**params)
+            except Exception as _first_err:
+                _err_text = str(_first_err).lower()
+                if _include_usage and (
+                    "stream_options" in _err_text
+                    or "unrecognized" in _err_text and "argument" in _err_text
+                    or "unknown" in _err_text and "parameter" in _err_text
+                    or "unexpected keyword" in _err_text
+                ):
+                    logger.warning(
+                        "Provider rejected stream_options (%s); retrying without include_usage",
+                        str(_first_err)[:160],
+                    )
+                    params.pop("stream_options", None)
+                    try:
+                        response = await self.client.chat.completions.create(**params)
+                    except Exception as _retry_err:
+                        # 遗留④：重试失败不掩蔽首错——两个错误都进错误信息。
+                        raise Exception(
+                            f"{_first_err}; (stream_options 降级重试亦失败: {_retry_err})"
+                        ) from _retry_err
+                else:
+                    raise
             inside_think = False
             think_buf = ""
             tool_calls_accumulated: List[Dict[str, Any]] = []
             chunk = None
+            _usage_sent = False
+            _last_finish_reason = None
 
             async for chunk in _heartbeat_wrapped(response.__anext__):
                 if isinstance(chunk, dict) and chunk.get("type") == "heartbeat":
@@ -405,6 +447,21 @@ class LLMService:
                     # silent — pass the sentinel through.
                     yield chunk
                     continue
+                _usage = getattr(chunk, "usage", None)
+                _pt = getattr(_usage, "prompt_tokens", 0) if _usage is not None else 0
+                if _usage is not None and _pt and not _usage_sent:
+                    _usage_sent = True  # A4.9 R1 M2：每 stream 只发一次
+                    # 遗留①：prompt_tokens 缺失/0（null-usage 供应商）不发事件，
+                    # 前端保留估算徽章——绝不出 measured tokens:0。
+                    # DeepSeek: usage 随最后一个 content chunk；OpenAI: 独立空 choices 块。
+                    yield {"type": "usage", "data": {
+                        "prompt_tokens": _pt,
+                        "completion_tokens": getattr(_usage, "completion_tokens", 0) or 0,
+                        "prompt_cache_hit_tokens": getattr(_usage, "prompt_cache_hit_tokens", 0) or 0,
+                        "prompt_cache_miss_tokens": getattr(_usage, "prompt_cache_miss_tokens", 0) or 0,
+                    }}
+                if chunk.choices and getattr(chunk.choices[0], "finish_reason", None) is not None:
+                    _last_finish_reason = chunk.choices[0].finish_reason
                 if not chunk.choices or not chunk.choices[0].delta:
                     continue
 
@@ -464,11 +521,9 @@ class LLMService:
 
                     yield {"type": "content", "data": text}
 
-            finish_reason = None
-            if chunk is not None and hasattr(chunk, 'choices') and chunk.choices:
-                fr = getattr(chunk.choices[0], 'finish_reason', None)
-                if fr is not None:
-                    finish_reason = fr
+            # A4.9 R1 M3：include_usage 的空 choices 末块会覆盖 chunk 变量，
+            # finish_reason 取流中最后见到的非空值，不被 usage 块冲掉。
+            finish_reason = _last_finish_reason
 
             if tool_calls_accumulated and any(
                 tc.get("function", {}).get("name") for tc in tool_calls_accumulated

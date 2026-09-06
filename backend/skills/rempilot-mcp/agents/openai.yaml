@@ -1,0 +1,7 @@
+# Copyright (c) 2026 Weave Thinker Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+interface:
+  display_name: "RemPilot MCP"
+  short_description: "Connect and operate currently accessible RemPilot resources."
+  default_prompt: "Use $rempilot-mcp to connect to RemPilot and operate the resources currently available to this device."

@@ -43,23 +43,45 @@ def _get_client() -> httpx.AsyncClient:
     return _http_client
 
 
+def _embedding_endpoint():
+    """model_gateway 收口（2026-08-30）：embedding 端点统一来自 registry。"""
+    from app.model_gateway.registry import get_model_registry
+    try:
+        return get_model_registry().get("embedding")
+    except Exception:
+        return None
+
+
 def _get_embedding_api_base() -> str:
-    base = config.memory.get("embedding_api_base", "")
-    if base:
-        return base.rstrip("/")
+    ep = _embedding_endpoint()
+    if ep is not None and ep.base_url:
+        return ep.base_url.rstrip("/")
     return config.api_base_url.rstrip("/")
 
 
 def _get_embedding_api_key() -> str:
-    key = config.memory.get("embedding_api_key", "")
-    if key:
-        return key
+    ep = _embedding_endpoint()
+    if ep is not None:
+        # 显式配置的端点（base_url 已填）空键 = 该服务不需要鉴权 → wire "no-key"
+        # 占位，绝不回落全局 main key（否则 DeepSeek key 会发进 embedding 服务器
+        # 的 Authorization 头；2026-09-01 no-key 哨兵从配置字面量改为消费层守卫）。
+        return ep.api_key or ("no-key" if ep.base_url else config.api_key or "")
     return config.api_key or ""
 
 
 def _get_embedding_dim() -> int:
+    ep = _embedding_endpoint()
+    if ep is not None and ep.extra.get("dim"):
+        return int(ep.extra["dim"])
     # 新鲜 get_config()：SIGHUP reload 后模块级 config 是旧实例（A4.9 round5 复审 Minor #5）
     return int(get_config().memory.get("embedding_dim", 1536))
+
+
+def _get_embedding_model() -> str:
+    ep = _embedding_endpoint()
+    if ep is not None and ep.model_name:
+        return ep.model_name
+    return config.memory.get("embedding_model", "text-embedding-3-small")
 
 
 async def _do_embed(text: str) -> Optional[list[float]]:
@@ -71,7 +93,7 @@ async def _do_embed(text: str) -> Optional[list[float]]:
             return None
         _circuit_failures = 0
 
-    model = config.memory.get("embedding_model", "text-embedding-3-small")
+    model = _get_embedding_model()
     api_key = _get_embedding_api_key()
     base_url = _get_embedding_api_base()
     client = _get_client()
@@ -326,24 +348,19 @@ async def find_neighbors_for_unit(
 
 
 async def _probe_main_provider() -> tuple[bool, Optional[int]]:
-    cfg = get_config()
-    base_url = (cfg.memory.get("embedding_api_base") or "").rstrip("/")
-    api_key = cfg.memory.get("embedding_api_key") or ""
-    model = cfg.memory.get("embedding_model", "text-embedding-3-small")
+    # model_gateway 收口（2026-08-30）：探测目标统一为 embedding 端点
+    # （合成已含 [api] 回落，legacy 的 router "default" 分支被等价覆盖）。
+    base_url = _get_embedding_api_base()
+    model = _get_embedding_model()
 
     if not base_url:
-        from app.services.provider_router import get_provider_router
-        try:
-            return await get_provider_router().embedding_available("default")
-        except Exception:
-            logger.exception("embedding provider probe failed")
-            return False, None
+        return False, None
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             resp = await client.post(
                 f"{base_url}/embeddings",
-                headers={"Authorization": f"Bearer {api_key}",
+                headers={"Authorization": f"Bearer {_get_embedding_api_key()}",
                          "Content-Type": "application/json"},
                 json={"input": "probe", "model": model},
             )

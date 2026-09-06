@@ -30,6 +30,19 @@ def get_aux_llm_override() -> Optional[LLMService]:
     return _aux_llm_override.get()
 
 
+_CLASSIFIER_TASKS = {
+    "error_classify", "triviality", "interest_extract", "skill_assess",
+    "identity_facts", "citation_disambiguate", "schedule_parse",
+    "creative_goal", "completion_reconcile", "title_fallback",
+}
+
+_TASK_PURPOSE = {
+    "compression": "aux.compression",
+    "search_decision": "aux.search_decision",
+    "title": "aux.title",
+}
+
+
 class AuxiliaryClient:
     def __init__(self, task: str = "default", llm: Optional[LLMService] = None):
         self.task = task
@@ -39,25 +52,14 @@ class AuxiliaryClient:
             # task-model keys (error_classify/compression/title/...).
             self.llm = _override
         else:
-            model_override = self._get_model_override(task)
-            self.llm = LLMService(
-                custom_model_name=model_override or None,
-            )
-
-    def _get_model_override(self, task: str) -> str:
-        if task == "compression":
-            return config.agent_auxiliary_compression_model
-        elif task == "search_decision":
-            return config.agent_auxiliary_search_decision_model
-        elif task == "title":
-            return config.agent_auxiliary_title_model
-        elif task in (
-            "error_classify", "triviality", "interest_extract", "skill_assess",
-            "identity_facts", "citation_disambiguate", "schedule_parse",
-            "creative_goal", "completion_reconcile", "title_fallback",
-        ):
-            return config.agent_auxiliary_classifier_model
-        return ""
+            # model_gateway 收口（2026-08-30）：task → purpose → registry 端点。
+            # 裸构造语义（is_custom=False + model_name 覆盖）与 legacy 一致。
+            from app.model_gateway import factory
+            from app.model_gateway.registry import get_model_registry
+            purpose = _TASK_PURPOSE.get(task)
+            if purpose is None:
+                purpose = "aux.classifier" if task in _CLASSIFIER_TASKS else "main"
+            self.llm = factory.build_llm_service(get_model_registry().resolve(purpose))
 
     async def complete(self, messages: list, **kwargs) -> str:
         content, _ = await self.complete_parts(messages, **kwargs)

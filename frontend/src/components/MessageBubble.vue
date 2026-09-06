@@ -1408,12 +1408,16 @@ onMounted(() => {
 }
 
 .reasoning-text :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
 .reasoning-text :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .msg-note-tag {
@@ -1661,12 +1665,16 @@ onMounted(() => {
 }
 
 .note-preview-body :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
 .note-preview-body :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .note-preview-body :deep(blockquote) {
@@ -1845,12 +1853,16 @@ onMounted(() => {
 }
 
 .text :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
 .text :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .text :deep(blockquote) {

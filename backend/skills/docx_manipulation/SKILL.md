@@ -45,9 +45,10 @@ run._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
 ## 样式体系（优先用内置样式，不要逐段手调）
 - 标题必须用内置样式 `Heading 1`~`Heading 6`（目录、导航窗格、大纲结构依赖它们）
 - 列表用 `List Bullet` / `List Number` 样式（禁止手工输入 `•`、`1.` 等字符）
+- **标题一律默认黑色**：python-docx 模板的 Heading 样式自带蓝色（#2F5496 系），中文文档必须覆写为黑色（`RGBColor(0, 0, 0)`），否则交付文档满页蓝标题
 - python-docx 模板的 Heading 样式默认是蓝色 Calibri Light，中文文档必须覆写：
 ```python
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
 from docx.oxml.ns import qn
 
 def _set_cn_style(doc, name, font, size, bold=False):
@@ -55,6 +56,7 @@ def _set_cn_style(doc, name, font, size, bold=False):
     st.font.name = font
     st.font.size = Pt(size)
     st.font.bold = bold
+    st.font.color.rgb = RGBColor(0, 0, 0)   # 标题/正文默认黑色（模板 Heading 自带蓝色，必须覆写）
     st.element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), font)
 
 _set_cn_style(doc, "Normal", "SimSun", 12)        # 正文
@@ -160,6 +162,74 @@ doc.save("xxx_修改.docx")                 # 另存新文件，不要覆盖 upl
 ```
 读取已有 docx 内容也可直接用 `workspace_read` 工具（支持 .docx）。
 
+## Markdown 表格映射（对话中的表格 → docx，必须完整还原）
+你在对话里输出的 markdown 管道表，转成 docx 时必须逐格完整映射：表头加粗+黑色、
+对齐（`:---` 左 / `:---:` 中 / `---:` 右）、单元格内换行（`<br>`）、转义竖线（`\|`）。
+直接用下面的配方（沙箱可整体粘贴执行）：
+
+```python
+import re
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+def md_table_to_rows(md_text):
+    """解析 markdown 管道表 → (rows, alignments)。支持 \| 转义与 <br> 换行。"""
+    rows, aligns = [], []
+    for ln in [l.strip() for l in md_text.strip().splitlines() if l.strip()]:
+        cells = [c.strip().replace('\\|', '|').replace('<br>', '\n')
+                 for c in re.split(r'(?<!\\)\|', ln.strip('|'))]
+        if cells and all(re.fullmatch(r':?-{3,}:?', c) for c in cells):
+            aligns = ['center' if c.startswith(':') and c.endswith(':')
+                      else 'right' if c.endswith(':') else 'left' for c in cells]
+            continue
+        rows.append(cells)
+    return rows, aligns
+
+def add_md_table(doc, md_text, widths=None):
+    rows, aligns = md_table_to_rows(md_text)
+    if not rows:
+        return None
+    n = max(len(r) for r in rows)
+    amap = {'left': WD_ALIGN_PARAGRAPH.LEFT, 'center': WD_ALIGN_PARAGRAPH.CENTER,
+            'right': WD_ALIGN_PARAGRAPH.RIGHT}
+    table = doc.add_table(rows=len(rows), cols=n, style="Table Grid")
+    table.autofit = False
+    for i, row in enumerate(rows):
+        for j in range(n):
+            text = row[j] if j < len(row) else ""
+            para = table.cell(i, j).paragraphs[0]
+            lines = text.split("\n")
+            run = para.add_run(lines[0])
+            for extra in lines[1:]:          # markdown <br> → Word 单元格内换行
+                para.add_run().add_break()
+                para.add_run(extra)
+            if i == 0:
+                for r in para.runs:              # 表头所有 run（含 <br> 续行）都加粗+黑色
+                    r.font.bold = True
+                    r.font.color.rgb = RGBColor(0, 0, 0)   # 表头加粗+默认黑色
+            if aligns and j < len(aligns):
+                para.alignment = amap[aligns[j]]
+            if widths and j < len(widths):   # 固定列宽：column 与 cell 双设置
+                table.columns[j].width = widths[j]
+                table.cell(i, j).width = widths[j]
+    return table
+
+# 用法：add_md_table(doc, md_text, widths=[Cm(3), Cm(4), Cm(4)])
+```
+
+**反向映射**（读取用户 docx → 在对话里展示 markdown 表）：
+```python
+def table_to_md(table):
+    lines = []
+    for i, row in enumerate(table.rows):
+        cells = [c.text.replace('\n', '<br>').replace('|', '\\|') for c in row.cells]
+        lines.append('| ' + ' | '.join(cells) + ' |')
+        if i == 0:
+            lines.append('|' + '---|' * len(cells))
+    return '\n'.join(lines)
+```
+注意：markdown 不支持合并单元格——docx 中已合并的表转 md 时会展开为重复文本；含合并单元格的表格必须在交付说明里向用户注明该损失。
+
 ## 生成后校验（必做）
 保存后重新打开文件校验，再向用户交付：
 ```python
@@ -177,9 +247,10 @@ for p in doc.paragraphs:
 3. 表格使用 `style="Table Grid"` 以显示边框；固定列宽需同时设置 `table.autofit = False`、`columns[i].width` 与每格 `cell.width`。
 4. 长文档先规划结构（标题层级），再逐节填充；标题必须用内置 Heading 样式。
 5. 列表用 `List Bullet` / `List Number` 样式，禁止手工输入 `•` 或 `1.` 字符。
-6. 中文文档显式设置 A4 页面；标题黑体、正文宋体（含 eastAsia 设置）。
+6. 中文文档显式设置 A4 页面；标题黑体、正文宋体（含 eastAsia 设置）；**标题一律黑色**（`_set_cn_style` 已含 `RGBColor(0,0,0)`，不得省略）。
 7. 修改已有文件时另存为新文件（`xxx_修改.docx`），不要覆盖 uploads 原文件。
 8. 生成后必须执行"生成后校验"步骤并如实报告结果。
+9. 对话中的 markdown 表格转 docx 必须使用「Markdown 表格映射」节的配方逐格完整还原（对齐/转义/换行/表头加粗黑色），禁止丢列、丢行或静默省略单元格。
 
 ## 数学公式规范（必须使用 Word 公式编辑器）
 当文档中包含数学公式时，所有 LaTeX 公式必须转换为 **Word 公式编辑器原生格式（OMML / `m:oMath` 元素）** 保存，打开文档后公式是 Word 中可双击编辑的原生公式。

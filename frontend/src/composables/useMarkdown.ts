@@ -320,10 +320,25 @@ function createRenderer() {
 // Create and configure a single shared renderer
 const sharedRenderer = createRenderer()
 marked.use({ renderer: sharedRenderer, breaks: true, gfm: true })
+// Math discovery: tokenizer-level extension ($…$ / $$…$$ / \(…\) / \[…\] +
+// single-tilde strikethrough override). Function declaration is hoisted.
+marked.use(createMathExtension())
+/**
+ * Normalize bare `%` in TeX source to `\%`. LLMs habitually write `24%`
+ * inside math, but KaTeX (like LaTeX) treats `%` as a comment starter and
+ * silently swallows the rest of the expression (strict:'ignore' hides the
+ * warning) — `$1-(1-5%)\times(1-20%)=24%$` would render as just "1−(1−5".
+ * Already-escaped `\%` is left untouched. data-tex keeps the ORIGINAL tex
+ * (edit round-trip fidelity); only the render input is normalized.
+ */
+function escapeMathPercent(tex: string): string {
+  if (!tex.includes('%')) return tex
+  return tex.replace(/(?<!\\)%/g, '\\%')
+}
 
 function renderMathSafe(tex: string, displayMode: boolean): string {
   try {
-    const html = katex.renderToString(tex, {
+    const html = katex.renderToString(escapeMathPercent(tex), {
       displayMode,
       throwOnError: false,
       output: 'html',
@@ -354,7 +369,8 @@ const LATEX_MARKER_RE = /[\\^_{}]/
  * A `$$…$$` display-math span is real math when its first non-empty line
  * carries a LaTeX marker or a Latin letter — anything that currency amounts
  * never contain. Content that fails (e.g. a line starting `$$99 元`,
- * `$$5 + 3$$`) is left for escapeCurrencyDollars to treat as money. Checking
+ * `$$5 + 3$$`) is declined by the block tokenizer so the dollars stay
+ * literal money. Checking
  * only the FIRST line prevents a money run at line start from pairing with a
  * later formula's closing `$$` and swallowing the lines between them.
  */
@@ -363,243 +379,165 @@ function isRealDisplayMath(content: string): boolean {
   return /[A-Za-z\\^_{}]/.test(firstLine)
 }
 
+
 /**
- * Escape `$` characters that are money/currency indicators, not math
- * delimiters. LLMs routinely emit `$` runs as cost levels in markdown tables
- * (`免费~$$`, `$$~$$$`, `$$$`, `$$$$`) and after a tilde (`~$`). Without this
- * step the math extractors below treat them as LaTeX delimiters: two `$$`
- * cells in different rows pair into a fake `$$…$$` display-math span that
- * swallows every table row between them, and the mangled remainder is dumped
- * as raw markdown via the katex-error fallback (conv 149ce886, 2026-08-01).
+ * Paired-`$` inner classifier — the SINGLE place where math vs money is
+ * decided. The key architectural property: classification happens AFTER a
+ * `$…$` pair has been found by the tokenizer (the inner content is known),
+ * never on a lone `$` whose pairing is still unknown. The retired
+ * escapeCurrencyDollars string-rewrite layer judged each `$` in isolation
+ * BEFORE pairing, so every new LLM output shape (digit-start display math
+ * conv 1c7eb282, `$6.6$` decimals, `$200$` coupons, op+paren
+ * `$1-(1-5%)\times(1-20%)=24%$` conv 28ea1761) needed a new guard regex and
+ * each guard could silently kill a different shape (7 patch waves).
  *
- * Real display math is extracted by extractMath BEFORE this function runs
- * (line-anchored + LATEX_MARKER_RE validated), so the rules here only ever see
- * mid-line / non-math `$`. Each rule is marker-aware so genuine formulas that
- * reach this stage (e.g. inline `$2x+3$`, table cells `$W$` / `$\lambda$`)
- * keep their delimiters instead of being destroyed like the digit-starting
- * display formula `$$240.83\text{B 参数}...$$` (conv 1c7eb282, 2026-08-05).
+ * A paired span is MATH when its inner carries any of:
+ *   1. a LaTeX marker (`\\` command, `^`, `_`, `{`/`}`) — unmistakable;
+ *   2. a Latin letter — variables `$x$`/`$t$`/`$W$`, `\\text{…}` bodies;
+ *   3. a decimal point between digits — `$6.6$`, `$3.2$`;
+ *   4. a digit plus an arithmetic/paren char — `$2+3$`, `$1/2$`,
+ *      `$1-(1-5%)$` (op+paren), `$10>5$`.
+ * Everything else (`$200$`, `$49 起，$`, `$1,000$`, `$19$二折起`, bare
+ * integer `$7$` — documented coupon>integer-math tradeoff) is MONEY/TEXT:
+ * the tokenizer declines and the `$` stays literal.
+ */
+function isMathishInner(inner: string): boolean {
+  const t = inner.trim()
+  if (!t) return false
+  if (LATEX_MARKER_RE.test(t)) return true
+  if (/[A-Za-z]/.test(t)) return true
+  if (/\d\.\d/.test(t)) return true
+  if (/\d/.test(t) && /[+\-*/=<>()]/.test(t)) return true
+  return false
+}
+
+/**
+ * Math discovery as first-class marked tokens (replaces the placeholder
+ * pipeline: extractMath / escapeCurrencyDollars / restoreMath are gone).
  *
- * Escaping uses the HTML entity &#36;: no literal `$` char remains for the
- * math regexes, and marked/DOMPurify pass the entity through untouched so the
- * browser renders the original character. Code spans are protected by the
- * caller BEFORE this step, so `$` inside code is never affected.
+ * Why tokenizer-level: marked's lexer guarantees code spans/fences never
+ * reach these tokenizers (the @@CDB@@ code-placeholder dance is obsolete),
+ * pairing is attempted before classification (see isMathishInner), and the
+ * boundary rules below live in exactly one regex per delimiter form.
+ *
+ * Delimiter forms (matching the system-prompt math contract + LLM variants):
+ *   block  `$$…$$` line-anchored + isRealDisplayMath (money `$$99 元` stays);
+ *   inline `$$…$$` mid-line display (LLM variant of the block form);
+ *   inline `$…$` — non-space flanks, closer not followed by digit/`$`,
+ *          isMathishInner-validated;
+ *   inline `\(…\)`;
+ *   inline `\[…\]` display — mid-line allowed (parity with the retired
+ *          global replace), a broken closer written as a lone `]` on its
+ *          own line is tolerated (LLMs drop the backslash; otherwise it
+ *          would swallow everything to the next \] — conv memory 8d696c3d3).
+ * Unclosed `$` mid-stream never matches → stays literal (streaming-safe).
+ *
+ * Extension array order: marked unshifts each tokenizer, so the LAST entry
+ * is tried FIRST — `$$` forms sit after `$` so `$$` wins at a `$$` position
+ * (mathInlineDollar's `(?!\\$)` already makes this belt-and-suspenders).
  */
-function escapeCurrencyDollars(text: string): string {
-  let out = text
-  // 1. `~$` / `~$$` / `~$$$`… — approximate amounts ("免费~$$", "$~$$$$").
-  //    The tilde itself is escaped too: this marked build pairs two lone `~`
-  //    in one paragraph as strikethrough, so `5~10 … 免费~$` would otherwise
-  //    strike the text between the two tildes.
-  out = out.replace(/\~\$+/g, (m) => m.replace(/~/g, '&#126;').replace(/\$/g, '&#36;'))
-  // 1b. Integer money closed by its OWN `$` (`$200$`, `$1,000$` — coupon
-  //     shapes 满$200$减50 / 九折$1,000$封顶): escape BOTH dollars. Rule 2
-  //     below fires only on the opener (no digit follows the closer), and the
-  //     surviving live `$` would open a fake inline-math pair with the NEXT
-  //     real formula on the same line, swallowing CJK text (A4.9 R2:
-  //     满$200$减50券，公式$x^2$标定 → span `减50券，公式` + katex error +
-  //     $x^2$ destroyed). Decimal pairs ($6.6$) are the deliberate math
-  //     shape and stay untouched; bare-integer math ($7$) is sacrificed to
-  //     the money reading — documented tradeoff (coupon $ > integer math $).
-  out = out.replace(/\$(\d+(?:[.,]\d+)*)\$(?![\d.,$])/g, (m, nums) => {
-    if (/\./.test(nums)) return m
-    return '&#36;' + nums + '&#36;'
-  })
-  // 2. Runs of 3+ dollars ("$$$", "$$$$"), or dollars followed by a digit-run
-  //    that does NOT continue into LaTeX syntax — cost/price indicators
-  //    ("$$99", "$49", "$1,000"). The digit-run must be followed by a
-  //    non-letter/non-backslash char (or line end): `$49 起` is a price, but
-  //    `$2x+3$` and `$240.83\text{...}` are real math — a price `$49` paired
-  //    with a later lone `$` would otherwise swallow the text between them as
-  //    a fake `$…$` inline-math span.
-  //    Pure-numeric math is likewise real, but ONLY in the two shapes money
-  //    never takes (A4.9 round-1 refinement — bare-integer `$200$` closes are
-  //    adjacent-price money like `满$200$减50券` and must stay escaped):
-  //      a) the first digit-run carries a DECIMAL POINT (`.` — thousands
-  //      commas alone don't count, `$1,000$打九折` is money) — `$6.6$`,
-  //      `$3.2$–$6.6$` (conv 88a13446 2026-08-26); or
-  //      b) ≥1 arithmetic-op+digit group follows (`$2+3$`, `$10^2$`,
-  //      `$1/2$`). The closing `$` itself must not be followed by a digit or
-  //      another `$` (`$9.9$5元档`, `尾 $6.6$$结束` are not clean pairs).
-  //    NOTE (assertion position): the prefix `\d+…` must live in its OWN
-  //    lookahead, closed before the MATH negation — nested inside one `(?=…)`
-  //    the prefix consumes the digits and the inner math shape (which starts
-  //    with `\d+`) is evaluated at the wrong, already-advanced position and
-  //    never matches (silent regression, caught by A1 unit case).
-  out = out.replace(
-    /\$\$\$+|\$\$+(?=\d+(?:[.,]\d+)*(?![\d.,])(?![A-Za-z\\]))|\$(?=\d+(?:[.,]\d+)*(?![\d.,])(?![A-Za-z\\]))(?!(?:\d+\.\d+(?:[.,]\d+)*|\d+(?:[.,]\d+)*(?:[+\-*/^=%]\d+(?:[.,]\d+)*(?![\d.,]))+)\$(?![\d.$]))/g,
-    (m) => m.replace(/\$/g, '&#36;')
-  )
-  // 3. GFM table lines: escape the remaining `$` that is currency while
-  //    keeping real inline-math cells intact. A paired `$…$` span is math
-  //    when its interior carries a LaTeX marker or is a short letter variable
-  //    ("$W$", "$s$"); otherwise ("$49 起，$", "免费~$$", "$100,000") every
-  //    `$` on the line is escaped. Display math never reaches this step.
-  const escapeTableCellDollars = (line: string): string =>
-    line.replace(/\$([^$\n]+?)\$(?!\d)|\$/g, (m, inner) => {
-      if (inner !== undefined) {
-        if (LATEX_MARKER_RE.test(inner)) return m
-        if (/^[A-Za-z][A-Za-z0-9]{0,2}$/.test(inner)) return m
-      }
-      return m.replace(/\$/g, '&#36;')
-    })
-  const lines = out.split('\n')
-  let inTable = false
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    const isSep = /^[\s|:-]+$/.test(line) && /---/.test(line) && /\|/.test(line)
-    if (isSep) {
-      // Header = previous non-empty line; separator + following non-blank
-      // lines form the table body.
-      let h = i - 1
-      while (h >= 0 && !lines[h].trim()) h--
-      if (h >= 0 && lines[h].includes('|')) lines[h] = escapeTableCellDollars(lines[h])
-      lines[i] = line.replace(/\$/g, '&#36;')
-      inTable = true
-      continue
-    }
-    if (inTable) {
-      if (!line.trim()) {
-        inTable = false
-        continue
-      }
-      if (line.includes('|')) {
-        lines[i] = escapeTableCellDollars(line)
-      } else {
-        inTable = false
-      }
-    }
+function createMathExtension() {
+  return {
+    extensions: [
+      {
+        name: 'mathInlineDollar',
+        level: 'inline',
+        start(src: string): number | undefined {
+          const i = src.indexOf('$')
+          return i < 0 ? undefined : i
+        },
+        tokenizer(src: string) {
+          const m = src.match(/^\$(?!\$)(?!\s)([^$\n]+?)(?<!\s)\$(?![\d$])/)
+          if (!m) return undefined
+          if (!isMathishInner(m[1])) return undefined
+          return { type: 'mathInlineDollar', raw: m[0], text: m[1] }
+        },
+        renderer(token: { text: string }): string {
+          return renderMathSafe(token.text, false)
+        },
+      },
+      {
+        name: 'mathInlineParen',
+        level: 'inline',
+        start(src: string): number | undefined {
+          const i = src.indexOf('\\(')
+          return i < 0 ? undefined : i
+        },
+        tokenizer(src: string) {
+          const m = src.match(/^\\\(([\s\S]+?)\\\)/)
+          if (!m) return undefined
+          return { type: 'mathInlineParen', raw: m[0], text: m[1] }
+        },
+        renderer(token: { text: string }): string {
+          return renderMathSafe(token.text, false)
+        },
+      },
+      {
+        name: 'mathDisplayBracket',
+        level: 'inline',
+        start(src: string): number | undefined {
+          const i = src.indexOf('\\[')
+          return i < 0 ? undefined : i
+        },
+        tokenizer(src: string) {
+          const m = src.match(/^\\\[([\s\S]+?)(?:\\\]|\n[ \t]*\][ \t]*(?=\n|$))/)
+          if (!m) return undefined
+          return { type: 'mathDisplayBracket', raw: m[0], text: m[1].trim() }
+        },
+        renderer(token: { text: string }): string {
+          return renderMathSafe(token.text, true)
+        },
+      },
+      {
+        name: 'mathDisplayDollarInline',
+        level: 'inline',
+        start(src: string): number | undefined {
+          const i = src.indexOf('$$')
+          return i < 0 ? undefined : i
+        },
+        tokenizer(src: string) {
+          const m = src.match(/^\$\$(?!\$)([^$\n]+?)\$\$(?![\d$])/)
+          if (!m) return undefined
+          if (!isMathishInner(m[1])) return undefined
+          return { type: 'mathDisplayDollarInline', raw: m[0], text: m[1] }
+        },
+        renderer(token: { text: string }): string {
+          return renderMathSafe(token.text, true)
+        },
+      },
+      {
+        name: 'mathBlockDollar',
+        level: 'block',
+        start(src: string): number | undefined {
+          const i = src.search(/^[ \t]*\$\$/m)
+          return i < 0 ? undefined : i
+        },
+        tokenizer(src: string) {
+          const m = src.match(/^[ \t]*\$\$([\s\S]+?)\$\$[ \t]*(?=\n|$)/)
+          if (!m) return undefined
+          if (!isRealDisplayMath(m[1])) return undefined
+          return { type: 'mathBlockDollar', raw: m[0], text: m[1].trim() }
+        },
+        renderer(token: { text: string }): string {
+          return renderMathSafe(token.text, true)
+        },
+      },
+    ],
+    tokenizer: {
+      // A single `~` is NEVER a strikethrough delimiter: marked 17 (like
+      // GitHub) accepts lone `~`, so Chinese range/approximation notation
+      // (700~900 t/s, 1.5~2.5x, ~510 倍) mis-paired and struck everything
+      // between two tildes (conv efaf8f9c; streaming re-parse flicker).
+      // Only explicit `~~…~~` strikes. This override replaces the retired
+      // escapeLoneTildes string-rewrite layer (which needed code/math
+      // placeholder protection; tokens make that unnecessary).
+      del(src: string) {
+        const m = src.match(/^~~(?=\S)([\s\S]*?\S)~~/)
+        if (!m) return undefined
+        return { type: 'del', raw: m[0], text: m[1], tokens: this.lexer.inlineTokens(m[1]) }
+      },
+    },
   }
-  return lines.join('\n')
-}
-
-/**
- * Extract math segments and replace them with placeholders so markdown parsing
- * doesn't corrupt TeX syntax (backslashes, underscores, asterisks in equations).
- * Returns the protected text and a map of placeholder→rendered HTML.
- */
-/**
- * Escape `~` runs of length EXACTLY one so they cannot be consumed as
- * strikethrough delimiters. marked 17 (like GitHub) accepts a lone `~` as a
- * valid strikethrough delimiter, so Chinese range/approximation notation
- * (`700~900 t/s`, `1.5~2.5x`, `~510 倍`) mis-pairs: any two lone tildes in
- * one paragraph strike everything between them and eat both tildes (conv
- * efaf8f9c — the user read "700~900" as a struck-through "700900"; during
- * streaming the 80ms re-parse makes the struck span flicker as text accumulates).
- * Runs of 2+ tildes (explicit `~~…~~`) are left untouched, so genuine
- * GFM strikethrough keeps working. Must run AFTER code/math extraction in
- * extractMath so placeholders — and the ~ inside them — are never touched.
- * (Sister to escapeCurrencyDollars' `~$` escape, which only covered the
- * currency case.)
- */
-export function escapeLoneTildes(text: string): string {
-  if (!text.includes('~')) return text
-  return text.replace(/(?<!~)~(?!~)/g, '&#126;')
-}
-
-function extractMath(text: string): { text: string; placeholders: Record<string, string> } {
-  const placeholders: Record<string, string> = {}
-  const codePlaceholders: Record<string, string> = {}
-  let counter = 0
-  const key = () => `@@KTX${Date.now().toString(36)}${counter++}@@`
-  const codeKey = () => `@@CDB${Date.now().toString(36)}${counter++}@@`
-
-  let processed = text
-
-  // Step 1: Protect fenced code blocks from math extraction
-  processed = processed.replace(/```[\s\S]*?```/g, (match) => {
-    const k = codeKey()
-    codePlaceholders[k] = match
-    return k
-  })
-
-  // Step 2: Protect inline code from math extraction
-  processed = processed.replace(/`[^`\n]+`/g, (match) => {
-    const k = codeKey()
-    codePlaceholders[k] = match
-    return k
-  })
-
-  // Step 2.5: `$$ ... $$` display math — extracted BEFORE the currency escaper
-  // (which would otherwise destroy any formula whose content starts with a
-  // digit, e.g. `$$240.83\text{B 参数}...$$` — conv 1c7eb282, 2026-08-05).
-  // Two guards separate real formulas from money:
-  //   1. LINE-ANCHORED: opening `$$` at line start, closing `$$` at line end
-  //      (the shape the system prompt mandates for display formulas; also
-  //      covers fence style `$$\n…\n$$` and attached fences
-  //      `$$\begin{cases}…\end{cases}$$`). Money cells (`免费~$$`, `$$~$$$`)
-  //      sit mid-line and can never form this shape, so they can't pair into
-  //      a fake display-math span that eats table rows (conv 149ce886).
-  //   2. isRealDisplayMath validation: a span whose first non-empty line is
-  //      not mathish (e.g. a line starting `$$99 元`) is returned unchanged
-  //      so escapeCurrencyDollars can escape it as money.
-  // Pass 1 extracts single-line spans first so a rejected multi-line span
-  // (pass 2) can never swallow a real formula on a later line.
-  processed = processed.replace(/^\s*\$\$(.+?)\$\$\s*$/gm, (m, inner) => {
-    if (!isRealDisplayMath(inner)) return m
-    const k = key()
-    placeholders[k] = renderMathSafe(inner.trim(), true)
-    return `\n\n${k}\n\n`
-  })
-  processed = processed.replace(/^\s*\$\$([\s\S]+?)\$\$\s*$/gm, (m, inner) => {
-    if (!isRealDisplayMath(inner)) return m
-    const k = key()
-    placeholders[k] = renderMathSafe(inner.trim(), true)
-    return `\n\n${k}\n\n`
-  })
-
-  // \[ ... \] display math — also tolerate a broken closer written as a lone `]`
-  // on its own line (LLMs occasionally drop the backslash), which would otherwise
-  // swallow everything up to the next \] and break all rendering in between.
-  processed = processed.replace(/\\\[([\s\S]+?)(?:\\\]|\n[ \t]*\][ \t]*(?=\n|$))/g, (_m, inner) => {
-    const k = key()
-    placeholders[k] = renderMathSafe(inner.trim(), true)
-    return `\n\n${k}\n\n`
-  })
-
-  // Step 3: escape currency/money `$` (tables + prose) so cost levels are
-  // never mistaken for LaTeX delimiters. Runs AFTER display-math extraction
-  // and code protection, so real formulas and `$` inside code stay untouched.
-  processed = escapeCurrencyDollars(processed)
-
-  // \( ... \) inline math
-  processed = processed.replace(/\\\(([\s\S]+?)\\\)/g, (_m, inner) => {
-    const k = key()
-    placeholders[k] = renderMathSafe(inner.trim(), false)
-    return k
-  })
-
-  // $ ... $ inline math — avoid currency like "$5 and $6" / "$100"
-  // Rule: non-space after opening $, non-space before closing $, no digit after closing $
-  processed = processed.replace(
-    /(^|[^\\$])\$(?!\s)([^\$\n]+?)(?<!\s)\$(?!\d)/g,
-    (_m, pre, inner) => {
-      const k = key()
-      placeholders[k] = renderMathSafe(inner, false)
-      return `${pre}${k}`
-    }
-  )
-
-  // Step 3b: escape lone-tilde runs NOW (math + code are placeholders, so
-  // their ~ are protected) — see escapeLoneTildes for why marked pairs them.
-  processed = escapeLoneTildes(processed)
-
-  // Step 3: Restore code blocks
-  for (const [k, v] of Object.entries(codePlaceholders)) {
-    processed = processed.split(k).join(v)
-  }
-
-  return { text: processed, placeholders }
-}
-
-function restoreMath(html: string, placeholders: Record<string, string>): string {
-  let out = html
-  for (const [k, v] of Object.entries(placeholders)) {
-    // Strip a surrounding <p>…</p> that the markdown parser may have wrapped
-    // around a lone display-math placeholder.
-    out = out.split(`<p>${k}</p>`).join(v)
-    out = out.split(k).join(v)
-  }
-  return out
 }
 
 function fixMarkdownTables(text: string): string {
@@ -716,9 +654,11 @@ function fixHeadingBeforeTable(text: string): string {
  * `理解为**"把离散的 token 序列…"**` renders as literal asterisks
  * (conv c38ed824, 2026-08-26). Both fixes insert the same invisible-in-CJK
  * space — after the closing run / before the opening run — to make the run
- * flanking-legal. Runs of 1 or 3+ `*` are left untouched, and `**` runs
- * inside code spans / math are already placeholder-protected by extractMath
- * before this runs.
+ * flanking-legal. Runs of 1 or 3+ `*` are left untouched. The caller wraps
+ * this pass in maskProtectedSpans so code spans/fences and math spans are
+ * opaque placeholders while the state machine runs (A4.9 I1 — an unmasked
+ * `` `a**"b"**c` `` code span got silently re-spaced, and a `$2**3$` math
+ * span flipped the open state and broke a same-paragraph real bold).
  */
 export function fixCjkBoldFlanking(text: string): string {
   let out = ''
@@ -774,8 +714,45 @@ export function fixCjkBoldFlanking(text: string): string {
   return out
 }
 
+/**
+ * Mask code spans/fences and math spans behind opaque placeholders so
+ * fixCjkBoldFlanking's `**` state machine never sees inside them. The math
+ * tokenizer extension made discovery token-level — but this one pre-parse
+ * string pass (bold-flanking repair) still runs on raw text, so it keeps
+ * its own narrow mask. Pairing regexes mirror the tokenizer forms; no
+ * isMathishInner check is needed here (over-masking is harmless — the
+ * original text is restored verbatim before marked.parse ever runs).
+ * Placeholder keys use control chars and contain no `*`/`$`/`~`, so the
+ * flanking pass passes them through untouched.
+ */
+function maskProtectedSpans(text: string) {
+  const store: Record<string, string> = {}
+  let counter = 0
+  let out = text
+  const mask = (re: RegExp) => {
+    out = out.replace(re, (m) => {
+      const k = `MD${counter++}`
+      store[k] = m
+      return k
+    })
+  }
+  mask(/```[\s\S]*?```/g)
+  mask(/`[^`\n]+`/g)
+  mask(/^[ \t]*\$\$[\s\S]+?\$\$[ \t]*(?=\n|$)/gm)
+  mask(/\\\[[\s\S]+?(?:\\\]|\n[ \t]*\][ \t]*(?=\n|$))/g)
+  mask(/\\\([\s\S]+?\\\)/g)
+  mask(/\$\$(?!\$)[^$\n]+?\$\$(?![\d$])/g)
+  mask(/\$(?!\$)(?!\s)[^$\n]+?(?<!\s)\$(?![\d$])/g)
+  const restore = (s: string): string => {
+    for (const [k, v] of Object.entries(store)) s = s.split(k).join(v)
+    return s
+  }
+  return { text: out, restore }
+}
+
 function normalizeMarkdownSpacing(text: string): string {
-  let out = fixCjkBoldFlanking(text)
+  const masked = maskProtectedSpans(text)
+  let out = masked.restore(fixCjkBoldFlanking(masked.text))
 
   // Replace segment_split comments with blank lines (tool-call segment separator)
   out = out.replace(/<!--\s*segment_split\s*-->/g, '\n\n')
@@ -1115,13 +1092,13 @@ export function renderMarkdownToHtml(content: string): string {
     headingAutoIdCounter = 0
     const dsmlCleaned = stripDsmlTags(content)
     const cleaned = cleanupEmbeddedMermaidHtml(dsmlCleaned)
-    const { text, placeholders } = extractMath(cleaned)
-    const { text: iframeText, placeholders: iframePlaceholders } = extractSafeIframes(text)
+    // Math is discovered by the marked tokenizer extension (createMathExtension,
+    // wired at module init) — no placeholder extraction/restore needed here.
+    const { text: iframeText, placeholders: iframePlaceholders } = extractSafeIframes(cleaned)
     const normalized = normalizeMarkdownSpacing(iframeText)
     const html = marked.parse(normalized, { async: false }) as string
     const processed = splitOlContainingHeadings(html)
-    const restored = restoreMath(processed, placeholders)
-    const sanitized = DOMPurify.sanitize(restored, {
+    const sanitized = DOMPurify.sanitize(processed, {
       ALLOW_DATA_ATTR: true,
       ADD_ATTR: ['target', 'rel', 'style'],
       ADD_TAGS: ['button'],
@@ -1644,7 +1621,8 @@ export function htmlToMarkdown(html: string): string {
   // (e.g. "2 * 3", "a_b", "1 < 2") do not turn into emphasis/links/tags on
   // the next render cycle. Square brackets and tilde use HTML entities —
   // backslash-escaped "\[" would be mistaken for a LaTeX \[...\] delimiter
-  // by extractMath, and marked does not honor "\~" for strikethrough.
+  // by the mathDisplayBracket tokenizer, and marked does not honor "\~" for
+  // strikethrough.
   function escapeMdText(s: string): string {
     return stripZeroWidth(s)
       .replace(/&/g, '&amp;')

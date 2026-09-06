@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from app.core.config import get_config
+from app.services.tool_progress import report_tool_progress
 
 if sys.platform != "win32":
     import resource
@@ -272,6 +273,13 @@ class CodeExecutionService:
                     if not chunk:
                         break
                     chunks.append(chunk)
+                    # 2026-09-03 (conv 827a6f78): output flow = liveness.
+                    # Feeds the agent loop's stall watchdog so a running
+                    # subprocess is never mistaken for a hung tool call.
+                    try:
+                        report_tool_progress("code_output_chunk")
+                    except Exception:
+                        pass
                 return b"".join(chunks)
 
             stdout_task = asyncio.ensure_future(_read_all(proc.stdout))

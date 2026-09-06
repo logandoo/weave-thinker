@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.config import get_config
 from app.db.database import Assistant, UserWorkspace
-from app.services.llm_service import LLMService, PRESERVE_THINKING_PROVIDERS
+from app.services.llm_service import LLMService
 from app.services.memory_service import AgentSharedContext, build_shared_agent_context
 from app.tools.memory import _get_memory_path, _read_entries
 
@@ -115,10 +115,22 @@ def should_use_custom_model(assistant: Optional[Assistant]) -> bool:
     - provider_type is "qwen3.8_vllm" (address is assistant-configured per the
       modelscope vLLM deployment guide; falls back to server config inside
       create_llm_service when the field is empty), OR
-    - use_custom_model is True (for built-in providers with overrides)
+    - use_custom_model is True (for built-in providers with overrides), OR
+    - model_alias selects a non-default endpoint (model_gateway era: an
+      explicit alias choice = the assistant's own model setting, P0 rule —
+      all of the assistant's LLM behavior follows it).
     """
     if not assistant:
         return False
+    alias = str(getattr(assistant, "model_alias", None) or "")
+    if alias:
+        try:
+            from app.model_gateway.registry import get_model_registry
+            if alias != get_model_registry().default_alias():
+                return True
+        except Exception:
+            if alias != "deepseek":
+                return True
     pt = getattr(assistant, "provider_type", "deepseek")
     if pt in ("custom", "qwen3.8_vllm"):
         return True
@@ -147,11 +159,9 @@ class AgentService:
             return main_llm
         coord_model = config.agent_auxiliary_coordinator_model
         if coord_model:
-            return LLMService(
-                custom_api_url=config.api_base_url,
-                custom_api_key=config.api_key,
-                custom_model_name=coord_model,
-            )
+            from app.model_gateway import factory
+            from app.model_gateway.registry import get_model_registry
+            return factory.build_llm_service(get_model_registry().resolve("coordinator"))
         return None
 
     def title_generator_kwargs(self, assistant: Optional[Assistant], main_llm: Optional[LLMService]) -> dict:
@@ -172,54 +182,21 @@ class AgentService:
         }
 
     def create_llm_service(self, assistant: Optional[Assistant]) -> LLMService:
-        """Create LLM service based on assistant's provider_type and configuration.
+        """Create LLM service for the assistant.
 
-        Uses process-level cache keyed by (url, api_key_hash, model) to avoid
-        per-request TCP+TLS handshake overhead (P0-4).
+        model_gateway 收口（2026-08-30 解耦重构）：端点解析统一走
+        registry.endpoint_for_assistant（model_alias 优先，legacy
+        provider_type/custom_* 行级字段语义完全一致），客户端构造走
+        factory.build_llm_service。进程级缓存键不变（url, key hash, model,
+        preserve）——P0-4 的 TCP+TLS 复用不受影响。
         """
         import hashlib
-        provider_type = getattr(assistant, "provider_type", "deepseek") or "deepseek" if assistant else "deepseek"
-        provider_cfg = config.get_provider_config(provider_type)
 
-        if provider_type == "custom":
-            custom_api_url = assistant.custom_api_url if assistant else None
-            custom_api_key = assistant.custom_api_key if assistant else None
-            custom_model_name = assistant.custom_model_name if assistant else None
-        elif provider_type == "qwen3.8_vllm":
-            # Address is assistant-configured (modelscope vLLM deployment
-            # guide); empty fields fall back to the server-side provider
-            # config ([providers."qwen3.8_27b"]).
-            custom_api_url = None
-            custom_api_key = None
-            custom_model_name = None
-            if assistant:
-                custom_api_url = assistant.custom_api_url or provider_cfg.get("base_url") or None
-                custom_api_key = assistant.custom_api_key or provider_cfg.get("api_key") or None
-                custom_model_name = assistant.custom_model_name or provider_cfg.get("model_name") or None
-            else:
-                custom_api_url = provider_cfg.get("base_url") or None
-                custom_api_key = provider_cfg.get("api_key") or None
-                custom_model_name = provider_cfg.get("model_name") or None
-        else:
-            custom_api_url = provider_cfg.get("base_url") if provider_cfg.get("base_url") else None
-            custom_api_key = None
-            custom_model_name = None
-            if assistant:
-                if assistant.custom_api_key:
-                    custom_api_key = assistant.custom_api_key
-                else:
-                    custom_api_key = provider_cfg.get("api_key") or None
-                if assistant.custom_model_name:
-                    custom_model_name = assistant.custom_model_name
-                else:
-                    custom_model_name = provider_cfg.get("model_name") or None
-                if assistant.use_custom_model and assistant.custom_api_url:
-                    custom_api_url = assistant.custom_api_url
-                    if assistant.custom_api_key:
-                        custom_api_key = assistant.custom_api_key
-            else:
-                custom_api_key = provider_cfg.get("api_key") or None
-                custom_model_name = provider_cfg.get("model_name") or None
+        from app.model_gateway import factory
+        from app.model_gateway.registry import get_model_registry
+
+        provider_type = getattr(assistant, "provider_type", "deepseek") or "deepseek" if assistant else "deepseek"
+        ep = get_model_registry().endpoint_for_assistant(assistant)
 
         # A2 (2026-08-21): preserve-thinking providers keep the current
         # turn's assistant reasoning_content on the wire (qwen3.8_vllm
@@ -227,20 +204,24 @@ class AgentService:
         # contract / mimo thinking chain). Without this flag the reasoning
         # attached by _rejected_append would be stripped at the wire — the
         # A2 mechanism is dead code (A4.9 Critical-1 fix).
-        _preserve = provider_type in PRESERVE_THINKING_PROVIDERS
+        # 模型网关：以解析端点的 provider_type 为准（model_alias 助手的
+        # DB 旧列与新模型无关；legacy inline 端点携带旧列值）。
+        # wave-7：preserve 语义由 thinking profile 承载（profiles 收口）。
+        from app.model_gateway.profiles import get_thinking_profile
+        _preserve = get_thinking_profile(ep.provider_type or provider_type).preserve_thinking
 
         cache_key = (
-            (custom_api_url or ""),
-            hashlib.sha256((custom_api_key or "").encode()).hexdigest()[:16],
-            (custom_model_name or ""),
+            (ep.base_url or ""),
+            hashlib.sha256((ep.api_key or "").encode()).hexdigest()[:16],
+            (ep.model_name or ""),
             _preserve,
+            # A4.9 复审 R2 Minor：同凭据不同格式的端点不得共享缓存实例
+            # （endpoint 元数据随首个构建者，provider_type 必须入键）
+            (ep.provider_type or ""),
         )
         if cache_key not in AgentService._llm_cache:
-            AgentService._llm_cache[cache_key] = LLMService(
-                custom_api_url=custom_api_url,
-                custom_api_key=custom_api_key,
-                custom_model_name=custom_model_name,
-                preserve_reasoning=_preserve,
+            AgentService._llm_cache[cache_key] = factory.build_llm_service(
+                ep, preserve_reasoning=_preserve
             )
         return AgentService._llm_cache[cache_key]
 
@@ -264,28 +245,37 @@ class AgentService:
         when the caller already has one (e.g. chat.py's llm_service).
         """
         main_llm = main_llm or self.create_llm_service(assistant)
-        main_provider = getattr(assistant, "provider_type", "deepseek") or "deepseek"
         if assistant is None:
-            return main_llm, main_provider
+            return main_llm, "deepseek"
 
-        if not bool(getattr(assistant, "use_subtask_model", False)):
-            return main_llm, main_provider
+        from app.model_gateway import factory
+        from app.model_gateway.registry import get_model_registry
 
-        sub_url = getattr(assistant, "subtask_custom_api_url", None)
-        sub_key = getattr(assistant, "subtask_custom_api_key", None)
-        sub_model = getattr(assistant, "subtask_custom_model_name", None)
-        if not (sub_url and sub_key and sub_model):
+        # 模型网关：迭代 wire provider_type 以主端点为准（A4.9 复审 Critical-1）。
+        try:
+            main_provider = factory.wire_provider_type(
+                main_llm, getattr(assistant, "provider_type", "deepseek") or "deepseek"
+            )
+        except Exception:
+            main_provider = getattr(assistant, "provider_type", "deepseek") or "deepseek"
+
+        # model_gateway 收口：subtask_model_alias（新）或 legacy subtask_custom_*
+        # 行级字段 → 独立迭代客户端；否则复用主客户端（live-thinking 仅在主
+        # 客户端迭代时开启的既有语义不变）。
+        has_subtask = bool(getattr(assistant, "subtask_model_alias", None)) or bool(
+            getattr(assistant, "use_subtask_model", False)
+        )
+        if not has_subtask:
             return main_llm, main_provider
 
         try:
-            sub_llm = LLMService(
-                custom_api_url=sub_url,
-                custom_api_key=sub_key,
-                custom_model_name=sub_model,
-            )
-            sub_provider = (
-                getattr(assistant, "subtask_provider_type", None) or main_provider
-            )
+            registry = get_model_registry()
+            main_ep = registry.endpoint_for_assistant(assistant)
+            sub_ep = registry.endpoint_for_subtask(assistant, main_ep)
+            if sub_ep == main_ep:
+                return main_llm, main_provider
+            sub_llm = factory.build_llm_service(sub_ep)
+            sub_provider = sub_ep.provider_type or main_provider
             return sub_llm, sub_provider
         except Exception:
             logger.exception(
@@ -379,18 +369,13 @@ class AgentService:
 
         static_sections.append(
             "图表输出规范（ECharts 交互图表，全局规则）：\n"
-            "当用户要求展示统计图表（柱状图、折线图、饼图、散点图、雷达图、热力图、K线图、仪表盘等），"
-            "且数据适合在对话内直接展示时：\n"
-            "1. 直接在回答中使用 ```echarts 代码块输出一个标准 JSON 对象（ECharts option 配置），"
-            "禁止为此调用 execute_code 绘图生成图片文件，禁止使用 ASCII 艺术图或纯文本表格代替图表。\n"
-            "2. 代码块内必须是可被 JSON.parse 直接解析的标准 JSON："
-            "禁止 JavaScript 函数/表达式、注释、尾逗号、单引号；字段名和字符串必须用双引号。"
-            "常用字段与布局防重叠（grid top 预留等）完整规范见 echarts_chart 技能。\n"
-            "3. 图表会直接在对话界面渲染为可交互图表；导出笔记或对话为 MD/PDF 时，"
-            "图表会自动转换为图片保存，用户无需任何额外操作。\n"
-            "4. 图表说明文字写在代码块外的正文里，不要写在 JSON 内。\n"
-            "5. 只有当用户明确要求生成可下载的图片/Excel 文件（如 PNG 附件、xlsx 数据表）时，"
-            "才允许使用 execute_code 绘图。\n"
+            "用户要求统计图表（柱状/折线/饼/散点/雷达/热力/K线/仪表盘等）且适合对话内展示时，"
+            "直接用 ```echarts 代码块输出一个可 JSON.parse 的标准 ECharts option："
+            "禁止 JS 函数/表达式、注释、尾逗号、单引号，字段名与字符串用双引号；"
+            "禁止为此调用 execute_code，禁止 ASCII 图或纯文本表格代替；"
+            "只有用户明确要 PNG/xlsx 等下载文件时才允许 execute_code 绘图。"
+            "图表说明文字写在代码块外的正文里。完整字段与布局防重叠规范见 echarts_chart 技能；"
+            "导出笔记/对话为 MD/PDF 时图表自动转图片。\n"
         )
 
         static_sections.append(
@@ -405,9 +390,12 @@ class AgentService:
             "- `terminal`：执行 shell 命令。"
             "仅当用户明确要求运行外部 CLI 工具（xelatex、pandoc、ffmpeg、gcc 等）、"
             "安装软件包（pip install 等）或其他非 Python 的系统级操作时使用。\n"
-            "- `execute_code`：生成并执行 Python 代码。"
-            "仅当用户明确要求生成可下载文件（Excel/PPT/Word/CSV/图片等，PDF 除外）"
-            "或需要复杂计算/数据处理时使用；"
+            "- `calculate`：确定性数学计算器（毫秒级）。任何产生推导数值的计算——"
+            "四则运算、百分比、单位换算、几何/财务/统计公式——一律先用 calculate 求值，"
+            "严禁心算后直接作答；表达式必须包含题目中的输入数值，写完整公式。\n"
+            "- `execute_code`：生成并执行 Python 代码。多步计算/数据处理时使用——"
+            "必须 print 公式、输入参数与中间量（便于核对），严禁 print 裸数字字面量；"
+            "也用于生成可下载文件（Excel/PPT/Word/CSV/图片等，PDF 除外用 pdf_export）；"
             "常用库 python-pptx、openpyxl、reportlab、matplotlib、numpy、pandas、Pillow；"
             "沙箱禁止 subprocess 和 os.system，外部命令改用 terminal。\n"
             "- `pdf_export`：导出笔记、对话或工作区文件为 PDF（export_note 用笔记 UUID，"
@@ -418,7 +406,7 @@ class AgentService:
             "- `context7_resolve_library_id` + `context7_query_docs`：查询库/框架的最新官方文档与代码示例"
             "（先 resolve 拿库 ID 再 query）。\n"
             "- `memory`：记录或检索长期记忆。三个 target：agent（助手观察）、user（用户偏好）、"
-            "system（系统功能文档 func.md，只读）。用户询问系统功能/产品介绍/版本更新时，"
+            "system（系统文档 changelog.md，只读）。用户询问系统功能/产品介绍/版本更新时，"
             "先用 memory(target='system', action='read') 读取文档再回答；"
             "创作类任务无需主动读取用户记忆，只有用户明确要求参考时才读取。\n"
             "- `delegate_task`：将复杂任务委派给子智能体执行。工具结果以 `<tool-digest>` 信封返回时，"
@@ -427,30 +415,28 @@ class AgentService:
             "**当用户要求在未来某个时间执行某事（如『明天早上7点推送新闻』）时，只调用 `schedule(action='create')` 创建任务并立即结束本轮回复；"
             "不要在本轮继续调用 web_search/browser/execute_code 去现场完成任务体。任务届时会在新会话中自动执行。**\n\n"
             "上传文件处理规则（完全自主）：\n"
-            "当用户消息中包含 `[file-ref:文件名]` 标记时，说明用户上传了文件，文件已保存在系统路径中。"
-            "你必须完全自主地判断该文件应如何解析，禁止依赖任何硬编码的文件类型映射。\n"
-            "处理流程：用户指定了技能就直接用该技能；否则按扩展名判断文件类型 → "
-            "用 `skill_manage(action='list')` 找匹配技能（xlsx/docx/pptx 等）并用 `skill_view` 加载 → "
-            "没有匹配技能就 `web_search` 查最佳解析方式 → 用 `execute_code`/`skill_run_script`/`terminal` 执行解析"
-            "（缺库用 `terminal` 执行 `pip install 包名`，禁止 --break-system-packages）→ 解析完成后基于内容回答。"
-            "完整流程见 file_parsing 技能。\n"
-            "重要约束：禁止在系统提示或任何工具结果中硬编码'某类型文件必须用某库解析'。"
-            "所有解析方式必须由你根据当前可用技能、搜索结果和代码执行能力自主决定。\n\n"
+            "用户消息含 `[file-ref:文件名]` 标记时文件已入库，你必须完全自主判断解析方式，"
+            "禁止依赖/硬编码'某类型文件必须用某库解析'的映射：\n"
+            "用户指定了技能就直接用；否则 skill_manage(action='list') 找匹配技能并 skill_view 加载 → "
+            "没有就 web_search 查最佳解析方式 → execute_code/skill_run_script/terminal 执行解析"
+            "（缺库 terminal pip install，禁止 --break-system-packages）→ 基于内容回答。"
+            "完整流程见 file_parsing 技能。\n\n"
             "图片显示能力：对话界面原生支持 Markdown 图片语法 `![描述](图片URL)`。"
             "当你通过 `web_search` 或 `browser` 找到在线图片 URL 时，应直接在最终回答中使用该语法显示图片，"
             "不需要调用 `execute_code` 生成文件，也不需要声明无法显示图片。"
             "只有当用户明确要求生成可下载的图片文件（如 PNG/JPG 附件）时，才使用 `execute_code`。"
              "显示图片时，必须在图片语法后紧跟来源引用标号，格式为 `![描述](图片URL) [N]`，"
              "其中 [N] 是该图片来源页面对应的搜索结果序号。\n\n"
-             "媒体播放能力：对话界面原生支持内嵌音频/视频播放器（`<video controls src=\"路径\"></video>`、"
-             "`<audio controls src=\"路径\"></audio>`；工作区相对路径自动转换为可播放地址），"
-             "也支持 YouTube/Bilibili 官方 embed iframe 内嵌（合法播放方式，不要宣称'版权限制无法内嵌'）。"
-             "当用户要求'直接显示/播放视频或音频'时，不要声明界面不支持播放——"
-             "优先把可直链的媒体文件下载到工作区后内嵌播放，或调用 `provide_file` 提供媒体附件。"
-             "embed 链接构造细节与白名单见 media_playback 技能。\n\n"
+             "媒体播放能力：界面原生内嵌 <video>/<audio controls src>（工作区相对路径自动转播放地址）"
+             "与 YouTube/Bilibili 官方 embed iframe（合法方式，不要宣称'版权限制无法内嵌'）。"
+             "用户要求播放/展示媒体时不要声明不支持：优先把可直链媒体下载到工作区后内嵌播放，"
+             "或调用 `provide_file` 提供附件。embed 构造细节与白名单见 media_playback 技能。\n\n"
             "核心原则 — 主动求知：\n"
             "当你不确定某个事实、数据、事件、最新动态或任何需要实时信息才能准确回答的问题时，"
             "必须主动调用 `web_search` 搜索，而不是凭记忆猜测或编造答案。"
+            "涉及具体史实、典故、地名由来、人物事件、文物古迹、日期数字等冷僻细节的问题"
+            "（尤其是地方性、小众主题），即使你有印象也必须先搜索核实——"
+            "你对这类冷僻细节的记忆不可靠，凭印象展开具体叙述等同于编造。"
             "宁可多搜一次也不要给出过时或错误的信息。"
             "你的知识有截止日期，而用户的问题可能涉及最新发生的事。\n\n"
             "使用规则：\n"
@@ -533,9 +519,9 @@ class AgentService:
             "必须能够如实描述。\n"
             "7. 身份类问题属于工具使用规则的例外：不要调用 web_search、session_search、notes、execute_code、terminal 等任何工具。\n"
              "8. “智能助手自我介绍”、“产品功能介绍”、“系统功能说明”、“版本更新说明”等涉及产品功能或版本的问题，"
-             "不是纯身份问题。回答这些问题时，必须调用 memory(target='system', action='read') 读取 func.md，"
-             "然后基于 func.md 文档内容回答，禁止随口编造或只给一句“我是 Weave Thinker”。"
-             "（若本轮对话已经读取过 func.md 且内容未变化，不要重复调用，直接基于已有内容回答。）\n"
+             "不是纯身份问题。回答这些问题时，必须调用 memory(target='system', action='read') 读取 changelog.md，"
+             "然后基于 changelog.md 文档内容回答，禁止随口编造或只给一句“我是 Weave Thinker”。"
+             "（若本轮对话已经读取过 changelog.md 且内容未变化，不要重复调用，直接基于已有内容回答。）\n"
             "9. 如果用户问题是在比较、询问、讨论不同的AI模型/产品（例如'deepseekv4flash和minimax3相比哪个好'），"
             "这属于普通的产品比较问题，不是身份问题，应当按正常流程回答（可调用工具获取最新信息），"
             "不要拒绝回答，也不要把它当成在问你自己的身份。\n"
@@ -562,9 +548,19 @@ class AgentService:
             "   直接基于上下文中的已有内容作答（重复读取只会浪费上下文，系统也会拦截）。\n"
             "7. 身份与模型信息保密规则优先级高于本规则：当用户问“你是谁/你是什么模型”等纯身份问题时，"
             "   不要调用任何工具，简短自然回答即可。\n"
-            "   但“智能助手自我介绍”、“产品功能介绍”、“版本更新说明”等不是纯身份问题，必须调用 memory(target='system') 读取 func.md。\n"
+            "   但“智能助手自我介绍”、“产品功能介绍”、“版本更新说明”等不是纯身份问题，必须调用 memory(target='system') 读取 changelog.md。\n"
             "</mandatory_tool_use>\n"
         )
+
+        # MCP 渐进发现（A4.9 Minor-2）：仅在渐进模式开启时宣传 search_tools，
+        # 避免回滚模式/子代理场景宣传一个未被 offer 的工具。
+        if config.agent_tools_mcp_progressive_enabled:
+            static_sections.append(
+                "扩展工具按需加载：除上列工具外，还有一批专业扩展工具"
+                "（远程服务器运维/MCP 服务器提供的工具等）默认未加载。"
+                "需要时先调用 search_tools 按关键词检索（中英文均可），"
+                "匹配到的工具会自动加载到当前会话，然后即可直接调用。"
+            )
 
         static_sections.append(
             "重要格式要求：本系统面向企业级用户，回答中禁止使用任何emoji表情符号（如📋🔍✅❌💡📌🎯🚀等）和颜文字。"

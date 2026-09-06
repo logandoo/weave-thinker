@@ -19,6 +19,13 @@
           </svg>
         </button>
         <span class="mobile-title">{{ currentTitle }}</span>
+        <span
+          v-if="showMobileContextChip"
+          class="context-token-chip context-token-chip-mobile"
+          :title="mobileContextTooltip"
+        >
+          本轮 {{ formatContextTokens(chatStore.currentContextInfo!.tokens) }}
+        </span>
         <button
           v-if="showMobileSaveNote"
           class="mobile-save-note-btn"
@@ -78,6 +85,7 @@ import { navigateWithMobileHistory } from '@/composables/useMobileNavigation'
 import { useChatStore } from '@/stores/chat'
 import { useNotesStore } from '@/stores/notes'
 import { useAssistantStore } from '@/stores/assistant'
+import { formatContextTokens, contextTokenTooltipText } from '@/composables/useContextTokens'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuth()
@@ -157,6 +165,15 @@ const showMobileSaveNote = computed(() => {
   if (chatStore.currentMessages.length === 0) return false
   return !chatStore.saveModeActive
 })
+
+// P2 (2026-09-05): 移动端 token 徽章——数据源与桌面端 .chat-header 徽章一致
+// （chatStore.currentContextInfo，含跨设备播种的持久化快照）；仅聊天页显示。
+const showMobileContextChip = computed(() => {
+  if (isOnNotesPage.value || isOnZenPage.value || isOnVoicePage.value) return false
+  if (!chatStore.currentConversationId) return false
+  return !!chatStore.currentContextInfo
+})
+const mobileContextTooltip = computed(() => contextTokenTooltipText(chatStore.currentContextInfo))
 
 function enterSaveMode() {
   chatStore.saveModeActive = true
@@ -308,6 +325,24 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* P2 (2026-09-05): 移动端 token 徽章——与桌面 .context-token-chip 同族
+   （同名 class，皮肤覆写如 mono-brutal 自动命中），尺寸收紧适配 40px 顶栏。 */
+.context-token-chip-mobile {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-light);
+  background-color: var(--color-hover);
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  cursor: default;
 }
 
 .mobile-save-note-btn {

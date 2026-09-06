@@ -205,7 +205,7 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
         if not force and key in existing_keys:
             skipped += 1
             continue
-        # 已有同名 profile 概念则改写描述；否则新建
+        # 已有同名 profile 概念则更新描述；否则新建
         existing = await db.execute(
             text("SELECT id FROM memory_concepts WHERE user_id = :uid AND source_type = :st AND canonical_name = :nm"),
             {"uid": user_id, "st": _PROFILE_SOURCE, "nm": fact["name"]},
@@ -223,8 +223,8 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
             # 描述变化后需重生成 embedding 与 BM25 索引
             from app.services.memory_concept_service import update_concept_description
             await update_concept_description(db, row[0], fact["desc"], fact["desc"])
-            # 修改分支也持久化 key（缺 key 的旧行补写，
-            # 否则每次扫描都走修改分支重复 re-embed）
+            # A4.9 复审 Important #2：更新分支也持久化 key（缺 key 的旧行补写，
+            # 否则每次扫描都走更新分支重复 re-embed）
             await db.execute(
                 text("UPDATE memory_concepts SET source_raw_ids = :keys WHERE id = :cid AND (source_raw_ids IS NULL OR source_raw_ids = '')"),
                 {"keys": json.dumps([key], ensure_ascii=False), "cid": row[0]},

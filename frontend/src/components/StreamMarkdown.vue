@@ -426,12 +426,16 @@ onBeforeUnmount(() => {
 }
 
 .stream-markdown :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
 .stream-markdown :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .stream-markdown :deep(blockquote) {

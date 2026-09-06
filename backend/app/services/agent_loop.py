@@ -2,19 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import hashlib
 import json
 import logging
 import re as _re
 import uuid
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Dict, List, Optional, Set
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set
 
-from app.services.llm_service import LLMService, PRESERVE_THINKING_PROVIDERS
+from app.services.llm_service import LLMService
 from app.tools.registry import registry
 from app.services.retry_utils import coerce_tool_args, repair_tool_call_arguments, sanitize_messages_surrogates, jittered_backoff
 from app.services.tool_result_budget import maybe_persist_tool_result, enforce_turn_budget, BudgetConfig, DEFAULT_BUDGET
 from app.services.tool_result_digest import digest_tool_results_batch, DigestConfig, DEFAULT_DIGEST_TOOLS
+from app.services.numeric_provenance_gate import evaluate_numeric_provenance
+from app.services.deathmatch_archive import record_harness_run
+from app.services.tool_progress import ToolStalledError
 from app.services.provider_router import build_thinking_extra_body
 from app.services.agent_permissions import (
     is_permission_allowed,
@@ -44,6 +48,7 @@ _PARALLEL_SAFE_TOOLS: Set[str] = {
     "provide_file",
     "grep",
     "diff",
+    "vision_interpret",
 }
 
 _TOOL_CALL_RE = _re.compile(r'<tool_calls>.*?</tool_calls>', _re.DOTALL)
@@ -344,6 +349,15 @@ class ToolCallResult:
     error: bool = False
 
 
+def _context_info_from_usage(usage: Dict[str, Any], context_window: int) -> Dict[str, Any]:
+    """实测 provider usage → 前端 context_info（P4 真值徽章）。"""
+    return {
+        "tokens": int(usage.get("prompt_tokens") or 0),
+        "context_length": context_window,
+        "measured": True,
+    }
+
+
 def _inject_directive(state: "AgentLoopState", content: str, *, enabled: Optional[bool] = None, **extra: Any) -> None:
     """Inject an internal agent directive into the in-flight message list.
 
@@ -408,6 +422,18 @@ _AUDIT_RETRY_BREVITY_HINT = (
     "只输出完整合法的JSON，不要任何其他内容。"
 )
 
+# T8 (JIT-Agent F module): when a deathmatch plan step declares its tool
+# classes, the loop offers only that subset PLUS this minimal always-on core
+# (file/memory capability — steps still need to read/write their workspace
+# and keep notes). Undeclared → full registry (default, opt-in-by-absence).
+_DM_STEP_TOOL_CORE = frozenset({
+    "workspace_read", "workspace_write", "workspace_glob", "execute_code",
+    "calculate", "memory", "notes", "provide_file", "word_count",
+    # MCP 渐进发现（2026-09-02）：MCP schema 已入延迟池，dm 步骤若需 MCP
+    # 能力必须能先 search_tools 检索（A4.9 Important-1：否则 dm 计划合法
+    # 声明的 MCP 工具既不被 offer 也无法发现，静默死路）。
+    "search_tools",
+})
 # Per-turn settled-verdict ledger injected into the AUDITOR's context
 # (conv efaf8f9c 2026-08-20: the auditor re-litigated the same datum each
 # round — VGM 32GB -> 48GB -> ~32GB+GTT — an unsatisfiable loop). The
@@ -557,7 +583,7 @@ _ORPHAN_PUNCT = "，；。"
 def _strip_leading_orphan_punct(text: str) -> str:
     """Strip exactly ONE leading orphan full-width punctuation (，；。).
 
-    Defense for the qwen3.8_27b@vLLM first-token glitch family (conv
+    Defense for the qwen3.8@vLLM (model qwen3.8_27b) first-token glitch family (conv
     e7d51dcb 2026-08-19 bare '：' — persistence-layer strip; conv efaf8f9c
     2026-08-21 复盘: drafts opened with '，但属于…' and the auditor rejected
     five regenerations for the same grammar defect). No legitimate prose
@@ -877,8 +903,9 @@ def _rejected_append(loop: "AgentLoop", state: "AgentLoopState", content: str, r
     instruction-following degradation + hallucinations)."""
     _cap = config.agent_audit_retry_reasoning_keep_chars
     _pt = getattr(loop, "provider_type", "") or ""
+    from app.model_gateway.profiles import get_thinking_profile
     if (
-        _pt in PRESERVE_THINKING_PROVIDERS
+        get_thinking_profile(_pt).preserve_thinking
         and _cap > 0
         and reasoning_content
     ):
@@ -963,6 +990,8 @@ def _search_class_tool_used(state: "AgentLoopState") -> bool:
 class AgentLoopState:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     tool_results: List[ToolCallResult] = field(default_factory=list)
+    # P4 真值徽章：主链路最近一次实测 usage（provider usage.prompt_tokens）。
+    last_usage: Optional[Dict[str, Any]] = None
     iterations: int = 0
     total_tool_calls: int = 0
     consecutive_tool_iterations: int = 0
@@ -1064,6 +1093,11 @@ class AgentLoopState:
     # the event queue. Checked at tool execution boundaries to skip pending
     # tool calls and mark running ones as interrupted.
     cancelled: bool = False
+    # 插话队列（2026-08-29，codex pending-input / deepseek-harness next-step
+    # inbox 模式）：运行中 run 的用户插话由 interject 端点投入此队列，
+    # _run_loop 在每轮迭代顶部 drain 为真实 user 消息（commit-echo），
+    # 不打断在途 token。None = 本 run 不支持插话（后台任务等调用方）。
+    interjection_queue: Optional[asyncio.Queue] = None
     # 遵循词 canary: True after one miss-triggered compression ran for this
     # request — the per-request budget (cross-request budget is the tracker's
     # auto_disable_after).
@@ -1089,6 +1123,16 @@ class AgentLoopState:
     # evidence "can't see" must not burn the reject budget into the failure
     # text path); capped separately by [agent.audit] soft_reject_limit.
     audit_soft_rejections: int = 0
+    # NPG（数值溯源闸门）enforce 打回历史（conv 3a216a51, 2026-09-02）：每次
+    # enforce needs_evidence 记录 (flags 数, 当时 total_tool_calls)。no-progress
+    # 守卫据此判定「连续打回且无收敛」→ 视同软预算耗尽直接进入 salvage，
+    # 不再整稿重发（法条/定义式文本的数值不可计算自救，生产实证重发只会
+    # 让 flags 越改越多：3→6→6→8，用户看到答案反复闪现）。
+    npg_reject_flags: List[int] = field(default_factory=list)
+    npg_reject_tool_calls: List[int] = field(default_factory=list)
+    # 每次 enforce 打回的 raw 值集合（churn 感知：修旧增新不算停滞）。
+    # 跨 canary 重答保留（同一 run 内无工具前提仍成立，见守卫 docstring）。
+    npg_reject_raws: List[frozenset] = field(default_factory=list)
     # Best-of-N stash (conv 7dc7a0d5, 2026-08-18): every audit-rejected draft
     # (draft path AND synthesis path, INCLUDING the budget-spending one) is
     # kept here in full — `_prune_guardrail_pairs` wipes the `_rejected`
@@ -1120,12 +1164,26 @@ class AgentLoopState:
     # document every iteration — a second identical read short-circuits with
     # a small note instead of re-injecting the whole file into context.
     memory_read_targets: set = field(default_factory=set)
+    # Per-turn redundancy records (conv a8290d37 2026-08-28 行动层/决策层冲突):
+    # signatures of tool calls that SUCCEEDED this turn, and the set of page
+    # URLs the browser tool actually returned text for. The answer/tool
+    # conflict arbitration uses these to tell objective redundancy (a repeat
+    # of an already-succeeded call) from new intent — only fully-redundant
+    # call sets may be dropped in favor of a substantial co-emitted answer.
+    _succeeded_call_sigs: Set[tuple] = field(default_factory=set)
+    _fetched_urls: Set[str] = field(default_factory=set)
+    # Doom result-awareness (A4.9 R1 I2): sig → sha256 hashes of the last few
+    # SUCCESS results for that call. The windowed doom detector only convicts
+    # when repeated identical calls also returned IDENTICAL results — polling
+    # a status page for fresh data (same args, changing payload) is a healthy
+    # workflow, not a loop.
+    _doom_result_hashes: Dict[tuple, List[str]] = field(default_factory=dict)
 
 
 def _maybe_dedupe_memory_read(state: "AgentLoopState", tool_args: dict) -> Optional[str]:
     """Per-turn memory-read dedup guard (conv dfc40619 2026-08-09).
 
-    The coordinator turn-focus directive ("需要读取 func.md") persists across
+    The coordinator turn-focus directive ("需要读取 changelog.md") persists across
     ALL iterations of a turn, and the system prompt's mandatory_tool_use rule
     8 forces fresh tool calls even when the model already has the data — so
     DeepSeek re-issues the SAME ``memory read`` every iteration, re-injecting
@@ -1180,11 +1238,185 @@ def _clear_memory_read_cache(state: "AgentLoopState") -> None:
     state.memory_read_targets.clear()
 
 
+# ── 行动层/决策层冲突仲裁 helpers (conv a8290d37 2026-08-28) ─────────────
+#
+# 事故机制：模型的响应同时携带「完整正式回答 content + 冗余 browser
+# tool_call」（决策层说完成、行动层说继续）；旧规则「有 tool_calls →
+# content 是临时过渡文本」丢弃了 ~11 份完整答案（stream buffer 实证
+# 33,471 字 vs 落库 2,857 字），发送前审计（validator）只对无 tool_call
+# 终稿运行 → 结构性失明；doom 检测只认「连续 3 次完全相同参数」，模型在
+# 2-3 个 URL 变体间交替即绕过，触发后也只回一句错误文本、被无视 4 次。
+#
+# 修复：客观冗余判据（已成功同参 / 非分页 browser 且 URL 全部已抓取）+
+# 实质内容阈值（系统提示词规定过渡文字必须「简短、明显不像最终回答」，
+# ≥800 字定义性属于正式回答）→ 决策层优先：丢弃冗余调用，content 走
+# 正常终答路径（含发送前审计）。doom 检测窗口化并在触发时强制收尾。
+
+
+def _normalize_fetch_urls(tool_args: Dict[str, Any]) -> List[str]:
+    """Extract the browser tool's `urls` argument as a clean list."""
+    urls = tool_args.get("urls") or []
+    if isinstance(urls, str):
+        urls = [urls]
+    return [u.strip() for u in urls if isinstance(u, str) and u.strip()]
+
+
+def _call_signature(tool_name: str, tool_args: Dict[str, Any]) -> tuple:
+    """Stable (name, args-hash) signature — same construction for doom
+    history, redundancy records and redundancy checks so all three agree on
+    'identical'. Args are schema-coerced first (A4.9 R1 M3): the model's raw
+    ``{"max_pages": "5"}`` and the coerced ``{"max_pages": 5}`` must hash
+    identically or the exact-duplicate rule silently never matches."""
+    args = tool_args
+    try:
+        schema = registry.get_schema(tool_name)
+        if schema is not None:
+            args = coerce_tool_args(tool_name, dict(tool_args or {}), schema)
+    except Exception:
+        args = tool_args
+    return (
+        tool_name,
+        hashlib.sha256(
+            json.dumps(args, sort_keys=True, ensure_ascii=False, default=str).encode()
+        ).hexdigest(),
+    )
+
+
+def _record_tool_success(
+    state: "AgentLoopState", tool_name: str, tool_args: Dict[str, Any], result: str
+) -> None:
+    """Record a successful tool call for per-turn redundancy arbitration and
+    result-aware doom detection.
+
+    Error payloads ({"error": ...}) record nothing — an identical retry of a
+    FAILED call must never be treated as redundant. The browser tool almost
+    never returns a top-level error key (A4.9 R1 I1): page-level failures
+    arrive as HTTP-200-shaped payloads whose pages all lack text — those
+    record nothing either, so a retry after a transient 404/rate-limit is
+    not suppressed. Only pages that actually returned text count as fetched.
+    """
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return
+    if tool_name == "browser":
+        if not isinstance(parsed, dict):
+            return
+        pages_with_text = 0
+        for page in parsed.get("pages") or []:
+            if not isinstance(page, dict):
+                continue
+            url = (page.get("url") or "").strip()
+            if url and page.get("text"):
+                state._fetched_urls.add(url)
+                pages_with_text += 1
+        if pages_with_text == 0:
+            return
+    sig = _call_signature(tool_name, tool_args)
+    state._succeeded_call_sigs.add(sig)
+    hashes = state._doom_result_hashes.setdefault(sig, [])
+    hashes.append(hashlib.sha256(result.encode()).hexdigest())
+    state._doom_result_hashes[sig] = hashes[-6:]
+
+
+def _is_redundant_call(state: "AgentLoopState", tool_call: Dict[str, Any]) -> bool:
+    """Objective per-turn redundancy (never a content-quality guess):
+
+    1. exact duplicate of a call that already SUCCEEDED this turn; or
+    2. a non-paginated browser fetch whose URLs were all fetched this turn.
+    ``paginated=true`` requests deeper pages of a URL — always new intent.
+    Unparseable args are treated as new intent (never dropped).
+    """
+    fn = tool_call.get("function") or {}
+    name = fn.get("name") or ""
+    args_raw = fn.get("arguments")
+    try:
+        args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(args, dict):
+        return False
+    if _call_signature(name, args) in state._succeeded_call_sigs:
+        return True
+    if name == "browser" and not args.get("paginated"):
+        urls = _normalize_fetch_urls(args)
+        if urls and all(u in state._fetched_urls for u in urls):
+            return True
+    return False
+
+
+def _calls_all_redundant(state: "AgentLoopState", tool_calls: List[Dict[str, Any]]) -> bool:
+    return bool(tool_calls) and all(_is_redundant_call(state, tc) for tc in tool_calls)
+
+
+def _should_promote_answer_over_tools(
+    state: "AgentLoopState",
+    assistant_content: str,
+    tool_calls: List[Dict[str, Any]],
+    min_chars: int,
+) -> bool:
+    """Decision-layer priority arbitration: when a response carries BOTH an
+    answer-sized content AND tool calls that are ALL objectively redundant,
+    the redundant calls lose — the content proceeds down the normal
+    final-answer path (pre-send audit included). Short transitional prose
+    (< min_chars) keeps the legacy 'content is transient' semantics."""
+    return (
+        bool(assistant_content)
+        and len(assistant_content) >= min_chars
+        and _calls_all_redundant(state, tool_calls)
+    )
+
+
+def _detect_doom_loop(
+    history: List[tuple], result_hashes: Optional[Dict[tuple, List[str]]] = None
+) -> Optional[tuple]:
+    """Windowed, result-aware doom-loop detection: a (tool, args-hash) seen
+    ≥3 times in the last 6 calls whose results are STAGNANT (all recorded
+    results identical, or none recorded — freshness unprovable, conservative
+    doom per the legacy rule). Subsumes the old consecutive-3 rule and
+    catches the alternating-variant escape (A,B,A,B,A) from conv a8290d37,
+    while exempting healthy polling workflows that repeat an identical call
+    but keep receiving FRESH results (A4.9 R1 I2)."""
+    counts: Dict[tuple, int] = {}
+    for entry in history[-6:]:
+        counts[entry] = counts.get(entry, 0) + 1
+    for entry, n in counts.items():
+        if n < 3:
+            continue
+        if result_hashes is None:
+            return entry  # legacy callers without result tracking
+        recorded = result_hashes.get(entry) or []
+        if not recorded:
+            return entry  # no fresh result ever observed — cannot prove progress
+        if len(set(recorded[-3:])) == 1:
+            return entry  # identical call, identical outcome — a true loop
+        # results keep changing (monitoring/polling) — not a loop
+    return None
+
+
+def _filter_force_stage_calls(
+    state: "AgentLoopState", tool_calls: List[Dict[str, Any]]
+) -> tuple:
+    """Force-final-answer stage hard stop (A4.9 R1 M6): during the forced
+    phase only execute_code is OFFERED, but a non-compliant model can still
+    emit native calls to other tools (conv a8290d37: the model ignored 4
+    consecutive doom aborts and kept issuing native browser calls). Mirrors
+    the DSML inline-markup filter: non-execute_code calls are dropped before
+    execution so the circuit breaker is a hard stop, not bounded waste."""
+    if not state.force_final_answer:
+        return tool_calls, []
+    kept = [tc for tc in tool_calls if (tc.get("function") or {}).get("name") == "execute_code"]
+    dropped = [tc for tc in tool_calls if (tc.get("function") or {}).get("name") != "execute_code"]
+    return kept, dropped
+
+
 def _tool_evidence_fragment(result: str, limit: int = 800) -> str:
     """Head+tail fragment of a tool result for the auditor context.
 
     conv a67faa04 (2026-08-14): head-only truncation hid tail-anchored
-    evidence — the memory read of func.md is ~10.6k chars and its changelog
+    evidence — the memory read of changelog.md is ~10.6k chars and its 版本记录
     section lives at the END of the file, so grounded drafts quoting that
     changelog were falsely accused of fabrication. Same 800-char budget as
     before (auditor is a repeated hot-path LLM call), but both ends are
@@ -1212,7 +1444,7 @@ async def _load_full_tool_result(result_text: str) -> str:
     the budget layer (tool_result_budget) with <persisted-output> envelopes
     (Full output saved to:). Both keep an on-disk pointer — read it back so
     the auditor sees the SAME evidence the model saw (conv a67faa04
-    2026-08-14: head-only truncation hid func.md's tail changelog and
+    2026-08-14: head-only truncation hid changelog.md's tail section and
     grounded drafts were falsely accused of fabrication).
 
     User principle (2026-08-14): information integrity > saving tokens —
@@ -1233,7 +1465,25 @@ async def _load_full_tool_result(result_text: str) -> str:
     return text or result_text
 
 
-_AUDIT_GROUNDING_TOOLS = frozenset({"memory", "workspace_read", "web_search", "browser", "workspace_glob"})
+_AUDIT_GROUNDING_TOOLS = frozenset({
+    "memory", "workspace_read", "web_search", "browser", "workspace_glob",
+    # NPG (2026-09-02, conv 83d97ede): computed outputs are the canonical
+    # numeric ground truth — the auditor template says the ONLY legal basis
+    # for numeric rejections is visible execute_code/calculate/terminal
+    # output, so those outputs must be full-text evidence (not fragments).
+    "execute_code", "terminal", "calculate",
+})
+
+
+def _is_audit_grounding(name: str) -> bool:
+    """Grounding-class = the auditor gets FULL-TEXT evidence (disk read-back),
+    not a head+tail fragment. Fixed tools in _AUDIT_GROUNDING_TOOLS plus ALL
+    MCP tools (conv 6dcae019, 2026-09-03): MCP tool outputs are the primary
+    evidence of MCP-driven tasks (RemPilot remote_shell → nvidia-smi numbers);
+    fragmenting them made the auditor reject every draft with 「输出被截断」
+    until the budget fell to selection. The evidence token budget remains the
+    guardrail — grounding only changes fragment-vs-full, not the cap."""
+    return name in _AUDIT_GROUNDING_TOOLS or name.startswith("mcp_")
 
 # Non-evidence share of the audit prompt: system template (~1.6k tok) +
 # user msg/turn_focus/tools list (~1k) + prev-answer window (~2.5k) +
@@ -1308,11 +1558,11 @@ async def _build_audit_evidence(
             arguments={},
             result=_content,
         )))
-    items.sort(key=lambda it: (it[0] == "" and it[1].name not in _AUDIT_GROUNDING_TOOLS, it[0] == "", it[1].error))
+    items.sort(key=lambda it: (it[0] == "" and not _is_audit_grounding(it[1].name), it[0] == "", it[1].error))
     for idx, (label, tr) in enumerate(items, 1):
         raw = tr.result or ""
         _err_mark = " error" if tr.error else ""
-        if tr.error or tr.name not in _AUDIT_GROUNDING_TOOLS:
+        if tr.error or not _is_audit_grounding(tr.name):
             frag = _tool_evidence_fragment(raw)
             _tk = estimate_text_tokens_rough(frag)
             if used_tokens + _tk <= budget:
@@ -1352,6 +1602,32 @@ class AuditVerdict:
     guidance: str = ""
     problem: str = ""
     unsupported_claims: list = field(default_factory=list)
+    # 打回来源（conv 3a216a51 no-progress 守卫，2026-09-02）："llm"（LLM 审计
+    # 员，默认）| "npg"（数值溯源闸门 enforce）。守卫只认 npg 来源——LLM
+    # 审计员的 needs_evidence 不得骑在历史 NPG 打回上触发 salvage 截断。
+    source: str = "llm"
+
+
+def _npg_soft_reject_no_progress(
+    flags_history: Sequence[int],
+    tool_calls_history: Sequence[int],
+    raws_history: Sequence[frozenset],
+) -> bool:
+    """NPG enforce no-progress 守卫（conv 3a216a51, 2026-09-02）。
+
+    连续两次 NPG enforce needs_evidence 打回，期间无新工具调用，且**没有任何
+    一个先前被 flag 的数值被修复**（raws_prev ⊆ raws_last——churn 感知：
+    修 5 个又引入 1 个新的（raws 互不包含）不算停滞，交给 soft_reject_limit
+    兜底）→ guidance 的两条自救路径（calculate 回执 / 改写定性表述）均已
+    失败，继续整稿重发没有收敛指望。返回 True 时调用方视同软预算耗尽，
+    直接进入有界 salvage/selection 链。
+    """
+    if len(flags_history) < 2 or len(tool_calls_history) < 2 or len(raws_history) < 2:
+        return False
+    return (
+        raws_history[-2].issubset(raws_history[-1])
+        and tool_calls_history[-1] == tool_calls_history[-2]
+    )
 
 
 def _build_salvage_prompt(state: "AgentLoopState", last_user_msg: str) -> str:
@@ -1571,6 +1847,67 @@ class AgentLoop:
                 schema for schema in self.tool_schemas
                 if (schema.get("function") or {}).get("name") in self._visible_tool_names
             ]
+        # MCP 渐进发现（progressive discovery, 2026-09-02）：MCP server 工具
+        # （toolset 前缀 "mcp-"）schema 默认不进入每轮请求——n 个 server × m 个
+        # 工具无条件注入会让 90%+ 用不到 MCP 的对话白白背上 ~250 tokens/工具的
+        # prefill 与注意力稀释。模型用常驻元工具 search_tools 按需检索，命中后
+        # _maybe_expand_searched_tools 把 schema 追加回来（只增不减）；跨轮粘性
+        # 由 _preload_discovered_from_history 承担（历史即真相，worker 进程同样
+        # 生效）。连接与注册保持常驻，延迟的只是 schema 注入。
+        # [agent.tools] mcp_progressive_enabled=false 一键回滚；
+        # [mcp.servers.<name>] eager=true 按 server 逃生（运维型助手场景）。
+        self._deferred_mcp_schemas: List[Dict[str, Any]] = []
+        self._expanded_search_calls: set = set()
+        if tool_schemas is None and config.agent_tools_mcp_progressive_enabled:
+            _eager_servers: set = set()
+            try:
+                _mcp_cfg = config.mcp if isinstance(config.mcp, dict) else {}
+                for _sname, _sdata in (_mcp_cfg.get("servers") or {}).items():
+                    if isinstance(_sdata, dict) and _sdata.get("eager"):
+                        _eager_servers.add(_sname)
+            except Exception:
+                _eager_servers = set()
+            _kept: List[Dict[str, Any]] = []
+            _deferred: List[Dict[str, Any]] = []
+            for _s in self.tool_schemas:
+                _n = (_s.get("function") or {}).get("name", "")
+                _ts = registry.get_toolset_for_tool(_n) or ""
+                if _ts.startswith("mcp-") and _ts[len("mcp-"):] not in _eager_servers:
+                    _deferred.append(_s)
+                else:
+                    _kept.append(_s)
+            if _deferred:
+                self._deferred_mcp_schemas = _deferred
+                self.tool_schemas = _kept
+                logger.info(
+                    "MCP progressive discovery: deferring %d tool schema(s) "
+                    "(use search_tools to load on demand)",
+                    len(_deferred),
+                )
+                # A4.9 Minor-3: visible_tools 若把 search_tools 过滤掉而延迟池
+                # 非空，模型将失去唯一发现通道——静默死路配置，必须大声警告。
+                _active_now = {(s.get("function") or {}).get("name") for s in self.tool_schemas}
+                if "search_tools" not in _active_now:
+                    logger.warning(
+                        "MCP progressive discovery ON but visible_tools filter "
+                        "removed search_tools — deferred MCP tools are "
+                        "unreachable; add search_tools to [agent.tools] "
+                        "visible_tools or disable the filter"
+                    )
+            elif any((s.get("function") or {}).get("name") == "search_tools"
+                     for s in self.tool_schemas):
+                # 池空（无 MCP server）：search_tools 元工具无意义，剔除 schema。
+                self.tool_schemas = [
+                    s for s in self.tool_schemas
+                    if (s.get("function") or {}).get("name") != "search_tools"
+                ]
+        if tool_schemas is None and not config.agent_tools_mcp_progressive_enabled:
+            # 回滚模式（A4.9 R1 Minor-1 / M1 收口）：恢复特性引入前的行为——
+            # search_tools 元工具不进 schema。
+            self.tool_schemas = [
+                s for s in self.tool_schemas
+                if (s.get("function") or {}).get("name") != "search_tools"
+            ]
         # Names of tools the model can actually see/dispatch this run — used by
         # guardrails to avoid synthesizing calls to unavailable tools.
         self._active_tool_names: Set[str] = {
@@ -1654,6 +1991,52 @@ class AgentLoop:
             digest_tools=frozenset(config.agent_tool_digest_tools) or DEFAULT_DIGEST_TOOLS,
         )
 
+    def _dm_forced_compression_needed(self, message_count: int) -> bool:
+        """Deathmatch forced-compression gate: the len>80 rule is the
+        unconditional fallback; with rubric_compression_enabled the judge's
+        compact=yes signal (P2-11, SELFCOMPACT light) fires early at len>40."""
+        dm = self.deathmatch_manager
+        if self._compressor is None or dm is None or not dm.is_goal_active:
+            return False
+        if message_count > 80:
+            return True
+        return bool(
+            config.deathmatch_rubric_compression_enabled
+            and getattr(dm, "_last_judge_compact", False)
+            and message_count > 40
+        )
+
+    async def _maybe_spike_compress(self, state: "AgentLoopState") -> Optional[dict]:
+        """P0-2 (round-4 eval): pre-iteration context spike guard.
+
+        Estimates the next request's tokens BEFORE the iteration; when the
+        estimate exceeds ``spike_guard_ratio × context_length``, compress
+        first instead of hitting the provider 400 and paying an emergency
+        compression + retry after the fact. Returns the compression event
+        (caller yields it) or None. Fail-open: any error → None.
+        """
+        try:
+            ratio = float(config.agent_compression_spike_guard_ratio or 0)
+            if ratio <= 0 or not self._compressor:
+                return None
+            from app.services.context_compressor import estimate_request_tokens_rough
+            window = int(config.agent_compression_context_length or 0)
+            if window <= 0:
+                return None
+            before = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
+            if before <= int(ratio * window):
+                return None
+            state.messages = await self._compressor.compress_async(state.messages)
+            after = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
+            logger.warning(
+                "Spike guard: estimate %d > %.0f%%×%d — compressed %d->%d tokens before iteration %d",
+                before, ratio * 100, window, before, after, state.iterations,
+            )
+            return {"compression": {"before": before, "after": after, "spike_guard": True}}
+        except Exception:
+            logger.warning("Spike guard failed (non-blocking)", exc_info=True)
+            return None
+
     def _skip_guardrails(self) -> bool:
         """In deathmatch mode, skip force_final_answer, max_consecutive_iterations,
         and web_search limit guards. The judge alone decides when to stop."""
@@ -1661,6 +2044,23 @@ class AgentLoop:
             self.deathmatch_manager is not None
             and self.deathmatch_manager.is_goal_active
         )
+
+    def _dm_step_tool_names(self) -> Optional[Set[str]]:
+        """T8 (JIT-Agent F module): effective tool names for the CURRENT
+        deathmatch plan step — the step's declared ``tools`` subset unioned
+        with the always-on core (_DM_STEP_TOOL_CORE). Returns None when no
+        subset applies (no deathmatch / step declares nothing), meaning the
+        full registry is offered (default, opt-in-by-absence)."""
+        dm = self.deathmatch_manager
+        if dm is None or not dm.is_goal_active:
+            return None
+        try:
+            subset = dm.current_step_tool_subset()
+        except Exception:
+            return None
+        if not subset:
+            return None
+        return set(subset) | set(_DM_STEP_TOOL_CORE)
 
     def _live_thinking_enabled(self) -> bool:
         """opencode-style live streaming: iterations run with thinking enabled
@@ -1683,10 +2083,12 @@ class AgentLoop:
 
     def _sampling_kwargs(self, thinking: bool, provider_type: str | None = None) -> dict:
         """Sampling kwargs for the current mode. Empty unless the effective
-        provider is qwen3.8_vllm (A4.9 I1: sampling sets must never leak to
-        subtask/fallback providers) — callers fall back to existing defaults."""
+        provider's thinking profile carries sampling presets (wave-7 profiles
+        收口：qwen3.8_vllm 模型卡预设；A4.9 I1: sampling sets must never leak
+        to subtask/fallback providers) — callers fall back to existing defaults."""
         pt = provider_type or self.provider_type
-        if pt != "qwen3.8_vllm":
+        from app.model_gateway.profiles import get_thinking_profile
+        if not get_thinking_profile(pt).sampling_defaults(thinking):
             return {}
         return dict(self.thinking_sampling if thinking else self.non_thinking_sampling)
 
@@ -1796,6 +2198,16 @@ class AgentLoop:
                 _start, len(tool_results),
                 [getattr(tr, "name", "?") for tr in tool_results][:6],
             )
+        # P0-3 (2026-08-30): context occupancy estimate for the deathmatch
+        # telemetry block — same rough estimator as the ctx badge, computed
+        # once per judge pass (cheap, no LLM).
+        _ctx_est = 0
+        if state is not None:
+            try:
+                from app.services.context_compressor import estimate_request_tokens_rough
+                _ctx_est = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
+            except Exception:
+                _ctx_est = 0
         timeout = config.agent_tool_loop_judge_timeout
         if timeout <= 0:
             try:
@@ -1804,6 +2216,7 @@ class AgentLoop:
                     user_initiated=user_initiated,
                     workspace_path=workspace_path,
                     tool_results=tool_results,
+                    ctx_estimate_tokens=_ctx_est,
                 )
             except Exception as exc:
                 # Fail open even on the unbounded branch (A4.9 review I4):
@@ -1834,6 +2247,7 @@ class AgentLoop:
                     user_initiated=user_initiated,
                     workspace_path=workspace_path,
                     tool_results=tool_results,
+                    ctx_estimate_tokens=_ctx_est,
                 ),
                 timeout=timeout,
             )
@@ -1882,8 +2296,72 @@ class AgentLoop:
                 ),
             }
 
+    async def _maybe_dm_context_reset(self, dm, state: "AgentLoopState") -> Optional[dict]:
+        """B2 (SKILL.state 2608.26263): step-boundary context reset.
+
+        When the verifier crossed a plan-step boundary this turn, rebuild the
+        executor context from the structured state (handoff document: goal /
+        plan progress / continuity anchor / reflections / telemetry) instead
+        of letting it accumulate unboundedly — the fresh-context-executor
+        pattern. Non-synthetic system messages (the agent system prompt) are
+        kept; synthetic directives are dropped by design (history rebuilds
+        skip them naturally). Durable state (wall clock / plan / counters)
+        stays in the conversation row. Returns a compression-shaped event
+        (frontend token-badge channel) or None. Fail-open.
+        """
+        if not getattr(dm, "_step_transition_pending", False):
+            return None
+        dm._step_transition_pending = False
+        try:
+            from app.services.context_compressor import estimate_request_tokens_rough
+            before = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
+            handoff = ""
+            try:
+                handoff = dm.generate_handoff_document() or ""
+            except Exception:
+                handoff = ""
+            kept = [
+                m for m in state.messages
+                if m.get("role") == "system" and not m.get("synthetic")
+            ]
+            state.messages = kept + (
+                [{"role": "user", "content": (
+                    "[死磕模式 — 步骤切换，执行上下文已重启]\n"
+                    "以下是结构化交接文档（目标/计划进度/连续性锚点/反思/遥测），"
+                    "它是你的全部状态来源；PROGRESS.md 与工作区文件是事实补充。\n\n"
+                    f"{handoff}"
+                )}] if handoff.strip() else []
+            )
+            after = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
+            logger.warning(
+                "Deathmatch context reset at step boundary: %d->%d tokens (%d system msgs kept)",
+                before, after, len(kept),
+            )
+            return {"compression": {"before": before, "after": after, "context_reset": True}}
+        except Exception:
+            logger.warning("deathmatch context reset failed (non-blocking)", exc_info=True)
+            return None
+
+    async def _maybe_archive_deathmatch(self, dm, decision: dict) -> None:
+        """C3 (JIT-Agent harness bank): archive terminal goal-loop states
+        (done / partial_complete / human_gate) into deathmatch_harness_runs.
+        Fail-open — archiving must never break the verdict flow."""
+        status = (decision or {}).get("status") or ""
+        if status not in ("done", "partial_complete", "human_gate"):
+            return
+        try:
+            conv = getattr(dm, "_conv", None)
+            factory = self.session_factory
+            if conv is None or factory is None:
+                return
+            async with factory() as db:
+                await record_harness_run(db, conv, decision)
+        except Exception:
+            logger.warning("deathmatch harness archive failed (non-blocking)", exc_info=True)
+
     async def _emit_deathmatch_verdict(self, dm, decision: dict):
         """Yield the deathmatch_verdict SSE event (4.6: extracted common pattern)."""
+        await self._maybe_archive_deathmatch(dm, decision)
         yield {
             "deathmatch_verdict": {
                 **dm.get_verdict_dict(),
@@ -1911,6 +2389,19 @@ class AgentLoop:
         if _final_table:
             yield {"content": _final_table}
         yield {"done": True}
+
+    async def _dm_decision_backoff(self, decision: dict) -> None:
+        """Autonomy WAIT (2026-08-31): sleep the bounded in-loop backoff
+        carried by a deathmatch decision (0/absent = no wait). Capped
+        defensively at 120s — the judge's wait_seconds is already clamped
+        by the manager, this is the second line of defense."""
+        try:
+            _b = float(decision.get("backoff_seconds") or 0)
+        except Exception:
+            _b = 0.0
+        if _b > 0:
+            logger.info("Deathmatch autonomy WAIT: in-loop backoff %.0fs", min(_b, 120.0))
+            await asyncio.sleep(min(_b, 120.0))
 
     async def _stop_inactivity_paused(self, dm) -> AsyncIterator[dict]:
         """Emit a visible paused deathmatch verdict after repeated inactivity
@@ -1971,8 +2462,8 @@ class AgentLoop:
             llm_stream = self.llm.stream_chat_structured(
                 messages,
                 tools=None,
-                extra_body=build_thinking_extra_body(
-                    self.provider_type, self.enable_reasoning, self.reasoning_effort, thinking_budget=self.thinking_budget, preserve_thinking=self.preserve_thinking
+                extra_body=self._thinking_extra_body(
+                    self.provider_type, self.enable_reasoning, thinking_budget=self.thinking_budget, preserve_thinking=self.preserve_thinking
                 ),
                 **_sum_kwargs,
             )
@@ -2023,7 +2514,7 @@ class AgentLoop:
         "1. 用户要求介绍系统/产品功能、版本更新、或智能助手能力？\n"
         "   典型表达：'智能助手自我介绍'、'产品功能介绍'、'系统功能说明'、'版本更新说明'、\n"
         "   '你们有什么功能'、'介绍一下你们产品'、'说说你能做什么'。\n"
-        "   如果是，必须选择 \"tool_loop\"，让主代理调用 memory(target='system', action='read') 读取 func.md 后回答。\n"
+        "   如果是，必须选择 \"tool_loop\"，让主代理调用 memory(target='system', action='read') 读取 changelog.md 后回答。\n"
         "2. 用户明确询问你的 harness 能力/工具列表/是否为裸模型/是否为 agent，"
         "或把 Weave Thinker 与你自身关联（自我指认）？"
         "   典型表达：'你是什么模型'、'你是不是裸模型'、'你是不是 harness'、'你有哪些工具'、\n"
@@ -2042,10 +2533,15 @@ class AgentLoop:
         "expects_tools 应为 false（除非用户明确要求生成可下载的图片/Excel 等文件，"
         "或需要先搜索/读取文档等获取新信息）。\n\n"
         "【search_required 判断（用于防'用户要搜索但模型凭记忆作答'）】\n"
-        "用户最新消息是否明确要求联网搜索/检索（如'搜索一下''检索资料''联网查''查最新'），"
-        "或回答该问题必须获取当前/时效性信息（新闻、行情、最新版本、事实核查）？\n"
-        "- 是 → search_required: true\n"
-        "- 否（只需基于已有知识/对话历史作答，或用户明确说不用搜索）→ search_required: false\n"
+        "满足以下任一条件 → search_required: true：\n"
+        "1. 用户最新消息明确要求联网搜索/检索（如'搜索一下''检索资料''联网查''查最新'）；\n"
+        "2. 回答该问题必须获取当前/时效性信息（新闻、行情、最新版本、事实核查）；\n"
+        "3. 准确回答依赖具体、冷僻的事实细节——如历史典故、地名由来、人物事件、文物古迹、"
+        "特定数据/日期/数字、地方性知识、专业小众主题等，仅凭训练记忆作答有编造具体细节的风险"
+        "（conv 8074c1c5：模型凭记忆答地方史冷僻典故，整段编造'地名原名''历史传说'）。\n"
+        "- 以上都不是（只需基于对话历史/常识作答，或用户明确说不用搜索）→ search_required: false\n"
+        "注意：常识通识级问题（如'水的沸点是多少''清朝是哪一年建立的'这类教科书知识）不算第3条，"
+        "第3条只针对模型容易编造细节的冷僻具体事实。\n"
         "注意：'请查一下你的知识库/文档'这种本地检索不算 search_required。\n"
         "注意：你是路由协调器，只负责分发判断；具体搜索关键词的拟定由专门的检索规划器负责，"
         "你不需要也不应该输出 search_query 字段。\n\n"
@@ -2054,7 +2550,11 @@ class AgentLoop:
         "文学作品（包括用户给出情节要点、要求融入要点继续写的情况）？\n"
         "- 是 → creative_turn: true（续写天然延续旧话题、篇幅可能很长，质量审计的"
         "话题锚定/篇幅标准不适用，必须豁免，否则会把用户正在看的草稿整段作废）\n"
-        "- 否 → creative_turn: false\n\n"
+        "- 否 → creative_turn: false\n"
+        "注意：以'讲故事/给孩子讲/通俗易懂地讲'的形式要求讲解真实历史、人物、地名、科学知识等"
+        "事实性内容，不是创意写作——回答必须忠于事实，必须走正常审计，creative_turn 应为 false"
+        "（conv 8074c1c5：'给孩子讲地名故事'被豁免审计，编造的传说直接出货）。"
+        "创意写作仅指内容本身为虚构文学创作的情况。\n\n"
         "【笔记写入控制】\n"
         "重要：除非用户最新消息明确表达了保存/修改/新增/删除笔记的意图"
         "（如\u201c记下来\u201d\u201c保存到笔记\u201d\u201c修改笔记\u201d\u201c删除笔记\u201d"
@@ -2074,7 +2574,7 @@ class AgentLoop:
         "- '智能助手自我介绍' 不是身份闲聊，而是要求介绍产品功能，必须选 tool_loop。\n"
         "- '你是什么模型/你是不是裸模型/你有哪些工具' 等 harness 能力问题必须选 tool_loop，"
         "让主代理给出完整的 harness 能力描述。\n"
-        "- '版本更新说明' 涉及系统版本变更，必须选 tool_loop 读 func.md。\n"
+        "- '版本更新说明' 涉及系统版本变更，必须选 tool_loop 读 changelog.md。\n"
         "- 绝不要透露任何底层模型名称、API提供商、版本号或技术架构"
         "（如DeepSeek、MiMo、GPT、Claude、LLM、Transformer等）。\n"
         "- {identity_clause}"
@@ -2132,22 +2632,45 @@ class AgentLoop:
         "（如“AMD官方FAQ为48GB；CraftRigs指南为~32GB+GTT”）属于合格回答，"
         "不得因“未采用某一来源”判 reject；只有草稿数值与【所有】可见来源均矛盾时"
         "才可判 reject。\n\n"
-        "【数字核对硬性约束（2026-08-18，conv 7dc7a0d5）】\n"
+        "【数字核对硬性约束（2026-08-18，conv 7dc7a0d5；2026-09-02 B7 边界修订）】\n"
         "对草稿中数字/计算结果的核对，唯一合法的 reject 依据是 <evidence-ledger> 中"
-        "可见的工具结果（execute_code 计算输出、检索全文等）；严禁以你自身的心算或"
+        "可见的工具结果（execute_code/calculate 计算输出、检索全文等）；严禁以你自身的心算或"
         "记忆作为 reject 依据——conv 7dc7a0d5 中审计员心算得出 28,800/14,100 均为"
         "错误值，却据以驳回实际更正确的草稿，造成不可满足的驳回循环。"
         "心算怀疑不一致时 → verdict=needs_evidence，problem 建议模型调用 execute_code"
-        "重算后再答。\n\n"
+        "或 calculate 重算后再答。\n"
+        "【审计员重算边界（2026-09-02 B7，conv 83d97ede）】你是无工具的审计员——"
+        "严禁在 problem 中声称你自己重算/验证过任何数值（你没有执行任何代码，"
+        "不得虚构重算结果）。怀疑草稿数值不一致时 → verdict=needs_evidence，"
+        "problem 要求写手调用 execute_code/calculate 实际重算后自查；"
+        "reject 仍然必须引用 <evidence-ledger> 中可见证据的直接矛盾。\n"
+        "【无回执推导数值（2026-09-02，conv 83d97ede 容积事故）】草稿中出现由计算得出的"
+        "数值，而本轮与历史轮次均无工具计算输出（execute_code/calculate/terminal）支撑时 → "
+        "verdict=needs_evidence，problem 点名该数值并要求模型先实际计算再答。\n\n"
         "【诚实回答豁免（2026-08-14，conv a67faa04）】\n"
         "若对话中的证据（工具结果/记忆/历史）不足以回答用户问题"
         "（如问题要求“最近更新/最新信息”而证据中确实没有对应记录），"
         "草稿如实说明“我无法获知/没有可查证的记录”是合格回答，不得因此拒绝；"
         "同样，对证据中没有的信息如实说不了解，绝不等于答非所问。\n\n"
+        "【无证据高特异性事实声称（2026-08-29，conv 8074c1c5）】\n"
+        "当草稿凭训练知识作答（本轮零工具调用）时，仅凭知识作答本身不违规；"
+        "但模型对冷僻具体事实（地方典故、地名由来、小众人物事件、文物古迹细节、"
+        "具体日期/数字）的参数化记忆极易编造细节且无法自证。\n"
+        "触发口径（声称级）：草稿中的冷僻具体事实声称在证据台账（含历史轮次工具结果）中"
+        "【无对应证据】、且超出常识通识范围时，按 needs_evidence 处理（不消耗 reject 预算），"
+        "problem 指明“调用 web_search 核实具体细节后再答，或删除/弱化无法核实的具体声称”；"
+        "注意：台账中有历史轮次的无关检索结果不等于这些声称有据——必须逐条对应到"
+        "声称本身所指的证据。常识通识范围内的陈述（教科书级知识）不在此限，可正常放行。\n"
+        "硬性约束：严禁以你自身的记忆或印象作为采信/反驳草稿细节的依据——"
+        "你与草稿模型可能共享同一份错误记忆，依据只能是台账中可见的证据。\n\n"
         "【判定顺序（必须依次执行，2026-08-14 判据优先级）】\n"
         "1. 先判切题性与自足性（规则 1/2/3/5/7——含悬空引用检查）；\n"
         "2. 再逐条核对草稿的事实性声称与下方 <evidence-ledger> 证据台账："
-        "每条声称必须有对应证据可见；\n"
+        "每条声称必须有对应证据可见；"
+        "特别地，草稿的高特异性冷僻具体事实声称（地方典故、地名由来、小众人物事件、"
+        "具体日期/数字等）在台账（含历史轮次工具结果）中无对应证据、且超出常识通识范围时，"
+        "不得默认采信——按 needs_evidence 处理"
+        "（见【无证据高特异性事实声称】条款）；\n"
         "3. 声称有据但含润色细节（如证据中无“8月以来”而草稿声称）→ 判 reject，"
         "problem 指明“修正/删除无法核实的细节”——属局部修正，不是整体推翻；\n"
         "4. 声称对应的证据被截断（ledger 中标 截断/片段/未展示）或在可见证据中不存在、"
@@ -2277,7 +2800,12 @@ class AgentLoop:
                 "若上下文中看不到这些编号对应的前次检索结果内容，按无法核实处理——不得仅凭“沿用了编号”判合格，"
                 "应要求重新检索或删除无法核实的引用；"
                 "(c) 助手带有用户长期记忆（设备型号、偏好、个人信息等），草稿中用户相关事实可能来自记忆，"
-                "不要仅因对话历史中未出现就判编造。"
+                "不要仅因对话历史中未出现就判编造；"
+                "(d) 草稿中的冷僻具体事实声称（地方典故、地名由来、小众人物事件、"
+                "具体日期/数字等）若在下方证据台账（含历史轮次工具结果）中没有对应证据"
+                "且超出常识通识范围，按 needs_evidence 处理——"
+                "要求调用 web_search 核实后再答，或删除/弱化无法核实的具体声称；"
+                "常识通识性陈述不受此限。"
             )
         # Give the auditor the ACTUAL tool results so claims about grounding
         # are judged against the data the model really saw — not against the
@@ -2290,6 +2818,103 @@ class AgentLoop:
         # evidence; truncation is a last resort and is always marked in the
         # ledger — claims beyond a cut are unverifiable, never fabrication.
         _evidence_ledger, _evidence_text = await _build_audit_evidence(state)
+        # NPG (2026-09-02, conv 83d97ede): writer-side numeric provenance gate
+        # — B-series design (memory/research_math_bi_agent_numeric_guarantees_
+        # 20260902.md). Deterministic, zero LLM: high-risk derived numbers in
+        # the draft must be quoted (ledger/user messages, unit-family aware)
+        # or receipt-backed (CURRENT-turn execute_code/terminal output + B1
+        # param provenance — `print(40000)` launders nothing). Pure mental
+        # arithmetic on a fresh computation question previously shipped
+        # unchecked (40ml vs 186.5ml, 4.66× off) because the ledger never
+        # contains computed values and the auditor is forbidden to mental-
+        # math reject. Modes (B10 gray rollout): shadow=observe only
+        # (default), enforce=needs_evidence BEFORE the LLM audit, off=skip.
+        _npg_mode = config.agent_audit_numeric_provenance_mode
+        _npg_report = None
+        if _npg_mode != "off":
+            # I5 (A4.9): fail-open — a pathological NPG input must degrade to
+            # the pre-NPG behavior, never kill the turn (auditor contract).
+            try:
+                _npg_user_msgs = [
+                    str(m.get("content") or "")
+                    for m in state.messages
+                    if m.get("role") == "user" and not m.get("synthetic")
+                    and not str(m.get("content") or "").startswith(_directive_openers)
+                ]
+                _npg_tools = []
+                for _tr in state.tool_results:
+                    if _tr.error:
+                        continue
+                    if _tr.name in ("execute_code", "terminal"):
+                        _npg_tools.append({
+                            "name": _tr.name,
+                            "code": str((_tr.arguments or {}).get("code")
+                                        or (_tr.arguments or {}).get("command") or ""),
+                            "output": _tr.result or "",
+                        })
+                    elif _tr.name == "calculate":
+                        # C1 (A4.9): calculate receipts must reach the receipt
+                        # domain — the expression is the B1 "code" (a bare
+                        # literal expression is still a hardcode).
+                        _npg_tools.append({
+                            "name": _tr.name,
+                            "code": str((_tr.arguments or {}).get("expression") or ""),
+                            "output": _tr.result or "",
+                        })
+                _npg_report = evaluate_numeric_provenance(
+                    draft=draft,
+                    evidence_text=_evidence_text or "",
+                    user_messages=_npg_user_msgs,
+                    current_tool_calls=_npg_tools,
+                    tolerance=config.agent_audit_numeric_gate_tolerance,
+                )
+            except Exception:
+                logger.exception("npg evaluation failed — fail-open, skipping numeric gate")
+                _npg_report = None
+            if _npg_report is not None and _npg_report.flagged:
+                _npg_flags = _npg_report.flags
+                _flag_view = "、".join(f"「{f.raw}」" for f in _npg_flags[:6])
+                if len(_npg_flags) > 6:
+                    _flag_view += f" 等{len(_npg_flags)}处"
+                if _npg_mode == "enforce":
+                    # no-progress 守卫输入（conv 3a216a51）：记录本次 enforce
+                    # 打回的 flags 数、raw 集合与当时的工具调用数。
+                    state.npg_reject_flags.append(len(_npg_flags))
+                    state.npg_reject_raws.append(frozenset(f.raw for f in _npg_flags))
+                    state.npg_reject_tool_calls.append(state.total_tool_calls)
+                    logger.info(
+                        "audit_metric outcome=needs_evidence npg=enforce flags=%d draft_chars=%d",
+                        len(_npg_flags), len(draft),
+                    )
+                    # I1 (A4.9): settled-ledger context — re-flagged numeric
+                    # corrections keep the anti flip-flop protection.
+                    _npg_settled = _settled_items_view(state, evidence_text=_evidence_text)
+                    _npg_prefix = (
+                        f"{_AUDIT_GUIDANCE_SETTLED_PREFIX}\n{_npg_settled}\n"
+                    ) if _npg_settled else ""
+                    return AuditVerdict(
+                        verdict="needs_evidence",
+                        source="npg",
+                        problem=f"草稿含未经计算回执的推导数值：{_flag_view}",
+                        guidance=(
+                            _npg_prefix
+                            + f"你刚才生成的回答草稿（本轮）包含未经计算验证的推导数值：{_flag_view}。\n"
+                            "【数值溯源闸门】上述数值未出现在用户提供的资料或任何工具输出中——"
+                            "严禁以心算得出数值。请立即调用 calculate（或 execute_code，多步计算时"
+                            "打印公式、输入参数与中间量）实际计算这些数值，以计算输出为准修正草稿；"
+                            "已有 calculate/execute_code 回执的数值及其单位换算（mL/cm³/L、"
+                            "mm³/cm³ 等同族换算）无需重复计算，可直接引用台账输出；"
+                            "非计算所得的行业经验/常识范围数值（如「150~250 mL 常见」）"
+                            "请改写为定性表述或标注「经验值」，不要因此删除有效分析内容；"
+                            "若该数值本应来自资料引用，请改写为与原文一致的表述并标注来源。"
+                            + "\n" + _AUDIT_GUIDANCE_LOCALIZED_CLAUSE
+                            + "\n" + _AUDIT_GUIDANCE_INDEPENDENCE_CLAUSE
+                        ),
+                    )
+                logger.info(
+                    "audit_metric npg_shadow flags=%d values=%s draft_chars=%d",
+                    len(_npg_flags), _flag_view, len(draft),
+                )
         if _evidence_ledger:
             context_parts.append(_evidence_ledger)
             # Deterministic hard constraint (2026-08-14, live behavior test):
@@ -2517,21 +3142,25 @@ class AgentLoop:
         # (xhigh first-token latency > 120s). Dedicated [agent.audit]
         # salvage_timeout_seconds (default 240s, same as selection); 0 falls
         # back to grace for non-thinking fast providers.
+        # conv 3a216a51 (2026-09-02): salvage 默认关思考（salvage_thinking_
+        # enabled=false，与打回修正轮 revision_thinking_enabled=false 同口径）
+        # ——生产实证 salvage 以 xhigh 全量缓冲生成 ~120s，SSE 零事件，用户
+        # 观感=卡死并取消；关思考后与修正轮同为 ~12-13s 量级。
         _grace_timeout = config.agent_audit_salvage_timeout_seconds
         if _grace_timeout <= 0:
             _grace_timeout = self._has_grace_timeout()
         try:
             _started = asyncio.get_event_loop().time()
-            _sal_kwargs = self._sampling_kwargs(self.enable_reasoning)
+            _sal_thinking = self.enable_reasoning and config.agent_audit_salvage_thinking_enabled
+            _sal_kwargs = self._sampling_kwargs(_sal_thinking)
             if not _sal_kwargs:
                 _sal_kwargs = {"temperature": config.default_temperature}
             stream = self.llm.stream_chat_structured(
                 clean_messages,
                 tools=None,
-                extra_body=build_thinking_extra_body(
+                extra_body=self._thinking_extra_body(
                     self.provider_type,
-                    self.enable_reasoning,
-                    self.reasoning_effort,
+                    _sal_thinking,
                     thinking_budget=self.thinking_budget,
                     preserve_thinking=self.preserve_thinking,
                 ),
@@ -2646,16 +3275,19 @@ class AgentLoop:
         _timed_out = False
         try:
             _started = asyncio.get_event_loop().time()
-            _sel_kwargs = self._sampling_kwargs(self.enable_reasoning)
+            # conv 3a216a51 (2026-09-02): selection 与 salvage 同口径——
+            # 默认关思考（salvage_thinking_enabled），xhigh 全量缓冲生成
+            # 在兜底链里只会拉长静默期。
+            _sel_thinking = self.enable_reasoning and config.agent_audit_salvage_thinking_enabled
+            _sel_kwargs = self._sampling_kwargs(_sel_thinking)
             if not _sel_kwargs:
                 _sel_kwargs = {"temperature": config.default_temperature}
             stream = self.llm.stream_chat_structured(
                 clean_messages,
                 tools=None,
-                extra_body=build_thinking_extra_body(
+                extra_body=self._thinking_extra_body(
                     self.provider_type,
-                    self.enable_reasoning,
-                    self.reasoning_effort,
+                    _sel_thinking,
                     thinking_budget=self.thinking_budget,
                     preserve_thinking=self.preserve_thinking,
                 ),
@@ -3157,11 +3789,23 @@ class AgentLoop:
             _kwargs = {"temperature": 0.7}
         async for chunk in self.llm.stream_chat_structured(
             messages,
-            extra_body=build_thinking_extra_body(self.provider_type, self.enable_reasoning, self.reasoning_effort, thinking_budget=self.thinking_budget, preserve_thinking=self.preserve_thinking),
+            extra_body=self._thinking_extra_body(self.provider_type, self.enable_reasoning, thinking_budget=self.thinking_budget, preserve_thinking=self.preserve_thinking),
             **_kwargs,
         ):
             ctype = chunk.get("type")
             data = chunk.get("data")
+            if ctype == "usage":
+                # P4 真值徽章：direct_reply 路径同样上报实测 prompt_tokens。
+                state.last_usage = data
+                logger.info(
+                    "LLM usage (measured, direct_reply): prompt=%s cache_hit=%s completion=%s",
+                    data.get("prompt_tokens"),
+                    data.get("prompt_cache_hit_tokens"),
+                    data.get("completion_tokens"),
+                )
+                yield {"context_info": _context_info_from_usage(
+                    data, config.agent_compression_context_length)}
+                continue
             if ctype == "content" and data:
                 produced_content = True
                 yield {"content": data}
@@ -3204,6 +3848,111 @@ class AgentLoop:
                 sorted(self._lazy_tool_names),
             )
 
+    def _maybe_expand_searched_tools(self, state: Any) -> None:
+        """Append schemas for tools discovered via ``search_tools`` (MCP
+        progressive discovery). Called at the top of each tool-loop iteration
+        next to ``_maybe_load_lazy_tools``. Only grows; each search result is
+        consumed exactly once (tracked by call_id) so repeated iterations are
+        idempotent."""
+        if not self._deferred_mcp_schemas:
+            return
+        for tr in getattr(state, "tool_results", None) or []:
+            if getattr(tr, "name", None) != "search_tools":
+                continue
+            cid = getattr(tr, "call_id", "") or str(id(tr))
+            if cid in self._expanded_search_calls:
+                continue
+            self._expanded_search_calls.add(cid)
+            try:
+                data = json.loads(getattr(tr, "result", "") or "{}")
+                matches = data.get("matches") or [] if isinstance(data, dict) else []
+            except Exception:
+                continue
+            wanted = [
+                str(m.get("name"))
+                for m in matches
+                if isinstance(m, dict) and m.get("name")
+            ]
+            if not wanted:
+                continue
+            pool_names = {
+                (s.get("function") or {}).get("name")
+                for s in self._deferred_mcp_schemas
+            }
+            hit_names = [n for n in wanted if n in pool_names]
+            if not hit_names:
+                continue
+            new_schemas = [
+                s for s in self._deferred_mcp_schemas
+                if (s.get("function") or {}).get("name") in hit_names
+                and (s.get("function") or {}).get("name") not in self._active_tool_names
+            ]
+            if not new_schemas:
+                continue
+            self.tool_schemas = list(self.tool_schemas) + new_schemas
+            self._active_tool_names.update(
+                (s.get("function") or {}).get("name") for s in new_schemas
+            )
+            self._deferred_mcp_schemas = [
+                s for s in self._deferred_mcp_schemas if s not in new_schemas
+            ]
+            logger.info(
+                "Expanded %d searched tool(s): %s",
+                len(new_schemas),
+                sorted((s.get("function") or {}).get("name") for s in new_schemas),
+            )
+
+    def _preload_discovered_from_history(self, messages: List[Dict[str, Any]]) -> None:
+        """History-driven stickiness for MCP progressive discovery.
+
+        Each turn constructs a fresh AgentLoop, so schemas discovered last
+        turn would otherwise vanish while the history still shows their
+        calls. Scan the incoming history for ``mcp_*`` tool names (assistant
+        ``tool_calls`` and role="tool" result rows) and re-append those
+        schemas before the first LLM call — no cross-process state store
+        needed (the DB history is the truth, worker processes included)."""
+        if not self._deferred_mcp_schemas:
+            return
+        used: Set[str] = set()
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") == "tool":
+                n = str(m.get("name") or "")
+                if n.startswith("mcp_"):
+                    used.add(n)
+            raw_calls = m.get("tool_calls") or []
+            if isinstance(raw_calls, str):
+                try:
+                    raw_calls = json.loads(raw_calls)
+                except Exception:
+                    raw_calls = []
+            for tc in raw_calls or []:
+                n = (((tc or {}).get("function") or {}).get("name")) or ""
+                if str(n).startswith("mcp_"):
+                    used.add(str(n))
+        if not used:
+            return
+        new_schemas = [
+            s for s in self._deferred_mcp_schemas
+            if (s.get("function") or {}).get("name") in used
+            and (s.get("function") or {}).get("name") not in self._active_tool_names
+        ]
+        if not new_schemas:
+            return
+        self.tool_schemas = list(self.tool_schemas) + new_schemas
+        self._active_tool_names.update(
+            (s.get("function") or {}).get("name") for s in new_schemas
+        )
+        self._deferred_mcp_schemas = [
+            s for s in self._deferred_mcp_schemas if s not in new_schemas
+        ]
+        logger.info(
+            "Preloaded %d MCP tool schema(s) from conversation history: %s",
+            len(new_schemas),
+            sorted((s.get("function") or {}).get("name") for s in new_schemas),
+        )
+
     async def run(
         self,
         messages: List[Dict[str, Any]],
@@ -3214,8 +3963,12 @@ class AgentLoop:
         conversation: Any = None,
         assistant: Any = None,
         precomputed_coord: Any = _UNSET,
+        interjection_queue: Optional[asyncio.Queue] = None,
     ) -> AsyncIterator[dict]:
         state = AgentLoopState(messages=list(messages))
+        state.interjection_queue = interjection_queue
+        # MCP 渐进发现：把历史里已用过的 MCP 工具 schema 预载回来（跨轮粘性）。
+        self._preload_discovered_from_history(state.messages)
         # Introspection hook for tests/diagnostics (stash, counters, flags).
         self._last_state = state
         state.max_web_searches = config.web_search_max_rounds * 3
@@ -3429,6 +4182,33 @@ class AgentLoop:
             self._compressor.threshold_percent = min(self._compressor.threshold_percent, 0.5)
             self._compressor.protect_last_tokens = max(self._compressor.protect_last_tokens, 30000)
 
+    def _drain_interjections(self, state: AgentLoopState) -> List[dict]:
+        """Drain pending user interjections into the live message list.
+
+        Iteration-boundary steering (codex pending_input / deepseek-harness
+        next-step inbox / opencode steer): interjected text becomes a REAL
+        user message appended to ``state.messages`` — the next LLM request of
+        this turn sees it in context. Never drained for deathmatch runs (the
+        goal loop has its own human_gate/continuation semantics; the interject
+        endpoint also rejects deathmatch conversations, this is belt-and-
+        suspenders). Returns commit-echo events for the producer to persist
+        and broadcast.
+        """
+        if self.deathmatch_manager is not None:
+            return []
+        q = state.interjection_queue
+        if q is None:
+            return []
+        events: List[dict] = []
+        while True:
+            try:
+                text = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            state.messages.append({"role": "user", "content": text, "_interjection": True})
+            events.append({"interjection_committed": {"content": text}})
+        return events
+
     async def _run_loop(
         self,
         state: AgentLoopState,
@@ -3479,6 +4259,10 @@ class AgentLoop:
                         yield _ev
                     self._mark_activity(state)
                     if _budget_should_continue and _budget_decision.get("continuation_prompt"):
+                        await self._dm_decision_backoff(_budget_decision)
+                        _reset_ev = await self._maybe_dm_context_reset(dm, state)
+                        if _reset_ev is not None:
+                            yield _reset_ev
                         _inject_directive(state, _budget_decision["continuation_prompt"])
                         await state.budget.reset()
                         logger.info("Deathmatch: budget reset for next turn (turns=%d)", dm._conv.deathmatch_turns)
@@ -3495,6 +4279,11 @@ class AgentLoop:
             state.iterations += 1
             logger.debug("Agent loop iteration %d/%d (budget remaining: %d)",
                          state.iterations, self.max_iterations, await state.budget.get_remaining())
+
+            # 插话注入（迭代边界）：用户在本轮生成期间发送的插话在此成为
+            # 真实 user 消息，本轮下一次 LLM 调用即在上下文中可见。
+            for _interjection_event in self._drain_interjections(state):
+                yield _interjection_event
 
             if self._check_inactivity(state):
                 elapsed = asyncio.get_event_loop().time() - state.last_activity_at
@@ -3533,7 +4322,7 @@ class AgentLoop:
                         int(config.agent_tool_loop.get("max_inactivity_judge_cycles", 4)),
                         1,
                     )
-                    if state.consecutive_inactivity_cycles >= _max_inact_cycles:
+                    if state.consecutive_inactivity_cycles >= _max_inact_cycles and not config.deathmatch_autonomy_enabled:
                         logger.warning(
                             "Deathmatch: %d consecutive inactivity cycles (turns=%d) — "
                             "stopping with visible state instead of spinning",
@@ -3566,6 +4355,10 @@ class AgentLoop:
                             yield _ev
                         return
                     if _inact_should_continue and _inact_decision.get("continuation_prompt"):
+                        await self._dm_decision_backoff(_inact_decision)
+                        _reset_ev = await self._maybe_dm_context_reset(dm, state)
+                        if _reset_ev is not None:
+                            yield _reset_ev
                         _inject_directive(state, _inact_decision["continuation_prompt"])
                         await state.budget.reset()
                         # Refresh the inactivity timer WITHOUT resetting the
@@ -3599,12 +4392,19 @@ class AgentLoop:
             if self.enable_compression and self._compressor is None:
                 self._ensure_compressor()
 
+            # P0-2: pre-iteration spike guard — estimate first, compress
+            # before the call instead of after the 400 (round-4 eval).
+            _spike_ev = await self._maybe_spike_compress(state)
+            if _spike_ev is not None:
+                yield _spike_ev
+
             # Deathmatch mode: force compression when the message list grows
             # too large, even if token count is below the threshold. This
             # prevents unbounded growth with high max_turns (e.g. 9999).
-            if (self._compressor and self.deathmatch_manager
-                    and self.deathmatch_manager.is_goal_active
-                    and len(state.messages) > 80):
+            # (Skipped when the spike guard already compressed THIS
+            # iteration — one compression per iteration, A4.9 r2 M4.)
+            # Gate logic: _dm_forced_compression_needed (P2-11 rubric aware).
+            if (_spike_ev is None and self._dm_forced_compression_needed(len(state.messages))):
                 from app.services.context_compressor import estimate_request_tokens_rough
                 before = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
                 state.messages = await self._compressor.compress_async(state.messages)
@@ -3612,7 +4412,7 @@ class AgentLoop:
                 logger.info("Deathmatch forced compression (msg count=%d): %d->%d tokens",
                             len(state.messages), before, after)
                 yield {"compression": {"before": before, "after": after}}
-            elif self._compressor and self._compressor.should_compress(state.messages):
+            elif _spike_ev is None and self._compressor and self._compressor.should_compress(state.messages):
                 from app.services.context_compressor import estimate_request_tokens_rough
                 before = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
                 state.messages = await self._compressor.compress_async(state.messages)
@@ -3624,6 +4424,7 @@ class AgentLoop:
             self._repair_message_sequence(state.messages)
 
             self._maybe_load_lazy_tools(state)
+            self._maybe_expand_searched_tools(state)
 
             active_tool_schemas = None
             if self.tool_schemas:
@@ -3654,6 +4455,22 @@ class AgentLoop:
                         )
                 else:
                     active_tool_schemas = self.tool_schemas
+                    # T8: deathmatch step-level capability orchestration —
+                    # when the current plan step declares its tools, offer
+                    # only that subset (schema tokens↓ + tool misuse↓). Log
+                    # on subset CHANGE (per-turn noise must stay low).
+                    _dm_names = self._dm_step_tool_names()
+                    if _dm_names is not None:
+                        active_tool_schemas = [
+                            ts for ts in active_tool_schemas
+                            if ts.get("function", {}).get("name") in _dm_names
+                        ]
+                        if getattr(state, "_dm_last_tool_subset", None) != _dm_names:
+                            state._dm_last_tool_subset = _dm_names
+                            logger.info(
+                                "deathmatch step tool subset active: %d/%d schemas offered",
+                                len(active_tool_schemas), len(self.tool_schemas),
+                            )
 
             tool_calls_collected: List[Dict[str, Any]] = []
             assistant_content = ""
@@ -3690,8 +4507,8 @@ class AgentLoop:
                 _iter_extra_body = (
                     self.iteration_extra_body_override
                     if self.iteration_extra_body_override is not None
-                    else build_thinking_extra_body(
-                        self.iteration_provider_type, _use_thinking, self.reasoning_effort, thinking_budget=self.thinking_budget, preserve_thinking=self.preserve_thinking
+                    else self._thinking_extra_body(
+                        self.iteration_provider_type, _use_thinking, llm=self.iteration_llm, thinking_budget=self.thinking_budget, preserve_thinking=self.preserve_thinking
                     )
                 )
                 # A4.9 I1: sampling sets apply only to the qwen3.8_vllm
@@ -3875,6 +4692,17 @@ class AgentLoop:
                                 yield {"content": content_text}
                                 self._mark_activity(state)
 
+                    elif event_type == "usage":
+                        # P4 真值徽章：主链路实测 prompt_tokens → 刷新前端
+                        state.last_usage = event_data
+                        logger.info(
+                            "LLM usage (measured): prompt=%s cache_hit=%s completion=%s",
+                            event_data.get("prompt_tokens"),
+                            event_data.get("prompt_cache_hit_tokens"),
+                            event_data.get("completion_tokens"),
+                        )
+                        yield {"context_info": _context_info_from_usage(
+                            event_data, config.agent_compression_context_length)}
                     elif event_type == "tool_calls":
                         tool_calls_collected = event_data
                         self._mark_activity(state)
@@ -4082,6 +4910,61 @@ class AgentLoop:
                 # grammar defect — clean BEFORE the audit sees the draft).
                 assistant_content = _strip_leading_orphan_punct(assistant_content)
 
+            # ── 行动层/决策层冲突仲裁 (conv a8290d37 2026-08-28) ──
+            # 响应同时携带「完整正式回答 + 工具调用」时，旧规则把 content 当
+            # 临时过渡文本丢弃、无条件服从行动层 → 模型 11 份完整答案被弃、
+            # 发送前审计结构性失明、循环 16 轮。仲裁：content 达实质长度且
+            # 所有调用客观冗余（本轮已成功同参 / 非分页 browser 且 URL 全部
+            # 已抓取）→ 决策层优先：丢弃冗余调用，content 落入下方常规终答
+            # 路径（turn_content_segments + 发送前审计）。任一调用含新意图
+            # （新 URL / paginated 深抓 / 新参数）则照常执行工具。
+            if (
+                tool_calls_collected
+                and not self._skip_guardrails()
+                and config.agent_tool_loop_answer_conflict_arbitration
+                and _should_promote_answer_over_tools(
+                    state, assistant_content, tool_calls_collected,
+                    min_chars=config.agent_tool_loop_answer_conflict_min_chars,
+                )
+            ):
+                logger.warning(
+                    "Answer/tool conflict arbitration: dropping %d redundant tool "
+                    "call(s), promoting %d-char co-emitted answer to the audit "
+                    "path (iteration=%d, total_tool_calls=%d)",
+                    len(tool_calls_collected), len(assistant_content),
+                    state.iterations, state.total_tool_calls,
+                )
+                yield {
+                    "agent_step": {
+                        "name": "answer_tool_conflict",
+                        "title": "采纳完整回答",
+                        "content": "助手已产出完整回答，其附带的工具调用与本轮已成功的调用完全重复（冗余），已采纳回答并交由审计判定。",
+                        "step_type": "system",
+                    }
+                }
+                tool_calls_collected = []
+
+            # Force-final stage hard stop (A4.9 R1 M6): only execute_code is
+            # offered during the forced phase, but a non-compliant model can
+            # still emit NATIVE calls to other tools — conv a8290d37 kept
+            # issuing native browser calls through 4 doom aborts. Mirror the
+            # DSML inline filter: drop them before execution.
+            if (
+                tool_calls_collected
+                and state.force_final_answer
+                and not self._skip_guardrails()
+            ):
+                tool_calls_collected, _force_dropped = _filter_force_stage_calls(
+                    state, tool_calls_collected
+                )
+                if _force_dropped:
+                    logger.warning(
+                        "Force-final stage: dropped %d native non-execute_code "
+                        "call(s) (%s) before execution",
+                        len(_force_dropped),
+                        ",".join(sorted({(tc.get("function") or {}).get("name", "?") for tc in _force_dropped})),
+                    )
+
             # Accumulate the cleaned assistant text for this iteration so
             # tools invoked later in the same turn (e.g. pdf_export
             # export_conversation) can access the in-progress response
@@ -4135,11 +5018,15 @@ class AgentLoop:
                     }
                     _prune_guardrail_pairs(state)
                     _rejected_append(self, state, assistant_content, reasoning_content)
+                    # A4.9 R1 M5: mirror the audit-reject path — the rejected
+                    # draft must not linger in turn_content_segments and leak
+                    # into _current_turn_context / a later stitched audit.
+                    state.turn_content_segments.clear()
                     _inject_directive(
                         state,
                         "【轮次核对】本轮（用户最新一条消息之后）你尚未调用任何搜索工具——"
                         "上下文中可见的 web_search/检索结果全部来自之前的消息轮次，不属于本轮调用。\n"
-                        "协调器判定本轮需要联网检索最新信息，请立即调用 web_search 执行真实检索，"
+                        "协调器判定本轮需要联网检索核实（最新信息或冷僻具体事实），请立即调用 web_search 执行真实检索，"
                         "基于检索结果回答并在正文中使用 [N] 引用标号。\n"
                         "如果你判断之前轮次的检索结果已足以准确回答本轮问题，可以直接基于这些已有结果作答，"
                         "但必须在回答中明确说明依据的是此前已获取的检索结果；"
@@ -4190,6 +5077,9 @@ class AgentLoop:
                 if assistant_content:
                     _prune_guardrail_pairs(state)
                     _rejected_append(self, state, assistant_content, reasoning_content)
+                    # A4.9 R1 M5 (same class as search_demand): keep rejected
+                    # drafts out of turn_content_segments.
+                    state.turn_content_segments.clear()
                 _inject_directive(
                     state,
                     "【轮次核对】本轮（用户最新一条消息之后）你尚未调用任何工具——"
@@ -4334,14 +5224,15 @@ class AgentLoop:
                                         }
                                     }
                                     _turn_text, _turn_tr = self._current_turn_context(state)
+                                    _guarded, _hard = self._tool_liveness_coro(tool_name, self._execute_single_tool(
+                                        tc["id"], tool_name, tool_args, session_factory, user, conversation, assistant,
+                                        state,
+                                        current_turn_content=_turn_text,
+                                        current_turn_tool_results=_turn_tr,
+                                    ))
                                     coros.append((tc, tool_args, asyncio.wait_for(
-                                        self._execute_single_tool(
-                                            tc["id"], tool_name, tool_args, session_factory, user, conversation, assistant,
-                                            state,
-                                            current_turn_content=_turn_text,
-                                            current_turn_tool_results=_turn_tr,
-                                        ),
-                                        timeout=self._tool_call_timeout,
+                                        _guarded,
+                                        timeout=_hard,
                                     )))
 
                                 par_task = asyncio.gather(*(c[2] for c in coros), return_exceptions=True)
@@ -4359,6 +5250,14 @@ class AgentLoop:
                                                 name=tc["function"]["name"],
                                                 arguments=tool_args,
                                                 result=json.dumps({"error": f"Tool '{tc['function']['name']}' timed out"}),
+                                                error=True,
+                                            ))
+                                        elif isinstance(r, ToolStalledError):
+                                            results.append(ToolCallResult(
+                                                call_id=tc["id"],
+                                                name=tc["function"]["name"],
+                                                arguments=tool_args,
+                                                result=json.dumps({"error": str(r)}),
                                                 error=True,
                                             ))
                                         elif isinstance(r, Exception):
@@ -4497,15 +5396,16 @@ class AgentLoop:
                                 }
 
                                 _turn_text, _turn_tr = self._current_turn_context(state)
+                                _guarded, _hard = self._tool_liveness_coro(tool_name, self._execute_single_tool(
+                                    tc["id"], tool_name, tool_args, session_factory, user, conversation, assistant,
+                                    state,
+                                    current_turn_content=_turn_text,
+                                    current_turn_tool_results=_turn_tr,
+                                ))
                                 tool_task = asyncio.ensure_future(
                                     asyncio.wait_for(
-                                        self._execute_single_tool(
-                                            tc["id"], tool_name, tool_args, session_factory, user, conversation, assistant,
-                                            state,
-                                            current_turn_content=_turn_text,
-                                            current_turn_tool_results=_turn_tr,
-                                        ),
-                                        timeout=self._tool_call_timeout,
+                                        _guarded,
+                                        timeout=_hard,
                                     )
                                 )
                                 try:
@@ -4520,6 +5420,14 @@ class AgentLoop:
                                         name=tool_name,
                                         arguments=tool_args,
                                         result=json.dumps({"error": f"Tool '{tool_name}' timed out"}),
+                                        error=True,
+                                    )
+                                except ToolStalledError as stalled:
+                                    result = ToolCallResult(
+                                        call_id=tc["id"],
+                                        name=tool_name,
+                                        arguments=tool_args,
+                                        result=json.dumps({"error": str(stalled)}),
                                         error=True,
                                     )
                                 except asyncio.CancelledError:
@@ -4714,6 +5622,9 @@ class AgentLoop:
                             if not _dm_should_continue:
                                 yield {"done": True}
                                 return
+                            # Autonomy WAIT: honor the bounded in-loop backoff
+                            # before hot-continuing the tool loop (A4.9 W1-I1).
+                            await self._dm_decision_backoff(decision)
                     # Iteration boundary signal: chat.py's relay uses it to
                     # disarm the pre-tool text gate deterministically. When
                     # the tool_call event itself was dropped (slow client
@@ -4859,11 +5770,33 @@ class AgentLoop:
                             # budget branch — the budget-spending draft is a
                             # selection candidate too.
                             _stash_rejected_draft(state, _audit_target, guidance, source="draft", reasoning=reasoning_content)
+                            # NPG no-progress 守卫（conv 3a216a51, 2026-09-02）：
+                            # 连续两次 NPG enforce 打回且 flags 不降、期间无新
+                            # 工具调用 → guidance 的两条自救路径（calculate
+                            # 回执 / 改写定性表述）均已失败，整稿重发无收敛
+                            # 指望（生产实证 flags 3→6→6→8），视同软预算耗尽
+                            # 直接进入 salvage/selection 链。
+                            _npg_no_progress = (
+                                guidance.verdict == "needs_evidence"
+                                and getattr(guidance, "source", "") == "npg"
+                                and _npg_soft_reject_no_progress(
+                                    state.npg_reject_flags,
+                                    state.npg_reject_tool_calls,
+                                    state.npg_reject_raws,
+                                )
+                            )
                             _budget_spent = (
                                 state.audit_rejections > _audit_reject_budget
                                 or state.audit_soft_rejections > _soft_limit
+                                or _npg_no_progress
                             )
                             if _budget_spent:
+                                if _npg_no_progress:
+                                    logger.warning(
+                                        "NPG soft-reject no-progress (flags=%s tool_calls=%s) — cutting to salvage instead of another full regeneration",
+                                        state.npg_reject_flags[-2:],
+                                        state.npg_reject_tool_calls[-2:],
+                                    )
                                 # Budget spent: NEVER ship the just-rejected
                                 # draft (conv 97ff355d 2026-08-12: 5 correct
                                 # rejections — the model hallucinated that the
@@ -5201,12 +6134,16 @@ class AgentLoop:
                         yield _ev
                     self._mark_activity(state)
                     if _dm_should_continue and decision.get("continuation_prompt"):
+                        await self._dm_decision_backoff(decision)
                         # Use repetition-detected prompt if agent is repeating itself
                         if state.repetition_count >= 2:
                             rep_prompt = dm.get_repetition_prompt()
                             if rep_prompt:
                                 _inject_directive(state, rep_prompt)
                                 continue
+                        _reset_ev = await self._maybe_dm_context_reset(dm, state)
+                        if _reset_ev is not None:
+                            yield _reset_ev
                         _inject_directive(state, decision["continuation_prompt"])
                         # Deathmatch escalation: after 3+ turns of only searching,
                         # force the agent to generate the output file.
@@ -5291,6 +6228,7 @@ class AgentLoop:
                         yield _ev
                     self._mark_activity(state)
                     if _dm_should_continue and decision.get("continuation_prompt"):
+                        await self._dm_decision_backoff(decision)
                         # Use repetition-detected prompt if agent is repeating itself
                         if state.repetition_count >= 2:
                             rep_prompt = dm.get_repetition_prompt()
@@ -5299,6 +6237,9 @@ class AgentLoop:
                                 if (await state.budget.get_remaining()) <= 0:
                                     await state.budget.refund()
                                 continue
+                        _reset_ev = await self._maybe_dm_context_reset(dm, state)
+                        if _reset_ev is not None:
+                            yield _reset_ev
                         _inject_directive(state, decision["continuation_prompt"])
                         if (await state.budget.get_remaining()) <= 0:
                             await state.budget.refund()
@@ -5437,6 +6378,9 @@ class AgentLoop:
                         async for event in self._grace_call(state):
                             yield event
                         return
+                _reset_ev = await self._maybe_dm_context_reset(dm, state)
+                if _reset_ev is not None:
+                    yield _reset_ev
                 _inject_directive(state, decision["continuation_prompt"])
                 if (await state.budget.get_remaining()) <= 0:
                     await state.budget.refund()
@@ -5716,10 +6660,9 @@ class AgentLoop:
             _produced_parts: list = []
             _finish_reason = None
             _attempt_error = None
-            _eb = build_thinking_extra_body(
+            _eb = self._thinking_extra_body(
                 self.provider_type,
                 (self.enable_reasoning and not state.revision_thinking_off) if _attempt == 0 else False,
-                self.reasoning_effort if _attempt == 0 else None,
                 thinking_budget=self.thinking_budget,
                 preserve_thinking=self.preserve_thinking,
             )
@@ -6095,34 +7038,50 @@ class AgentLoop:
 
         return False, strategy.action, retry_after
 
+    def _thinking_extra_body(self, provider_type: str, enable: bool, llm=None, **kw) -> dict:
+        """build_thinking_extra_body + 模型层 effort_meta.params 合并（wave-5）。
+
+        所选档位命中端点 capabilities.effort_meta.<effort>.params 时并入
+        thinking extra_body（模型层显式配置思考档位的 wire 参数）；llm 为
+        实际出调客户端（主/迭代），其 endpoint 携带 effort_meta。
+        """
+        body = build_thinking_extra_body(
+            provider_type, enable, self.reasoning_effort if enable else None, **kw
+        )
+        if enable and self.reasoning_effort:
+            ep = getattr(llm or self.llm, "endpoint", None)
+            meta = ((getattr(ep, "capabilities", None) or {}).get("effort_meta") or {})
+            params = (meta.get(self.reasoning_effort) or {}).get("params")
+            if isinstance(params, dict) and params:
+                # provider-aware 合并（wave-7：逻辑单一事实源在 thinking profile，
+                # A4.9 wave-7 复审 Minor2——此处不再内联副本）
+                from app.model_gateway.profiles import get_thinking_profile
+                body = get_thinking_profile(provider_type).merge_extra_params(body, params)
+        return body
+
     def _try_fallback_provider(self) -> bool:
         """Switch to next available provider when primary fails.
 
         Returns True if a fallback provider was found and switched to.
         """
         try:
-            from app.services.provider_router import get_provider_router
-            router = get_provider_router()
-            available = router.list_available()
-            if len(available) <= 1:
+            from app.model_gateway import factory
+            from app.model_gateway.registry import get_model_registry
+            registry = get_model_registry()
+            available = registry.provider_names()
+            if not available:
                 return False
             for name in available:
-                if name == "default":
+                ep = registry.get(name)
+                if not ep.base_url:
                     continue
-                kwargs = router.get_client_kwargs(name)
-                model_name = router.get_model_name(name)
-                if not kwargs.get("base_url"):
-                    continue
-                from app.services.llm_service import LLMService
-                new_llm = LLMService(
-                    custom_api_url=kwargs.get("base_url", ""),
-                    custom_api_key=kwargs.get("api_key", ""),
-                    custom_model_name=model_name,
-                )
+                new_llm = factory.build_llm_service(ep)
                 self.iteration_llm = new_llm
                 self.llm = new_llm
-                self.iteration_provider_type = name
-                logger.info("Switched to fallback provider: %s (%s)", name, model_name)
+                # A4.9 复审 R2/R3：wire provider_type 以端点为准；无类型端点
+                # 给中性 "custom"（别名串不是类型）
+                self.iteration_provider_type = factory.fallback_wire_type(ep)
+                logger.info("Switched to fallback provider: %s (%s)", name, ep.model_name)
                 return True
             return False
         except Exception as e:
@@ -6230,6 +7189,38 @@ class AgentLoop:
         tool_results_json = json.dumps({"results": web_search_results}) if web_search_results else ""
         return content, tool_results_json
 
+    def _tool_liveness_coro(self, tool_name: str, coro):
+        """Wrap a tool coroutine with the progress-aware stall watchdog.
+
+        Deadline semantics (用户修正 2026-09-03，ADR D-4): 进展重置的是上限
+        本身——对有存活信号的工具（stall override > 0），deadline =
+        last_progress + 上限，无绝对墙钟（外层 timeout=None）；中止条件只有
+        「静默 ≥ min(stall, hard)」。无存活信号的工具（未配置 stall）无进展
+        可言，保持绝对墙钟上限 wait_for(hard) 不变。
+        Returns ``(guarded_coro, outer_wait_for_timeout)`` — outer timeout is
+        None for liveness tools (wait_for(None) = plain await, zero call-site
+        change at both wiring sites).
+        """
+        from app.services.tool_progress import resolve_tool_deadlines, run_with_liveness
+
+        hard, stall = resolve_tool_deadlines(
+            tool_name,
+            hard_default=self._tool_call_timeout,
+            hard_overrides=config.agent_tool_loop_tool_timeout_overrides,
+            stall_overrides=config.agent_tool_loop_stall_timeout_overrides,
+        )
+        if stall <= 0:
+            # 无存活信号：绝对墙钟上限（原语义）
+            return coro, hard
+        # 有存活信号：进展重置上限本身——静默阈值取 min(stall, hard)，
+        # 外层不再有从起点起算的绝对墙钟。
+        effective_silence = min(stall, hard)
+        return run_with_liveness(
+            coro,
+            stall_timeout=effective_silence,
+            check_interval=config.agent_tool_loop_progress_check_interval_seconds,
+        ), None
+
     async def _execute_single_tool(
         self,
         call_id: str,
@@ -6280,25 +7271,36 @@ class AgentLoop:
                     error=False,
                 )
 
-        import hashlib, time as _time
+        import time as _time
         _t_start = _time.monotonic()
-        _args_signature = hashlib.sha256(
-            json.dumps(tool_args, sort_keys=True, ensure_ascii=False).encode()
-        ).hexdigest()
-        state._doom_tool_history.append((tool_name, _args_signature))
+        state._doom_tool_history.append(_call_signature(tool_name, tool_args))
         if len(state._doom_tool_history) > 6:
             state._doom_tool_history = state._doom_tool_history[-6:]
 
-        recent_doom = state._doom_tool_history[-3:]
-        if len(recent_doom) == 3 and len(set(recent_doom)) == 1:
-            doom_name = recent_doom[0][0]
-            logger.warning("Doom loop detected: %s called 3x with same args — aborting", doom_name)
+        doom_hit = _detect_doom_loop(state._doom_tool_history, state._doom_result_hashes)
+        if doom_hit is not None:
+            doom_name = doom_hit[0]
+            # conv a8290d37: an abort-and-continue doom verdict is toothless —
+            # the model re-issued the identical call 4 more times after the
+            # error. Trigger = circuit breaker: force the final-answer stage
+            # (tools shrink to execute_code only next iteration). Deathmatch
+            # keeps its own judge (skip_guardrails) and only gets the abort.
+            _force = (
+                config.agent_tool_loop_doom_force_final
+                and not self._skip_guardrails()
+            )
+            logger.warning(
+                "Doom loop detected: %s called >=3x in last 6 with identical args and no new result — aborting%s",
+                doom_name, " + forcing final answer" if _force else "",
+            )
+            if _force:
+                state.force_final_answer = True
             return ToolCallResult(
                 call_id=call_id,
                 name=tool_name,
                 arguments=tool_args,
                 result=json.dumps({
-                    "error": f"Doom loop detected: {doom_name} called 3 consecutive times with identical arguments. Aborting to prevent infinite loop. Try a different tool or approach."
+                    "error": f"Doom loop detected: {doom_name} called >=3 times within the last 6 tool calls with identical arguments and no new information returned. Aborting to prevent infinite loop. 工具使用已受限——你已拥有该调用能提供的全部信息，请立即基于已有信息给出最终回答，不要再发起任何重复调用。"
                 }, ensure_ascii=False),
                 error=True,
             )
@@ -6333,6 +7335,43 @@ class AgentLoop:
                 dispatch_kwargs["permission_context"] = perm_ctx
                 if self._visible_tool_names is not None:
                     dispatch_kwargs["allowed_tools"] = self._visible_tool_names
+                if tool_name == "search_tools" and not config.agent_tools_mcp_progressive_enabled:
+                    # A4.9 R1 M4：回滚模式下 search_tools 不在 schema（M1），
+                    # 幻觉调用直接拒绝，恢复特性前"未知工具"语义。
+                    return ToolCallResult(
+                        call_id=call_id,
+                        name=tool_name,
+                        arguments=tool_args,
+                        result=json.dumps({
+                            "error": "工具 search_tools 当前不可用（扩展工具检索未启用）。"
+                            "请直接基于已有信息回答或使用其他可见工具。"
+                        }, ensure_ascii=False),
+                        error=True,
+                    )
+                if tool_name == "search_tools" and self.blocked_tools:
+                    # A4.9 R1 Minor-4（M4 收口）：搜索目录排除本 loop 显式
+                    # blocked 的工具——不广告一个必然被 fail-close 的能力。
+                    dispatch_kwargs["_blocked_tool_names"] = frozenset(self.blocked_tools)
+                # T8 fail-closed (A4.9 r2 M5): a deathmatch step tool subset
+                # constrains DISPATCH too, not just the offered schemas — a
+                # hallucinated/DSML call outside the subset must not execute.
+                _dm_dispatch_names = self._dm_step_tool_names()
+                if _dm_dispatch_names is not None:
+                    _allowed = dispatch_kwargs.get("allowed_tools")
+                    _effective = (
+                        _dm_dispatch_names if _allowed is None
+                        else (set(_allowed) & _dm_dispatch_names)
+                    )
+                    if not _effective:
+                        # A4.9 r3 M4: visibleTools ∩ subset = ∅ would fail-close
+                        # EVERY tool (operator misconfiguration) — keep the dm
+                        # subset and warn loudly instead of stalling the loop.
+                        logger.warning(
+                            "deathmatch tool subset ∩ visibleTools is empty — "
+                            "using the step subset alone (check [agent.tools] visible_tools)"
+                        )
+                        _effective = _dm_dispatch_names
+                    dispatch_kwargs["allowed_tools"] = _effective
 
                 result = await registry.dispatch(
                     tool_name,
@@ -6421,6 +7460,10 @@ class AgentLoop:
                     _track_memory_read(state, tool_args, result)
                 elif tool_name == "delegate_task":
                     _clear_memory_read_cache(state)
+            # Per-turn redundancy records for the answer/tool conflict
+            # arbitration (conv a8290d37): only the success path reaches
+            # here — error payloads are filtered inside the helper.
+            _record_tool_success(state, tool_name, tool_args, result)
             return ToolCallResult(
                 call_id=call_id,
                 name=tool_name,

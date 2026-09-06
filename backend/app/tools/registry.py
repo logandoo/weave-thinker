@@ -223,9 +223,16 @@ class ToolRegistry:
         try:
             self._usage_counter[name] += 1
             if entry.is_async:
-                if asyncio.iscoroutinefunction(entry.handler):
+                handler = entry.handler
+                if not asyncio.iscoroutinefunction(handler):
+                    # Async callable instance (async __call__): iscoroutinefunction
+                    # on the instance is False; inspect the bound __call__ instead.
+                    call = getattr(handler, "__call__", None)
+                    if call is not None and asyncio.iscoroutinefunction(call):
+                        handler = call
+                if asyncio.iscoroutinefunction(handler):
                     return await asyncio.wait_for(
-                        entry.handler(args, **kwargs),
+                        handler(args, **kwargs),
                         timeout=config.agent_tool_loop_tool_call_timeout,
                     )
             return entry.handler(args, **kwargs)

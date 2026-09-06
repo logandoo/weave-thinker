@@ -90,6 +90,10 @@ class Assistant(Base):
     thinking_presence_penalty = Column(Float, nullable=True)
     thinking_repetition_penalty = Column(Float, nullable=True)
     preserve_thinking = Column(Boolean, default=True)
+    # 模型网关解耦（2026-08-31 两文件合并）：模型选择 = 逻辑别名（config_model.toml 的
+    # [endpoints.<alias>]）；NULL = 未显式选择（legacy provider_type/custom_* 语义）。
+    model_alias = Column(String(64), nullable=True)
+    subtask_model_alias = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -132,7 +136,7 @@ class Conversation(Base):
     deathmatch_goal = Column(Text, nullable=True)
     deathmatch_status = Column(String(20), default="inactive")
     deathmatch_turns = Column(Integer, default=0)
-    deathmatch_max_turns = Column(Integer, default=30)
+    deathmatch_max_turns = Column(Integer, default=0)  # 0 = unlimited (autonomy wave 2026-08-31); snapshotted from config at grilling completion / resume
     deathmatch_consecutive_failures = Column(Integer, default=0)
     deathmatch_verdict = Column(Text, nullable=True)
     deathmatch_reason = Column(Text, nullable=True)
@@ -151,10 +155,15 @@ class Conversation(Base):
     deathmatch_plan_version = Column(Integer, default=0)     # bumped on each replan
     deathmatch_reflections = Column(JSON, default=list)       # recent reflection entries
     deathmatch_wall_time_started_at = Column(DateTime, nullable=True)
-    deathmatch_max_wall_time_seconds = Column(Integer, default=3600)
+    deathmatch_max_wall_time_seconds = Column(Integer, default=0)  # 0 = unlimited (autonomy wave 2026-08-31); snapshotted from config at grilling completion / resume
     deathmatch_wall_time_used_seconds = Column(Integer, default=0)  # cumulative across resume cycles (C1)
     deathmatch_bible_draft = Column(JSON, nullable=True)  # story-bible draft written right after grilling (creative goals)
     deathmatch_subgoals = Column(JSON, default=list)  # user-appended acceptance criteria mid-loop (D3)
+    # P1-5 (2026-08-30): settled-verdict ledger — step completions and
+    # reconcile overturns; injected into judge/verifier prompts with the
+    # no-flip-without-new-evidence rule. MUST be ORM-mapped (A4.9 W2-C1:
+    # an unmapped attribute silently persists nothing across requests).
+    deathmatch_settled_ledger = Column(JSON, nullable=True)
     deathmatch_last_verification_result = Column(JSON, nullable=True)
     deathmatch_verify_failures = Column(Integer, default=0)   # consecutive verifier non-complete
     deathmatch_human_gate = Column(Text, nullable=True)       # structured human-gate report
@@ -180,6 +189,9 @@ class Message(Base):
     # multi-turn conversations replay structured tool history through the
     # LLM context instead of just opaque content text.
     tool_calls = Column(Text, nullable=True)
+    # 本轮上下文 token 用量（context_info 事件的最新值，JSON 字符串）——
+    # 持久化后跨设备可见（手机端发出的轮次在电脑端打开也能看到本轮 tokens）。
+    context_info = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")
@@ -308,7 +320,7 @@ class MemoryConcept(Base):
     valid_from = Column(DateTime, default=datetime.utcnow)
     valid_to = Column(DateTime, nullable=True)
     superseded_by = Column(String(36), nullable=True)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
     embedding_updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -322,7 +334,7 @@ class MemoryCluster(Base):
     name = Column(String(255), nullable=False)
     summary = Column(Text, nullable=True)
     weight = Column(Float, nullable=False, default=0.5)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
     member_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -373,7 +385,7 @@ class SubconsciousLog(Base):
     unit_kind = Column(String(20), nullable=False, default="message")
     raw_text = Column(Text, nullable=False)
     source_ids = Column(Text, nullable=False)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
     promoted = Column(Boolean, nullable=False, default=False)
     promoted_at = Column(DateTime, nullable=True)
     recurrence_count = Column(Integer, nullable=False, default=0)
@@ -393,7 +405,7 @@ class MemoryEpisode(Base):
     valid_from = Column(DateTime, default=datetime.utcnow)
     valid_to = Column(DateTime, nullable=True)
     superseded_by = Column(String(36), nullable=True)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
     merged_from = Column(String(36), nullable=True)
     last_recalled_at = Column(DateTime, nullable=True)
     source_type = Column(String(50), default="extracted")  # 'extracted' | 'migration'

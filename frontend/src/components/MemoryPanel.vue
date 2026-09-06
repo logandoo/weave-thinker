@@ -201,7 +201,7 @@ const expandedDreams = ref<Set<string>>(new Set())
 
 function checkDreamClamp(el: HTMLElement | null, id: string): void {
   if (!el) return
-  // nextTick：DOM 修改完成后 layout 完成，scrollHeight 才是 clamp 后的真实高度
+  // nextTick：DOM 已更新后 layout 完成，scrollHeight 才是 clamp 后的真实高度
   nextTick(() => {
     if (el.scrollHeight > el.clientHeight + 1 && !dreamClamped.value.has(id)) {
       // 新 Set 赋值触发响应式（Set 内部 mutate 不会被 Vue 追踪）

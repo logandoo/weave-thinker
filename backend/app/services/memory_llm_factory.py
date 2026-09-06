@@ -34,36 +34,18 @@ _CONFIG_KEY_MAP = {
 def _memory_llm(kind: str):
     """Return an LLMService instance routed to the provider configured for *kind*.
 
+    model_gateway 收口（2026-08-30）：kind → purpose "memory.<kind>" →
+    registry routing（[memory] *_model 键 → provider 别名，"default"/空 → main）。
+    与 legacy 的 provider_router 解析语义一致。
+
     Args:
         kind: One of "concept_extraction", "dream", "clarification",
               "query_expansion", "migration", "consolidation".
     """
-    from app.core.config import get_config
-    from app.services.llm_service import LLMService
+    from app.model_gateway import factory
+    from app.model_gateway.registry import get_model_registry
 
-    config = get_config()
-    cfg_key = _CONFIG_KEY_MAP.get(kind)
-    if not cfg_key:
+    if kind not in _CONFIG_KEY_MAP:
         logger.warning("Unknown memory LLM kind %r, using default provider", kind)
-        return LLMService()
-
-    provider_name = config.memory.get(cfg_key, "default")
-    if not provider_name or provider_name == "default":
-        return LLMService()
-
-    try:
-        from app.services.provider_router import get_provider_router
-        router = get_provider_router()
-        kwargs = router.get_client_kwargs(provider_name)
-        model_name = router.get_model_name(provider_name)
-        return LLMService(
-            custom_api_url=kwargs.get("base_url"),
-            custom_api_key=kwargs.get("api_key"),
-            custom_model_name=model_name,
-        )
-    except Exception as e:
-        logger.warning(
-            "Failed to resolve memory provider %r for kind %r, falling back to default: %s",
-            provider_name, kind, e,
-        )
-        return LLMService()
+        return factory.build_llm_service(get_model_registry().get("main"))
+    return factory.build_llm_service(get_model_registry().resolve(f"memory.{kind}"))

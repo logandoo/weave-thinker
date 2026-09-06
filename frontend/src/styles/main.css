@@ -3,7 +3,7 @@
  */
 
 /* ==========================================================================
-   设计令牌默认值 = 默认皮肤「青野平面 (verdant-flat)」
+   设计令牌基线 = 默认皮肤「青野平面 (verdant-flat)」
    - 本块即注册表中的 verdant-flat：未设置 data-skin 时由此生效
    - 其他皮肤见 styles/themes/*.css（[data-skin="<id>"] 覆盖块）
    - 皮肤契约文档：docs/SKINS.md；目录 API：GET /api/skins
@@ -97,7 +97,7 @@
    --danger-tint: color-mix(in srgb, var(--color-error) 8%, transparent);
    --warning-tint: color-mix(in srgb, var(--color-warning) 10%, transparent);
    --info-tint: color-mix(in srgb, var(--color-info) 12%, transparent);
-   /* 公式/mermaid 查看卡（默认=柔和卡，皮肤逐皮覆写） */
+   /* 公式/mermaid 查看卡（wave-16；基线=柔和卡，皮肤逐皮覆写） */
    --formula-bg: var(--surface-panel-subtle);
    --formula-border: var(--panel-border);
    --formula-radius: var(--radius-md);
@@ -108,11 +108,19 @@
    --action-edit-bg: #6b7280;
    --swipe-move-bg: #f59e0b;
    --success-strong: #2e7d32;
-   /* 弹出菜单家族（reasoning-menu / more-dropdown / skill-popup / context-menu；默认皮肤=青野玻璃卡 16px） */
+   /* wave-17 swipe 动作条令牌族（ConversationRow/NotesList/NotebooksList/Sidebar np 行共用） */
+   --swipe-rename-bg: var(--color-primary);
+   --swipe-export-bg: var(--color-info);
+   --swipe-delete-bg: var(--color-error);
+   --swipe-save-note-bg: var(--color-success);
+   --swipe-move-group-bg: #8b5cf6;
+   --swipe-default-bg: var(--color-success);
+   --swipe-default-active-bg: var(--success-strong);
+   /* 弹出菜单家族（reasoning-menu / more-dropdown / skill-popup / context-menu；基线=青野玻璃卡 16px） */
    --menu-radius: 16px;
    --menu-border: 1px solid var(--panel-border);
    --menu-shadow: 0 4px 16px color-mix(in srgb, var(--color-text) 10%, transparent);
-   /* 笔记本/笔记桌面 wallet-stack 卡片（默认皮肤=青野浮起卡） */
+   /* 笔记本/笔记桌面 wallet-stack 卡片（基线=青野浮起卡） */
    --stack-card-radius: 18px;
    --stack-card-shadow: 0 -2px 8px rgba(90, 130, 60, 0.08), 0 4px 14px rgba(90, 130, 60, 0.12);
    --stack-card-shadow-hover: 0 -4px 16px rgba(90, 130, 60, 0.12), 0 18px 38px rgba(0, 0, 0, 0.22);
@@ -216,7 +224,7 @@
   --scrollbar-thumb: #4a5e40;
   --scrollbar-thumb-hover: #6b8060;
 
-  /* 组件对齐令牌（暗色） */
+  /* 组件对齐令牌（暗色基线） */
   --sidebar-card-bg: var(--color-sidebar);
   --sidebar-card-radius: 0;
   --sidebar-card-shadow: none;
@@ -254,7 +262,7 @@
   --btn-hover-lift: 0;
   --dialog-radius: 24px;
   --dialog-shadow: var(--frame-shadow), 0 20px 40px rgba(0, 0, 0, 0.15);
-  /* 共享交互态（暗色） */
+  /* 共享交互态（暗色基线；wave-11） */
   --overlay-scrim: rgba(0, 0, 0, 0.62);
   --focus-ring-color: color-mix(in srgb, var(--color-primary) 22%, transparent);
   --danger-tint: color-mix(in srgb, var(--color-error) 12%, transparent);
@@ -267,9 +275,9 @@
   --success-tint: color-mix(in srgb, var(--color-success) 22%, transparent);
   --success-tint-strong: color-mix(in srgb, var(--color-success) 32%, transparent);
   --primary-glow: 0 8px 20px rgba(0, 0, 0, 0.4);
-  /* 弹出菜单家族（暗色） */
+  /* 弹出菜单家族（暗色基线） */
   --menu-shadow: var(--shadow-md);
-  /* notebook/笔记 wallet-stack（暗色） */
+  /* notebook/笔记 wallet-stack（暗色基线） */
   --stack-card-shadow: 0 -2px 8px rgba(0, 0, 0, 0.35), 0 4px 14px rgba(0, 0, 0, 0.40);
   --stack-card-shadow-hover: 0 -4px 16px rgba(0, 0, 0, 0.40), 0 18px 38px rgba(0, 0, 0, 0.55);
 

@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from app.core.config import get_config
-from app.services.provider_router import get_provider_router
 
 logger = logging.getLogger(__name__)
 config = get_config()
@@ -39,7 +38,30 @@ class MoAResponse:
 
 class MoAService:
     def __init__(self):
-        self._router = get_provider_router()
+        pass
+
+    @staticmethod
+    def _endpoint_kwargs(provider_name: str):
+        """model_gateway 收口（2026-08-30）：provider 名 → registry 端点 →
+        (client_kwargs, model_name)。语义同 legacy ProviderAdapter
+        （key 空回落 [api]，model 空回落 [api] model，"default"→main）。"""
+        from app.model_gateway.registry import get_model_registry
+        registry = get_model_registry()
+        if provider_name in ("", "default"):
+            ep = registry.get("main")
+        elif registry.has(provider_name):
+            ep = registry.get(provider_name)
+        else:
+            return None, None
+        return (
+            {
+                "base_url": ep.base_url or config.api_base_url,
+                # 空键守卫（2026-09-01）：显式端点空键 = 无需鉴权 → "no-key" 占位，
+                # 绝不把全局 main key 发进无鉴权参考模型（A4.9 wave2 Critical）。
+                "api_key": ep.api_key or ("no-key" if ep.base_url else config.api_key or "dummy-key"),
+            },
+            ep.model_name or config.model_name,
+        )
 
     async def run_moa(
         self,
@@ -57,11 +79,10 @@ class MoAService:
             reference_providers = moa_cfg.get("reference_providers", [])
 
         if not reference_providers:
-            available = self._router.list_available()
-            reference_providers = [p for p in available if p != "default"][:max_references]
+            from app.model_gateway.registry import get_model_registry
+            reference_providers = get_model_registry().provider_names()[:max_references]
             if not reference_providers:
                 reference_providers = ["default"]
-
         full_prompt = prompt
         if context:
             full_prompt = f"{context}\n\n---\n\n{prompt}"
@@ -110,14 +131,12 @@ class MoAService:
         provider_name: str,
         timeout_seconds: float,
     ) -> Optional[str]:
-        adapter = self._router.get_provider(provider_name)
-        if not adapter:
+        kwargs, model_name = self._endpoint_kwargs(provider_name)
+        if not kwargs:
             logger.warning("MoA: provider '%s' not found", provider_name)
             return None
 
         try:
-            kwargs = adapter.get_client_kwargs()
-            model_name = adapter.get_model_name()
             client = OpenAI(**kwargs)
 
             loop = asyncio.get_running_loop()
@@ -165,15 +184,13 @@ class MoAService:
             f"请综合以上回答，生成一个更完善的最终答案。"
         )
 
-        adapter = self._router.get_provider(aggregator_provider)
-        if not adapter:
-            adapter = self._router.get_provider("default")
-        if not adapter:
+        kwargs, model_name = self._endpoint_kwargs(aggregator_provider)
+        if not kwargs:
+            kwargs, model_name = self._endpoint_kwargs("default")
+        if not kwargs:
             return reference_responses[0]["response"] if reference_responses else ""
 
         try:
-            kwargs = adapter.get_client_kwargs()
-            model_name = adapter.get_model_name()
             client = OpenAI(**kwargs)
 
             loop = asyncio.get_running_loop()

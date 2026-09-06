@@ -16,7 +16,7 @@
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
         </svg>
-        上下文 {{ formatContextTokens(chatStore.currentContextInfo.tokens) }} tokens
+        本轮 {{ formatContextTokens(chatStore.currentContextInfo.tokens) }} tokens
       </span>
       <button
         v-if="chatStore.currentConversationId && chatStore.currentMessages.length > 0 && !saveMode"
@@ -261,14 +261,14 @@
                        manually. Previously these rendered inline with no
                        <details>, so the first round's thinking could never be
                        folded away. -->
-                  <div v-if="item.type === 'reasoning'" class="reasoning-block">
-                    <details :open="isReasoningBlockOpen(idx)">
-                      <summary class="reasoning-summary" @click.prevent="toggleReasoningBlock(idx)">💭 思考过程</summary>
-                      <div class="reasoning-text">
-                        <StreamMarkdown :content="item.content" />
-                      </div>
-                    </details>
-                  </div>
+                   <div v-if="item.type === 'reasoning'" class="reasoning-block">
+                     <details :open="isReasoningBlockOpen(idx)">
+                       <summary class="reasoning-summary" @click.prevent="toggleReasoningBlock(idx)">💭 思考过程</summary>
+                       <div class="reasoning-text">
+                         <StreamMarkdown :content="liveReasoningContent(item, idx)" />
+                       </div>
+                     </details>
+                   </div>
                   <!-- Tool call: self-contained state card (F1-2) -->
                   <ToolPartCard v-else-if="item.type === 'tool_call'" :item="item" />
                   <!-- Context tool group: folded consecutive read-only tools (F0-2) -->
@@ -324,9 +324,9 @@
                 <div v-if="chatStore.currentStreamingReasoningContent" class="reasoning-block">
                   <details open>
                     <summary class="reasoning-summary">💭 思考过程</summary>
-                    <div class="reasoning-text">
-                      <StreamMarkdown :content="chatStore.currentStreamingReasoningContent" />
-                    </div>
+                     <div class="reasoning-text">
+                       <StreamMarkdown :content="liveReasoningTail(chatStore.currentStreamingReasoningContent, chatStore.isStreamingCurrentConversation)" />
+                     </div>
                   </details>
                 </div>
                 <div class="text">
@@ -444,9 +444,11 @@ import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import { useChatStore } from '@/stores/chat'
 import { useNotesStore } from '@/stores/notes'
+import { liveReasoningTail } from '@/stores/streamReducer'
 import { useToast } from '@/composables/useToast'
 import { downloadBlob } from '@/composables/useDownload'
 import { stripDsmlTags } from '@/composables/useMarkdown'
+import { formatContextTokens, contextTokenTooltipText } from '@/composables/useContextTokens'
 import api from '@/api/client'
 import type { SearchResult, DisplaySequenceItem } from '@/types'
 import MessageBubble from './MessageBubble.vue'
@@ -634,6 +636,16 @@ const timelineItems = computed(() => {
 // Tool result expand/collapse state (per timeline index)
 const toolResultExpanded = ref<Record<number, boolean>>({})
 
+// Live reasoning tail-window (conv 827a6f78 turn-B 2026-09-03): a 113k-char
+// reasoning stream froze StreamMarkdown's whole-tree re-render and the live
+// view degraded to "answer = only the thinking text". While streaming, the
+// ACTIVE (last) reasoning block renders only its tail; done/persisted views
+// render full content.
+function liveReasoningContent(item: any, idx: number): string {
+  const isLast = idx === timelineItems.value.length - 1
+  return liveReasoningTail(item.content, isLast && chatStore.isStreamingCurrentConversation)
+}
+
 // The actively-streaming reasoning block stays expanded so the user watches
 // the thinking live. "Active" = the LAST reasoning block in the timeline —
 // NOT merely the last item: when the answer/tool part arrives after the
@@ -760,17 +772,8 @@ function formatStepTitle(item: any): string {
 }
 
 // 上下文 token 用量显示（头部徽章）。千分位 + 窗口占比 tooltip。
-function formatContextTokens(n: number): string {
-  return (n || 0).toLocaleString('en-US')
-}
-const contextTokenTooltip = computed(() => {
-  const info = chatStore.currentContextInfo
-  if (!info || !info.context_length) return ''
-  const pct = info.context_length > 0
-    ? ((info.tokens / info.context_length) * 100).toFixed(1)
-    : '0.0'
-  return `上下文窗口 ${info.context_length.toLocaleString('en-US')} tokens · 本轮占 ${pct}%`
-})
+// P2 (2026-09-05)：formatter/tooltip 移入 useContextTokens 共享（移动端徽章复用）。
+const contextTokenTooltip = computed(() => contextTokenTooltipText(chatStore.currentContextInfo))
 const messageListRef = ref<HTMLElement | null>(null)
 
 // Virtual scrolling for the message list. Long conversations with heavy
@@ -910,7 +913,7 @@ watch(() => chatStore.currentStreamingAgentSteps, (steps) => {
   }
 }, { deep: true })
 
-watch(() => chatStore.isStreaming, (streaming) => {
+watch(() => chatStore.isStreamingCurrentConversation, (streaming) => {
   if (!streaming) {
     // Clear all timers on stream end
     for (const key in stepTimers) {
@@ -941,7 +944,7 @@ const latestAssistantMessageId = computed(() => {
 })
 
 function canRegenerateMessage(messageId: string) {
-  return !saveMode.value && !chatStore.isStreaming && latestAssistantMessageId.value === messageId
+  return !saveMode.value && !chatStore.isStreamingCurrentConversation && latestAssistantMessageId.value === messageId
 }
 
 function enterSaveMode() {
@@ -1806,12 +1809,16 @@ watch(
 }
 
 .reasoning-text :deep(ol > li) {
+  position: relative;
   counter-increment: ol-counter;
 }
 
 .reasoning-text :deep(ol > li::before) {
   content: counters(ol-counter, ".") ". ";
-  margin-right: 2px;
+  position: absolute;
+  right: 100%;
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .streaming-message .text {

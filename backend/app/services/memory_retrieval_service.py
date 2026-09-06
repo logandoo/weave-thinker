@@ -1229,7 +1229,14 @@ async def _stage4_cross_encoder(
     复用 RRF 各 tier 上限），不再 flat top-12——subconscious RRF 权重 0.5
     恒垫底，flat 切片把最相关原文排除在 CE 之外（A4.6 根因 2 延伸）。
     """
-    api_base = (config.memory.get("rerank_api_base") or "").rstrip("/")
+    # model_gateway 收口（2026-08-30）：rerank 端点统一来自 registry
+    from app.model_gateway.registry import get_model_registry
+    try:
+        _rr_ep = get_model_registry().get("rerank")
+        api_base = (_rr_ep.base_url or "").rstrip("/")
+    except Exception:
+        _rr_ep = None
+        api_base = (config.memory.get("rerank_api_base") or "").rstrip("/")
     if not api_base:
         logger.warning("rerank_mode=cross_encoder 但 rerank_api_base 未配置，回退 score_only")
         return ordered
@@ -1259,16 +1266,18 @@ async def _stage4_cross_encoder(
     if not docs:
         return ordered
     headers = {"Content-Type": "application/json"}
-    api_key = config.memory.get("rerank_api_key") or ""
+    api_key = (_rr_ep.api_key if _rr_ep is not None else "") or config.memory.get("rerank_api_key") or ""
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    rerank_model = (_rr_ep.model_name if _rr_ep is not None and _rr_ep.model_name else None) \
+        or config.memory.get("rerank_model", "bge-reranker-v2-m3")
     timeout_s = float(config.memory_retrieval.get("stage4_cross_encoder_timeout_ms", 800)) / 1000.0
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s + 0.5)) as client:
             resp = await client.post(
                 f"{api_base}/rerank",
                 json={
-                    "model": config.memory.get("rerank_model", "bge-reranker-v2-m3"),
+                    "model": rerank_model,
                     "query": query_text,
                     "documents": docs,
                     "top_n": len(docs),
@@ -1849,7 +1858,7 @@ async def _get_profile_summary(db: AsyncSession, user_id: str, max_chars: int = 
         logger.debug("profile concepts load failed", exc_info=True)
 
     # profile 概念未生成时兜底：最新 memory_summary（v1 每日生成）。
-    # 2026-08-09 A4.9 实测回归：v1 摘要含偏好变更叙述（"从 VSCode 换成 Vim"），
+    # 2026-08-09 A4.9 实测回归：v1 摘要含偏好更新叙述（"从 VSCode 换成 Vim"），
     # 恒定注入会污染当前偏好语义（as-of 违背：当前查询 must_not 旧偏好）。
     # 兜底时裁剪变化叙述行——只保留稳定画像（职业/家庭/居住等）。
     # 裁剪判断由 LLM 完成（agentic 原则，原 _CHANGE_RE 正则已删除）。

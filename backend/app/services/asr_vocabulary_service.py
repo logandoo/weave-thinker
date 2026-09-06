@@ -29,7 +29,20 @@ class ASRVocabularyService:
         self._asr_config = get_config().asr
 
     @property
+    def _endpoint(self):
+        """model_gateway 收口（2026-08-30）：热词表 REST 的 url/key/model
+        统一来自 registry 的 asr 端点 extra。"""
+        from app.model_gateway.registry import get_model_registry
+        try:
+            return get_model_registry().get("asr")
+        except Exception:
+            return None
+
+    @property
     def _api_url(self) -> str:
+        ep = self._endpoint
+        if ep is not None and ep.extra.get("dashscope_vocabulary_url"):
+            return ep.extra["dashscope_vocabulary_url"]
         return self._asr_config.get(
             "dashscope_vocabulary_url",
             "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/customization",
@@ -37,14 +50,23 @@ class ASRVocabularyService:
 
     @property
     def _api_key(self) -> str:
+        ep = self._endpoint
+        if ep is not None:
+            return str(ep.extra.get("dashscope_api_key", "") or "")
         return self._asr_config.get("dashscope_api_key", "")
 
     @property
     def _target_model(self) -> str:
+        ep = self._endpoint
+        if ep is not None and ep.extra.get("dashscope_model"):
+            return ep.extra["dashscope_model"]
         return self._asr_config.get("dashscope_model", "fun-asr-realtime")
 
     @property
     def _prefix(self) -> str:
+        ep = self._endpoint
+        if ep is not None and ep.extra.get("vocabulary_prefix"):
+            return ep.extra["vocabulary_prefix"]
         return self._asr_config.get("vocabulary_prefix", "wvthinker")
 
     @property

@@ -258,18 +258,33 @@ def _is_voice_noise(text: str) -> bool:
     )
 
 
-def _pick_aux_phrase(phrases: list, last: str) -> str:
-    """Randomly pick one phrase from ``phrases``, never the same as ``last``
-    when alternatives exist (auxiliary speech: filler prefix / backchannel).
+# P5（2026-09-05）：辅助语音（填充词/应和）近期排除窗口长度。
+_AUX_RECENT_CAP = 3
+
+
+def _pick_aux_phrase(phrases: list, last: str, recent: Optional[list] = None) -> str:
+    """Randomly pick one phrase from ``phrases``, excluding ``last`` AND any
+    phrase in ``recent`` (the session's last-N picks) when alternatives exist
+    (auxiliary speech: filler prefix / backchannel).
+
+    2026-09-05 P5：仅排除上一条时 4 词池高频出现 A-B-A-B 与同族重复
+    （"我来想想啊"/"嗯，我想想" 听感几乎恒为"我想想啊"）——recent 排除
+    把窗口扩到最近 N 条，池 >2 时同短语不会连续 3 次选中。
 
     Pure and deterministic-friendly for unit tests. Returns "" when the list
     is empty or contains no usable strings."""
-    pool = [
-        p for p in (phrases or [])
-        if isinstance(p, str) and p.strip() and p != last
-    ]
+    def _usable(pool: list) -> list:
+        return [p for p in (pool or []) if isinstance(p, str) and p.strip()]
+
+    avoid = {last} if last else set()
+    for p in (recent or []):
+        if isinstance(p, str) and p.strip():
+            avoid.add(p)
+    pool = [p for p in _usable(phrases) if p not in avoid]
     if not pool:
-        pool = [p for p in (phrases or []) if isinstance(p, str) and p.strip()]
+        pool = [p for p in _usable(phrases) if p != last]
+    if not pool:
+        pool = _usable(phrases)
     if not pool:
         return ""
     return random.choice(pool)
@@ -1410,6 +1425,9 @@ class VoiceDuplexSession:
         # marked aux=True so the consumer excludes them from the pause
         # breakpoint pool (_turn_segments) and the dup window.
         self._last_filler_phrase = ""
+        # P5（2026-09-05）：最近 N 条已选短语（recent 排除窗口），打破
+        # last-only 排除的 A-B-A-B 交替与同族重复（"几乎总是我想想啊"）。
+        self._recent_filler_phrases: list[str] = []
         # Filler prefetch (填充词预取): the phrase's TTS synthesis is spawned
         # SPECULATIVELY while the EoT watchdog is still deciding whether the
         # utterance ended (arm), and converts to a playable aux item at the
@@ -1420,6 +1438,7 @@ class VoiceDuplexSession:
         self._last_filler_at = 0.0
         self._filler_prefetch = {"text": "", "phrase": "", "q": None, "task": None}
         self._last_backchannel_phrase = ""
+        self._recent_backchannel_phrases: list[str] = []
         self._last_backchannel_time = 0.0
         self._backchannel_acked_text = ""
         self._backchannel_count_this_turn = 0
@@ -1581,7 +1600,7 @@ class VoiceDuplexSession:
         self._vmem_last_ids: set = set()                # 已插话过的记忆 id（全会话去重）
         # 预算/冷却为进程级 per-user registry（_vmem_budget）——重连不重置；
         # 会话级不再持有计数，避免双源漂移。
-        self._vmem_baseline = ""                        # 会话启动时哨兵区块的原始内容（空召回还原）
+        self._vmem_baseline = ""                        # 会话启动时哨兵区块的基线内容（空召回还原）
         self._vmem_gen_done = asyncio.Event()           # 本轮生成结束信号（插话仲裁等待，超时封顶）
         self._vmem_gen_done_epoch = 0                   # _generate_and_speak 退出时的 epoch
         self._vmem_answer_epoch = 0                     # _last_answer_text 属于哪一轮（防跨轮错配）
@@ -1633,41 +1652,42 @@ class VoiceDuplexSession:
         await self._send_json({"event": "state", "state": state})
 
     # ---- LLM helpers ----
-    def _build_llm(self, model_override: str = "") -> tuple[LLMService, str]:
-        provider_name = self.config.voice_provider or "default"
-        router = get_provider_router()
-        kwargs = router.get_client_kwargs(provider_name)
-        model = model_override or self.config.voice_model_name or router.get_model_name(provider_name)
+    def _build_llm(self, purpose: str = "voice") -> tuple[LLMService, str]:
+        from app.model_gateway import factory
+        from app.model_gateway.registry import get_model_registry
+        registry = get_model_registry()
 
         # The 语音助理 assistant row's own model config takes precedence over
         # the global [voice] block (mirrors agent-mode create_llm_service):
         # a model edited in the agent assistant modal must actually drive the
         # voice sessions instead of being silently ignored, and other
         # assistants' settings must never leak into voice.
+        # model_gateway 收口（2026-08-30）：model_alias / legacy 行级字段统一
+        # 走 registry.endpoint_for_assistant；否则走 routing["voice"]。
+        # 2026-08-31 端点池化：子用途（voice.duplex/intent/interjection/
+        # memory_interjection）默认继承此处解析的端点（助手全链路继承反馈
+        # 2026-08-21）；仅当 [routing] 显式配置该子用途（或 legacy [voice]
+        # 覆盖键非空）= 专门设置例外，才走池成员。
         asst = self._voice_assistant
+        asst_model = getattr(asst, "custom_model_name", None) if asst is not None else None
+        use_custom = False
         if asst is not None:
-            asst_provider = (getattr(asst, "provider_type", None) or "deepseek") or "deepseek"
-            asst_model = getattr(asst, "custom_model_name", None)
-            use_custom = asst_provider == "custom" or bool(getattr(asst, "use_custom_model", False))
-            if asst_model or use_custom:
-                provider_name = asst_provider
-                router = get_provider_router()
-                kwargs = router.get_client_kwargs(provider_name)
-                if use_custom:
-                    if getattr(asst, "custom_api_url", None):
-                        kwargs["base_url"] = asst.custom_api_url
-                    if getattr(asst, "custom_api_key", None):
-                        kwargs["api_key"] = asst.custom_api_key
-                    model = model_override or asst_model or router.get_model_name(provider_name)
-                else:
-                    model = model_override or asst_model or self.config.voice_model_name or router.get_model_name(provider_name)
+            use_custom = (getattr(asst, "provider_type", None) or "") == "custom" or bool(
+                getattr(asst, "use_custom_model", False)
+            )
+        # model_alias == 默认别名 = "未显式选择" → 仍走 [voice] routing
+        # （语音助理默认行的模型由 [voice] 配置驱动的既有语义不变）。
+        alias = str(getattr(asst, "model_alias", None) or "") if asst is not None else ""
+        explicit_alias = bool(alias) and alias != registry.default_alias()
+        if asst is not None and (explicit_alias or asst_model or use_custom):
+            ep = registry.endpoint_for_assistant(asst)
+        else:
+            ep = registry.resolve("voice")
+        if purpose != "voice" and registry.has_explicit_routing(purpose):
+            ep = registry.resolve(purpose)
 
-        svc = LLMService(
-            custom_api_url=kwargs.get("base_url"),
-            custom_api_key=kwargs.get("api_key"),
-            custom_model_name=model,
-        )
-        return svc, model
+        svc = factory.build_llm_service(ep)
+        return svc, (ep.model_name or "")
 
     def _system_prompt(self) -> str:
         if self._identity_loaded and self._identity_prompt:
@@ -1843,7 +1863,7 @@ class VoiceDuplexSession:
             "- 当用户说'记住'、'记到记忆'、'加到记忆'时，调用 memory 工具。"
             "记忆是助手的内部知识库，用户通常不会直接查看。\n"
             "- memory 工具新增 system target（只读）：当用户询问系统功能、产品特性、版本更新时，"
-            "先用 memory(target='system', action='read') 读取系统功能文档 func.md，再基于文档内容回答。\n"
+            "先用 memory(target='system', action='read') 读取系统文档 changelog.md，再基于文档内容回答。\n"
             "- 如果不确定用户想保存到哪里，默认使用 notes（笔记），因为笔记是用户可直接查看和编辑的。\n"
             "工具调用风格：对于简单明确的任务（如保存笔记、搜索信息），直接连续调用工具完成，"
             "不要反复询问确认。例如用户说“把XX保存到笔记”，就直接调用 notes 的 create_note 完成，"
@@ -1870,7 +1890,7 @@ class VoiceDuplexSession:
 
         self._identity_prompt = "\n\n".join(s for s in sections if s and s.strip())
         self._identity_loaded = True
-        # 原始区块捕获：会话启动记忆（哨兵区块）——空召回时 _apply_vmem_block(None)
+        # 基线捕获：会话启动记忆（哨兵区块）——空召回时 _apply_vmem_block(None)
         # 还原到此内容，避免跨话题残留上一主题的召回区块。
         self._vmem_baseline = _vmem_extract_block(self._identity_prompt)
         # Seed conversation history with the identity prompt as system message.
@@ -2160,16 +2180,20 @@ class VoiceDuplexSession:
                 base_url = ""
         if not base_url:
             try:
-                base_url = str(
-                    get_provider_router()
-                    .get_client_kwargs(self.config.voice_provider or "default")
-                    .get("base_url", "")
-                    or ""
-                )
+                # model_gateway 收口（2026-08-30）：voice 端点来自 routing
+                from app.model_gateway.registry import get_model_registry
+                base_url = get_model_registry().resolve("voice").base_url or ""
             except Exception:
                 base_url = ""
-        provider_type = "qwen" if "dashscope" in base_url.lower() else "deepseek"
-        return build_thinking_extra_body(provider_type, False)
+        # wave-7：关思考 wire 形状由 thinking profile 统一给出。parity 注记
+        # （A4.9 wave-7 R2 Minor2）：旧 voice 仅匹配 "dashscope" 字面量——
+        # dashscope→enable_thinking False；其余（含 aliyuncs 非 dashscope）
+        # →generic thinking{type:disabled}，不经 aliyuncs 敏感的 sniff。
+        if "dashscope" in base_url.lower():
+            from app.model_gateway.profiles import get_thinking_profile
+            return get_thinking_profile("qwen").disable()
+        from app.model_gateway.profiles import get_thinking_profile
+        return get_thinking_profile("custom").disable()
 
     def _extra_body(self, svc: Optional[LLMService] = None) -> Optional[dict]:
         """Thinking OFF by default for every provider (voice.disable_thinking
@@ -2241,8 +2265,8 @@ class VoiceDuplexSession:
         return [{"role": "system", "content": base}]
 
     # ---- subagents ----
-    async def _quick_classify(self, system: str, user: str, model_override: str = "") -> str:
-        svc, model = self._build_llm(model_override)
+    async def _quick_classify(self, system: str, user: str, purpose: str = "voice") -> str:
+        svc, model = self._build_llm(purpose)
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
         async def _call() -> str:
@@ -2407,7 +2431,7 @@ class VoiceDuplexSession:
         ctx_parts.append(f"用户插话：{text}")
         ctx_parts.append(_prox_evidence_line(self._prox_evidence_near()))
         user_msg = "\n\n".join(ctx_parts)
-        raw = await self._quick_classify(system, user_msg, self.config.voice_duplex_model)
+        raw = await self._quick_classify(system, user_msg, "voice.duplex")
         _perf("barge_in_classify", (_now() - self._barge_classify_start) * 1000,
               text_len=len(text), raw_len=len(raw or ""))
         raw = (raw or "").strip().lower()
@@ -2504,7 +2528,7 @@ class VoiceDuplexSession:
                     f"用户：{text}"
                 )
         user_msg = ctx_block if ctx_block else f"用户：{text}"
-        raw = await self._quick_classify(system, user_msg, self.config.voice_intent_model)
+        raw = await self._quick_classify(system, user_msg, "voice.intent")
         _perf("intent_classify", (_now() - self._intent_classify_start) * 1000,
               text_len=len(text), ctx_msgs=len(recent))
         try:
@@ -2555,7 +2579,7 @@ class VoiceDuplexSession:
             "拿不准时：宁可判 false（继续等，硬阈值兜底会 flush），也不要打断正在思考的用户。"
         )
         user_msg = text
-        raw = await self._quick_classify(system, user_msg, self.config.voice_intent_model)
+        raw = await self._quick_classify(system, user_msg, "voice.intent")
         try:
             m = re.search(r"\{.*\}", raw, re.DOTALL)
             data = json.loads(m.group(0)) if m else {}
@@ -2651,7 +2675,7 @@ class VoiceDuplexSession:
             "愤怒/崩溃时使用，不要轻易破防。"
         )
         user_msg = f"{_ASR_CORRECTION_HINT}\n\n{prior}用户新说完的一句话：{sentence}"
-        raw = await self._quick_classify(system, user_msg, self.config.voice_interjection_model)
+        raw = await self._quick_classify(system, user_msg, "voice.interjection")
         _perf("interjection_classify", (_now() - self._interjection_classify_start) * 1000,
               sentence_len=len(sentence))
         try:
@@ -2755,7 +2779,7 @@ class VoiceDuplexSession:
         remove = False
         if ctx is None:
             if not self._vmem_baseline:
-                return  # 原始区块为空：保留当前区块（宁存勿清）
+                return  # 基线空：保留当前区块（宁存勿清）
             ctx = self._vmem_baseline
         block = _vmem_wrap(ctx[:4000])
         if not block:
@@ -2813,7 +2837,7 @@ class VoiceDuplexSession:
             self._vmem_block_ctx = ctx
             self._apply_vmem_block(ctx)
         elif ids == []:
-            # 空召回（无候选）：还原会话原始区块，不残留上一主题的区块。
+            # 空召回（无候选）：还原会话基线，不残留上一主题的区块。
             self._apply_vmem_block(None)
         logger.info(
             "voice memory recall done: turn=%s ids=%d top=%.2f chars=%d",
@@ -2835,8 +2859,9 @@ class VoiceDuplexSession:
         校验（JSON 解析、长度、开关、emotion 白名单）。任何失败 → none 静默。
         """
         fail = {"action": "none", "line": "", "emotion": self._emotion, "reason": ""}
-        model = (self.config.voice_memory_interjection_model
-                 or self.config.voice_interjection_model)
+        # 2026-08-31 池化：子用途 purpose 传递（legacy 覆盖链已由 registry
+        # 升格为显式 routing），不再读 config 模型名。
+        model = "voice.memory_interjection"
         window_desc = {
             "w1_user_speaking": "用户现在正在说话（你插话会打断 ta 的叙述，必须极强相关且极简短）",
             "postscript": "你刚说完/回答刚播完，用户还没开口（适合句尾顺口补一句）",
@@ -2967,7 +2992,7 @@ class VoiceDuplexSession:
                     await asyncio.wait_for(self._vmem_gen_done.wait(), timeout=step)
                 except asyncio.TimeoutError:
                     pass
-        # 过期防护：等期间若已有新的一轮开始，本批召回/回答已错位 → 弃。
+        # 过期防护：等期间若已有更新一轮开始，本批召回/回答已错位 → 弃。
         if self._turn_epoch != gen_epoch:
             return
         if self._vmem_gen_done_epoch > gen_epoch:
@@ -3055,7 +3080,7 @@ class VoiceDuplexSession:
             })
             if emotion != old_emotion:
                 await self._send_json({"event": "emotion", "emotion": emotion})
-            # 预算/冷却在出声前写入：并发 judge 的复检立即可见；
+            # 预算/冷却在出声前更新：并发 judge 的复检立即可见；
             # 即使 TTS 后续失败也不放行第二个（宁可少说）。
             if kind == "memory_append":
                 budget.append += 1
@@ -3175,7 +3200,10 @@ class VoiceDuplexSession:
         ``ignore_paused``: the resume pre-synthesis (spawned at pause time)
         must keep producing while ``_playback_paused`` is set — overlapping
         the barge-in classifier. Normal synthesis keeps the pause gate."""
-        style = self.config.voice_tts_style_instruction or None
+        # 2026-08-31 端点池化：风格指令由 tts_service 解析链决定（显式参数 >
+        # 端点 extra.style_instruction > [voice] legacy 键），此处不再用
+        # config 显式覆盖（否则端点配置的音色风格永远被配置键压掉）。
+        style = None
         tts_text = text
         if self._style_tag and not text.lstrip().startswith(("(", "（")):
             tts_text = self._style_tag + text
@@ -3499,6 +3527,16 @@ class VoiceDuplexSession:
             except Exception:
                 pass
 
+    def _record_filler_pick(self, phrase: str) -> None:
+        """填充词选取落账：last + 近期窗口（_pick_aux_phrase 的 recent 源）。"""
+        self._last_filler_phrase = phrase
+        self._recent_filler_phrases = (self._recent_filler_phrases + [phrase])[-_AUX_RECENT_CAP:]
+
+    def _record_backchannel_pick(self, phrase: str) -> None:
+        """应和选取落账：last + 近期窗口。"""
+        self._last_backchannel_phrase = phrase
+        self._recent_backchannel_phrases = (self._recent_backchannel_phrases + [phrase])[-_AUX_RECENT_CAP:]
+
     async def _speak_filler(self) -> None:
         """Filler prefix (填充词): speak a random "让我想想" phrase at the start
         of an answer turn so the user is never met with dead silence while the
@@ -3521,14 +3559,15 @@ class VoiceDuplexSession:
             return
         if self._closed:
             return
-        phrase = _pick_aux_phrase(cfg.voice_filler_phrases, self._last_filler_phrase)
+        phrase = _pick_aux_phrase(cfg.voice_filler_phrases, self._last_filler_phrase,
+                                  recent=self._recent_filler_phrases)
         if not phrase:
             return
         if len(phrase) > 24:
             # A pathological over-long configured phrase would play in full
             # before the answer arrives — never (A4.9 M4).
             return
-        self._last_filler_phrase = phrase
+        self._record_filler_pick(phrase)
         self._last_filler_at = _now()
         await self._send_json({"event": "filler", "text": phrase})
         await self._speak_text(phrase, wait=False, aux=True)
@@ -3597,9 +3636,11 @@ class VoiceDuplexSession:
             return
         if _STOP_TASK_RE.search(t) or _STOP_TASK_EXACT_RE.match(t):
             return
-        phrase = _pick_aux_phrase(cfg.voice_filler_phrases, self._last_filler_phrase)
+        phrase = _pick_aux_phrase(cfg.voice_filler_phrases, self._last_filler_phrase,
+                                  recent=self._recent_filler_phrases)
         if not phrase or len(phrase) > 24:
             return
+        self._record_filler_pick(phrase)
         # Defensive: the watchdog only arms when no prefetch is alive; drop
         # anything stale so we never hold two candidate syntheses.
         self._drop_filler_prefetch()
@@ -3699,7 +3740,8 @@ class VoiceDuplexSession:
             return
         if self._backchannel_count_this_turn >= cfg.voice_backchannel_max_per_turn:
             return
-        phrase = _pick_aux_phrase(cfg.voice_backchannel_phrases, self._last_backchannel_phrase)
+        phrase = _pick_aux_phrase(cfg.voice_backchannel_phrases, self._last_backchannel_phrase,
+                                  recent=self._recent_backchannel_phrases)
         if not phrase:
             return
         if len(phrase) > 4:
@@ -3709,7 +3751,7 @@ class VoiceDuplexSession:
             # turn (A4.9 M4).
             return
         self._last_backchannel_time = now
-        self._last_backchannel_phrase = phrase
+        self._record_backchannel_pick(phrase)
         self._backchannel_acked_text = t
         self._backchannel_count_this_turn += 1
         await self._send_json({"event": "agent_backchannel", "text": phrase})
@@ -5549,6 +5591,33 @@ class VoiceDuplexSession:
         elif event == "playback_drained":
             # Client finished playing every scheduled chunk — the audible tail
             # is over, so speaking is truly done (clears barge-in state).
+            #
+            # Advance the burst anchors to the HEARD position first: after a
+            # drain the next item (e.g. an interjection aux after a gap) begins
+            # a NEW client burst (speaking_start resets the client's clock), so
+            # its played_sec restarts at 0. Without this anchor a later onset
+            # pause would compute the breakpoint as base(0) + tiny played_sec
+            # and a backchannel/defer resume would REPLAY the whole answer the
+            # user had already heard (60 生产事故 conv 19b63be9 2026-09-04:
+            # 270 字答案播完后插话期间被打断，defer 恢复重播了 263 字旧答案，
+            # 新问题的回答音频排队直到连接关闭都未播出）。
+            # 只计入已完成答案段（aux 从不入 _turn_segments，口径一致）；
+            # 在飞片段未录段不计——低估方向安全（最多重播一小段已听尾部，
+            # 绝不跳过未听内容）。_playback_paused 期间客户端不会发 drained。
+            _heard_chars = sum(len(s["text"]) for s in self._turn_segments)
+            _full_len = len(self._turn_reply_text or "")
+            if _full_len:
+                # 插话（interjection）走 _speak_text 无 aux 标记、会被录段，
+                # 但其文本不属于答案正文——计入会越过答案末尾（A4.9 R1 M3）。
+                # 钳制到答案长度：答案段文本恒为 _turn_reply_text 的前缀子集，
+                # 超限只可能来自非答案污染。
+                _heard_chars = min(_heard_chars, _full_len)
+            self._burst_base_chars = _heard_chars
+            self._burst_base_sec = self._turn_audio_sec_total
+            # 客户端对新 burst 从 0 重计 played_sec；清掉上一 burst 的残值，
+            # 否则 drained→首个 progress 事件（≤250ms）窗口内的暂停会把
+            # 过期 played_sec 叠进断点（A4.9 R1 M2）。
+            self._playback_played_sec = 0.0
             await self._mark_speaking_end()
         elif event == "audio_proximity":
             # Browser-side acoustic near-field signal: the client classifies

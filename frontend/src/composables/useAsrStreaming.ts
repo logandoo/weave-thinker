@@ -87,6 +87,10 @@ const READY_TIMEOUT_MS = 10_000
 const MAX_RECONNECT_ATTEMPTS = 10
 const RECONNECT_BASE_DELAY_MS = 500
 const RECONNECT_MAX_DELAY_MS = 5000
+// ~85ms of audio per chunk at a 48kHz source (~256ms at 16kHz); 1200 chunks
+// bounds the buffer to ~100s–5min. Beyond this the oldest chunks are dropped
+// so a dead network cannot grow memory unboundedly.
+const MAX_PENDING_CHUNKS = 1200
 
 export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
   const isRecording = ref(false)
@@ -108,6 +112,15 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let reconnectAttempt = 0
   let reconnecting = false
+  // Display-text invariant: displayText = committedText + sessionText.
+  // committedText survives reconnects (text from dead sessions is never
+  // dropped); sessionText is the live backend session's accumulated text.
+  let committedText = ''
+  let sessionText = ''
+  // Generation counter: bumped by start()/stop()/cancel(). An in-flight
+  // reconnect whose epoch has gone stale belongs to a dead generation and
+  // must be closed without touching the new generation's state.
+  let sessionEpoch = 0
 
   function stopFlushTimer() {
     if (flushTimer !== null) {
@@ -125,7 +138,9 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
 
   function flushPendingChunks() {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      pendingChunks = []
+      // Socket dead (reconnect pending): KEEP the buffered audio — it will be
+      // flushed by reconnect() once the new session is ready. Never silently
+      // drop recorded speech.
       stopFlushTimer()
       return
     }
@@ -138,6 +153,19 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
       flushTimer = setTimeout(flushPendingChunks, FLUSH_INTERVAL_MS)
     } else {
       stopFlushTimer()
+    }
+  }
+
+  function bufferChunk(chunk: ArrayBuffer) {
+    pendingChunks.push(chunk)
+    // Ring bound: drop the oldest audio beyond ~100s so a dead network
+    // cannot grow memory unboundedly (drop-oldest, never drop-newest).
+    while (pendingChunks.length > MAX_PENDING_CHUNKS) {
+      pendingChunks.shift()
+      console.warn('[ASR] pending audio buffer full, dropping oldest chunk')
+    }
+    if (flushTimer === null) {
+      flushTimer = setTimeout(flushPendingChunks, FLUSH_INTERVAL_MS)
     }
   }
 
@@ -199,6 +227,8 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
     partialText.value = ''
     finalText.value = ''
     error.value = null
+    committedText = ''
+    sessionText = ''
   }
 
   function handleSocketMessage(event: MessageEvent) {
@@ -227,22 +257,35 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
       return
     }
 
-    if (payload.text) {
-      partialText.value = payload.text
-      finalText.value = payload.text
-    }
-
     if (payload.event === 'partial' || payload.event === 'segment') {
-      // Backend already accumulates text across VAD sentence boundaries,
-      // so we can forward the payload directly without local accumulation.
-      options.onPartial?.(payload)
+      // Backend already accumulates text across VAD sentence boundaries
+      // within ONE session; committedText carries text from dead sessions
+      // across reconnects so the display text never shrinks.
+      if (payload.text) {
+        sessionText = payload.text
+      }
+      const displayText = committedText + sessionText
+      partialText.value = displayText
+      finalText.value = displayText
+      options.onPartial?.({ ...payload, text: displayText })
       return
     }
 
     if (payload.event === 'final') {
-      options.onFinal?.(payload)
+      // The final is authoritative: FunASR composes it from the same
+      // finalized segments INCLUDING the in-progress tail, and re-transcribe
+      // backends (MiMo) may legitimately return shorter corrected text.
+      // An empty final keeps the last partial so text never vanishes.
+      if (payload.text) {
+        sessionText = payload.text
+      }
+      const displayText = committedText + sessionText
+      partialText.value = displayText
+      finalText.value = displayText
+      const finalPayload = { ...payload, text: displayText }
+      options.onFinal?.(finalPayload)
       if (pendingFinal) {
-        pendingFinal.resolve(payload)
+        pendingFinal.resolve(finalPayload)
         pendingFinal = null
       }
       reconnectAttempt = 0
@@ -335,13 +378,21 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
       cleanupState()
       closeAudioGraph()
       clearSocket()
+      // Drop the buffered audio of the dead session — it must never be
+      // replayed into the user's NEXT recording as ghost text.
+      pendingChunks = []
+      stopFlushTimer()
       return
     }
+    const epoch = sessionEpoch
     const delay = Math.min(
       RECONNECT_BASE_DELAY_MS * (2 ** reconnectAttempt),
       RECONNECT_MAX_DELAY_MS,
     )
     reconnectTimer = setTimeout(() => {
+      if (epoch !== sessionEpoch) {
+        return
+      }
       void reconnect()
     }, delay)
   }
@@ -350,16 +401,35 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
     if (reconnecting) return
     reconnecting = true
     reconnectAttempt += 1
+    const epoch = sessionEpoch
     try {
       await startSocket(undefined, true)
+      if (epoch !== sessionEpoch) {
+        // stop()/cancel()/start() happened while this socket was coming up:
+        // it belongs to a dead generation — close it without touching state.
+        // BUT a concurrent stop() may have legitimately adopted this very
+        // socket for its finish handshake (onopen fired before the click):
+        // tearing it down here would drop the in-flight final and hang the
+        // stop for 60s. Leave an adopted socket to stop()'s own cleanup.
+        reconnecting = false
+        if (!isFinishing.value && !pendingFinal) {
+          clearSocket()
+        }
+        return
+      }
       reconnecting = false
       if (audioContext && audioContext.state !== 'closed' && sourceNode) {
         isRecording.value = true
+        // Replay the audio buffered during the reconnect window.
+        flushPendingChunks()
       } else {
         await stop()
       }
     } catch {
       reconnecting = false
+      if (epoch !== sessionEpoch) {
+        return
+      }
       if (isRecording.value || isFinishing.value) {
         scheduleReconnect()
       } else {
@@ -373,6 +443,10 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
   function handleSocketClose(closeEvent: CloseEvent) {
     const closedByClient = closeEvent.code === 1000 || closeEvent.code === 1005
     if (!closedByClient && isRecording.value) {
+      // Abnormal close mid-recording: commit everything the dead session
+      // produced so the next session only ever appends to it.
+      committedText += sessionText
+      sessionText = ''
       if (!error.value) {
         const message = closeEvent.reason || '语音识别连接已断开'
         error.value = message
@@ -439,7 +513,7 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
     muteNode.gain.value = 0
 
     processorNode.onaudioprocess = audioEvent => {
-      if (!socket || socket.readyState !== WebSocket.OPEN || !isRecording.value) {
+      if (!isRecording.value) {
         return
       }
 
@@ -451,13 +525,13 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
 
       const chunk = float32ToLittleEndianBuffer(resampled)
 
-      if (socket.bufferedAmount < BACKPRESSURE_THRESHOLD && pendingChunks.length === 0) {
+      if (socket && socket.readyState === WebSocket.OPEN && socket.bufferedAmount < BACKPRESSURE_THRESHOLD && pendingChunks.length === 0) {
         socket.send(chunk)
       } else {
-        pendingChunks.push(chunk)
-        if (flushTimer === null) {
-          flushTimer = setTimeout(flushPendingChunks, FLUSH_INTERVAL_MS)
-        }
+        // Socket not OPEN (reconnect window) or backpressured: buffer the
+        // audio so speech during the gap is replayed after reconnect instead
+        // of being silently dropped.
+        bufferChunk(chunk)
       }
     }
 
@@ -473,6 +547,10 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
 
     resetTranscriptState()
     reconnectAttempt = 0
+    sessionEpoch += 1
+    // Defensive: a fresh recording never carries audio from a previous one.
+    pendingChunks = []
+    stopFlushTimer()
 
     try {
       await startSocket(startPayload)
@@ -495,14 +573,35 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
     stopReconnectTimer()
     reconnectAttempt = 0
     reconnecting = false
+    sessionEpoch += 1
 
-    if (!socket || socket.readyState !== WebSocket.OPEN || !isRecording.value) {
+    // Guard: nothing to stop (never started / already stopped), or a stop is
+    // already in flight (a second stop must not clobber the pending final).
+    if (!isRecording.value || isFinishing.value) {
       return null
     }
 
+    // Always leave the recording state first — the user asked to stop, so the
+    // mic must turn off and the UI must exit 录音中 no matter what the socket
+    // is doing (this is what makes stop work during a reconnect window).
     isRecording.value = false
-    isFinishing.value = true
     closeAudioGraph()
+
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      // Socket dead (mid-reconnect / already errored): finalize with the last
+      // text the user saw instead of hanging or dropping it.
+      isFinishing.value = false
+      pendingChunks = []
+      stopFlushTimer()
+      clearSocket()
+      const displayText = committedText + sessionText
+      if (!displayText) {
+        return null
+      }
+      return { event: 'final', text: displayText }
+    }
+
+    isFinishing.value = true
 
     // Flush any remaining buffered audio before sending finish
     while (pendingChunks.length > 0 && socket.readyState === WebSocket.OPEN) {
@@ -520,19 +619,31 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
       }, FINISH_TIMEOUT_MS)
     })
 
-    socket.send(JSON.stringify({ event: 'finish' }))
+    try {
+      socket.send(JSON.stringify({ event: 'finish' }))
+    } catch (err) {
+      // Send itself failed: clean up and fall back to the last known text.
+      pendingFinal = null
+      cleanupState()
+      clearSocket()
+      const displayText = committedText + sessionText
+      if (displayText) {
+        return { event: 'final', text: displayText }
+      }
+      throw err
+    }
 
     try {
       return await Promise.race([finalResult, timeoutPromise])
     } catch (err) {
-      // On timeout, clean up properly
+      // Any failure (timeout, socket drop, cancel) must reset the UI state.
       if (err instanceof Error && err.message === '语音识别超时，请重试') {
         error.value = err.message
         options.onError?.(err.message)
-        pendingFinal = null
-        cleanupState()
-        clearSocket()
       }
+      pendingFinal = null
+      cleanupState()
+      clearSocket()
       throw err
     }
   }
@@ -540,6 +651,7 @@ export function useAsrStreaming(options: UseAsrStreamingOptions = {}) {
   function cancel() {
     reconnectAttempt = 0
     reconnecting = false
+    sessionEpoch += 1
     stopReconnectTimer()
     rejectPendingReady('录音已取消')
     rejectPendingFinal('录音已取消')

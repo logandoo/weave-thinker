@@ -11,6 +11,12 @@
 import { useChatStore } from './chat'
 import { chatApi } from '@/api/chat'
 
+// P1（2026-09-05）：连接静默判死阈值。后端 setup 期每 10s 一次 ping、agent
+// 循环 keepalive 同为 10s——超过 25s（2.5 个心跳周期）无任何事件的连接在
+// 移动端几乎必为系统已回收的僵尸（socket 死亡不会触发 error 事件），
+// "保留连接"只会把恢复推迟到 30s 看门狗甚至永久卡死。
+const VISIBILITY_STALE_MS = 25000
+
 let _visibilityChangeHandler: (() => void) | null = null
 
 if (typeof window !== 'undefined' && !_visibilityChangeHandler) {
@@ -42,19 +48,31 @@ if (typeof window !== 'undefined' && !_visibilityChangeHandler) {
           liveBuffer = false
         }
         if (!liveBuffer) {
-          // Setup phase (no buffer yet) or already finished: aborting would
-          // kill the run irrecoverably (or is pointless). Keep the in-flight
-          // connection; touch the watchdog timestamp so a healthy setup
-          // isn't mis-killed either.
-          s._lastEventTime = Date.now()
-          await store.refreshConversation(convId)
-          return
+          // Setup phase (no buffer yet) or already finished — 但先要区分
+          // 连接死活（P1 2026-09-05）：后台期间 socket 被系统静默回收时
+          // 不会有 error 事件，"保留连接"等于保留一具尸体，直播永远恢复
+          // 不了（只剩最后一条 query）。静默超阈值 → 视为已死，落入下方
+          // abort→resume/恢复路径（resume 对 setup 期 'none' 判暂态续命）。
+          const silentMs = Date.now() - (s._lastEventTime || 0)
+          if (!s.streaming || silentMs <= VISIBILITY_STALE_MS) {
+            // 健康 setup 连接（ping 正常）或流已结束：保留现状 + 刷新。
+            // Touch the watchdog timestamp so a healthy setup isn't mis-killed.
+            s._lastEventTime = Date.now()
+            await store.refreshConversation(convId)
+            return
+          }
+          // 连接可疑死亡：不破旗直接 abort（catch 走 tabSwitch 分支，
+          // streaming 保持 true 由本处理器接管）。
+          s.tabSwitchAbort = true
+          try { s.abortController.abort() } catch {}
+          await new Promise<void>(r => setTimeout(() => r(), 150))
+        } else {
+          // 如果当前还有活跃连接，先优雅 abort，让 streamChat catch 块走 tabSwitch 分支
+          s.tabSwitchAbort = true
+          try { s.abortController.abort() } catch {}
+          // 给 abort 传播留出时间，然后再 resume
+          await new Promise<void>(r => setTimeout(() => r(), 150))
         }
-        // 如果当前还有活跃连接，先优雅 abort，让 streamChat catch 块走 tabSwitch 分支
-        s.tabSwitchAbort = true
-        try { s.abortController.abort() } catch {}
-        // 给 abort 传播留出时间，然后再 resume
-        await new Promise<void>(r => setTimeout(() => r(), 150))
       }
 
       // 如果经过 abort 后 streaming 已经停了，说明 catch 块已经走完；

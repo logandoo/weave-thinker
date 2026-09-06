@@ -73,7 +73,7 @@ class ProactiveLearningService:
             task="interest_extract",
             default=None,
 
-            timeout=25.0,
+            timeout=float(config.memory_interest_extract_timeout_seconds),
         )
         if not isinstance(parsed, dict):
             logger.info("interest extraction LLM unavailable — structural counts only")

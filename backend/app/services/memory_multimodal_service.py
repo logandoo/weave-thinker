@@ -168,7 +168,7 @@ async def _call_mm_llm_messages(messages: list, user_id: str, db: Optional[Async
 
     response = await asyncio.wait_for(
         llm.complete_chat(messages, temperature=0.1),
-        timeout=60,
+        timeout=120,
     )
     return (response or "").strip()
 

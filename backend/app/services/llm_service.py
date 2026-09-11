@@ -231,10 +231,13 @@ class LLMService:
             top_k = _ep_params.get("top_k")
         if top_k not in (None, "", 0, "0"):
             _sdk_extra["top_k"] = top_k
+        # min_p=0.0 是真实数据不是哨兵（Qwen3.8 模型卡采样预设；llama.cpp
+        # 未设 min_p 时用服务端非零默认——0.0 被吞=偏离卡预设）。None/""/"0"
+        # 仍视为未设置；显式数字 0/0.0 送达 wire（A4.9 qwen3.8_next 评审 Imp-2）。
         min_p = kwargs.get("min_p")
-        if min_p in (None, "", 0, "0"):
+        if min_p in (None, "", "0"):
             min_p = _ep_params.get("min_p")
-        if min_p not in (None, "", 0, "0"):
+        if min_p not in (None, "", "0"):
             _sdk_extra["min_p"] = min_p
         repetition_penalty = kwargs.get("repetition_penalty")
         if repetition_penalty in (None, "", 0, "0"):

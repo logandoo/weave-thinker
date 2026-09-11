@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 DEFAULT_MAX_TURNS = 30
-DEFAULT_JUDGE_TIMEOUT = 30.0
+DEFAULT_JUDGE_TIMEOUT = 120.0
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
 DEFAULT_MAX_GRILLING_ROUNDS = 3
 DEFAULT_QUESTIONS_PER_ROUND = 3
@@ -445,7 +445,7 @@ async def _ensure_creative_judged(goal: str) -> bool:
             f"用户目标：\n{key[:800]}\n\n只输出JSON。",
             task="creative_goal",
             default=None,
-            timeout=15.0,
+            timeout=120.0,
         )
         if isinstance(parsed, dict):
             result = bool(parsed.get("is_creative"))
@@ -1120,7 +1120,7 @@ class DeathmatchManager:
                 '输出JSON：{"choice": "tighten_step_tools|length_discipline|coarse_replan|none"}',
                 task="harness_repair",
                 default=None,
-                timeout=15.0,
+                timeout=120.0,
             )
             if isinstance(parsed, dict):
                 c = str(parsed.get("choice") or "").strip()
@@ -2177,10 +2177,15 @@ class DeathmatchManager:
             )
             msgs = result.scalars().all()
             messages = []
+            # conv a040c24e (D-12): neutralize historical [N] citation markers
+            # on assistant rows before they re-enter the goal-loop context.
+            from app.services.tool_history import neutralize_historical_citations
             for m in msgs:
                 content = self.strip_markers(m.content or "")
                 if not content.strip():
                     continue
+                if m.role == "assistant":
+                    content = neutralize_historical_citations(content)
                 messages.append({"role": m.role, "content": content})
             if len(messages) <= 3:
                 summary = "\n\n".join(f"[{m['role']}] {m['content']}" for m in messages)
@@ -5228,7 +5233,7 @@ intent 只能是以下之一：
             user_prompt,
             task="completion_reconcile",
             default=None,
-            timeout=25.0,
+            timeout=120.0,
         )
         if not isinstance(parsed, dict):
             logger.info(

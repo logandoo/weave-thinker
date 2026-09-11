@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # 可视交付物扩展名（确定性判定，无需 LLM）
 VISUAL_EXTENSIONS = frozenset({".html", ".htm", ".svg"})
 
-_VLM_TIMEOUT_SECONDS = 60.0
+_VLM_TIMEOUT_SECONDS = 120.0
 _MAX_ISSUES = 6
 
 

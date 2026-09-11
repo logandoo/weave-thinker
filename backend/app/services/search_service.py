@@ -6,7 +6,7 @@ import json as _json
 import logging
 import re as _re
 from dataclasses import dataclass, asdict, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import httpx
@@ -53,17 +53,51 @@ _DATE_PATTERNS = [
 ]
 
 
+_EN_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+# "Aug 15, 2026" / "August 15, 2026" (Serper's human-readable format)
+_EN_DATE_RE = _re.compile(r'^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(20[12]\d)$')
+# "2 days ago" / "3 weeks ago" (Serper relative format)
+_REL_AGO_RE = _re.compile(r'(\d+)\s*(minute|hour|day|week|month|year)s?\s*ago', _re.IGNORECASE)
+
+
 def _normalise_date(raw: str) -> Optional[str]:
     """Try to normalise a raw date string into YYYY-MM-DD."""
     raw = raw.strip()
-    # Already YYYY-MM-DD or YYYY/MM/DD
-    m = _re.match(r'^(20[12]\d)[/\-](0?[1-9]|1[0-2])[/\-](0?[1-9]|[12]\d|3[01])', raw)
+    # Already YYYY-MM-DD or YYYY/MM/DD. Alternations are ordered longest-first:
+    # a leading `0?[1-9]` would match only the first digit of "15"/"31" and
+    # silently return day "01"/"03" (2026-09-11 wave-3 bug fix — publish dates
+    # feed the recency judgment, so truncation corrupts timeline ordering).
+    # The trailing `(?![0-9])` rejects malformed days ("2026-08-32"/"…155")
+    # instead of prefix-matching a bogus date.
+    m = _re.match(r'^(20[12]\d)[/\-](1[0-2]|0?[1-9])[/\-]([12]\d|3[01]|0?[1-9])(?![0-9])', raw)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     # ISO 8601 with T
-    m = _re.match(r'^(20[12]\d)[/\-](0?[1-9]|1[0-2])[/\-](0?[1-9]|[12]\d|3[01])T', raw)
+    m = _re.match(r'^(20[12]\d)[/\-](1[0-2]|0?[1-9])[/\-]([12]\d|3[01]|0?[1-9])T', raw)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    # English month format (Serper): "Aug 15, 2026" / "August 15, 2026"
+    m = _EN_DATE_RE.match(raw)
+    if m:
+        month = _EN_MONTHS.get(m.group(1)[:3].lower())
+        if month:
+            return f"{m.group(3)}-{month:02d}-{int(m.group(2)):02d}"
+    # Relative format (Serper): "2 days ago" / "3 weeks ago" — approximate at
+    # day granularity (minute/hour → today), which is what recency ordering
+    # needs; anything else stays undated rather than guessed.
+    m = _REL_AGO_RE.search(raw)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        delta_days = {
+            "minute": 0, "hour": 0, "day": n,
+            "week": n * 7, "month": n * 30, "year": n * 365,
+        }[unit]
+        d = datetime.now(timezone.utc) - timedelta(days=delta_days)
+        return d.strftime("%Y-%m-%d")
     return None
 
 
@@ -362,9 +396,9 @@ class WebSearchService:
         if provider == "firecrawl":
             return await self._search_firecrawl(query, time_sensitive=time_sensitive)
         if provider == "tavily":
-            return await self._search_tavily(get_shared_async_client(), query)
+            return await self._search_tavily(get_shared_async_client(), query, time_sensitive=time_sensitive)
         if provider == "serper":
-            return await self._search_serper(get_shared_async_client(), query)
+            return await self._search_serper(get_shared_async_client(), query, time_sensitive=time_sensitive)
         logger.warning("web_search: unknown provider %r", provider)
         return None
 
@@ -501,7 +535,7 @@ class WebSearchService:
                 elif line.startswith("Published:"):
                     pub_raw = line[10:].strip()
                     if pub_raw and pub_raw != "N/A":
-                        published = pub_raw[:10]
+                        published = _normalise_date(pub_raw) or ""
                 elif line.startswith("Author:") or line.startswith("Highlights:"):
                     continue
                 elif line.startswith("[...]"):
@@ -582,7 +616,7 @@ class WebSearchService:
             published = ""
             date_raw = item.get("datePublished") or ""
             if date_raw:
-                published = date_raw[:10]
+                published = _normalise_date(str(date_raw)) or ""
             hits.append(
                 SearchHit(
                     title=title[:300],
@@ -654,7 +688,7 @@ class WebSearchService:
             published = ""
             date_raw = item.get("date") or ""
             if date_raw:
-                published = date_raw[:10]
+                published = _normalise_date(str(date_raw)) or ""
             hits.append(
                 SearchHit(
                     title=title[:300],
@@ -665,16 +699,19 @@ class WebSearchService:
             )
         return hits
 
-    async def _search_tavily(self, client: httpx.AsyncClient, query: str) -> List[SearchHit]:
+    async def _search_tavily(self, client: httpx.AsyncClient, query: str, time_sensitive: bool = False) -> List[SearchHit]:
+        request_body: Dict[str, object] = {
+            "api_key": config.web_search_api_key,
+            "query": query,
+            "max_results": config.web_search_max_results,
+            "search_depth": "basic",
+            "include_answer": False,
+        }
+        if time_sensitive:
+            request_body["time_range"] = "month"
         response = await client.post(
             config.web_search_api_url or "https://api.tavily.com/search",
-            json={
-                "api_key": config.web_search_api_key,
-                "query": query,
-                "max_results": config.web_search_max_results,
-                "search_depth": "basic",
-                "include_answer": False,
-            },
+            json=request_body,
         )
         response.raise_for_status()
         payload = response.json()
@@ -684,15 +721,19 @@ class WebSearchService:
                 title=item.get("title", "Untitled result"),
                 url=item.get("url", ""),
                 snippet=item.get("content", ""),
+                published_date=_normalise_date(str(item.get("published_date") or "")),
             )
             for item in results[: config.web_search_max_results]
         ]
 
-    async def _search_serper(self, client: httpx.AsyncClient, query: str) -> List[SearchHit]:
+    async def _search_serper(self, client: httpx.AsyncClient, query: str, time_sensitive: bool = False) -> List[SearchHit]:
+        request_body: Dict[str, object] = {"q": query, "num": config.web_search_max_results}
+        if time_sensitive:
+            request_body["tbs"] = "qdr:m"
         response = await client.post(
             config.web_search_api_url or "https://google.serper.dev/search",
             headers={"X-API-KEY": config.web_search_api_key or "", "Content-Type": "application/json"},
-            json={"q": query, "num": config.web_search_max_results},
+            json=request_body,
         )
         response.raise_for_status()
         payload = response.json()
@@ -702,6 +743,7 @@ class WebSearchService:
                 title=item.get("title", "Untitled result"),
                 url=item.get("link", ""),
                 snippet=item.get("snippet", ""),
+                published_date=_normalise_date(str(item.get("date") or "")),
             )
             for item in results[: config.web_search_max_results]
         ]

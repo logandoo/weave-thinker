@@ -524,7 +524,7 @@ html[data-skin="ink-paper"] .context-token-chip {
 html[data-skin="ink-paper"] .context-token-chip svg { opacity: 0.7; }
 
 /* 消息气泡（mockup .bubble：radius 6 / user 6 6 2 6） */
-html[data-skin="ink-paper"] .text {
+html[data-skin="ink-paper"] div.text {
   border-radius: var(--msg-bubble-radius);
   border: var(--msg-bubble-border);
   box-shadow: var(--msg-bubble-shadow);
@@ -532,11 +532,11 @@ html[data-skin="ink-paper"] .text {
   font-size: 14px;
   line-height: 1.7;
 }
-html[data-skin="ink-paper"] .assistant .text {
+html[data-skin="ink-paper"] .assistant div.text {
   border-bottom-left-radius: var(--msg-bubble-bl);
   background: var(--msg-assistant-bg);
 }
-html[data-skin="ink-paper"] .user .text {
+html[data-skin="ink-paper"] .user div.text {
   border-bottom-right-radius: var(--msg-bubble-br);
   border-radius: 6px 6px 2px 6px;
   background: var(--msg-user-bg);

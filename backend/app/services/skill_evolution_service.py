@@ -57,7 +57,7 @@ class SkillEvolutionService:
             task="skill_assess",
             default=None,
 
-            timeout=25.0,
+            timeout=120.0,
         )
         if not isinstance(parsed, dict):
             logger.info("skill quality assessment LLM unavailable — needs_improvement fallback")

@@ -303,7 +303,7 @@ class TitleGeneratorService:
             f"用户提问：\n{query[:400]}\n\n只输出JSON。",
             task="title_fallback",
             default=None,
-            timeout=15.0,
+            timeout=120.0,
         )
         if isinstance(parsed, dict):
             try:

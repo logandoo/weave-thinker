@@ -120,7 +120,7 @@ async def _record_failure(db: AsyncSession, user_id: str, meta: dict, progress: 
 async def _llm_extract(db: AsyncSession, user_id: str, source_text: str) -> dict | None:
     from app.services.memory_llm_factory import _memory_llm
     llm = _memory_llm("migration")
-    timeout = int(config.memory.get("migration_llm_timeout_seconds", 60))
+    timeout = int(config.memory.get("migration_llm_timeout_seconds", 120))
     prompt = _build_migration_prompt()
     resp = await asyncio.wait_for(
         llm.complete_chat(

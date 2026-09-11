@@ -566,12 +566,12 @@ input::placeholder, textarea::placeholder {
     max-width: 90%;
   }
 
-  .message-bubble .text {
+  .message-bubble div.text {
     padding: 10px 12px;
     font-size: 13px;
   }
 
-  .streaming-message .text {
+  .streaming-message div.text {
     padding: 10px 12px;
     font-size: 13px;
   }

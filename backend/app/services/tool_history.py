@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
+
+from app.services.citation_ledger import _CITE_RE, _FENCE_RE
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +37,105 @@ __all__ = [
     "build_persisted_tool_calls",
     "rebuild_structured_history",
     "sanitize_api_messages",
+    "neutralize_historical_citations",
+    "build_history_message",
 ]
 
 _ORPHAN_RESULT_STUB = "[Result unavailable — see context summary above]"
+
+
+def neutralize_historical_citations(text: Optional[str]) -> str:
+    """Remove ``[N]`` citation markers from HISTORICAL assistant prose before
+    the text re-enters the model context.
+
+    Why (conv a040c24e, 2026-09-10): each turn's CitationLedger restarts at 1,
+    but prior turns' ``[N]`` markers replayed verbatim into the prompt. The
+    model then reused two-turns-old numbers — in-range collisions resolve to
+    unrelated URLs (frontend maps positionally), out-of-range ones dangle.
+    The ids are unresolvable outside their own turn, so the markers carry no
+    actionable information for a new turn; deleting them restores the ledger
+    invariant ("the model only ever emits small integers it was handed" —
+    the current turn's).
+
+    Why REMOVAL and not a replacement glyph (2026-09-10 post-deploy smoke,
+    conv b650d7c2): the first version rewrote ``[N]`` → full-width ``（N）``
+    to keep enumeration prose readable — the model MIMICKED the full-width
+    form in its own new answer ("吹不到手 （6）（10）", persisted without
+    badges). Any number-preserving replacement is imitable; removal is the
+    only non-imitable transform. Enumeration numbers in replayed history
+    ("[3] 个要点") lose the digit but keep the prose — replay-context-only,
+    never persisted, never user-visible.
+
+    Code fences / inline code are masked (``a[1]`` inside code survives).
+    Replay-time only — persisted rows are never mutated.
+    """
+    if not text:
+        return ""
+    spans = list(_FENCE_RE.finditer(text))
+    if not spans:
+        return _CITE_RE.sub("", text)
+    parts: List[str] = []
+    last = 0
+    for m in spans:
+        parts.append(_CITE_RE.sub("", text[last:m.start()]))
+        parts.append(m.group(0))
+        last = m.end()
+    parts.append(_CITE_RE.sub("", text[last:]))
+    return "".join(parts)
+
+
+def build_history_message(
+    role: str,
+    content: Optional[str],
+    reasoning_content: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build one replay message for LLM context from a persisted row.
+
+    Single seam for the role-conditional citation neutralization used by the
+    chat / background-worker / scheduler replay loops (A4.9 R1 M3): assistant
+    rows get ``neutralize_historical_citations``; user/other roles pass
+    through byte-identical. ``reasoning_content`` is attached only when
+    truthy (DeepSeek thinking round-trip invariant lives on tool-call rows,
+    which ``rebuild_structured_history`` handles separately).
+    """
+    msg: Dict[str, Any] = {"role": role, "content": content or ""}
+    if role == "assistant":
+        msg["content"] = neutralize_historical_citations(msg["content"])
+        if reasoning_content:
+            msg["reasoning_content"] = reasoning_content
+    return msg
+
+
+# A formatted search-list entry header ("12. <title>") is de-numbered when its
+# BLOCK (entries are separated by blank lines per CitationLedger.format_hits)
+# contains a "URL: " line — the structural signature of a real search entry.
+# Block-level (not next-line) signature so multi-line titles are covered
+# (A4.9 R1 M4). Digit-leading lines inside snippets lack the signature and
+# stay untouched.
+_SEARCH_ENTRY_HEADER_RE = re.compile(r"^\d{1,3}\. ")
+
+
+def _denumber_search_formatted(content: Optional[str]) -> str:
+    """De-number a historical web_search ``formatted`` result list.
+
+    Entries ``"N. title\\nURL: url\\n摘要: snippet"`` become ``"- title\\n…"``
+    so replayed history carries its facts (titles/URLs/snippets intact) but
+    none of its stale ledger integers (conv a040c24e). Deleting the number
+    is safe because historical ids are unresolvable outside their own turn.
+    """
+    if not content:
+        return content or ""
+    out_blocks: List[str] = []
+    for block in content.split("\n\n"):
+        lines = block.split("\n")
+        if (
+            lines
+            and _SEARCH_ENTRY_HEADER_RE.match(lines[0])
+            and any(ln.startswith("URL: ") for ln in lines[1:])
+        ):
+            lines[0] = "- " + lines[0].split(". ", 1)[1]
+        out_blocks.append("\n".join(lines))
+    return "\n\n".join(out_blocks)
 
 
 def _unique_tool_call_id() -> str:
@@ -125,30 +224,21 @@ def rebuild_structured_history(
     so the assistant.tool_calls / tool message pairing remains intact.
     """
     if role != "assistant" or not tool_calls_json:
-        msg: Dict[str, Any] = {"role": role, "content": content or ""}
-        if role == "assistant" and reasoning_content:
-            # DeepSeek ignores reasoning on non-tool turns; harmless to carry.
-            msg["reasoning_content"] = reasoning_content
-        return [msg]
+        return [build_history_message(role, content, reasoning_content)]
 
     try:
         tool_calls = json.loads(tool_calls_json)
         if not isinstance(tool_calls, list) or not tool_calls:
-            msg = {"role": "assistant", "content": content or ""}
-            if reasoning_content:
-                msg["reasoning_content"] = reasoning_content
-            return [msg]
+            return [build_history_message("assistant", content, reasoning_content)]
     except (json.JSONDecodeError, TypeError):
-        msg = {"role": "assistant", "content": content or ""}
-        if reasoning_content:
-            msg["reasoning_content"] = reasoning_content
-        return [msg]
+        return [build_history_message("assistant", content, reasoning_content)]
 
     result_by_id = _extract_tool_result_content_by_id(tool_results_json)
 
     # Strip the inter-segment marker that the chat handler embeds between
     # text emitted before vs. after tool calls.
     cleaned_content = (content or "").replace("<!-- segment_split -->", "").strip()
+    cleaned_content = neutralize_historical_citations(cleaned_content)
 
     assistant_msg: Dict[str, Any] = {
         "role": "assistant",
@@ -171,6 +261,10 @@ def rebuild_structured_history(
                 cid,
             )
             result_content = _ORPHAN_RESULT_STUB
+        elif name == "web_search":
+            # Historical search lists carry their own turn's ledger ids —
+            # strip the numbers so the model can't re-cite them (a040c24e).
+            result_content = _denumber_search_formatted(result_content)
         messages.append({
             "role": "tool",
             "tool_call_id": cid,

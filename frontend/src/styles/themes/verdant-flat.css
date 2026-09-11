@@ -556,17 +556,17 @@ html[data-skin="verdant-flat"] .context-token-chip {
 }
 
 /* 消息气泡（mockup .msg：avatar 36 圆 green；bubble radius 22/8） */
-html[data-skin="verdant-flat"] .text {
+html[data-skin="verdant-flat"] div.text {
   border-radius: var(--msg-bubble-radius);
   border: var(--msg-bubble-border);
   font-size: 14px;
   line-height: 1.7;
 }
-html[data-skin="verdant-flat"] .assistant .text {
+html[data-skin="verdant-flat"] .assistant div.text {
   border-bottom-left-radius: var(--msg-bubble-bl);
   background: var(--msg-assistant-bg);
 }
-html[data-skin="verdant-flat"] .user .text {
+html[data-skin="verdant-flat"] .user div.text {
   border-bottom-right-radius: var(--msg-bubble-br);
   background: var(--msg-user-bg);
   border-color: #cfdbc4;
@@ -1515,7 +1515,7 @@ html[data-skin="verdant-flat"][data-theme="dark"] .user-info-wrapper { border-to
 html[data-skin="verdant-flat"][data-theme="dark"] .chat-input-container:focus-within {
   border-color: color-mix(in srgb, #86b45e 55%, #1d201d);
 }
-html[data-skin="verdant-flat"][data-theme="dark"] .user .text {
+html[data-skin="verdant-flat"][data-theme="dark"] .user div.text {
   border-color: color-mix(in srgb, #86b45e 35%, transparent);
 }
 html[data-skin="verdant-flat"][data-theme="dark"] .send-btn:disabled {

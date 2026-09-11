@@ -31,7 +31,7 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 - **原生富内容渲染**：公式 KaTeX、流程图 Mermaid、交互图表 ECharts、图片/视频内嵌播放，流式输出
 - **UI 字体自托管**：Inter + Noto Sans SC（SIL OFL 1.1）全量 vendored 于
   `frontend/public/fonts/`，运行时零第三方 CDN 请求，离线/内网可用
-  （许可与再分发义务见 `docs/LICENSE-COMPLIANCE.md` 第五节）
+  （许可与再分发义务见 `docs/license-compliance.md` 第五节）
 - **全双工语音对话**：它说话的同时还在听，可随时插话、打断并断点续播
 - **死磕模式**：自主长线执行复杂目标——盘问澄清 → 计划-执行-验证-重规划循环，
   直到裁判判定目标完成
@@ -145,7 +145,7 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 最简依赖集：**Python ≥ 3.10（推荐 3.12/3.13）· Node.js ≥ 18（推荐 20/22）· PostgreSQL ≥ 14**，
 外加（可选）Android SDK（做 APK 壳）与 Playwright Chromium（跑 E2E + 服务端浏览器工具，
 npm/Python 双侧各装一次，见「测试」节）。
-依赖 license 合规审核见 [docs/LICENSE-COMPLIANCE.md](docs/LICENSE-COMPLIANCE.md)。
+依赖 license 合规审核见 [docs/license-compliance.md](docs/license-compliance.md)。
 
 ### 部署流程（逐步命令；macOS 与 Ubuntu 差异处已标注，Windows/WSL2 见 windows.md）
 
@@ -296,7 +296,7 @@ scripts/     构建/启停生命周期（PID 文件安全，stop 只杀记录的
 - [docs/API.md](docs/API.md) — 后端接口详版（字段级表格 + 示例 + SSE/WS 协议）
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 功能与机制总览
 - [docs/SKINS.md](docs/SKINS.md) — 皮肤系统令牌契约（前端/自定义皮肤开发必读）
-- [docs/LICENSE-COMPLIANCE.md](docs/LICENSE-COMPLIANCE.md) — 依赖库 license 合规审核报告（逐项判定 + fork/PR 满足方式）
+- [docs/license-compliance.md](docs/license-compliance.md) — 依赖库 license 合规审核报告（逐项判定 + fork/PR 满足方式）
 - [CONTRIBUTING.md](CONTRIBUTING.md) — 贡献指南（DCO / CCLA 流程）
 
 ## 测试

@@ -2,8 +2,23 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 <template>
-  <div class="chat-input-wrapper">
-        
+  <div
+    class="chat-input-wrapper"
+    :class="{ 'drag-over': dragOver }"
+    @dragenter="onDragEnter"
+    @dragover="onDragOver"
+    @dragleave="onDragLeave"
+    @drop="onDrop"
+  >
+    <div v-if="dragOver" class="drop-upload-overlay" aria-hidden="true">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <span>松开以上传文件</span>
+    </div>
+
 
     <div v-if="showConfirmModal" class="voice-confirm-modal">
       <div class="modal-content">
@@ -395,7 +410,7 @@ import NotePicker from './NotePicker.vue'
 import FileUploadDialog from './FileUploadDialog.vue'
 import { skillsApi } from '@/api/skills'
 import type { Skill } from '@/types'
-import type { FileParseResult } from '@/api/fileUpload'
+import { fileUploadApi, type FileParseResult } from '@/api/fileUpload'
 
 const chatStore = useChatStore()
 const assistantStore = useAssistantStore()
@@ -491,6 +506,11 @@ const showNotePicker = ref(false)
 const showDrafts = ref(false)
 const showFileUpload = ref(false)
 const uploadedFiles = ref<FileParseResult[]>([])
+// Paste-image / drag-drop upload: drag depth guards the flicker between
+// child-element dragenter/dragleave pairs. Only file drags are intercepted —
+// text/link drags keep the contenteditable's native drop behavior.
+const dragOver = ref(false)
+let dragDepth = 0
 
 const currentCapabilities = computed(() => {
   const assistantId = assistantStore.currentAssistantId
@@ -1140,6 +1160,68 @@ function handleFileUploaded(results: FileParseResult[], _saveToNotebook: boolean
   }
 }
 
+/** Upload files picked up from paste/drag-drop (images first for stable chips). */
+async function uploadIncomingFiles(files: File[]) {
+  if (files.length === 0) return
+  const ordered = [
+    ...files.filter(f => f.type.startsWith('image/')),
+    ...files.filter(f => !f.type.startsWith('image/')),
+  ]
+  try {
+    const response = await fileUploadApi.uploadFiles(ordered, false)
+    const successful = response.results.filter(r => r.success && r.file_path)
+    if (successful.length > 0) {
+      uploadedFiles.value = [...uploadedFiles.value, ...successful]
+      showToast(successful.length === 1 ? `已上传 ${successful[0].filename}` : `已上传 ${successful.length} 个文件`)
+    }
+    const failed = response.results.filter(r => !r.success)
+    if (failed.length > 0) {
+      showToast(`上传失败：${failed[0]?.error || '未知错误'}`, 'error')
+    }
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : '文件上传失败', 'error')
+  }
+}
+
+// Serialize paste/drop uploads so a fast second paste is queued, never dropped.
+let incomingUploadChain: Promise<void> = Promise.resolve()
+function queueIncomingFiles(files: File[]) {
+  if (files.length === 0) return
+  incomingUploadChain = incomingUploadChain.then(() => uploadIncomingFiles(files))
+}
+
+function isFileDrag(e: DragEvent): boolean {
+  return Array.from(e.dataTransfer?.types || []).includes('Files')
+}
+
+function onDragEnter(e: DragEvent) {
+  if (!isFileDrag(e)) return
+  e.preventDefault()
+  dragDepth += 1
+  dragOver.value = true
+}
+
+function onDragOver(e: DragEvent) {
+  if (!isFileDrag(e)) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+}
+
+function onDragLeave() {
+  if (!dragOver.value) return
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) dragOver.value = false
+}
+
+function onDrop(e: DragEvent) {
+  const files = Array.from(e.dataTransfer?.files || [])
+  if (files.length === 0) return // text/link drag → keep native drop behavior
+  e.preventDefault()
+  dragDepth = 0
+  dragOver.value = false
+  queueIncomingFiles(files)
+}
+
 function removeUploadedFile(idx: number) {
   uploadedFiles.value.splice(idx, 1)
 }
@@ -1326,8 +1408,26 @@ function onCompositionEnd() {
 }
 
 function onPaste(e: ClipboardEvent) {
-  e.preventDefault()
+  const pastedFiles: File[] = []
+  const items = e.clipboardData?.items
+  if (items) {
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile()
+        if (file) pastedFiles.push(file)
+      }
+    }
+  }
   const text = e.clipboardData?.getData('text/plain') || ''
+  // Pasting an image (screenshot etc.) is treated as a file upload. Rich-text
+  // sources (Excel/Word) carry BOTH an image fallback and real text — there the
+  // text is the user's intent, so only upload when no meaningful text exists.
+  if (pastedFiles.length > 0 && !text.trim()) {
+    e.preventDefault()
+    queueIncomingFiles(pastedFiles)
+    return
+  }
+  e.preventDefault()
   document.execCommand('insertText', false, text)
 }
 
@@ -1438,6 +1538,28 @@ defineExpose({ setEditContent })
   align-items: stretch;
   overflow: visible;
   position: relative;
+}
+
+/* 拖拽文件到输入框：容器高亮 + 覆盖提示（皮肤令牌自适应） */
+.chat-input-wrapper.drag-over .chat-input-container {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-primary) 25%, transparent);
+}
+
+.drop-upload-overlay {
+  position: absolute;
+  inset: 6px 14px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 2px dashed var(--color-primary);
+  border-radius: var(--input-container-radius, 12px);
+  background: color-mix(in srgb, var(--surface-input) 86%, transparent);
+  color: var(--color-primary);
+  font-size: 13px;
+  pointer-events: none;
 }
 
 .chat-input-container {

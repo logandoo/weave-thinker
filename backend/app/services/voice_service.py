@@ -465,6 +465,34 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _local_time_line() -> str:
+    """Explicit UTC+8 clock line — single format source for the system-prompt
+    injection and the per-query marker. The timezone is DELIBERATE: a bare
+    now() drifts on non-CST deployments and a "北京时间" label would lie
+    (2026-08-25 review I1). Reads the clock per call so long sessions never
+    serve a stale timestamp."""
+    now = datetime.now(timezone(timedelta(hours=8)))
+    return f"当前时间: {now.strftime('%Y年%m月%d日 %H:%M:%S')} (北京时间, {now.strftime('%A')})"
+
+
+def _stamp_query_time(messages: list[dict]) -> list[dict]:
+    """Append the current-time marker to the LAST user message (the query the
+    model is about to answer) so every voice turn carries its own local time
+    and the model can perceive time passing across turns (2026-09-06).
+
+    The messages list may share dicts with ``_history`` (``_trimmed_history``
+    is a shallow copy) — the stamped entry is a NEW dict; the original is
+    never mutated, so persistence/UI semantics are untouched."""
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].strip():
+            stamped = dict(m)
+            stamped["content"] = f"{m['content']}\n[{_local_time_line()}]"
+            messages[i] = stamped
+            break
+    return messages
+
+
 def _prox_is_near_signal(seen: bool, near: bool, updated: float, stale_sec: float, now: float) -> bool:
     """Acoustic near-field gate decision (pure, testable).
 
@@ -1955,6 +1983,14 @@ class VoiceDuplexSession:
             select(Message).where(Message.conversation_id == self.conversation_id)
             .order_by(Message.created_at)
         )
+        # conv a040c24e (D-12): historical [N] citation markers and numbered
+        # search lists must never re-enter the model context — the voice path
+        # has no citation ledger (markers would be read out by TTS or mimicked
+        # into new answers), so neutralize them at replay like the chat path.
+        from app.services.tool_history import (
+            _denumber_search_formatted,
+            neutralize_historical_citations,
+        )
         for msg in result.scalars():
             if msg.role == "user" and msg.content:
                 self._history.append({"role": "user", "content": msg.content})
@@ -1968,7 +2004,10 @@ class VoiceDuplexSession:
                 except (json.JSONDecodeError, TypeError):
                     tool_calls = None
             if not tool_calls:
-                self._history.append({"role": "assistant", "content": msg.content})
+                self._history.append({
+                    "role": "assistant",
+                    "content": neutralize_historical_citations(msg.content),
+                })
                 continue
             steps: list[dict] = []
             if getattr(msg, "tool_results", None):
@@ -1994,11 +2033,19 @@ class VoiceDuplexSession:
                     self._history.append({
                         "role": "tool",
                         "tool_call_id": cid,
-                        "content": (steps_by_id[cid].get("content") or "")[:1500],
+                        "content": _denumber_search_formatted(
+                            steps_by_id[cid].get("content") or ""
+                        )[:1500],
                     })
-                self._history.append({"role": "assistant", "content": msg.content})
+                self._history.append({
+                    "role": "assistant",
+                    "content": neutralize_historical_citations(msg.content),
+                })
             else:
-                self._history.append({"role": "assistant", "content": msg.content})
+                self._history.append({
+                    "role": "assistant",
+                    "content": neutralize_historical_citations(msg.content),
+                })
 
     async def _persist_turn_progress(
         self,
@@ -2236,11 +2283,11 @@ class VoiceDuplexSession:
         # Current-time injection — mirrors chat mode (agent_service dynamic
         # section: "当前时间: … (北京时间, …)"), INCLUDING the explicit
         # UTC+8 so a non-CST deployment stays correct (review I1). Voice
-        # turns routinely ask "几点了/周几/还有几天"; without a clock in
-        # context the model can only confabulate. Computed PER CALL so a
-        # long session never serves a stale timestamp (2026-08-25 wave-2).
-        now = datetime.now(timezone(timedelta(hours=8)))
-        base = base + f"\n\n当前时间: {now.strftime('%Y年%m月%d日 %H:%M:%S')} (北京时间, {now.strftime('%A')})"
+        # turns routinely ask "几点了/周几"; without a clock in context the
+        # model can only confabulate. Computed PER CALL via _local_time_line
+        # so a long session never serves a stale timestamp (2026-08-25
+        # wave-2); the per-QUERY stamp lives in _generation_messages.
+        base = base + "\n\n" + _local_time_line()
         # Inject emotion state so the main agent's tone matches the current mood.
         if self.config.voice_emotion_enabled and self._emotion != "calm":
             emotion_desc = {
@@ -2263,6 +2310,19 @@ class VoiceDuplexSession:
             self._pending_interruption_note = None
             logger.info("voice: injecting playback-interruption note into LLM context")
         return [{"role": "system", "content": base}]
+
+    def _generation_messages(self, extra_user: Optional[str] = None) -> list[dict]:
+        """Assemble the LLM-bound messages for one answer generation: system
+        (with its per-call clock) + trimmed history, plus an optional extra
+        user text (prefetch path — the turn is not yet in history), then
+        stamp the current query with the local time (query-level clock,
+        2026-09-06) so every turn the model receives carries its own
+        timestamp. The stamped query is a fresh dict — ``_history`` and DB
+        persistence keep the raw text."""
+        msgs = self._system_messages() + self._trimmed_history()
+        if extra_user is not None:
+            msgs.append({"role": "user", "content": extra_user})
+        return _stamp_query_time(msgs)
 
     # ---- subagents ----
     async def _quick_classify(self, system: str, user: str, purpose: str = "voice") -> str:
@@ -4066,9 +4126,7 @@ class VoiceDuplexSession:
     async def _generate_reply_text(self, text: str) -> str:
         """Generate the full reply text without speaking (used for prefetch)."""
         svc, _ = self._build_llm()
-        messages = self._system_messages() + self._trimmed_history() + [
-            {"role": "user", "content": text}
-        ]
+        messages = self._generation_messages(text)
         out = []
         # Runs through the same provider gate as the main stream — the defer
         # path fires while the main stream and intent classify may still hold
@@ -4779,7 +4837,7 @@ class VoiceDuplexSession:
                 logger.debug("voice tool defs unavailable: %s", exc)
                 tools = None
 
-        messages = self._system_messages() + self._trimmed_history()
+        messages = self._generation_messages()
         full_reply = ""
         tool_rounds = 0
         max_tool_rounds = 8
@@ -5598,7 +5656,7 @@ class VoiceDuplexSession:
             # its played_sec restarts at 0. Without this anchor a later onset
             # pause would compute the breakpoint as base(0) + tiny played_sec
             # and a backchannel/defer resume would REPLAY the whole answer the
-            # user had already heard (60 生产事故 conv 19b63be9 2026-09-04:
+            # user had already heard (生产事故 conv 19b63be9 2026-09-04:
             # 270 字答案播完后插话期间被打断，defer 恢复重播了 263 字旧答案，
             # 新问题的回答音频排队直到连接关闭都未播出）。
             # 只计入已完成答案段（aux 从不入 _turn_segments，口径一致）；

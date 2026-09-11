@@ -72,7 +72,7 @@ async def _filter_trivial_texts(texts: list[str]) -> set[int]:
                 f"消息列表：\n{numbered}\n\n只输出JSON。",
                 task="triviality",
                 default=None,
-                timeout=25.0,
+                timeout=120.0,
             )
             if isinstance(parsed, dict):
                 for idx in parsed.get("trivial_indices") or []:

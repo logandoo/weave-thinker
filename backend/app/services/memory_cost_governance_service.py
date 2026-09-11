@@ -97,7 +97,7 @@ async def check_user_threshold_and_degrade(db: AsyncSession, user_id: str) -> in
     # 2026-08-25 修复：绝对下限。产品正常节奏每天就有 1-4 次记忆 LLM 调用
     # （午夜 dream + 每会话 subconscious extract），当 7 日均值本身很低（~1）时，
     # 纯相对阈值 avg×warn_mult≈1.5 使普通天也触发升级，且降级条件（见下）
-    # 永远无法满足 → level 长期卡在 L1/L2（60 服务器实证：正常 4 调用/天
+    # 永远无法满足 → level 长期卡在 L1/L2（生产环境实证：正常 4 调用/天
     # 触发 L1，rerank 被降级数周）。有下限后只有真失控 burst
     # （迁移 41 / 回填 37）才会升级。
     min_today_calls = float(cg.get("min_today_calls", 8))

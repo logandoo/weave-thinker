@@ -112,7 +112,7 @@ weave-thinker/
 ├─ scripts/                            # project_build.sh · start/stop/restart/status.sh
 │                                     # · dev_frontend.sh · apk_generate.sh
 ├─ webview-app/                        # Android WebView 壳（Gradle；keystore 随发布不随仓，构建脚本自动生成）
-├─ docs/                               # ARCHITECTURE（本文）· API.md · SKINS.md · LICENSE-COMPLIANCE.md
+├─ docs/                               # ARCHITECTURE（本文）· API.md · SKINS.md · license-compliance.md
 ├─ requirements/                       # 分平台部署指南（macos / ubuntu / windows / dependencies）
 └─ README.md · AGENTS.md · CONTRIBUTING.md · LICENSE（Apache-2.0）
 ```

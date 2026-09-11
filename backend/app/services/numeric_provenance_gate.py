@@ -25,8 +25,12 @@ AgentLoop._audit_response before the auditor LLM):
     2. RECEIPT — value appears in a CURRENT-TURN execute_code/terminal
        output AND the tool's code survives the B1 anti-hardcode checks:
        the value is not a bare literal print (`print(40000)` launders
-       nothing) and the code references at least one ≥2-digit number from
-       the user's messages (input params in code). A bare tool output
+       nothing) and the code references at least one number from the
+       provenance corpus — the user's messages ∪ the evidence ledger
+       (tool outputs), so tool-derived computations are groundable too
+       (conv 5abef2bf, 2026-09-11: 282KB = 175+50+30+27 from an
+       execute_code listing; the old user-only anchor made the gate
+       unsatisfiable on non-numeric questions). A bare tool output
        (print(V)) grounds a unit'd draft value if the value is consistent
        with the draft under ANY unit factor of the same family (the tool
        printed the quantity in an unknown unit of that family).
@@ -517,16 +521,22 @@ def _num_in_code(user_num: float, code: str) -> bool:
 
 
 def _receipt_grounds(value: float, unit: str, family: str,
-                     tool_calls: Sequence[dict], user_nums: Sequence[float],
+                     tool_calls: Sequence[dict], provenance_nums: Sequence[float],
                      tol: float) -> bool:
     """B1 anti-hardcode receipt:
       ① value must appear in the tool output — same-family unit'd output
          (SI compare), OR a bare output number consistent with the draft
          value under SOME unit factor of the draft's family;
       ② the printed value must not be a bare literal (`print(40000)`);
-      ③ the code must reference ≥1 ≥2-digit number from the user's
-         messages (input params in code)."""
-    user_nums = list(user_nums or [])
+      ③ the code must reference ≥1 number from the provenance corpus
+         (user messages ∪ evidence ledger — input params in code).
+    Residual risk (accepted, A4.9 review 2026-09-11): one anchored operand
+    can carry a fabricated sibling (`175+107` with 175 in the ledger) — a
+    deterministic soft gate cannot separate a fabricated operand from a
+    legitimate constant. The blast radius is bounded by the pre-existing
+    quoted-domain hole (a self-printed value grounds verbatim) and the LLM
+    auditor still judges the result semantically; test T19d pins this."""
+    anchors = list(provenance_nums or [])
     t = _eff_tol(value, tol)
     for tc in tool_calls or []:
         out = str(tc.get("output") or "")
@@ -563,8 +573,8 @@ def _receipt_grounds(value: float, unit: str, family: str,
         # `echo 40000`, and the whole-expression literal "186.5" on calculate)
         if _BARE_EXPR_RE.match(code or "") or _value_literal_in_code(code, value, unit, family, tol):
             continue
-        # B1b: param provenance — code numeric tokens reference ≥1 user number
-        if not any(_num_in_code(b, code) for b in user_nums):
+        # B1b: input provenance — code numeric tokens reference ≥1 real input
+        if not any(_num_in_code(b, code) for b in anchors):
             continue
         return True
     return False
@@ -622,7 +632,8 @@ def evaluate_numeric_provenance(
     report = NumericProvenanceReport()
     if not draft or not draft.strip():
         return report
-    quoted: List[Tuple[float, str, str]] = list(_extract_corpus_tuples(evidence_text or ""))
+    evidence_tuples: List[Tuple[float, str, str]] = _extract_corpus_tuples(evidence_text or "")
+    quoted: List[Tuple[float, str, str]] = list(evidence_tuples)
     user_families: set = set()
     user_nums: List[float] = []
     for um in user_messages or []:
@@ -634,6 +645,11 @@ def evaluate_numeric_provenance(
         for m in re.finditer(r"(?<![\d.])\d[\d,]*(?:\.\d+)?", um_clean):
             # 单数字也作锚点（A4.9 R2 finding-1：半径9cm 场景）
             user_nums.append(float(m.group(0).replace(",", "")))
+    # B1b 溯源锚点（conv 5abef2bf, 2026-09-11）：回执表达式的输入可以来自
+    # 证据台账（工具输出），不限于用户消息——非数值问题 + 工具实测量的推导
+    # （175+50+30+27=282KB）否则不可接地：3 连打回 → salvage/selection 全被拒
+    # → 警示兜底，用户看到 4 轮完整重生成。
+    provenance_nums: List[float] = list(user_nums) + [v for v, _u, _f in evidence_tuples]
     receipt_values: List[float] = []
     for tc in current_tool_calls or []:
         for cv, cu, cf in _extract_corpus_tuples(str(tc.get("output") or "")):
@@ -645,7 +661,7 @@ def evaluate_numeric_provenance(
         report.checked += 1
         if _matches_quoted(value, unit, family, quoted, tolerance):
             continue
-        if _receipt_grounds(value, unit, family, current_tool_calls or [], user_nums, tolerance):
+        if _receipt_grounds(value, unit, family, current_tool_calls or [], provenance_nums, tolerance):
             continue
         # B8 low-risk exemption: single-step derivations from user numbers
         if any(_close(value, t, 1e-6) for un in user_nums for t in (

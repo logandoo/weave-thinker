@@ -124,7 +124,7 @@ PR 中**每一个** commit 都必须有合法的 sign-off（文本中 `Signed-of
   不要在代码里留下绕过验证的措施
 - **新增依赖**：必须说明理由（PR 描述）；临时引入后请运行依赖合规自查
   （`pip-licenses --from=mixed --fail-on="GNU AFFERO GPL"` 与 npm license 核查，
-  方法见 docs/LICENSE-COMPLIANCE.md「维护建议」），🔴 强 copyleft 依赖默认不合入
+  方法见 docs/license-compliance.md「维护建议」），🔴 强 copyleft 依赖默认不合入
 
 ## 5. 代码与风格约定
 

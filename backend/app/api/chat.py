@@ -1583,6 +1583,7 @@ async def chat_stream(
             # PR #3528 fixed).
             from app.services.agent_service import _sanitize_history_content
             from app.services.tool_history import (
+                build_history_message,
                 rebuild_structured_history,
                 sanitize_api_messages,
             )
@@ -1598,17 +1599,16 @@ async def chat_stream(
                         )
                     )
                 else:
-                    rebuilt = {
-                        "role": msg.role,
-                        "content": _sanitize_history_content(msg.content),
-                    }
-                    # DeepSeek thinking mode: assistant reasoning must round-trip
-                    # on tool-call turns (400 otherwise); harmless elsewhere.
-                    if msg.role == "assistant":
-                        _rc = getattr(msg, "reasoning_content", None)
-                        if _rc:
-                            rebuilt["reasoning_content"] = _rc
-                    messages_for_model.append(rebuilt)
+                    # build_history_message applies the conv-a040c24e citation
+                    # neutralization for assistant rows only (users untouched);
+                    # reasoning_content round-trips via the same helper.
+                    messages_for_model.append(
+                        build_history_message(
+                            msg.role,
+                            _sanitize_history_content(msg.content),
+                            reasoning_content=getattr(msg, "reasoning_content", None),
+                        )
+                    )
             messages_for_model = sanitize_api_messages(messages_for_model)
 
             # PHASE 3: build the iteration (sub-task) LLM. If the assistant
@@ -1697,17 +1697,22 @@ async def chat_stream(
             from app.services.canary_marker import make_canary, strip_canary_streaming
             _canary_marker = make_canary(str(conversation_id)) if _config.agent_canary_enabled else None
 
-            # Qwen3.8(Local): per-mode sampling param sets from the assistant
+            # Qwen3.8(VLLM/Next): per-mode sampling param sets from the assistant
             # (thinking vs non-thinking), NULL fields fall back to the
-            # model-card defaults（wave-7：预设单一事实源在 thinking profile）。
+            # model-card defaults（wave-7：预设单一事实源在 thinking profile；
+            # qwen3.8_next 复用同族预设，profile 按 wire 类型解析——A4.9 R1
+            # Minor-1：档位键未来分叉时各读各的列）。
             from app.model_gateway.profiles import get_thinking_profile
-            _q38_profile = get_thinking_profile("qwen3.8_vllm")
+            _q38_profile = get_thinking_profile(
+                _wire_provider_type if _wire_provider_type in ("qwen3.8_vllm", "qwen3.8_next")
+                else "qwen3.8_vllm"
+            )
             QWEN38_VLLM_THINKING_DEFAULTS = _q38_profile.sampling_defaults(True)
             QWEN38_VLLM_NON_THINKING_DEFAULTS = _q38_profile.sampling_defaults(False)
             _thinking_sampling: dict = {}
             _non_thinking_sampling: dict = {}
             _preserve_thinking: bool | None = None
-            if _wire_provider_type == "qwen3.8_vllm":
+            if _wire_provider_type in ("qwen3.8_vllm", "qwen3.8_next"):
                 _thinking_sampling = {
                     k: getattr(assistant, f"thinking_{k}", None)
                     for k in QWEN38_VLLM_THINKING_DEFAULTS

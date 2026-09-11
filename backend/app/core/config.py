@@ -1633,6 +1633,15 @@ class Config:
         return str(self.agent_auxiliary.get("classifier_model", "") or "")
 
     @property
+    def agent_auxiliary_judge_default_timeout(self) -> float:
+        """Default timeout (seconds) for LLM judgment calls (judge_json) when
+        the caller does not pass an explicit timeout. User ruling 2026-09-10:
+        LLM-based judgments must NOT be time-boxed tightly — a timed-out judge
+        returns the default and silently degrades a decision (conv a040c24e
+        citation judge 20s incident). Background judgments default to 120s."""
+        return float(self.agent_auxiliary.get("judge_default_timeout_seconds", 120.0))
+
+    @property
     def agent_cache(self) -> dict:
         return self.agent.get("cache", {})
 
@@ -1695,6 +1704,27 @@ class Config:
         miss is not context rot — re-assert the marker directive and re-answer
         instead. 0 = legacy always-compress behavior."""
         return float(self.agent_canary.get("compress_min_ratio", 0.6))
+
+    # ---- Citation ledger (引用台账) ----
+
+    @property
+    def agent_citation(self) -> dict:
+        return self.agent.get("citation", {})
+
+    @property
+    def agent_citation_disambiguate_timeout(self) -> float:
+        """Timeout (seconds) for the citation-disambiguate judge call on the
+        persist path. conv a040c24e (2026-09-10): the hardcoded 20s timed out
+        under production provider congestion → fail-open kept a dangling [11].
+        Default 30.0."""
+        return float(self.agent_citation.get("disambiguate_timeout_seconds", 60.0))
+
+    @property
+    def agent_citation_disambiguate_retries(self) -> int:
+        """Extra attempts for the citation-disambiguate judge after a failed
+        (timeout/unparseable) call. 0 = single attempt (legacy behavior).
+        Default 1. Total failure stays fail-open (markers kept, documented)."""
+        return int(self.agent_citation.get("disambiguate_retries", 1))
 
     # ---- Response auditor (发送前质量审计) ----
 
@@ -2089,12 +2119,13 @@ class Config:
         """兴趣画像提取（proactive_learning extract_interests → judge_json
         interest_extract）的 LLM 判定超时秒数。默认 40：DeepSeek 拥塞时
         prefill 11-33s 波动（TTFT 诊断），25s 预算贴线导致画像降级为纯结构
-        统计（60 服务器 2026-09-02 两次实测超时）。超时兜底=topics/preferences
+        统计（生产环境 2026-09-02 两次实测超时）。2026-09-10 超时审核 wave：
+        用户裁决 LLM 判断类超时不应过短（40→120）。超时兜底=topics/preferences
         空壳+结构计数保留，下一轮画像构建自愈。"""
         try:
-            return float(self.memory.get("interest_extract_timeout_seconds", 40.0))
+            return float(self.memory.get("interest_extract_timeout_seconds", 120.0))
         except (TypeError, ValueError):
-            return 40.0
+            return 120.0
 
     @property
     def memory_concept(self) -> dict:

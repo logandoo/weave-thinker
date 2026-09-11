@@ -334,12 +334,16 @@ class AgentScheduler:
                 recent = all_msgs[-context_limit:] if len(all_msgs) > context_limit else all_msgs
                 for m in recent:
                     if m.role in ("user", "assistant") and m.content:
-                        _h = {"role": m.role, "content": m.content}
-                        if m.role == "assistant":
-                            _rc = getattr(m, "reasoning_content", None)
-                            if _rc:
-                                _h["reasoning_content"] = _rc
-                        history_messages.append(_h)
+                        # build_history_message: conv-a040c24e citation
+                        # neutralization for assistant rows only.
+                        from app.services.tool_history import build_history_message
+                        history_messages.append(
+                            build_history_message(
+                                m.role,
+                                m.content,
+                                reasoning_content=getattr(m, "reasoning_content", None),
+                            )
+                        )
 
             user_msg = Message(
                 id=str(uuid.uuid4()),

@@ -108,6 +108,13 @@ miss_threshold = 2
 auto_disable_after = 3
 compress_min_ratio = 0.6
 
+[agent.citation]
+disambiguate_timeout_seconds = 60.0
+disambiguate_retries = 1
+
+[agent.auxiliary]
+judge_default_timeout_seconds = 120.0
+
 [agent.ptc]
 enabled = false
 allowed_tools = ["web_search", "browser", "memory"]
@@ -362,7 +369,7 @@ max_tokens = ""
 repair_max_tokens = ""
 
 [memory]
-interest_extract_timeout_seconds = 40
+interest_extract_timeout_seconds = 120
 enabled = true
 migration_enabled = false
 retrieval_enabled = true
@@ -373,7 +380,7 @@ cost_governance_enabled = true
 migration_max_concurrent = 2
 migration_batch_size = 5
 migration_max_retries = 5
-migration_llm_timeout_seconds = 60
+migration_llm_timeout_seconds = 120
 timezone = "Asia/Shanghai"
 concept_extraction_temperature = 0.1
 concept_extraction_max_tokens = ""

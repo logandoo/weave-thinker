@@ -174,7 +174,7 @@ embedding retrieval (autocreated when available).
 - `docs/` — current feature docs (ARCHITECTURE, SKINS protocol)
 - `scripts/` — build/start/stop/restart/apk lifecycle (PID-file safe: stop only
   kills the recorded PID, never pattern-kills)
-- `docs/LICENSE-COMPLIANCE.md` — dependency license audit report
+- `docs/license-compliance.md` — dependency license audit report
 - `requirements/` — per-OS setup guides
 
 ## Gotchas

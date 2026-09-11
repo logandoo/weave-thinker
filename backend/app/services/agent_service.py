@@ -28,6 +28,25 @@ _EPHEMERAL_NUDGE_RE = _re.compile(
 )
 
 
+# 时间轴判断规则（检索与引用）— static section, appended to every system
+# prompt (2026-09-11 wave-3). The current time itself is injected in the
+# dynamic tier (`当前时间: … (北京时间, …)`); this rule tells the model how to
+# use publish dates when retrieved sources conflict or differ subtly, and to
+# turn on provider-side time filtering for time-sensitive queries.
+_TEMPORAL_AWARENESS_RULE = (
+    "时间轴判断规则（检索与引用）：\n"
+    "1. 当检索结果之间出现冲突、数值不一致或微妙差异时，先比较各来源的发布日期，"
+    "以发布日期最新的来源为最优先依据，并在回答中说明所依据来源的日期"
+    "（如“据 2026-09 的资料”）。\n"
+    "2. 若日期缺失或无法确定哪份更新，并列标注各来源及其日期/出处，不要单方面采信其一；"
+    "严禁臆造来源日期或时间先后。\n"
+    "3. 调用 web_search 时，若问题涉及最新/当前/实时信息（新闻、行情、价格、版本发布、"
+    "政策变化、赛事等），必须设置 time_sensitive=true，让搜索源按时间过滤；"
+    "查询历史/学术/常识类问题保持默认 false。\n"
+    "4. 引用检索结果时优先采用更新的来源；较旧来源仅用于说明历史演变或对比。"
+)
+
+
 def _sanitize_history_content(text: Optional[str]) -> str:
     if not text:
         return text or ""
@@ -89,7 +108,7 @@ async def _load_identity_memory_context(user_id: Optional[Any]) -> str:
             task="identity_facts",
             default=None,
 
-            timeout=20.0,
+            timeout=120.0,
         )
         if isinstance(parsed, dict) and isinstance(parsed.get("identity_entries"), list):
             chosen_texts = {str(e) for e in parsed["identity_entries"]}
@@ -132,7 +151,7 @@ def should_use_custom_model(assistant: Optional[Assistant]) -> bool:
             if alias != "deepseek":
                 return True
     pt = getattr(assistant, "provider_type", "deepseek")
-    if pt in ("custom", "qwen3.8_vllm"):
+    if pt in ("custom", "qwen3.8_vllm", "qwen3.8_next"):
         return True
     return bool(assistant.use_custom_model)
 
@@ -382,7 +401,8 @@ class AgentService:
             "你是一个具备工具调用能力的智能助手。你可以通过函数调用 (function calling) "
             "来使用系统提供的工具完成任务。"
             "可用的工具包括（功能与参数详见各工具 schema）：\n\n"
-            "- `web_search`：联网搜索最新信息（多搜索引擎自动容错，支持中英文查询）。"
+            "- `web_search`：联网搜索最新信息（多搜索引擎自动容错，支持中英文查询；"
+            "时效性查询必须设置 time_sensitive=true 启用搜索源时间过滤）。"
             "获取外部信息、时效性信息、不确定事实、数据对比的首选工具；"
             "搜索纪律：最多 3 轮搜索，每轮最多 3 个关键词，结果不佳时用 browser 深入已找到的网页。\n"
             "- `browser`：浏览指定网页内容。当用户给出 URL 或需要深入阅读具体网页时使用；"
@@ -459,7 +479,10 @@ class AgentService:
             "不要只输出思考过程而不给出最终结论。\n"
             "7. 引用格式要求：当你基于联网搜索结果回答时，必须在回答正文中使用角标引用格式 "
             "[1]、[2] 等标注所使用的检索结果序号，序号与搜索结果中的编号严格对应。"
-            "注意：多轮搜索共享同一套全局编号（第二轮搜索的编号延续第一轮，不重新从 1 开始），"
+            "注意：同一轮对话内的多次搜索共享同一套编号（本轮第 2 次搜索的编号延续第 1 次，"
+            "不重新从 1 开始）；不同对话轮次的编号互相独立、各从 1 开始——你只能引用本轮"
+            "搜索结果列表中实际显示的编号，严禁凭记忆或推算使用历史轮次的编号"
+            "（历史轮次的编号对本轮无效，推算编号必然指向错误来源）。"
             "引用 [N] 时以其对应网页为准，不要重复引用相同网页。"
             "每个事实陈述后紧跟对应的 [N] 标记。仅标注实际引用的来源，不要列出未使用的来源。"
             "如果搜索结果不足或你对答案不确定，请明确说明。"
@@ -551,6 +574,8 @@ class AgentService:
             "   但“智能助手自我介绍”、“产品功能介绍”、“版本更新说明”等不是纯身份问题，必须调用 memory(target='system') 读取 changelog.md。\n"
             "</mandatory_tool_use>\n"
         )
+
+        static_sections.append(_TEMPORAL_AWARENESS_RULE)
 
         # MCP 渐进发现（A4.9 Minor-2）：仅在渐进模式开启时宣传 search_tools，
         # 避免回滚模式/子代理场景宣传一个未被 offer 的工具。

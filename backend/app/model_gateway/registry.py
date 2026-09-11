@@ -54,6 +54,17 @@ _CAPABILITIES_BY_PROVIDER = {
             "low": {"label": "low", "desc": "轻量快速推理"},
         },
     },
+    # Qwen3.8-Flash-Next（modelscope 模型卡）：档位/默认与 27B 相同
+    # （xhigh 默认），模板无 thinking_budget——差异只在 profile wire 层。
+    "qwen3.8_next": {
+        "supports_reasoning": True,
+        "reasoning_efforts": ["xhigh", "medium", "low"],
+        "effort_meta": {
+            "xhigh": {"label": "xhigh", "desc": "最强推理深度"},
+            "medium": {"label": "medium", "desc": "均衡速度与深度"},
+            "low": {"label": "low", "desc": "轻量快速推理"},
+        },
+    },
 }
 # [providers.*] 键（legacy provider 段键名，非 endpoint alias——alias 已于
 # 2026-09-01 去点改名为 "qwen3.8"）→ 助手侧 provider_type 的双向映射。
@@ -562,7 +573,7 @@ class ModelRegistry:
 
         if provider_type == "custom":
             url, key, model = row_url, row_key, row_model
-        elif provider_type == "qwen3.8_vllm":
+        elif provider_type in ("qwen3.8_vllm", "qwen3.8_next"):
             cfg = self._provider_cfg(provider_type)
             url = row_url or cfg["base_url"]
             key = row_key or cfg["api_key"]

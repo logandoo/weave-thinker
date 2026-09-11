@@ -115,7 +115,7 @@ pip install -U pip
 pip install -r backend/requirements.txt     # 31 条直接声明（31 个包，2 个带 extras），完整表见 dependencies.md
 ```
 
-> 依赖画像为纯 permissive（详见 ../docs/LICENSE-COMPLIANCE.md）。
+> 依赖画像为纯 permissive（详见 ../docs/license-compliance.md）。
 >
 > **国内机房拉取**：直连 github.com 时通时断（clone 可能整体超时失败），不要
 > 依赖箱内直连。可靠路径：本地 clone → tar 打包 → scp 上传 → 解压（含 .git，

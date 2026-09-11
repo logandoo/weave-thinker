@@ -1818,7 +1818,7 @@ async def _filter_stable_profile_lines(summary: str, user_id: str) -> list[str]:
             f"摘要文本：\n{numbered[:5000]}\n\n只输出JSON。",
             task="identity_facts",
             default=None,
-            timeout=25.0,
+            timeout=120.0,
         )
         stable = lines
         if isinstance(parsed, dict) and isinstance(parsed.get("stable_lines"), list):

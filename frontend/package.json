@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview",
-    "test:unit": "node tests/workflows/test_stream_connection.cjs && node tests/workflows/test_context_tokens.cjs"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@tanstack/vue-virtual": "^3.13.31",

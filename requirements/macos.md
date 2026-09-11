@@ -53,7 +53,7 @@ pip install -r backend/requirements.txt     # 31 条直接声明（31 个包，2
 ```
 
 > 网络受限时可换国内镜像：`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r backend/requirements.txt`
-> 依赖画像为纯 permissive（详见 ../docs/LICENSE-COMPLIANCE.md）。
+> 依赖画像为纯 permissive（详见 ../docs/license-compliance.md）。
 
 ## 4. 配置
 

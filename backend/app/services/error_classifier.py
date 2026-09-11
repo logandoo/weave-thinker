@@ -253,7 +253,7 @@ class ErrorClassifier:
             task="error_classify",
             default=None,
 
-            timeout=20.0,
+            timeout=120.0,
         )
         if not isinstance(parsed, dict):
             return _LLM_FAILURE_CATEGORY

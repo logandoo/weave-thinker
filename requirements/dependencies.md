@@ -4,7 +4,7 @@
 # 依赖清单（跨平台汇总）
 
 > 版本与 license 数据来自 2026-08-26 的依赖合规审核（见根目录
-> [LICENSE-COMPLIANCE.md](../docs/LICENSE-COMPLIANCE.md)，证据在 `tests/license_audit/`）。
+> [license-compliance.md](../docs/license-compliance.md)，证据在 `tests/license_audit/`）。
 > 锁精确版本：pip 见 `backend/requirements.txt`，npm 见 `frontend/package-lock.json`
 > （构建请一律走 `scripts/project_build.sh`（内部 `npm install` + 锁文件）/
 > `pip install -r`，不要放宽版本）。
@@ -63,7 +63,7 @@
 | numpy | —（传递） | BSD-3-Clause（多许可聚合可选） | 数值 |
 > fresh `pip install -r backend/requirements.txt` 解析安装约 **84 包**
 > （31 条直接声明 + ≈53 传递；以平台实装 `pip list` 为准）。
-> [LICENSE-COMPLIANCE.md](../docs/LICENSE-COMPLIANCE.md) 第一节的"129 包"是
+> [license-compliance.md](../docs/license-compliance.md) 第一节的"129 包"是
 > **审计时主仓开发 venv 的实装快照**（含本地开发额外依赖，非 fresh 安装结果），
 > 仅作 license 判定证据引用。
 
@@ -91,4 +91,4 @@
 
 > devDependencies（仅构建/测试，不进产物）：vite、@vitejs/plugin-vue、typescript、vue-tsc、
 > @playwright/test、@types/dompurify。npm 生产传递依赖共 180 包，完整表见
-> [LICENSE-COMPLIANCE.md](../docs/LICENSE-COMPLIANCE.md) 第二节（全部 permissive，无风险）。
+> [license-compliance.md](../docs/license-compliance.md) 第二节（全部 permissive，无风险）。

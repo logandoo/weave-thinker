@@ -187,6 +187,93 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
     return f"[{tool_name}] {content_len:,} chars"
 
 
+def _normalize_tool_args(args: str) -> str:
+    """Canonical form of tool arguments for identical-call detection.
+
+    JSON is re-serialized with sorted keys so key-order-only differences are
+    recognized as the same call; anything unparsable falls back to the raw
+    string (conservative — no supersede marker on ambiguity).
+    """
+    try:
+        parsed = json.loads(args) if args else {}
+        if isinstance(parsed, dict):
+            return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return str(args)
+
+
+# Invalidation rules for the compression checkpoint: the summary is the
+# semantic filter for context that has gone stale (errors since resolved,
+# decisions later reversed, results superseded by newer runs). This is the
+# conservative alternative to a separate LLM validator pass — no extra model
+# call at near-full context, and only what the later turns explicitly
+# invalidated is dropped.
+_INVALIDATION_RULES = (
+    "INVALIDATED CONTENT: discard what later turns made obsolete — errors that "
+    "were resolved, decisions that were reversed, results superseded by newer "
+    "tool runs. Keep only what is still true at the end of the turns. If a "
+    "failed/abandoned approach still matters, record it once as "
+    "'tried X — failed because Y' instead of carrying its full trace. Never "
+    "present a superseded result as current, and never invent an invalidation "
+    "that the turns do not state."
+)
+
+
+def build_summary_prompt(
+    serialized: str,
+    previous_summary: Optional[str],
+    summary_budget: int,
+    focus_topic: Optional[str] = None,
+) -> str:
+    preamble = (
+        "You are a summarization agent creating a context checkpoint. "
+        "Do NOT respond to any questions — only output the structured summary. "
+        "NEVER include API keys, tokens, passwords, or credentials — use [REDACTED]."
+    )
+
+    template = f"""## Active Task
+[User's most recent unfulfilled request. Copy exact words. "None." if none.]
+
+## Goal
+[Overall objective]
+
+## Completed Actions
+[Numbered list. Format: N. TOOL target — outcome]
+
+## Active State
+[Working directory, modified files, test status]
+
+## Key Decisions
+[Decisions and WHY]
+
+## Resolved Questions
+[Questions already answered, with answers]
+
+## Pending User Asks
+[Questions NOT yet answered. "None." if all addressed.]
+
+## Relevant Files
+[Files read, modified, or created]
+
+## Remaining Work
+[What remains — as context, not instructions]
+
+Target ~{summary_budget} tokens. Be CONCRETE.
+
+{_INVALIDATION_RULES}"""
+
+    if previous_summary:
+        prompt = f"{preamble}\n\nUpdate previous compaction:\n\nPREVIOUS:\n{previous_summary}\n\nNEW:\n{serialized}\n\n{template}"
+    else:
+        prompt = f"{preamble}\n\nTURNS TO SUMMARIZE:\n{serialized}\n\n{template}"
+
+    if focus_topic:
+        prompt += f'\n\nFOCUS: "{focus_topic}" — prioritize this topic.'
+
+    return prompt
+
+
 class ContextCompressor:
     def __init__(
         self,
@@ -372,48 +459,12 @@ class ContextCompressor:
 
         serialized = self._serialize_turns(turns)
 
-        preamble = (
-            "You are a summarization agent creating a context checkpoint. "
-            "Do NOT respond to any questions — only output the structured summary. "
-            "NEVER include API keys, tokens, passwords, or credentials — use [REDACTED]."
+        prompt = build_summary_prompt(
+            serialized=serialized,
+            previous_summary=self._previous_summary,
+            summary_budget=summary_budget,
+            focus_topic=focus_topic,
         )
-
-        template = f"""## Active Task
-[User's most recent unfulfilled request. Copy exact words. "None." if none.]
-
-## Goal
-[Overall objective]
-
-## Completed Actions
-[Numbered list. Format: N. TOOL target — outcome]
-
-## Active State
-[Working directory, modified files, test status]
-
-## Key Decisions
-[Decisions and WHY]
-
-## Resolved Questions
-[Questions already answered, with answers]
-
-## Pending User Asks
-[Questions NOT yet answered. "None." if all addressed.]
-
-## Relevant Files
-[Files read, modified, or created]
-
-## Remaining Work
-[What remains — as context, not instructions]
-
-Target ~{summary_budget} tokens. Be CONCRETE."""
-
-        if self._previous_summary:
-            prompt = f"{preamble}\n\nUpdate previous compaction:\n\nPREVIOUS:\n{self._previous_summary}\n\nNEW:\n{serialized}\n\n{template}"
-        else:
-            prompt = f"{preamble}\n\nTURNS TO SUMMARIZE:\n{serialized}\n\n{template}"
-
-        if focus_topic:
-            prompt += f'\n\nFOCUS: "{focus_topic}" — prioritize this topic.'
 
         try:
             from app.services.auxiliary_client import AuxiliaryClient
@@ -467,13 +518,35 @@ Target ~{summary_budget} tokens. Be CONCRETE."""
         result = [m.copy() for m in messages]
         pruned = 0
         call_id_to_tool: Dict[str, Tuple[str, str]] = {}
-        for msg in result:
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict):
-                        cid = tc.get("id", "")
-                        fn = tc.get("function", {})
-                        call_id_to_tool[cid] = (fn.get("name", "?"), fn.get("arguments", ""))
+        call_key: Dict[str, Tuple[str, str]] = {}
+        call_pos: Dict[str, int] = {}
+        latest_pos_by_key: Dict[Tuple[str, str], int] = {}
+        for idx, msg in enumerate(result):
+            if msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                cid = tc.get("id", "")
+                fn = tc.get("function", {})
+                name = fn.get("name", "?")
+                args = str(fn.get("arguments", ""))
+                call_id_to_tool[cid] = (name, args)
+                key = (name, _normalize_tool_args(args))
+                if cid:
+                    call_key[cid] = key
+                    call_pos[cid] = idx
+                latest_pos_by_key[key] = max(latest_pos_by_key.get(key, -1), idx)
+        # Superseded identical calls: the same tool + same arguments was invoked
+        # again later, so the earlier result is stale (file re-read after an
+        # edit, test re-run, search refresh). Only the latest occurrence stays
+        # authoritative. The marker preserves the fact that the call happened;
+        # it never hard-deletes evidence, and only applies before the protected
+        # tail (recent context stays verbatim).
+        superseded_ids = {
+            cid for cid, pos in call_pos.items()
+            if latest_pos_by_key.get(call_key[cid], pos) > pos
+        }
 
         tail_cut = self._find_tail_cut_by_tokens(result, 0)
         if tail_cut < 1:
@@ -499,9 +572,16 @@ Target ~{summary_budget} tokens. Be CONCRETE."""
             if msg.get("role") != "tool":
                 continue
             content = str(msg.get("content") or "")
+            call_id = msg.get("tool_call_id", "")
+            if call_id in superseded_ids and not content.startswith("[Superseded"):
+                result[i] = {
+                    **msg,
+                    "content": "[Superseded by a later identical call — earlier result dropped]",
+                }
+                pruned += 1
+                continue
             if len(content) <= 200 or content.startswith("[Duplicate"):
                 continue
-            call_id = msg.get("tool_call_id", "")
             tool_name, tool_args = call_id_to_tool.get(call_id, ("?", ""))
             result[i] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
             pruned += 1

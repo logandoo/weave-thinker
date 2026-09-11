@@ -572,7 +572,7 @@ html[data-skin="mono-brutal"] .mobile-save-note-btn:active {
 }
 
 /* 消息气泡：3px 硬边直角；user = 黑底白字（mockup .bubble/.msg.user .bubble） */
-html[data-skin="mono-brutal"] .text {
+html[data-skin="mono-brutal"] div.text {
   border-radius: 0;
   border: 3px solid var(--skin-line);
   box-shadow: none;
@@ -582,11 +582,11 @@ html[data-skin="mono-brutal"] .text {
   background: var(--skin-wt);
   color: var(--color-text);
 }
-html[data-skin="mono-brutal"] .assistant .text {
+html[data-skin="mono-brutal"] .assistant div.text {
   border-bottom-left-radius: 0;
   background: var(--skin-wt);
 }
-html[data-skin="mono-brutal"] .user .text {
+html[data-skin="mono-brutal"] .user div.text {
   border-bottom-right-radius: 0;
   background: var(--skin-fill);
   color: var(--skin-onfill);

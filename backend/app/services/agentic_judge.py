@@ -74,7 +74,7 @@ async def judge_json(
     default: Optional[Dict[str, Any]] = None,
     temperature: float = 0.0,
     max_tokens: Optional[int] = None,
-    timeout: float = 30.0,
+    timeout: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """One LLM judgment call with JSON output.
 
@@ -83,7 +83,21 @@ async def judge_json(
     ``timeout`` is ENFORCED via asyncio.wait_for — a hung classifier model
     must never freeze a user-visible stream beyond the configured bound
     (A4.9 review finding: the SDK default alone caps at ~600s).
+
+    Timeout resolution (2026-09-10, docs/TIMEOUT_AUDIT.md): when the caller
+    passes no explicit timeout, the value comes from
+    ``[agent.auxiliary] judge_default_timeout_seconds`` (default 120s —
+    user ruling: LLM-based judgments must NOT be time-boxed tightly; a
+    timed-out judge returns the default and silently degrades a decision,
+    conv a040c24e).
     """
+    if timeout is None:
+        try:
+            from app.core.config import get_config
+
+            timeout = float(get_config().agent_auxiliary_judge_default_timeout)
+        except Exception:
+            timeout = 120.0
     try:
         client = AuxiliaryClient(task=task)
 

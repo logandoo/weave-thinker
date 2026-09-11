@@ -88,6 +88,7 @@ class CitationLedger:
         title: str = "",
         snippet: str = "",
         query: Optional[str] = None,
+        published_date: Optional[str] = None,
     ) -> int:
         key = normalize_url(url)
         existing = self.url_to_id.get(key)
@@ -95,6 +96,9 @@ class CitationLedger:
             entry = self.entries[existing - 1]
             if title and not entry.get("title"):
                 entry["title"] = title
+            cleaned = (published_date or "").strip()
+            if cleaned and not entry.get("published_date"):
+                entry["published_date"] = cleaned
             return existing
         entry_id = len(self.entries) + 1
         self.entries.append({
@@ -103,6 +107,7 @@ class CitationLedger:
             "title": (title or "").strip(),
             "snippet": (snippet or "").strip(),
             "query": query,
+            "published_date": (published_date or "").strip(),
         })
         self.url_to_id[key] = entry_id
         return entry_id
@@ -126,6 +131,7 @@ class CitationLedger:
                 title=h.get("title") or "",
                 snippet=h.get("snippet") or "",
                 query=query,
+                published_date=h.get("published_date") or "",
             ))
         return ids
 
@@ -137,7 +143,10 @@ class CitationLedger:
         lines = []
         for entry_id in ids:
             entry = self.entries[entry_id - 1]
-            line = f"{entry['id']}. {entry['title']}\nURL: {entry['url']}\n摘要: {entry['snippet']}"
+            line = f"{entry['id']}. {entry['title']}\nURL: {entry['url']}\n"
+            if entry.get("published_date"):
+                line += f"发布日期: {entry['published_date']}\n"
+            line += f"摘要: {entry['snippet']}"
             lines.append(line)
         return "\n\n".join(lines)
 
@@ -199,7 +208,13 @@ class CitationLedger:
             return text
         return self._sanitize_remove_ids(text, report.unknown)
 
-    async def sanitize_texts(self, texts: list[str]) -> list[str]:
+    async def sanitize_texts(
+        self,
+        texts: list[str],
+        *,
+        timeout: Optional[float] = None,
+        retries: Optional[int] = None,
+    ) -> list[str]:
         """Agentic sanitize across multiple text surfaces sharing ONE ledger.
 
         The union of unknown [N] ids across all surfaces is LLM-judged ONCE,
@@ -209,7 +224,14 @@ class CitationLedger:
         segments while ``content`` was clean). Enumeration uses ([3]个要点 /
         第[12]条) are preserved; LLM failure → keep ALL unknown markers
         intact (never mangle prose; leftover fabricated citations are
-        cosmetic)."""
+        cosmetic).
+
+        conv a040c24e (2026-09-10): the judge call is bounded by
+        ``[agent.citation] disambiguate_timeout_seconds`` (default 30s — the
+        old hardcoded 20s timed out under production congestion and let a
+        dangling [11] persist) and retried ``disambiguate_retries`` times
+        (default 1); total failure keeps the documented fail-open policy.
+        """
         texts = [t or "" for t in texts]
         if not any(texts):
             return texts
@@ -218,6 +240,18 @@ class CitationLedger:
             unknown |= self.verify(t).unknown
         if not unknown:
             return texts
+        if timeout is None or retries is None:
+            try:
+                from app.core.config import get_config
+
+                _cfg = get_config()
+                if timeout is None:
+                    timeout = float(getattr(_cfg, "agent_citation_disambiguate_timeout", 60.0))
+                if retries is None:
+                    retries = int(getattr(_cfg, "agent_citation_disambiguate_retries", 1))
+            except Exception:
+                timeout = 60.0 if timeout is None else timeout
+                retries = 1 if retries is None else retries
         try:
             from app.services.agentic_judge import judge_json
 
@@ -228,13 +262,19 @@ class CitationLedger:
             # Widen enough to cover typical answer bodies while bounding the
             # prompt for multi-surface turns.
             context = "\n\n---\n\n".join(t[:2400] for t in texts)[:16000]
-            parsed = await judge_json(
-                _CITE_DISAMBIGUATE_PROMPT.format(ids=ids_desc),
-                f"文本：\n{context}\n\n只输出JSON。",
-                task="citation_disambiguate",
-                default=None,
-                timeout=20.0,
-            )
+            parsed = None
+            for attempt in range(max(0, retries) + 1):
+                parsed = await judge_json(
+                    _CITE_DISAMBIGUATE_PROMPT.format(ids=ids_desc),
+                    f"文本：\n{context}\n\n只输出JSON。",
+                    task="citation_disambiguate",
+                    default=None,
+                    timeout=timeout,
+                )
+                if isinstance(parsed, dict):
+                    break
+                if attempt < max(0, retries):
+                    logger.info("citation disambiguation judge failed — retrying (%d/%d)", attempt + 1, max(0, retries))
             if not isinstance(parsed, dict):
                 return texts
             remove_ids = {

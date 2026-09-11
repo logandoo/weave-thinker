@@ -68,6 +68,16 @@ display_name = "Qwen3.8(Local)"
 is_custom = true
 provider_type = "qwen3.8_vllm"
 
+# Qwen3.8-Flash-Next（Qwen4Exp；thinking 模板同构 27B，无 thinking_budget）
+[endpoints."qwen3.8_next"]
+kind = "llm"
+base_url = "http://YOUR-LLAMACPP-HOST:8000/v1"
+api_key = ""
+model_name = "qwen3.8-flash-next"
+display_name = "Qwen3.8-Next"
+is_custom = true
+provider_type = "qwen3.8_next"
+
 # ── VLM（视觉语言；purpose "vlm"：agent vision_interpret 工具 + 死磕视觉批评）──
 [endpoints.vlm]
 kind = "llm"
@@ -177,6 +187,22 @@ label = "medium"
 desc = "均衡速度与深度"
 
 [endpoints."qwen3.8".capabilities.effort_meta.low]
+label = "low"
+desc = "轻量快速推理"
+
+[endpoints."qwen3.8_next".capabilities]
+supports_reasoning = true
+reasoning_efforts = [ "xhigh", "medium", "low",]
+
+[endpoints."qwen3.8_next".capabilities.effort_meta.xhigh]
+label = "xhigh"
+desc = "最强推理深度"
+
+[endpoints."qwen3.8_next".capabilities.effort_meta.medium]
+label = "medium"
+desc = "均衡速度与深度"
+
+[endpoints."qwen3.8_next".capabilities.effort_meta.low]
 label = "low"
 desc = "轻量快速推理"
 

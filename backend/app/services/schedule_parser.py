@@ -73,7 +73,7 @@ async def parse_schedule_agentic(
         user_prompt,
         task="schedule_parse",
         default=None,
-        timeout=20.0,
+        timeout=120.0,
     )
     if not isinstance(parsed, dict):
         logger.info("schedule parse LLM unavailable — parse failed")

@@ -1,0 +1,73 @@
+# Copyright (c) 2026 Weave Thinker Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# Weave Thinker 一键部署栈：app（后端 + 前端静态产物）+ PostgreSQL(pgvector)。
+#
+# 快速开始（详见 docs/USER_MANUAL.md「Docker 快速部署」）：
+#   cp backend/config.toml.example       backend/config.toml        # [database] host 改为 "db"
+#   cp backend/config_model.toml.example backend/config_model.toml  # 填写 LLM 端点
+#   cp docker/.env.example .env                                     # 改 POSTGRES_PASSWORD
+#   ./scripts/docker_start.sh
+#
+# 配置挂载：默认读取 ./backend/config.toml 与 ./backend/config_model.toml（只读）。
+# 可用 WT_CONFIG_FILE / WT_MODEL_CONFIG_FILE 指向其他路径。
+
+name: weave-thinker
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-weavethinker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-weavethinker}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-weavethinker} -d ${POSTGRES_DB:-weavethinker}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # 需要从宿主机直连数据库时取消注释（并同步 config.toml 的 host/port）：
+    # ports:
+    #   - "${POSTGRES_PORT:-5432}:5432"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WITH_BROWSER: ${WITH_BROWSER:-0}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8158}:8158"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-weavethinker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-weavethinker}
+      # 仅在 config.toml 未挂载、由 entrypoint 自动生成时生效：
+      WT_DB_HOST: db
+      # TLS（挂载证书后 entrypoint 自动检测；也可显式指定路径）：
+      # WT_SSL_KEYFILE: /app/backend/certs/key.pem
+      # WT_SSL_CERTFILE: /app/backend/certs/cert.pem
+    volumes:
+      - ${WT_CONFIG_FILE:-./backend/config.toml}:/app/backend/config.toml:ro
+      - ${WT_MODEL_CONFIG_FILE:-./backend/config_model.toml}:/app/backend/config_model.toml:ro
+      - workspace_data:/app/user_workspaces
+      - memories_data:/app/backend/agent_memories
+      - audio_data:/app/backend/audio_files
+      - output_data:/app/backend/output_files
+      - skins_data:/app/backend/skins_custom
+
+volumes:
+  pgdata:
+  workspace_data:
+  memories_data:
+  audio_data:
+  output_data:
+  skins_data:

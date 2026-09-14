@@ -34,8 +34,13 @@ backend/skins_custom/
 *.pid
 
 # Secrets & certificates — never commit
+.env
+.env.local
+.env.*.local
 backend/config.toml
 backend/config_model.toml
+backend/config.ci.toml
+backend/config_model.ci.toml
 backend/key.pem
 backend/cert.pem
 *.pem

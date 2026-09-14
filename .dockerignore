@@ -1,0 +1,89 @@
+# Docker 构建上下文排除（构建只需 backend/ + frontend/ + docker/）
+
+# 版本控制 / 工具
+.git
+.github
+.gitignore
+.vscode
+.idea
+.DS_Store
+.pnpm-store
+.vibeweaver
+.agents
+.impeccable
+.opencode
+.dsh-whale-assets
+
+# Python / Node 依赖与产物
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+node_modules
+frontend/dist
+backend/static
+
+# 运行时数据（容器内由 named volume 承接）
+user_workspaces
+backend/audio_files
+backend/output_files
+backend/Fonts
+backend/skins_custom
+backend/agent_memories/*
+!backend/agent_memories/changelog.md
+
+# 密钥与本地配置（绝不入镜像；运行时挂载）
+backend/config*.toml
+!backend/config.toml.example
+!backend/config_model.toml.example
+backend/*.toml.bak
+backend/*.pem
+backend/*.key
+backend/scripts/backups
+
+# 测试 / scratch / 文档资产
+tests
+screenshots
+design
+memory
+slides
+requirement
+docs
+requirements
+script
+apk
+main_page
+opensource
+frontend/e2e
+frontend/tests
+*.log
+*.pid
+dump-*.sql
+backend.zip
+1.pptx
+1.png
+1.pdf
+1.sql
+1.m4a
+26年*
+44a150ec*
+agent_improve.md
+API_CALL_EXAMPLES.md
+DESIGN.md
+PRODUCT.md
+MODIFY*.html
+BACKEND_DESIGN.html
+DATABASE_DESIGN.html
+FLOW_DESIGN.html
+PAGE_DESIGN.html
+
+# 外联参考仓库（非本项目）
+hermes-agent
+opencode
+deepseek-harness
+codex
+agent_skills
+
+# Android 壳与 WebView（镜像不需要）
+webview-app

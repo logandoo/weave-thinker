@@ -390,7 +390,7 @@ $$"""),
         valid_from TIMESTAMP DEFAULT NOW(),
         valid_to TIMESTAMP,
         superseded_by VARCHAR(36),
-        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
+        embedding vector(1024),  -- 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         embedding_updated_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -407,7 +407,7 @@ $$"""),
         name VARCHAR(255) NOT NULL,
         summary TEXT,
         weight FLOAT NOT NULL DEFAULT 0.5,
-        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
+        embedding vector(1024),  -- 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         member_count INTEGER NOT NULL DEFAULT 0,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -459,7 +459,7 @@ $$"""),
         unit_kind VARCHAR(20) NOT NULL DEFAULT 'message',
         raw_text TEXT NOT NULL,
         source_ids TEXT NOT NULL,
-        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
+        embedding vector(1024),  -- 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         promoted BOOLEAN NOT NULL DEFAULT FALSE,
         promoted_at TIMESTAMP,
         recurrence_count INTEGER NOT NULL DEFAULT 0,
@@ -486,7 +486,7 @@ $$"""),
         valid_from TIMESTAMP DEFAULT NOW(),
         valid_to TIMESTAMP,
         superseded_by VARCHAR(36),
-        embedding vector(1024),  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
+        embedding vector(1024),  -- 维度须与 [endpoints.embedding].extra.dim 一致（Wave D 2026-08-31）
         merged_from VARCHAR(36),
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()

@@ -132,6 +132,21 @@ Weave Thinker 是一个**自托管的个人 AI Agent Harness**。你交给它一
 
 ## 系统要求与部署
 
+### Docker 一键部署（推荐）
+
+```bash
+cp backend/config.toml.example       backend/config.toml        # [database] host 改为 "db"
+cp backend/config_model.toml.example backend/config_model.toml  # 至少填一个 LLM 端点
+cp docker/.env.example               .env
+./scripts/docker_start.sh
+```
+
+构建完成后访问 `http://<host>:8158/app/frontend/`。数据落在命名卷（`docker compose down` 不丢），
+浏览器工具可加 `WITH_BROWSER=1` 重建，HTTPS 由反代或证书挂载启用——完整说明（含备份、升级、
+故障排查）见 [docs/USER_MANUAL.md](docs/USER_MANUAL.md)。
+
+### 手动部署（三平台分步指南）
+
 三平台分步指南（系统依赖 + pip/npm 依赖 + 部署方式，均含可直接复制的命令）：
 
 | 平台                                        | 文档                                                        |
@@ -231,8 +246,9 @@ cd ..
 
 **复用（非空/共享）远端数据库时的两条注意**：
 
-1. 「**首用户即管理员**」只对**全新空库**成立——复用已有库时以库中
-   既有账号为准，不要期待注册获得管理员身份。
+1. **账号与管理员**：注册默认 `role=user`，系统没有「首用户自动成为管理员」的
+   机制；少数管理端点（如记忆迁移 `/api/admin/memory/*`）要求 `role='admin'`，
+   可在数据库中 `UPDATE users SET role='admin' WHERE username='…';` 后重新登录。
 2. **多实例共库**：每个实例都会轮询/执行共享表上的定时任务
    （`agent_scheduler` / `agent_worker` / 记忆调度器），会产生重复
    消费竞态——同一数据面建议单实例写共享库，或独立库隔离多实例。
@@ -293,6 +309,7 @@ scripts/     构建/启停生命周期（PID 文件安全，stop 只杀记录的
 
 ## 文档
 
+- [docs/USER_MANUAL.md](docs/USER_MANUAL.md) — 完整使用手册（Docker 快速部署 · 手动部署 · 全部功能操作 · 备份升级 · 故障排查 FAQ）
 - [docs/API.md](docs/API.md) — 后端接口详版（字段级表格 + 示例 + SSE/WS 协议）
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 功能与机制总览
 - [docs/SKINS.md](docs/SKINS.md) — 皮肤系统令牌契约（前端/自定义皮肤开发必读）

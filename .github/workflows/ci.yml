@@ -1,0 +1,160 @@
+# Copyright (c) 2026 Weave Thinker Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (install / compile / import)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: weavethinker
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: weavethinker
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U weavethinker -d weavethinker"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt pytest
+
+      - name: Byte-compile backend
+        run: python -m compileall -q backend/app backend/main.py
+
+      - name: Prepare config for import smoke
+        run: |
+          cd backend
+          if [ ! -f config.toml ]; then
+            if [ -f config.toml.example ]; then
+              cp config.toml.example config.toml
+            else
+              printf '[server]\nhost = "0.0.0.0"\nport = 8158\n\n[security]\njwt_secret_key = "ci-smoke-secret"\n\n[database]\nhost = "127.0.0.1"\nport = 5432\nusername = "weavethinker"\npassword = "changeme"\nname = "weavethinker"\n' > config.toml
+            fi
+          fi
+          if [ ! -f config_model.toml ] && [ -f config_model.toml.example ]; then
+            cp config_model.toml.example config_model.toml
+          fi
+
+      - name: Import smoke (app wiring)
+        run: cd backend && python -c "import main; print('import main OK')"
+
+      - name: Unit tests (hermetic subset; run when tests ship with the tree)
+        run: |
+          if [ -d backend/tests ]; then
+            cd backend
+            # 以下 5 个文件依赖开发机环境（真实 DB 种子数据 / 常驻 8158 服务），
+            # 非 hermetic：CI 只跑可独立复现的子集；它们仍可在本地开发环境运行。
+            # （实证：DB 指向不可达地址时该子集 699 passed）
+            python -m pytest tests -q \
+              --ignore=tests/test_models_api.py \
+              --ignore=tests/test_memory_batch_b_fixes.py \
+              --ignore=tests/test_memory_batch_cdef_fixes.py \
+              --ignore=tests/test_memory_retrieve_meta.py \
+              --ignore=tests/test_web_search_fallback.py
+          else
+            echo "backend/tests 未随发行树——跳过单测（发行面由 docker-smoke job 覆盖）"
+          fi
+
+  frontend:
+    name: Frontend (install / build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests (run when tests ship with the tree)
+        run: |
+          if node -e "process.exit(require('./package.json').scripts['test:unit'] ? 0 : 1)"; then
+            npm run test:unit
+          else
+            echo "test:unit 未随发行树——跳过单测"
+          fi
+
+  docker-smoke:
+    name: Docker (build + compose smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare CI configs and .env
+        run: |
+          SRC=backend/config.toml.example
+          if [ ! -f "$SRC" ]; then
+            SRC=backend/config.toml
+          fi
+          python3 docker/bootstrap_config.py \
+            --from "$SRC" \
+            --out backend/config.ci.toml \
+            --db-host db --db-user weavethinker --db-pass changeme --db-name weavethinker \
+            --jwt-secret ci-smoke-secret --force
+          cp backend/config_model.toml.example backend/config_model.ci.toml
+          cat > .env <<'EOF'
+          POSTGRES_USER=weavethinker
+          POSTGRES_PASSWORD=changeme
+          POSTGRES_DB=weavethinker
+          APP_PORT=8158
+          WT_CONFIG_FILE=./backend/config.ci.toml
+          WT_MODEL_CONFIG_FILE=./backend/config_model.ci.toml
+          EOF
+
+      - name: Build and start stack (waits for healthy)
+        run: docker compose up -d --build --wait --wait-timeout 1200
+
+      - name: Smoke checks
+        run: |
+          set -e
+          curl -fsS -o /dev/null http://127.0.0.1:8158/docs
+          curl -fsS -o /dev/null http://127.0.0.1:8158/app/frontend/login
+          docker compose ps
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --tail 300
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

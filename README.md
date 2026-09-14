@@ -24,9 +24,9 @@ Docker 一键部署（需 Docker 与 Compose 插件）：
 
 ```bash
 git clone <your-fork-url> weave-thinker && cd weave-thinker
-cp backend/config.toml.example       backend/config.toml        # [database] host 改为 "db"
+cp backend/config.toml.example       backend/config.toml        # [database] 四项与 .env 一致（host 填 "db"）；填 jwt_secret_key
 cp backend/config_model.toml.example backend/config_model.toml  # 至少填一个 LLM 端点
-cp docker/.env.example               .env
+cp docker/.env.example               .env                       # 改 POSTGRES_PASSWORD
 ./scripts/docker_start.sh
 ```
 
@@ -148,7 +148,7 @@ cd ..
 
 **全双工语音**：单条 WebSocket 上做流式识别与流式合成，播报中持续拾音，插话即时暂停并从断点续播；语义判端、近场声学门控、情绪应声、热词纠音；语音里可以调用搜索、代码、笔记、记忆等工具，随口提的事自动转笔记。当前针对 DashScope FunASR 识别 + MiMo 合成组合调优，其他 ASR/TTS 供应商未经完整测试。
 
-**原生渲染**：LaTeX 公式即时渲染，导出 Word 时逐个转为 OMML 原生公式对象（双击可编辑）；Mermaid 矢量图、ECharts 交互图表（数据须来自真实检索）；图片 lightbox、音视频行内播放。
+**原生渲染**：LaTeX 公式即时渲染；代码沙箱生成 Word 文档时，公式转为 OMML 原生对象（双击可编辑）；Mermaid 矢量图、ECharts 交互图表（数据须来自真实检索）；图片 lightbox、音视频行内播放。
 
 **文件解析**：图片走 VLM 视觉解读，音频经 ASR 转写，PDF 与 Office 文档按类型解析；解析结果可存为笔记继续追问。
 
@@ -193,7 +193,7 @@ cd ..
 | `backend/config.toml` | 基础设施与行为：`[server]` `[security]` `[database]` `[workspace]` `[browser]` `[asr]` `[voice]` `[deathmatch]` `[memory.*]` `[agent.*]` `[mcp]` `[secrets]` |
 | `backend/config_model.toml` | 模型端点池 `[endpoints.*]`（LLM / VLM / ASR / TTS / Embedding / Rerank）、`[routing]` 用途路由、`[defaults]` 采样默认 |
 
-模板见 `backend/config.toml.example` 与 `backend/config_model.toml.example`，逐键说明在 `backend/app/core/config.py`。未填写的占位符不阻塞启动，只在对应功能被调用时报缺配。
+模板见 `backend/config.toml.example` 与 `backend/config_model.toml.example`，逐键说明在 `backend/app/core/config.py`。模型端点未填不阻塞启动，只在对应功能被调用时报缺配；`[database]` 与 `[security] jwt_secret_key` 必须填对，否则启动失败或使用公开的签名密钥。
 
 ## 架构速览
 

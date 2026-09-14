@@ -12,7 +12,7 @@
 
 通用最简集：**Python ≥ 3.10（推荐 3.12/3.13）· Node.js ≥ 18（推荐 20/22）·
 PostgreSQL ≥ 14**，可选 Android SDK（APK 壳）、Playwright Chromium（E2E + 服务端浏览器工具，
-npm/Python 双侧各装一次）、ffmpeg。
+npm/Python 任一侧装一次即双侧复用）、ffmpeg。
 依赖 license 合规详见根目录 [license-compliance.md](../docs/license-compliance.md)。
 
 每个平台文档均含：系统依赖安装 → 数据库初始化 → 配置（两个 TOML 模板）→

@@ -23,7 +23,7 @@ Weave Thinker 是一个**具备长期记忆、工具调用、多模态语音交�
 核心能力一览：
 
 - **Agent 对话**：协调器语义路由 → ReAct 工具循环（≤50 轮）→ LLM 发送前审计 → 流式 SSE 渲染
-- **33 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务等
+- **38 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务等
 - **三层记忆**：v1 DB 摘要记忆、文件记忆工具（AGENT.md/USER.md/changelog.md）、v2 概念/潜意识/情节子系统
 - **死磕模式**：盘问 → 目标循环（PEVR + judge/verifier 双 LLM 门 + 三级停滞升级）的自主长线任务模式
 - **双工语音**：一条 WebSocket 实现全双工对话（流式 ASR + 语义 EoT + barge-in 打断 + 流式 TTS）
@@ -531,7 +531,7 @@ web_search 返回每轮 1 起编号的 formatted（tools/web_search.py:44）
 
 - **前端 E2E**：Playwright（`frontend/e2e/` 仅 2 个回归 specs（baseline_smoke、chat），其中 `chat.spec.ts` 为根基；默认配置 baseURL http://127.0.0.1:8159，需后端 8158 + `scripts/dev_frontend.sh` 起的 dev server；`playwright.prod8158.config.ts` 直接打 8158 生产构建；全局 setup 仅在存在种子脚本/venv 时运行，缺失自动跳过）
 - **后端**：本开源发行不含后端单元测试集（维护者仓内部保留）；后端改动验证走 CONTRIBUTING「测试要求」的可运行脚本 + 前端 E2E
-- **浏览器 chromium 双份**：服务端 agent 浏览器工具走 Python 侧 playwright（`python -m playwright install chromium`），前端 E2E 走 npm 侧（`npx playwright install chromium`）——两侧版本不同、chromium 构建 revision 不一致，装全功能需各装一次（见 requirements 各平台文档 §9）
+- **浏览器 chromium 单份**：服务端 agent 浏览器工具走 Python 侧 playwright（`python -m playwright install chromium`），前端 E2E 走 npm 侧（`npx playwright install chromium`）——两侧锁定同一版本（1.60.0）、chromium 构建 revision 一致、共用浏览器缓存，任一侧装一次即可双侧复用（见 requirements 各平台文档 §9）
 
 ---
 

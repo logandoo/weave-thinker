@@ -4,6 +4,9 @@ description: 生成、读取或修改 Excel 表格（.xlsx/.xlsm），通过 exe
 category: office
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # xlsx_manipulation — Excel 表格生成与编辑
 
 ## 适用场景

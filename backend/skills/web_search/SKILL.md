@@ -4,6 +4,9 @@ description: 联网搜索最新信息（时效性信息、不确定的事实、�
 category: builtin
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # web_search — 联网搜索
 
 ## 适用场景

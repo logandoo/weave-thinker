@@ -4,6 +4,9 @@ description: 生成、读取或修改 Word 文档（.docx），通过 execute_co
 category: office
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # docx_manipulation — Word 文档生成与编辑
 
 ## 适用场景

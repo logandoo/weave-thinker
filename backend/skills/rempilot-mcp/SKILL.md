@@ -3,6 +3,9 @@ name: rempilot-mcp
 description: Install, connect, diagnose, and use RemPilot MCP for the hosts and resources currently available in RemPilot. Use for saved-host discovery, background remote or local shells, SFTP and transfers, snippets, port forwards, and session logs without exposing SSH credentials or writing visible terminal UI.
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # RemPilot MCP
 
 Use one RemPilot MCP server and one resource model. Never ask whether the user wants Local or Team mode, never put login state in MCP configuration, and never infer resource visibility from the UI's selected workspace. RemPilot returns only the resources currently accessible on the device that executes the call.

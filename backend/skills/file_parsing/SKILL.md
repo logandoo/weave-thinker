@@ -4,6 +4,9 @@ description: 解析用户上传的文件（[file-ref:文件名] 标记），完�
 category: builtin
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # file_parsing — 上传文件解析（完全自主）
 
 ## 适用场景

@@ -4,6 +4,9 @@ description: 生成、读取或修改 PowerPoint 演示文稿（.pptx），通�
 category: office
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # pptx_manipulation — PowerPoint 演示文稿生成与编辑
 
 ## 适用场景

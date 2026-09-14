@@ -4,6 +4,9 @@ description: 在对话中直接输出 ECharts 交互图表（```echarts JSON 代
 category: builtin
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # echarts_chart — 对话内 ECharts 交互图表
 
 ## 适用场景

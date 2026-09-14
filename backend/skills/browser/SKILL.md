@@ -4,6 +4,9 @@ description: 浏览指定网页内容（用户给出 URL、需要深入阅读网
 category: builtin
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # browser — 网页浏览
 
 ## 适用场景

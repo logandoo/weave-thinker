@@ -4,6 +4,9 @@ description: 在回答中内嵌播放视频/音频（HTML video/audio 标签与 
 category: builtin
 ---
 
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # media_playback — 对话内媒体播放
 
 ## 适用场景

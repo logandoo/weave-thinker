@@ -1,0 +1,7 @@
+# Copyright (c) 2026 Weave Thinker Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+interface:
+  display_name: Weave Thinker Deployment
+  short_description: Deploy, upgrade, and troubleshoot a self-hosted Weave Thinker instance with Docker or bare metal (preflight, mirrors, SELinux, smoke tests).
+  default_prompt: Deploy Weave Thinker on this machine following the weave-thinker-deployment skill — run the preflight checks, prepare the two TOML configs and .env, deploy with the project scripts, and finish with the smoke test.

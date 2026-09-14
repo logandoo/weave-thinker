@@ -224,6 +224,7 @@ scripts/     构建与启停生命周期（PID 文件安全，stop 只杀记录�
 
 ## 文档
 
+- [.agents/skills/weave-thinker-deployment](.agents/skills/weave-thinker-deployment/SKILL.md)：部署 skill（Agent Skills 规范；Codex / Claude Code / opencode 等 harness 自动发现，按预检 → 配置 → 部署 → 冒烟流程执行）
 - [docs/USER_MANUAL.md](docs/USER_MANUAL.md)：完整使用手册（Docker 快速部署 · 手动部署 · 全部功能操作 · 备份升级 · 故障排查 FAQ）
 - [docs/API.md](docs/API.md)：后端接口详版（字段级表格 + 示例 + SSE/WS 协议）
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：功能与机制总览

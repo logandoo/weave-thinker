@@ -90,6 +90,9 @@ docker compose ps                # 查看容器健康状态
   （详见 [15.4](#154-tls-与反向代理)）。
 - **不挂载配置的试跑**：直接 `docker run` 或未提供配置文件时，容器入口会从镜像内模板 +
   `.env` 变量自动生成一份临时配置（重建容器即丢）。长期使用请按上面挂载两份配置。
+- **让 AI 助手代部署**：仓库自带 `weave-thinker-deployment` skill（`.agents/skills/`，Agent Skills 规范，
+  Codex / Claude Code / opencode 等 harness 自动发现），让助手按「环境预检 → 配置 → 部署 → 冒烟」流程执行，
+  并自带排障索引。
 
 ### 1.2 手动部署（摘要）
 

@@ -40,6 +40,10 @@ services:
       dockerfile: Dockerfile
       args:
         WITH_BROWSER: ${WITH_BROWSER:-0}
+        # 受限网络构建加速（可选，留空=官方源；见 docs/USER_MANUAL.md「受限网络与 SELinux」）：
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     restart: unless-stopped
     depends_on:
       db:
@@ -56,8 +60,9 @@ services:
       # WT_SSL_KEYFILE: /app/backend/certs/key.pem
       # WT_SSL_CERTFILE: /app/backend/certs/cert.pem
     volumes:
-      - ${WT_CONFIG_FILE:-./backend/config.toml}:/app/backend/config.toml:ro
-      - ${WT_MODEL_CONFIG_FILE:-./backend/config_model.toml}:/app/backend/config_model.toml:ro
+      # WT_MOUNT_OPTS：挂载选项。默认 ro；SELinux 系统（Fedora/RHEL/CentOS）设 ro,z 重打标签
+      - ${WT_CONFIG_FILE:-./backend/config.toml}:/app/backend/config.toml:${WT_MOUNT_OPTS:-ro}
+      - ${WT_MODEL_CONFIG_FILE:-./backend/config_model.toml}:/app/backend/config_model.toml:${WT_MOUNT_OPTS:-ro}
       - workspace_data:/app/user_workspaces
       - memories_data:/app/backend/agent_memories
       - audio_data:/app/backend/audio_files

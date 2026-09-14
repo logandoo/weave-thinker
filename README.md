@@ -30,7 +30,7 @@ cp docker/.env.example               .env                       # 改 POSTGRES_P
 ./scripts/docker_start.sh
 ```
 
-打开 `http://<host>:8158/app/frontend/` 注册账号即可使用。数据落在命名卷，`docker compose down` 不丢；浏览器工具在 `.env` 里设 `WITH_BROWSER=1` 后重建启用；HTTPS 由反向代理终结或挂载证书启用。备份、升级与故障排查见[使用手册](docs/USER_MANUAL.md)。
+打开 `http://<host>:8158/app/frontend/` 注册账号即可使用。数据落在命名卷，`docker compose down` 不丢；浏览器工具在 `.env` 里设 `WITH_BROWSER=1` 后重建启用；HTTPS 由反向代理终结或挂载证书启用。受限网络下可在 `.env` 设 `NPM_REGISTRY` / `PIP_INDEX_URL` / `APT_MIRROR` 加速构建，SELinux 系统设 `WT_MOUNT_OPTS=ro,z`（详见[使用手册](docs/USER_MANUAL.md)「受限网络与 SELinux」）。备份、升级与故障排查见[使用手册](docs/USER_MANUAL.md)。
 
 手动部署（Python ≥ 3.10，推荐 3.12/3.13 · Node.js ≥ 18，推荐 20/22 · PostgreSQL ≥ 14）：
 

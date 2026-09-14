@@ -581,6 +581,38 @@ A：可以（多用户彼此隔离）。注意：同一数据库建议单实例�
 - 子任务模型可配更便宜的端点（助手设置），审计/协调等高频调用随之降本。
 - 记忆 v2 有成本治理与降级阶梯，超预算自动降级并记录日志。
 
+### 15.6 受限网络与 SELinux（Docker 部署排障）
+
+**GitHub 拉取失败（国内网络）**：`git clone` 超时或 `github.com` 不可达时，改用源码包分发——在有网络/可访问的机器上克隆或解包本仓库，`tar -czf wt-src.tgz .` 后经内网传到目标机解压（结构与仓库根一致），再用校验值核对关键文件。第三方 GitHub 代理可用性不稳定，且内容不可信，不要用它替代校验。
+
+**Docker 镜像拉取慢/失败**：给 Docker 守护进程配镜像加速（`/etc/docker/daemon.json`），改完重启 docker：
+
+```json
+{
+  "registry-mirrors": ["https://docker.m.daocloud.io", "https://docker.1ms.run"]
+}
+```
+
+**构建极慢（apt/pip/npm 上游源）**：在 `.env` 里开启构建期镜像（留空=官方源），然后 `./scripts/docker_start.sh` 重建：
+
+```bash
+NPM_REGISTRY=https://registry.npmmirror.com
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+```
+
+实测参考：同一台机器上，默认源 30 分钟以上未完成、镜像加速后约 100 秒。
+
+**SELinux 系统（Fedora/RHEL/CentOS）**：容器读不到挂载的配置文件时（日志出现 `permission denied`），在 `.env` 加：
+
+```bash
+WT_MOUNT_OPTS=ro,z
+```
+
+`z` 会把宿主文件重打容器标签。**改完需重建容器**（`./scripts/docker_start.sh`）——挂载选项在容器创建时生效，`docker restart` 不会应用。也可以在宿主机执行 `chcon -t container_file_t <宿主机上的配置文件路径>`（与 `WT_CONFIG_FILE` 指向的实际路径一致）。此外 Fedora 上建议确认 Docker 使用经典 overlay2 存储（`docker info | grep "Storage Driver"` 应为 `overlay2`；containerd 快照存储与 SELinux 组合可能出现容器内 `exec permission denied`）。
+
+**磁盘空间**：Docker 默认把镜像与容器数据放在系统盘。系统盘较小（如 15G）时把存储迁到大盘，`/etc/docker/daemon.json` 增加 `"data-root": "/data/docker"`（重启 docker 前先迁移/清理旧数据）；containerd 镜像存储还需同步其 `root`（`/etc/containerd/config.toml`）。
+
 ---
 
 ## 16. 安全说明

@@ -50,6 +50,18 @@ if [ ! -f config_model.toml ] && [ -f config_model.toml.example ]; then
     log "警告: 未发现 config_model.toml——已复制模板。未填写 LLM 端点前界面可登录、对话不可用。"
 fi
 
+# 存在但不可读（典型：SELinux 系统 bind mount 未重打标签）→ 明确报错并给出处置，
+# 避免后续读取时抛 Python traceback
+for f in config.toml config_model.toml; do
+    if [ -e "$f" ] && [ ! -r "$f" ]; then
+        log "错误: $f 存在但容器内不可读 (permission denied)。"
+        log "常见原因：SELinux（Fedora/RHEL）的 bind mount 未重打标签。"
+        log "处置：compose 挂载选项加 :z（.env 设 WT_MOUNT_OPTS=ro,z，改后需重建容器：./scripts/docker_start.sh），"
+        log "或在宿主机执行 chcon -t container_file_t <宿主机上的该配置文件路径>。"
+        exit 1
+    fi
+done
+
 # ── 2. 读 [server] host/port（env 优先） ───────────────────────────────
 read -r CFG_HOST CFG_PORT <<<"$(python - <<'PY'
 import tomllib

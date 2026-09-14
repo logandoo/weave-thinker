@@ -109,11 +109,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _access_error(path, exc) -> str:
+    import errno as _errno
+
+    if getattr(exc, "errno", None) in (_errno.EACCES, _errno.EPERM):
+        return (
+            f"错误: 无权限访问 (permission denied): {path} —— {exc}。"
+            "容器场景常见原因：SELinux（Fedora/RHEL）的 bind mount 未重打标签；"
+            "处置：compose 挂载选项加 :z（.env 设 WT_MOUNT_OPTS=ro,z，改后需重建容器），"
+            "或在宿主机执行 chcon -t container_file_t <宿主机上的该文件>。"
+        )
+    return f"错误: 文件访问失败 (OSError): {path} —— {exc}。"
+
+
 def main() -> int:
     args = build_parser().parse_args()
     src = Path(args.src)
     out = Path(args.out)
+    try:
+        return _run(args, src, out)
+    except OSError as exc:
+        print(_access_error(out, exc), file=sys.stderr)
+        return 1
 
+
+def _run(args, src: Path, out: Path) -> int:
     if out.is_dir():
         print(
             f"错误: 输出路径是目录 (directory)，不是文件: {out} —— 通常因为 compose "

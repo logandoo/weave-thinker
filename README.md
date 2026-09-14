@@ -32,6 +32,18 @@ cp docker/.env.example               .env                       # 改 POSTGRES_P
 
 打开 `http://<host>:8158/app/frontend/` 注册账号即可使用。数据落在命名卷，`docker compose down` 不丢；浏览器工具在 `.env` 里设 `WITH_BROWSER=1` 后重建启用；HTTPS 由反向代理终结或挂载证书启用。受限网络下可在 `.env` 设 `NPM_REGISTRY` / `PIP_INDEX_URL` / `APT_MIRROR` 加速构建，SELinux 系统设 `WT_MOUNT_OPTS=ro,z`（详见[使用手册](docs/USER_MANUAL.md)「受限网络与 SELinux」）。备份、升级与故障排查见[使用手册](docs/USER_MANUAL.md)。
 
+### 用 AI 助手代部署（部署 skill）
+
+仓库自带 `weave-thinker-deployment` skill（Agent Skills 规范），让 AI 编程助手按「环境预检 → 配置 → 部署 → 冒烟 → 排障」流程代为部署：
+
+| 助手 | 自动发现路径 | 显式调用 |
+| --- | --- | --- |
+| opencode | `.agents/skills/` 与 `.claude/skills/` | 对话描述部署任务，或让 agent 加载 `weave-thinker-deployment` |
+| OpenAI Codex | `.agents/skills/` | `$weave-thinker-deployment` |
+| Claude Code | `.claude/skills/` | `/weave-thinker-deployment` |
+
+克隆仓库后用上述任一助手打开，说「部署 weave-thinker」或显式调用；助手会先跑环境预检（Docker / 磁盘 / SELinux / 端口 / 镜像源），再引导填写两份 TOML 与 `.env`，然后执行 `./scripts/docker_start.sh` 并跑冒烟。预检与冒烟脚本可独立运行（`bash .agents/skills/weave-thinker-deployment/scripts/preflight.sh`、`smoke.sh <URL> --chat`），排障索引见 `references/troubleshooting.md`。
+
 手动部署（Python ≥ 3.10，推荐 3.12/3.13 · Node.js ≥ 18，推荐 20/22 · PostgreSQL ≥ 14）：
 
 ```bash

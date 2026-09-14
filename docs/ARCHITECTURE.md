@@ -56,7 +56,7 @@ flowchart TD
         BK["后台循环（轮询 DB，独立于 HTTP）<br/>agent_worker（agent_tasks）· agent_scheduler（scheduled_tasks）<br/>memory_scheduler · export_worker"]
     end
     subgraph P["工具与持久化"]
-        TL["app/tools/ 33 工具函数 + MCP 动态扩展<br/>9 项系统技能（backend/skills/）· 浏览器套件驱动 Python 侧 playwright Chromium"]
+        TL["app/tools/ 38 工具函数 + MCP 动态扩展<br/>10 项系统技能（backend/skills/）· 浏览器套件驱动 Python 侧 playwright Chromium"]
         LLM["provider_router.py — LLM 供应商（config_model.toml [providers]）<br/>主模型/judge/verifier/子代理同一路由"]
         DB[("PostgreSQL（~30 表）<br/>database.py + STARTUP_MIGRATIONS 幂等迁移（无 Alembic）")]
         FS["agent_memories/（文件记忆 · changelog.md）<br/>user_workspaces/（沙箱 · 媒体本地化）· output_files/"]
@@ -89,12 +89,12 @@ weave-thinker/
 │  ├─ app/
 │  │  ├─ api/                          # 20+ 路由模块（§3.2 全表）
 │  │  ├─ services/                     # ~78 服务模块：AgentLoop/三层记忆/死磕/语音/导出（§3.3）
-│  │  ├─ tools/                        # 33 个工具函数 + MCP 动态扩展（§3.4）
+│  │  ├─ tools/                        # 38 个工具函数 + MCP 动态扩展（§3.4）
 │  │  ├─ core/                         # config.py（双 TOML 合并）· deps.py（JWT）· provider_router.py
 │  │  ├─ db/                           # database.py（模型 + 启动幂等迁移，无 Alembic）
 │  │  ├─ schemas/                      # Pydantic 请求/响应模型
 │  │  └─ vendor_js/                    # Mermaid/ECharts 等离线捆绑 JS（导出/渲染不依赖网络）
-│  ├─ skills/                          # 9 项系统技能（SKILL.md 机读手册 + 捆绑脚本）
+│  ├─ skills/                          # 10 项系统技能（SKILL.md 机读手册 + 捆绑脚本）
 │  ├─ scripts/                         # 数据库维修/审计小工具（python -m scripts.<name>，默认 dry-run）
 │  ├─ config.toml.example              # 随仓模板（真实 config.toml 由部署者自建，gitignored）
 │  ├─ config_model.toml.example        # 模型配置模板（同上）
@@ -168,7 +168,7 @@ weave-thinker/
 - **code_execution_service.py**：代码沙箱（子代理生成→执行→自动修复循环）
 - **interactive_browser_service.py / browser_service.py**：交互式浏览器会话（navigate/click/type/scroll/screenshot/execute_js）与一次性抓取
 
-### 3.4 工具系统（`backend/app/tools/`，33 个工具函数 + MCP）
+### 3.4 工具系统（`backend/app/tools/`，38 个工具函数 + MCP）
 
 注册机制：`registry.py` 单例 `ToolRegistry`，`register(name, toolset, schema, handler, check_fn, …)`，`dispatch()` 支持权限门、可见工具集 fail-closed、异步超时；启动时 `_discover_tools()` 自动导入 + `load_mcp_servers_from_config()` 注册 MCP 工具。
 
@@ -192,7 +192,7 @@ weave-thinker/
 | skill_view / skill_manage / skill_run_script | 技能系统（加载 SKILL.md 手册 / 创建用户技能 / 执行技能捆绑脚本） |
 | MCP 工具 | 按 `[mcp]` 配置动态注册 |
 
-**技能系统**：`backend/skills/` 9 个系统技能（web_search/browser/code_execution/echarts_chart/file_parsing/media_playback/docx_manipulation/pptx_manipulation/xlsx_manipulation，各含 SKILL.md），`skill_tools.py` 双源解析（系统技能优先 → 用户 DB `user_skills`+`skill_files`）并注入系统提示词；`skill_evolution_service.py` 在工具高频使用后建议沉淀新技能。
+**技能系统**：`backend/skills/` 10 个系统技能（browser/code_execution/docx_manipulation/echarts_chart/file_parsing/media_playback/pptx_manipulation/rempilot-mcp/web_search/xlsx_manipulation，各含 SKILL.md），`skill_tools.py` 双源解析（系统技能优先 → 用户 DB `user_skills`+`skill_files`）并注入系统提示词；`skill_evolution_service.py` 在工具高频使用后建议沉淀新技能。
 
 ---
 

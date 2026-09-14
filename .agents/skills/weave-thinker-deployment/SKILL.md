@@ -1,9 +1,6 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: weave-thinker-deployment
-description: 部署、升级与排障 Weave Thinker 自托管实例。Deploy, upgrade, and troubleshoot a self-hosted Weave Thinker instance with Docker or bare metal. TRIGGER when: 用户要求部署/安装/启动/升级 weave-thinker（Docker 或手动）；Docker 构建失败或极慢；容器起不来或重启循环；SELinux permission denied / 容器读不到挂载配置；国内网络 GitHub / registry / apt / pip / npm 不可达或极慢；数据库或模型端点配置问题；部署后的冒烟验证。Covers preflight environment checks, mirror-accelerated builds, SELinux mount handling, config bootstrap, smoke tests, and a troubleshooting index. NOT for: 开发功能或修改代码（走仓库常规开发流程）、纯前端调试。
+description: "部署、升级与排障 Weave Thinker 自托管实例。Deploy, upgrade, and troubleshoot a self-hosted Weave Thinker instance with Docker or bare metal. TRIGGER when：用户要求部署/安装/启动/升级 weave-thinker（Docker 或手动）；Docker 构建失败或极慢；容器起不来或重启循环；SELinux permission denied / 容器读不到挂载配置；国内网络 GitHub / registry / apt / pip / npm 不可达或极慢；数据库或模型端点配置问题；部署后的冒烟验证。Covers preflight environment checks, mirror-accelerated builds, SELinux mount handling, config bootstrap, smoke tests, and a troubleshooting index. NOT for：开发功能或修改代码（走仓库常规开发流程）、纯前端调试。"
 license: Apache-2.0
 compatibility: Requires Docker (or compatible runtime) and network access to container registries; Linux/macOS/WSL2. Helper scripts need bash, curl, and python3.
 ---
@@ -48,6 +45,8 @@ cp backend/config_model.toml.example backend/config_model.toml
 cp docker/.env.example               .env
 ```
 
+> 路径以发行树为准：`config.toml.example` 由发行构建生成（主仓开发树可能没有），`requirements/` 在发行树根；主仓开发树对应 `tools/openextras/requirements/`。
+
 必改：
 
 - `backend/config.toml`：`[database]` 的 host（Docker 部署填 `db`）/username/password/name 与 `.env` 的 `POSTGRES_*` 一致；`[security] jwt_secret_key` 填随机长串（`openssl rand -hex 32`）。
@@ -74,7 +73,7 @@ Docker（推荐）：
 ./scripts/docker_build.sh     # 只构建镜像（可透传 --build-arg）
 ```
 
-手动部署：分平台文档 `requirements/{macos,ubuntu,windows}.md` 与 `docs/USER_MANUAL.md` §1.2；构建 `./scripts/project_build.sh`，启停 `./scripts/start.sh` / `stop.sh` / `restart.sh`。
+手动部署：分平台文档 `requirements/{macos,ubuntu,windows}.md`（发行树；主仓在 `tools/openextras/requirements/`）与 `docs/USER_MANUAL.md` §1.2；构建 `./scripts/project_build.sh`，启停 `./scripts/start.sh` / `stop.sh` / `restart.sh`。
 
 ## 步骤 4 — 冒烟验证（必做）
 

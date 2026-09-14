@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: file_parsing
 description: 解析用户上传的文件（[file-ref:文件名] 标记），完全自主决定解析方式：技能优先、扩展名判断、web_search 辅助、execute_code/skill_run_script/terminal 执行

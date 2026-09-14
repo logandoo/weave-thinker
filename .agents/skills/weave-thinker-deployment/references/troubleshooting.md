@@ -55,8 +55,9 @@ APT_MIRROR=mirrors.tuna.tsinghua.edu.cn      # 只填主机名，不带 http(s):
 `/var/lib/containerd`（也在系统盘）。
 **处置**：把存储迁到大盘：
 
+写入 `/etc/docker/daemon.json`（该文件不接受注释，勿把路径写进 JSON）：
+
 ```json
-// /etc/docker/daemon.json
 { "data-root": "/data/docker" }
 ```
 

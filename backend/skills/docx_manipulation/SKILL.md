@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: docx_manipulation
 description: 生成、读取或修改 Word 文档（.docx），通过 execute_code 调用 python-docx，支持页面设置、样式体系、页眉页脚、目录、列表、表格、图片、数学公式（OMML）

@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: web_search
 description: 联网搜索最新信息（时效性信息、不确定的事实、数据、最新事件、用户明确要求查证）

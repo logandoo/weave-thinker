@@ -36,10 +36,11 @@ if [ "$CHAT" -ne 1 ]; then
 fi
 
 USER_NAME="smoke_$(date +%s)"
-REG="$("${CURL[@]}" -o /dev/null -m 15 -w '%{http_code}' -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' -d "{\"username\":\"$USER_NAME\",\"password\":\"123456\"}")"
+PASS="smoke$(date +%s)$$"   # 随机口令；无删用户 API，冒烟账号会保留在库中
+REG="$("${CURL[@]}" -o /dev/null -m 15 -w '%{http_code}' -X POST "$BASE/api/auth/register" -H 'Content-Type: application/json' -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASS\"}")"
 case "$REG" in 200|201) echo "[OK]   register -> $REG ($USER_NAME)";; *) echo "[FAIL] register -> $REG"; exit 1;; esac
 
-TOKEN="$("${CURL[@]}" -m 15 -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d "{\"username\":\"$USER_NAME\",\"password\":\"123456\"}" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)"
+TOKEN="$("${CURL[@]}" -m 15 -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASS\"}" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)"
 if [ -n "$TOKEN" ]; then echo "[OK]   login -> token"; else echo "[FAIL] login 未取得 token"; exit 1; fi
 
 AID="$("${CURL[@]}" -m 15 "$BASE/api/assistants" -H "Authorization: Bearer $TOKEN" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])' 2>/dev/null)"

@@ -10,11 +10,14 @@ set -u
 PORT=8158
 while [ $# -gt 0 ]; do
     case "$1" in
-        --port) PORT="${2:-8158}"; shift 2 ;;
+        --port)
+            if [ $# -lt 2 ]; then echo "错误: --port 需要一个端口号" >&2; exit 2; fi
+            PORT="$2"; shift 2 ;;
         -h|--help) echo "用法: bash scripts/preflight.sh [--port 8158]"; exit 0 ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
 done
+case "$PORT" in ''|*[!0-9]*) echo "错误: 非法端口 '$PORT'（应为数字）" >&2; exit 2 ;; esac
 
 PASS=0; WARN=0; FAIL=0
 ok()   { PASS=$((PASS + 1)); printf '[OK]   %s\n' "$1"; }
@@ -86,8 +89,10 @@ elif command -v lsof >/dev/null 2>&1; then
 fi
 if [ -n "$OCC" ]; then
     warn "端口 ${PORT} 已被占用 —— 改 .env 的 APP_PORT，或释放该端口（不要停无关服务）: $(echo "$OCC" | tr -s ' ' | cut -c1-90)"
-else
+elif command -v ss >/dev/null 2>&1 || command -v lsof >/dev/null 2>&1; then
     ok "端口 ${PORT} 空闲"
+else
+    warn "无法检测端口 ${PORT} 占用（缺少 ss/lsof 工具）"
 fi
 
 # 7. 资源

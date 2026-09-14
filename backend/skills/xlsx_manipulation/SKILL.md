@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: xlsx_manipulation
 description: 生成、读取或修改 Excel 表格（.xlsx/.xlsm），通过 execute_code 调用 openpyxl/pandas，支持公式、格式、条件格式、图表、数据验证

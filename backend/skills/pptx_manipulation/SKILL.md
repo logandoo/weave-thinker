@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: pptx_manipulation
 description: 生成、读取或修改 PowerPoint 演示文稿（.pptx），通过 execute_code 调用 python-pptx，支持版式、图表、表格、图片、演讲者备注

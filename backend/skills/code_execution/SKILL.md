@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: code_execution
 description: 生成可下载文件（Excel/PPT/Word/CSV/图片/PDF除外）或执行复杂计算/数据处理/编程绘图

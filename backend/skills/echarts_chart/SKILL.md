@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: echarts_chart
 description: 在对话中直接输出 ECharts 交互图表（```echarts JSON 代码块），含格式、布局防重叠规范。用户要求统计图表、柱状图、折线图、饼图等时使用

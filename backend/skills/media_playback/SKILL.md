@@ -1,6 +1,3 @@
-<!-- Copyright (c) 2026 Weave Thinker Contributors -->
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-
 ---
 name: media_playback
 description: 在回答中内嵌播放视频/音频（HTML video/audio 标签与 YouTube、Bilibili 官方 embed iframe）。用户要求播放、显示在线视频或音频时使用

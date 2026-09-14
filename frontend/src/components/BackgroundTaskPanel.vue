@@ -173,6 +173,15 @@ async function refreshTasks() {
       if (!_previousCompletedIds.has(id)) {
         justCompletedId.value = id
         setTimeout(() => { justCompletedId.value = null }, 5000)
+        // F1/H1（2026-09-14）：后台任务完成事件（零后端）——唤醒父级聊天界面
+        // 刷新对应会话（ChatArea 监听 background-task-completed）。
+        const finished = all.find(t => t.id === id)
+        const convId = finished?.output_conversation_id || finished?.conversation_id
+        if (convId) {
+          window.dispatchEvent(new CustomEvent('background-task-completed', {
+            detail: { task_id: id, conversation_id: convId }
+          }))
+        }
         break
       }
     }

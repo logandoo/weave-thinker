@@ -29,34 +29,62 @@
       <div v-else-if="concepts.length === 0" class="memory-empty">
         暂无概念记忆。新记忆架构未启用或尚未积累概念。
       </div>
-      <div
-        v-else
-        v-for="c in concepts"
-        :key="c.id"
-        class="memory-item"
-        :class="{ inactive: c.status !== 'active' || c.valid_to }"
-      >
-        <div class="memory-item-main">
-          <div class="memory-item-name">
-            {{ c.canonical_name }}
-            <span v-if="c.source_trust === 'agent_inferred'" class="tag inferred">推断</span>
-            <span v-if="c.status === 'silent'" class="tag silent">沉默</span>
-            <span v-if="c.status === 'cold_forgotten'" class="tag cold">冷遗忘</span>
-            <span v-if="c.valid_to" class="tag expired">已失效</span>
+      <template v-else>
+        <div
+          v-for="c in concepts"
+          :key="c.id"
+          class="memory-item"
+          :class="{ inactive: c.status !== 'active' || c.valid_to }"
+        >
+          <div class="memory-item-main">
+            <div class="memory-item-name">
+              {{ c.canonical_name }}
+              <span v-if="c.source_trust === 'agent_inferred'" class="tag inferred">推断</span>
+              <span v-if="c.status === 'silent'" class="tag silent">沉默</span>
+              <span v-if="c.status === 'cold_forgotten'" class="tag cold">冷遗忘</span>
+              <span v-if="c.valid_to" class="tag expired">已失效</span>
+            </div>
+            <div class="memory-item-desc">{{ c.description_short }}</div>
+            <div class="memory-item-meta">
+              重要度 {{ c.importance.toFixed(2) }} · 权重 {{ c.weight.toFixed(2) }} · {{ trustLabel(c.source_trust) }} · {{ typeLabel(c.memory_type) }}
+              <template v-if="c.created_at"> · {{ formatDate(c.created_at) }}</template>
+            </div>
+            <button class="memory-expand-btn" @click="toggleConcept(c.id)">
+              {{ expandedConcepts.has(c.id) ? '收起详情' : '详情' }}
+            </button>
+            <div v-if="expandedConcepts.has(c.id)" class="concept-detail">
+              <div v-if="c.description_full" class="memory-item-desc">{{ c.description_full }}</div>
+              <div v-if="c.aliases && c.aliases.length" class="memory-item-meta">
+                别名：{{ c.aliases.join('、') }}
+              </div>
+              <div class="memory-item-meta">
+                权重 {{ c.weight.toFixed(2) }} · 状态 {{ statusLabel(c.status) }}
+                <template v-if="c.recurrence_count != null"> · 复现 {{ c.recurrence_count }} 次</template>
+              </div>
+            </div>
           </div>
-          <div class="memory-item-desc">{{ c.description_short }}</div>
-          <div class="memory-item-meta">
-            重要度 {{ c.importance.toFixed(2) }} · 权重 {{ c.weight.toFixed(2) }} · {{ trustLabel(c.source_trust) }} · {{ typeLabel(c.memory_type) }}
-            <template v-if="c.created_at"> · {{ formatDate(c.created_at) }}</template>
+          <div class="memory-item-actions">
+            <button
+              class="memory-delete-btn forget"
+              :disabled="forgettingId === c.id"
+              title="遗忘此概念（软遗忘）"
+              @click="handleForgetConcept(c)"
+            >{{ forgettingId === c.id ? '…' : '遗忘' }}</button>
+            <button
+              class="memory-delete-btn"
+              :disabled="deletingId === c.id"
+              title="删除此概念"
+              @click="handleDeleteConcept(c)"
+            >{{ deletingId === c.id ? '…' : '删除' }}</button>
           </div>
         </div>
         <button
-          class="memory-delete-btn"
-          :disabled="deletingId === c.id"
-          title="删除此概念"
-          @click="handleDeleteConcept(c)"
-        >{{ deletingId === c.id ? '…' : '删除' }}</button>
-      </div>
+          v-if="!conceptsExhausted"
+          class="memory-more-btn"
+          :disabled="loading.concepts"
+          @click="loadMoreConcepts"
+        >{{ loading.concepts ? '加载中…' : '加载更多' }}</button>
+      </template>
     </div>
 
     <!-- Dream -->
@@ -166,6 +194,39 @@
         </div>
       </div>
     </div>
+
+    <!-- 台账 -->
+    <div v-else-if="activeSubTab === 'ledger'" class="memory-section">
+      <div v-if="loading.ledger" class="memory-loading">加载中…</div>
+      <div v-else-if="recallLog.length === 0" class="memory-empty">暂无召回台账记录</div>
+      <template v-else>
+        <div v-for="r in recallLog" :key="r.id" class="ledger-item">
+          <div class="ledger-row">
+            <span class="ledger-time">{{ formatDateTime(r.created_at) }}</span>
+            <span class="ledger-hash" :title="r.query_hash || ''">{{ hashShort(r.query_hash) }}</span>
+            <span class="ledger-badges">
+              <span v-if="r.truncated" class="tag truncated">截断</span>
+              <span v-if="r.cache_hit" class="tag cache">缓存</span>
+            </span>
+          </div>
+          <div class="ledger-row ledger-meta">
+            <span>门控 {{ r.gate_score.toFixed(3) }}</span>
+            <span>注入 {{ r.injected_chars }}/{{ r.budget_chars }}</span>
+            <span>耗时 {{ r.elapsed_ms }}ms</span>
+          </div>
+          <div v-if="tierSummary(r.tier_scores)" class="ledger-tiers">
+            {{ tierSummary(r.tier_scores) }}
+          </div>
+        </div>
+        <button
+          v-if="recallHasMore"
+          class="memory-more-btn"
+          :disabled="loadingRecallMore"
+          @click="loadMoreRecallLog"
+        >{{ loadingRecallMore ? '加载中…' : '加载更多' }}</button>
+        <div v-else class="ledger-end">已加载全部 {{ recallTotal }} 条</div>
+      </template>
+    </div>
   </div>
 </template>
 
@@ -177,6 +238,7 @@ import {
   type MemoryDream,
   type MemoryClarification,
   type CostGovernanceStatus,
+  type MemoryRecallLogItem,
 } from '@/api/memory'
 
 defineProps<{ embedded?: boolean }>()
@@ -187,13 +249,24 @@ const subTabs = [
   { key: 'dreams', label: 'Dream' },
   { key: 'clarifications', label: '澄清' },
   { key: 'status', label: '状态' },
+  { key: 'ledger', label: '台账' },
 ]
 const activeSubTab = ref('concepts')
+
+const CONCEPT_LIMIT_STEP = 100
+const CONCEPT_LIMIT_MAX = 200
+const conceptLimit = ref(CONCEPT_LIMIT_STEP)
+const conceptsExhausted = ref(false)
+const expandedConcepts = ref<Set<string>>(new Set())
 
 const concepts = ref<MemoryConcept[]>([])
 const dreams = ref<MemoryDream[]>([])
 const clarifications = ref<MemoryClarification[]>([])
 const costStatus = ref<CostGovernanceStatus | null>(null)
+const recallLog = ref<MemoryRecallLogItem[]>([])
+const recallTotal = ref(0)
+const recallHasMore = ref(false)
+const loadingRecallMore = ref(false)
 
 // dream 展开/收起：仅当摘要被 4 行截断时才显示"展开全文"
 const dreamClamped = ref<Set<string>>(new Set())
@@ -220,9 +293,10 @@ function toggleDream(id: string): void {
   expandedDreams.value = next
 }
 
-const loading = ref({ concepts: false, dreams: false, clarifications: false, status: false })
+const loading = ref({ concepts: false, dreams: false, clarifications: false, status: false, ledger: false })
 const errorMsg = ref('')
 const deletingId = ref('')
+const forgettingId = ref('')
 const revertingId = ref('')
 const confirmErase = ref(false)
 const eraseText = ref('')
@@ -236,8 +310,16 @@ function typeLabel(t: string): string {
   return { semantic: '语义', episodic: '事件', procedural: '方法' }[t] || t
 }
 
+function statusLabel(s: string): string {
+  return { active: '活跃', silent: '沉默', cold_forgotten: '冷遗忘', forgotten: '已遗忘' }[s] || s
+}
+
 function correctionLabel(t: string): string {
   return { negate: '否定', refine: '修正', add_constraint: '补充约束', forget: '遗忘' }[t] || t
+}
+
+function tierLabel(t: string): string {
+  return { concept: '概念', episodic: '事件', subconscious: '原文' }[t] || t
 }
 
 function formatDate(s: string): string {
@@ -245,15 +327,54 @@ function formatDate(s: string): string {
   return isNaN(d.getTime()) ? s : d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
 }
 
+function formatDateTime(s: string | null): string {
+  if (!s) return '—'
+  const d = new Date(s)
+  if (isNaN(d.getTime())) return s
+  return d.toLocaleString('zh-CN', {
+    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit'
+  })
+}
+
+function hashShort(h: string | null): string {
+  if (!h) return '—'
+  return h.length > 10 ? h.slice(0, 10) + '…' : h
+}
+
+function toggleConcept(id: string): void {
+  const next = new Set(expandedConcepts.value)
+  if (next.has(id)) {
+    next.delete(id)
+  } else {
+    next.add(id)
+  }
+  expandedConcepts.value = next
+}
+
+function tierSummary(t: Record<string, [string, number][]> | null): string {
+  if (!t) return ''
+  return Object.entries(t)
+    .filter(([, v]) => Array.isArray(v) && v.length)
+    .map(([k, v]) => `${tierLabel(k)}${v.length}`)
+    .join(' · ')
+}
+
 async function loadConcepts() {
   loading.value.concepts = true
   try {
-    concepts.value = await memoryApi.getConcepts()
+    const items = await memoryApi.getConcepts(conceptLimit.value)
+    concepts.value = items
+    conceptsExhausted.value = items.length < conceptLimit.value || conceptLimit.value >= CONCEPT_LIMIT_MAX
   } catch (e: any) {
     errorMsg.value = '概念加载失败：' + (e?.message || '未知错误')
   } finally {
     loading.value.concepts = false
   }
+}
+
+function loadMoreConcepts() {
+  conceptLimit.value = Math.min(conceptLimit.value + CONCEPT_LIMIT_STEP, CONCEPT_LIMIT_MAX)
+  loadConcepts()
 }
 
 async function loadDreams() {
@@ -289,6 +410,36 @@ async function loadStatus() {
   }
 }
 
+async function loadRecallLog() {
+  loading.value.ledger = true
+  try {
+    const { items, total } = await memoryApi.getRecallLog(50)
+    recallLog.value = items
+    recallTotal.value = total
+    recallHasMore.value = items.length >= 50 && items.length < total
+  } catch (e: any) {
+    errorMsg.value = '台账加载失败：' + (e?.message || '未知错误')
+  } finally {
+    loading.value.ledger = false
+  }
+}
+
+async function loadMoreRecallLog() {
+  const last = recallLog.value[recallLog.value.length - 1]
+  if (!last) return
+  loadingRecallMore.value = true
+  try {
+    const { items, total } = await memoryApi.getRecallLog(50, last.id)
+    recallLog.value = [...recallLog.value, ...items]
+    recallTotal.value = total
+    recallHasMore.value = items.length >= 50 && recallLog.value.length < total
+  } catch (e: any) {
+    errorMsg.value = '台账加载失败：' + (e?.message || '未知错误')
+  } finally {
+    loadingRecallMore.value = false
+  }
+}
+
 async function handleDeleteConcept(c: MemoryConcept) {
   if (!window.confirm(`删除概念"${c.canonical_name}"？此操作不可恢复。`)) return
   deletingId.value = c.id
@@ -299,6 +450,19 @@ async function handleDeleteConcept(c: MemoryConcept) {
     errorMsg.value = '删除失败：' + (e?.message || '未知错误')
   } finally {
     deletingId.value = ''
+  }
+}
+
+async function handleForgetConcept(c: MemoryConcept) {
+  if (!window.confirm(`遗忘概念"${c.canonical_name}"？遗忘后不再参与召回，可通过删除彻底移除。`)) return
+  forgettingId.value = c.id
+  try {
+    await memoryApi.forgetConcept(c.id)
+    await loadConcepts()
+  } catch (e: any) {
+    errorMsg.value = '遗忘失败：' + (e?.response?.data?.detail || e?.message || '未知错误')
+  } finally {
+    forgettingId.value = ''
   }
 }
 
@@ -336,6 +500,7 @@ watch(activeSubTab, (tab) => {
   else if (tab === 'dreams' && !dreams.value.length) loadDreams()
   else if (tab === 'clarifications' && !clarifications.value.length) loadClarifications()
   else if (tab === 'status' && !costStatus.value) loadStatus()
+  else if (tab === 'ledger' && !recallLog.value.length) loadRecallLog()
 })
 
 onMounted(loadConcepts)
@@ -538,6 +703,118 @@ onMounted(loadConcepts)
 .memory-delete-btn.revert:hover:not(:disabled) {
   color: var(--color-primary);
   border-color: var(--color-primary);
+}
+
+.memory-item-actions {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.memory-delete-btn.forget:hover:not(:disabled) {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.concept-detail {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--surface-panel-strong);
+}
+
+.memory-more-btn {
+  align-self: center;
+  padding: 6px 16px;
+  font-size: 13px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--surface-panel-strong);
+  color: var(--color-text);
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.memory-more-btn:hover:not(:disabled) {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.memory-more-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ledger-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: var(--surface-panel-subtle);
+}
+
+.ledger-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.ledger-time {
+  flex-shrink: 0;
+  color: var(--color-text-light);
+  font-variant-numeric: tabular-nums;
+}
+
+.ledger-hash {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--color-text-light);
+}
+
+.ledger-badges {
+  flex-shrink: 0;
+  display: flex;
+  gap: 4px;
+}
+
+.ledger-meta {
+  color: var(--color-text-light);
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ledger-tiers {
+  font-size: 12px;
+  color: var(--color-text-light);
+}
+
+.ledger-end {
+  font-size: 12px;
+  color: var(--color-text-light);
+  text-align: center;
+  padding: 4px 0;
+}
+
+.tag.truncated {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+  background: var(--warning-tint);
+}
+
+.tag.cache {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: var(--primary-tint);
 }
 
 .status-card {

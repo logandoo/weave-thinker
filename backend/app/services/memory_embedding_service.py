@@ -373,18 +373,30 @@ async def _probe_main_provider() -> tuple[bool, Optional[int]]:
         return False, None
 
 
+_VECTOR_TABLES_FOR_DIM = ("memory_concepts", "memory_episodes", "subconscious_log", "memory_clusters")
+# A4.9 C1 修复：参数用 CAST(:tbl AS regclass)——`:tbl::regclass` 会被
+# SQLAlchemy 解析为参数 `tb`，编译产物残留 ':' 导致 asyncpg 语法错误
+# （函数静默返回 False）。提取为常量以便编译级测试。
+_VECTOR_DIM_SQL = ("SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                   "WHERE attrelid = CAST(:tbl AS regclass) AND attname = 'embedding'")
+
+
 async def _db_vector_dim_matches(expected_dim: int) -> bool:
+    """B9（2026-09-14）：维度校验覆盖全部向量表——旧实现只查 memory_concepts，
+    集群/事件/subconscious 的维度不匹配（如 N1 的集群嵌入死列）漏网。"""
     from app.db.database import AsyncSessionLocal
     try:
         async with AsyncSessionLocal() as session:
-            r = await session.execute(text(
-                "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
-                "WHERE attrelid = 'memory_concepts'::regclass AND attname = 'embedding'"
-            ))
-            fmt = r.scalar()
-            if not fmt:
-                return False
-            return fmt == f"vector({expected_dim})"
+            for table in _VECTOR_TABLES_FOR_DIM:
+                r = await session.execute(text(_VECTOR_DIM_SQL), {"tbl": table})
+                fmt = r.scalar()
+                if fmt != f"vector({expected_dim})":
+                    logger.error(
+                        "vector dim mismatch: %s.embedding=%s expected=vector(%d)",
+                        table, fmt, expected_dim,
+                    )
+                    return False
+            return True
     except Exception:
         logger.exception("vector dim check failed")
         return False

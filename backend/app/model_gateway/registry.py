@@ -26,6 +26,7 @@ from app.model_gateway.schemas import (
     KIND_TTS,
     ModelEndpoint,
 )
+from app.model_gateway.user_overrides import apply_user_override
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +467,7 @@ class ModelRegistry:
 
     def get(self, alias: str) -> ModelEndpoint:
         try:
-            return self._endpoints[alias]
+            return apply_user_override(self._endpoints[alias])
         except KeyError:
             raise KeyError(f"unknown model alias: {alias!r}") from None
 
@@ -525,7 +526,7 @@ class ModelRegistry:
             overrides.pop("model_name")
         if "is_custom" in overrides and overrides["is_custom"] == ep.is_custom:
             overrides.pop("is_custom")
-        return ep.with_overrides(**overrides) if overrides else ep
+        return apply_user_override(ep.with_overrides(**overrides) if overrides else ep)
 
     # ---------------- 助手解析 ----------------
 
@@ -549,6 +550,10 @@ class ModelRegistry:
         return {"base_url": base_url, "api_key": api_key, "model_name": model_name}
 
     def endpoint_for_assistant(self, assistant) -> ModelEndpoint:
+        """助手 → 主 LLM 端点（用户级覆盖在出口统一套用）。"""
+        return apply_user_override(self._endpoint_for_assistant_raw(assistant))
+
+    def _endpoint_for_assistant_raw(self, assistant) -> ModelEndpoint:
         """助手 → 主 LLM 端点。
 
         优先级：model_alias（新）→ legacy provider_type/custom_* 行级字段
@@ -611,6 +616,9 @@ class ModelRegistry:
 
     def endpoint_for_subtask(self, assistant, main_ep: Optional[ModelEndpoint] = None) -> ModelEndpoint:
         """Subagent 任务模型端点：subtask_model_alias → legacy subtask_custom_* → 跟随主端点。"""
+        return apply_user_override(self._endpoint_for_subtask_raw(assistant, main_ep))
+
+    def _endpoint_for_subtask_raw(self, assistant, main_ep: Optional[ModelEndpoint] = None) -> ModelEndpoint:
         main_ep = main_ep or self.endpoint_for_assistant(assistant)
         if assistant is None:
             return main_ep

@@ -1075,6 +1075,15 @@ function onScheduledTaskResult(event: CustomEvent) {
   }
 }
 
+// F1/H1（2026-09-14）：后台任务完成唤醒（BackgroundTaskPanel 轮询发现新完成
+// → CustomEvent；当前会话命中则刷新）。
+function onBackgroundTaskCompleted(event: CustomEvent) {
+  const convId = event.detail?.conversation_id
+  if (convId && convId === chatStore.currentConversationId) {
+    chatStore.refreshConversation(convId)
+  }
+}
+
 function toggleMessageSelect(id: string) {
   const next = new Set(selectedMessageIds.value)
   if (next.has(id)) {
@@ -1346,6 +1355,7 @@ onMounted(() => {
   messageListRef.value?.addEventListener('touchstart', onMessageListTouchStart, { passive: true })
   messageListRef.value?.addEventListener('touchmove', onMessageListTouchMove, { passive: true })
   window.addEventListener('scheduled-task-result', onScheduledTaskResult as EventListener)
+  window.addEventListener('background-task-completed', onBackgroundTaskCompleted as EventListener)
   document.addEventListener('click', onDocumentClick)
   // Ensure the message list is scrolled to the bottom when the component
   // mounts with an already-loaded conversation. The watch on
@@ -1362,6 +1372,7 @@ onBeforeUnmount(() => {
   messageListRef.value?.removeEventListener('touchstart', onMessageListTouchStart)
   messageListRef.value?.removeEventListener('touchmove', onMessageListTouchMove)
   window.removeEventListener('scheduled-task-result', onScheduledTaskResult as EventListener)
+  window.removeEventListener('background-task-completed', onBackgroundTaskCompleted as EventListener)
   document.removeEventListener('click', onDocumentClick)
   for (const key in stepTimers) {
     clearInterval(stepTimers[key])

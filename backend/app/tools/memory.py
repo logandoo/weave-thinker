@@ -4,7 +4,6 @@
 import asyncio
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -16,22 +15,8 @@ config = get_config()
 
 _ENTRY_DELIMITER = "\n§\n"
 
-_INVISIBLE_CHARS = {
-    '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
-    '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
-}
-
-_MEMORY_THREAT_PATTERNS = [
-    (r'ignore\s+(previous|all|above|prior)\s+instructions', "prompt_injection"),
-    (r'you\s+are\s+now\s+', "role_hijack"),
-    (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
-    (r'system\s+prompt\s+override', "sys_prompt_override"),
-    (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
-    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc)', "read_secrets"),
-    (r'authorized_keys', "ssh_backdoor"),
-]
-
+# B8（2026-09-14）：威胁扫描统一到 memory_security（旧实现复制了一份词表，
+# 中文模式/后续维护会分叉）。_scan_threats 名称保留（voice 插话链依赖）。
 _memory_lock: asyncio.Lock | None = None
 
 
@@ -55,14 +40,9 @@ def _scan_threats(content: str) -> Optional[str]:
     """Pure threat scan (invisible unicode + known prompt-injection patterns).
     NOT affected by ``super_admin_bypass`` — callers who feed untrusted model
     output (e.g. the voice memory-interjection chain) must use THIS, not
-    ``_scan_memory_content``."""
-    for char in _INVISIBLE_CHARS:
-        if char in content:
-            return f"Blocked: content contains invisible unicode character U+{ord(char):04X}"
-    for pattern, pid in _MEMORY_THREAT_PATTERNS:
-        if re.search(pattern, content, re.IGNORECASE):
-            return f"Blocked: content matches threat pattern '{pid}'"
-    return None
+    ``_scan_memory_content``. Delegates to the shared scanner (B8)."""
+    from app.services.memory_security import scan_injection
+    return scan_injection(content)
 
 
 def _scan_memory_content(content: str) -> Optional[str]:

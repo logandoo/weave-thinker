@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import logging
 import math
 from collections import defaultdict
@@ -123,37 +124,96 @@ _desc_indexes: dict[str, BM25Index] = {}
 _epi_indexes: dict[str, BM25Index] = {}
 _sub_indexes: dict[str, BM25Index] = {}
 
+# B1（2026-09-14）：首建串行锁 + 构建完成后才发布——旧实现先把空索引放进
+# dict 再 await 构建，并发请求会读到空索引（漏召回）。
+# I1 修复（A4.9 2026-09-14）：构建窗口内的增量更新入 pending，发布后补放——
+# 否则"SELECT 快照之后、发布之前"提交的行永久漏出 stage1 词法索引。
+_index_build_lock = asyncio.Lock()
+
+_epi_pending: dict[str, dict[str, str | None]] = defaultdict(dict)
+_sub_pending: dict[str, dict[str, str | None]] = defaultdict(dict)
+_PENDING_CAP = 2000
+
+
+async def _get_or_build(cache: dict[str, BM25Index], user_id: str, build_fn,
+                        pending: dict[str, dict[str, str | None]] | None = None) -> BM25Index:
+    idx = cache.get(user_id)
+    if idx is not None:
+        return idx
+    async with _index_build_lock:
+        idx = cache.get(user_id)
+        if idx is not None:
+            return idx
+        idx = BM25Index()
+        await build_fn(idx)
+        cache[user_id] = idx
+        if pending is not None:
+            for doc_id, text in pending.pop(user_id, {}).items():
+                if text is None:
+                    idx.remove_doc(doc_id)
+                else:
+                    idx.update_doc(doc_id, text)
+    return idx
+
 
 async def get_name_index(db, user_id: str) -> BM25Index:
-    if user_id not in _name_indexes:
-        idx = BM25Index()
-        _name_indexes[user_id] = idx
-        await _build_concept_name_index_from_db(db, user_id, idx)
-    return _name_indexes[user_id]
+    return await _get_or_build(_name_indexes, user_id,
+                               lambda idx: _build_concept_name_index_from_db(db, user_id, idx))
 
 
 async def get_desc_index(db, user_id: str) -> BM25Index:
-    if user_id not in _desc_indexes:
-        idx = BM25Index()
-        _desc_indexes[user_id] = idx
-        await _build_concept_desc_index_from_db(db, user_id, idx)
-    return _desc_indexes[user_id]
+    return await _get_or_build(_desc_indexes, user_id,
+                               lambda idx: _build_concept_desc_index_from_db(db, user_id, idx))
 
 
 async def get_epi_index(db, user_id: str) -> BM25Index:
-    if user_id not in _epi_indexes:
-        idx = BM25Index()
-        _epi_indexes[user_id] = idx
-        await _build_episode_index_from_db(db, user_id, idx)
-    return _epi_indexes[user_id]
+    return await _get_or_build(_epi_indexes, user_id,
+                               lambda idx: _build_episode_index_from_db(db, user_id, idx),
+                               _epi_pending)
 
 
 async def get_sub_index(db, user_id: str) -> BM25Index:
-    if user_id not in _sub_indexes:
-        idx = BM25Index()
-        _sub_indexes[user_id] = idx
-        await _build_subconscious_index_from_db(db, user_id, idx)
-    return _sub_indexes[user_id]
+    return await _get_or_build(_sub_indexes, user_id,
+                               lambda idx: _build_subconscious_index_from_db(db, user_id, idx),
+                               _sub_pending)
+
+
+# B1：增量维护（仅在索引已构建时生效；未构建时首建会从 DB 全量拉取）。
+# asyncio 单线程下 add/update/remove_doc 无 await，天然原子，不与 search 交错。
+# I1：索引未发布（首建进行中）时写入 pending，发布时补放。
+
+def update_episode_index(user_id: str, doc_id: str, narrative: str) -> None:
+    idx = _epi_indexes.get(user_id)
+    if idx is not None:
+        if narrative:
+            idx.update_doc(doc_id, narrative)
+    elif len(_epi_pending[user_id]) < _PENDING_CAP:
+        _epi_pending[user_id][doc_id] = narrative
+
+
+def remove_episode_index(user_id: str, doc_id: str) -> None:
+    idx = _epi_indexes.get(user_id)
+    if idx is not None:
+        idx.remove_doc(doc_id)
+    elif len(_epi_pending[user_id]) < _PENDING_CAP:
+        _epi_pending[user_id][doc_id] = None
+
+
+def update_sub_index(user_id: str, doc_id: str, raw_text: str) -> None:
+    idx = _sub_indexes.get(user_id)
+    if idx is not None:
+        if raw_text:
+            idx.update_doc(doc_id, raw_text)
+    elif len(_sub_pending[user_id]) < _PENDING_CAP:
+        _sub_pending[user_id][doc_id] = raw_text
+
+
+def remove_sub_index(user_id: str, doc_id: str) -> None:
+    idx = _sub_indexes.get(user_id)
+    if idx is not None:
+        idx.remove_doc(doc_id)
+    elif len(_sub_pending[user_id]) < _PENDING_CAP:
+        _sub_pending[user_id][doc_id] = None
 
 
 async def _build_concept_name_index_from_db(db, user_id: str, idx: BM25Index) -> None:

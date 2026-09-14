@@ -61,24 +61,68 @@ class RetrievalCandidate:
 
 async def retrieve_with_meta(
     db: AsyncSession, user_id: str, conversation_messages: list[dict],
+    conversation_id: Optional[str] = None,
 ) -> tuple[str, list[str], float]:
     """召回管线 + meta 读出（语音每轮召回用）。
 
     返回 (ctx, memory_ids, top_gate_score)：ctx = 与旧入口逐字节相同的注入
     上下文；memory_ids = 本轮注入的全部候选 id（跨轮去重用）；top_gate_score
     = 注入候选中的最高绝对相关分（记忆插话预筛门槛，0.0 = 无候选）。
+
+    C1（2026-09-14）：出口采集逐轮召回台账（元数据，不存内容）；异步写，
+    失败静默，绝不影响本函数返回值（帕累托约束 5）。
     """
+    started = time.monotonic()
+    stats: dict = {"cache_hit": False, "truncated": False, "budget_chars": 0,
+                   "tier_scores": {}}
+    ctx, ids, top = await _retrieve_with_meta_inner(
+        db, user_id, conversation_messages, stats)
+    try:
+        _emit_recall_log(user_id, conversation_id, conversation_messages, ctx,
+                         ids, top, stats, (time.monotonic() - started) * 1000.0)
+    except Exception:
+        logger.debug("recall log emit failed", exc_info=True)
+    return ctx, ids, top
+
+
+def _emit_recall_log(user_id: str, conversation_id: Optional[str],
+                     conversation_messages: list[dict], ctx: str,
+                     ids: list[str], top: float, stats: dict,
+                     elapsed_ms: float) -> None:
+    """C1：组装台账行并 fire-and-forget 落库（独立会话，失败静默）。"""
+    from app.services.memory_recall_log_service import (
+        record_recall_log_bg, query_hash_of,
+    )
+    record_recall_log_bg(
+        user_id=user_id,
+        conversation_id=conversation_id,
+        query_hash=query_hash_of(_extract_recent_user_queries(conversation_messages)),
+        candidate_ids=ids,
+        tier_scores=stats.get("tier_scores") or {},
+        gate_score=float(top or 0.0),
+        budget_chars=int(stats.get("budget_chars") or 0),
+        injected_chars=len(ctx or ""),
+        truncated=bool(stats.get("truncated")),
+        elapsed_ms=int(elapsed_ms),
+        cache_hit=bool(stats.get("cache_hit")),
+    )
+
+
+async def _retrieve_with_meta_inner(
+    db: AsyncSession, user_id: str, conversation_messages: list[dict],
+    stats: dict,
+) -> tuple[str, list[str], float]:
     if not config.memory.get("retrieval_enabled", False):
         return await _fallback_context(db, user_id), [], 0.0
 
     user_queries = _extract_recent_user_queries(conversation_messages)
     if not user_queries:
         # 无用户查询仍注入恒定基底（用户长期记忆总览），避免零记忆
-        return (
-            await _build_injection_context(
-                db, user_id, [], Stage0Result(keywords=[], query_type="general", include_expired=False),
-                query_text=""),
-            [], 0.0)
+        ctx, meta = await _build_injection_context_ex(
+            db, user_id, [], Stage0Result(keywords=[], query_type="general", include_expired=False),
+            query_text="")
+        stats.update(meta)
+        return ctx, [], 0.0
 
     # §5.2 工程要求 4：会话级缓存（最近 3 轮消息哈希，TTL 5 分钟）。
     # 缓存值携带完整 meta（ctx, ids, top）：语音 vmem 的跨轮 id 去重与
@@ -86,7 +130,12 @@ async def retrieve_with_meta(
     cache_key = _session_cache_key(user_id, user_queries)
     cached = _session_cache_get(cache_key)
     if cached is not None:
-        return cached
+        if len(cached) >= 4 and isinstance(cached[3], dict):
+            stats.update(cached[3])
+        # A4.9 复评 Important：cache_hit 必须在 stats.update 之后设置——缓存快照
+        # 里的 cache_hit 恒为 False（首轮写入），先设会被覆盖为 False
+        stats["cache_hit"] = True
+        return cached[0], cached[1], cached[2]
 
     query_text = " ".join(user_queries)
     stage0 = await _stage0_query_expansion(query_text, user_id=user_id, db=db)
@@ -94,7 +143,9 @@ async def retrieve_with_meta(
     # temporal_list 捷径（§5.2 Stage 0）：episodic-first，跳过 Stage 2-4
     if stage0.query_type == "temporal_list":
         tctx, tids, ttop = await _temporal_list_shortcut(db, user_id, stage0)
-        _session_cache_put(cache_key, tctx, (tids, ttop))
+        stats.update({"truncated": False, "budget_chars": 0,
+                      "tier_scores": {"episodic": [[i, None] for i in tids]} if tids else {}})
+        _session_cache_put(cache_key, tctx, (tids, ttop), stats)
         return tctx, tids, ttop
 
     cold_start = await _is_cold_start(db, user_id)
@@ -127,6 +178,8 @@ async def retrieve_with_meta(
         logger.exception("Stage 4 failed")
 
     final_candidates = _composite_score_by_tier(candidates, stage0)
+    # D2（默认关）：文本路径跨轮去重（上一轮注入 id 本轮不重复）
+    final_candidates = _apply_text_cross_turn_dedup(user_id, final_candidates)
 
     # 召回后处理（M&D §5.2 / §5.3.1a）：fire-and-forget 写库，不阻塞响应。
     # 2026-08-16 修复（Oblivion 写路径解耦）：仅强命中概念（绝对相关分
@@ -158,19 +211,30 @@ async def retrieve_with_meta(
             task = asyncio.create_task(_apply_recall_boosts_bg(user_id, concept_ids, episode_ids, unit_ids))
             _boost_tasks.add(task)
             task.add_done_callback(_boost_tasks.discard)
+        stats["tier_scores"] = {
+            tier: [[c.id, round(_cand_gate_score(c), 4)] for c in tier_list]
+            for tier, tier_list in injected.items() if tier_list
+        }
     except Exception:
         logger.debug("recall boost scheduling failed", exc_info=True)
 
-    ctx = await _build_injection_context(db, user_id, final_candidates, stage0, query_text=query_text)
-    _session_cache_put(cache_key, ctx, (memory_ids, top_gate_score))
+    # D2（默认关）：记录本轮注入 id 供下一轮跨轮去重
+    _remember_text_injected(user_id, memory_ids)
+
+    ctx, meta = await _build_injection_context_ex(
+        db, user_id, final_candidates, stage0, query_text=query_text)
+    stats.update(meta)
+    _session_cache_put(cache_key, ctx, (memory_ids, top_gate_score), stats)
     return ctx, memory_ids, top_gate_score
 
 
 async def retrieve_and_build_context(
     db: AsyncSession, user_id: str, conversation_messages: list[dict],
+    conversation_id: Optional[str] = None,
 ) -> str:
     """文本通道入口——行为与重构前逐字节一致（仅委托 meta 版取 ctx）。"""
-    ctx, _ids, _top = await retrieve_with_meta(db, user_id, conversation_messages)
+    ctx, _ids, _top = await retrieve_with_meta(
+        db, user_id, conversation_messages, conversation_id=conversation_id)
     return ctx
 
 
@@ -179,7 +243,13 @@ async def _fallback_context(db: AsyncSession, user_id: str) -> str:
 
     不在请求路径同步生成摘要（§1.2 #13：force 生成 = 2 次串行 LLM + 共享会话 commit，
     5-30s TTFT 阻塞）。摘要缺失时调度后台生成（独立会话），本轮返回已有内容。
+
+    2026-09-13（v1 退休，方案 A）：v2 运行时直接返回空——不再读 v1 摘要、
+    不再调度 v1 生成（冷启动兜底链第 5 步因此短路；多模态兜底不受影响）。
     """
+    from app.services.memory_runtime_state import memory_runtime_enabled
+    if memory_runtime_enabled(config):
+        return ""
     try:
         result = await db.execute(
             text("SELECT memory_summary, dream_summary FROM user_agent_states WHERE user_id = :uid"),
@@ -364,8 +434,17 @@ async def _stage0_query_expansion(
         has_time or stage0_llm or len(query_text) >= 20
     )
     if should_llm:
+        # A4c（2026-09-14）：可选硬上限——默认 0（关闭，零行为变化）。
+        # 实测 stage0 LLM 0.5–17.8s；仅当配置 >0 时包裹 wait_for，超时走
+        # 既有异常回退（jieba），把病态长尾钉在预算内（不接线旧死键 1s）。
+        ceiling_ms = int(config.memory_retrieval.get("stage0_hard_ceiling_ms", 0) or 0)
         try:
-            keywords, time_range, llm_query_type, llm_include_expired = await _llm_time_normalization(query_text)
+            coro = _llm_time_normalization(query_text, user_id=user_id, db=db)
+            if ceiling_ms > 0:
+                keywords, time_range, llm_query_type, llm_include_expired = await asyncio.wait_for(
+                    coro, timeout=ceiling_ms / 1000.0)
+            else:
+                keywords, time_range, llm_query_type, llm_include_expired = await coro
             return Stage0Result(
                 keywords=keywords or _jieba_keywords(query_text),
                 time_range=time_range,
@@ -387,8 +466,11 @@ def _jieba_keywords(text: str) -> list[str]:
     return [w for w in text.split()[:5] if len(w) >= 2] or [text[:20]]
 
 
-async def _llm_time_normalization(text: str) -> tuple[list[str], Optional[tuple[datetime, datetime]], str, bool]:
+async def _llm_time_normalization(
+    text: str, user_id: str | None = None, db: AsyncSession | None = None,
+) -> tuple[list[str], Optional[tuple[datetime, datetime]], str, bool]:
     from app.services.memory_llm_factory import _memory_llm
+    from app.services.memory_cost_governance_service import record_llm_call_bg
     llm = _memory_llm("query_expansion")
     now_str = datetime.now(timezone.utc).isoformat()
     resp = await llm.complete_chat(
@@ -403,6 +485,19 @@ async def _llm_time_normalization(text: str) -> tuple[list[str], Optional[tuple[
         ],
         temperature=0.1,
     )
+    # DC1/A4a（2026-09-14）：读热路径调用入账为遥测（billing_class='read'），
+    # 只供观测，不参与成本治理降级口径。
+    # A4.9 修复 F1/F2：独立短会话后台记录——请求会话在 chat.py 关闭时不提交
+    # （直接 flush 会丢行），且 INSERT 失败不得毒化检索事务（PendingRollback
+    # 会令整段记忆注入丢失）。fire-and-forget + 强引用防 GC。
+    if user_id:
+        try:
+            task = asyncio.create_task(
+                record_llm_call_bg(user_id, "query_expand", billing_class="read"))
+            _telemetry_tasks.add(task)
+            task.add_done_callback(_telemetry_tasks.discard)
+        except RuntimeError:
+            pass
     resp = (resp or "").strip()
     if resp.startswith("```"):
         resp = resp.split("\n", 1)[1].rsplit("\n", 1)[0]
@@ -524,10 +619,38 @@ def _regex_match_boost(keywords: list[str], name: str, aliases_raw: str) -> floa
 
 # ---- §5.2 会话级缓存（最近 3 轮消息哈希，TTL 5min） ----
 
-# 值 = (写入时刻, (ctx, memory_ids, top_gate_score))
-_session_cache: dict[str, tuple[float, tuple[str, list, float]]] = {}
+# 值 = (写入时刻, (ctx, memory_ids, top_gate_score, stats))
+# A4.9 I2：stats 随缓存携带——命中轮的台账不再丢 budget/truncated/分层分
+_session_cache: dict[str, tuple[float, tuple]] = {}
 _SESSION_CACHE_TTL = 300.0
 _EMPTY_META: tuple[list, float] = ([], 0.0)
+
+
+def _cache_stats(stats: Optional[dict]) -> dict:
+    return dict(stats) if stats else {}
+
+# D2（默认关）：文本路径跨轮去重——per-user 上一轮注入 id 集合（有界 200 用户）
+_text_injected_ids: dict[str, set] = {}
+
+
+def _apply_text_cross_turn_dedup(user_id: str, candidates: list) -> list:
+    """D2：上一轮已注入的 id 本轮不重复注入；剩余 <2 时放弃过滤（防空注入）。"""
+    if not config.memory_retrieval.get("text_cross_turn_dedup_enabled", False):
+        return candidates
+    prev = _text_injected_ids.get(user_id) or set()
+    if not prev:
+        return candidates
+    kept = [c for c in candidates if c.id not in prev]
+    return kept if len(kept) >= 2 else candidates
+
+
+def _remember_text_injected(user_id: str, memory_ids: list[str]) -> None:
+    if not config.memory_retrieval.get("text_cross_turn_dedup_enabled", False):
+        return
+    _text_injected_ids[user_id] = set(memory_ids or [])
+    if len(_text_injected_ids) > 200:
+        for k in list(_text_injected_ids)[:100]:
+            _text_injected_ids.pop(k, None)
 
 
 def _session_cache_key(user_id: str, user_queries: list[str]) -> str:
@@ -536,7 +659,7 @@ def _session_cache_key(user_id: str, user_queries: list[str]) -> str:
     return f"{user_id}:{h}"
 
 
-def _session_cache_get(key: str) -> Optional[tuple[str, list, float]]:
+def _session_cache_get(key: str) -> Optional[tuple[str, list, float, dict]]:
     entry = _session_cache.get(key)
     if not entry:
         return None
@@ -547,12 +670,13 @@ def _session_cache_get(key: str) -> Optional[tuple[str, list, float]]:
     return value
 
 
-def _session_cache_put(key: str, value: str, meta: Optional[tuple[list, float]] = None) -> None:
+def _session_cache_put(key: str, value: str, meta: Optional[tuple[list, float]] = None,
+                       stats: Optional[dict] = None) -> None:
     if len(_session_cache) > 500:
         oldest = sorted(_session_cache.items(), key=lambda kv: kv[1][0])[:100]
         for k, _ in oldest:
             _session_cache.pop(k, None)
-    _session_cache[key] = (time.time(), (value, *(meta or _EMPTY_META)))
+    _session_cache[key] = (time.time(), (value, *(meta or _EMPTY_META), _cache_stats(stats)))
 
 
 # ---- §5.3.1a-2 多轮复现滑窗（per-user 5 轮） ----
@@ -670,6 +794,138 @@ def _concept_status_ok(detail: dict, include_expired: bool) -> bool:
     return detail.get("status") == "active" and (detail.get("activation_strength") or 0) > 0.05
 
 
+def _rho_score(seed_score: float, edge_weight: float, anchor_bonus: float = 1.0) -> float:
+    """D1（默认关）：扩展候选 ρ = 0.5·relevance + 0.3·anchor_proximity + 0.2·anchor_bonus。
+
+    anchor_proximity 用边权（1-hop 邻接归一化），anchor_bonus 直接邻居=1.0。
+    """
+    return round(0.5 * float(seed_score) + 0.3 * float(edge_weight) + 0.2 * float(anchor_bonus), 6)
+
+
+def _agpr_decay(parent_score: float, edge_weight: float, decay: float = 0.5) -> float:
+    """D1（默认关）：AGPR 第二跳传播衰减（简化：父分 × 边权 × 0.5）。"""
+    return float(parent_score) * float(edge_weight) * float(decay)
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """字符二元组 Jaccard（MMR 去冗余的确定性代理；零依赖、可单测）。"""
+    def grams(s: str) -> set:
+        s = "".join(ch for ch in (s or "") if not ch.isspace())
+        if len(s) < 2:
+            return {s} if s else set()
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+    ga, gb = grams(a), grams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+async def _fetch_candidate_vectors(
+    db: AsyncSession, user_id: str, candidates: list[RetrievalCandidate],
+) -> dict[str, list[float]]:
+    """D2：为 MMR 拉取候选向量（一次 UNION 查询；失败/缺失 → 空 dict，
+    调用方回退字符 Jaccard 代理）。仅 MMR 开启时调用（默认关零开销）。"""
+    ids = [c.id for c in candidates if c.id]
+    if not ids:
+        return {}
+    try:
+        rows = (await db.execute(
+            text("""
+                SELECT id, embedding::text FROM memory_concepts
+                WHERE user_id = :u AND id = ANY(:ids) AND embedding IS NOT NULL
+                UNION ALL
+                SELECT id, embedding::text FROM memory_episodes
+                WHERE user_id = :u AND id = ANY(:ids) AND embedding IS NOT NULL
+                UNION ALL
+                SELECT id, embedding::text FROM subconscious_log
+                WHERE user_id = :u AND id = ANY(:ids) AND embedding IS NOT NULL
+            """),
+            {"u": user_id, "ids": ids},
+        )).fetchall()
+    except Exception:
+        logger.debug("mmr vector fetch failed", exc_info=True)
+        return {}
+    out: dict[str, list[float]] = {}
+    for r in rows:
+        try:
+            out[r[0]] = [float(x) for x in str(r[1]).strip("[]").split(",")]
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _mmr_select(
+    cands: list[RetrievalCandidate], k: int, lam: float = 0.5,
+    sim_fn=None, vectors: dict | None = None,
+) -> list[RetrievalCandidate]:
+    """D2（默认关）：MMR 贪心选择 gain = score − λ·max(sim(c, s∈S))。
+
+    相似度：有向量（E3 式 UNION 拉取）→ embedding 余弦；缺失 → 字符二元组
+    Jaccard 代理。选择按数量 k，预算仍由 _apply_token_budget 独立执行。
+    """
+    if k <= 0 or not cands:
+        return []
+    if sim_fn is None:
+        _vecs = vectors or {}
+
+        def sim_fn(x, y):
+            vx, vy = _vecs.get(x.id), _vecs.get(y.id)
+            # A4.9 复评 Minor：维度不一致（跨 embedding_model）不得按前缀截断比较
+            if vx and vy and len(vx) == len(vy):
+                from app.services.memory_embedding_service import cosine_similarity
+                return max(0.0, float(cosine_similarity(vx, vy)))
+            tx = (x.content or "") + str(x.metadata.get("canonical_name") or "")
+            ty = (y.content or "") + str(y.metadata.get("canonical_name") or "")
+            return _text_similarity(tx, ty)
+    selected: list[RetrievalCandidate] = []
+    pool = list(cands)
+    while pool and len(selected) < k:
+        best = None
+        best_gain = None
+        for c in pool:
+            penalty = max((sim_fn(c, s) for s in selected), default=0.0)
+            gain = float(c.score) - float(lam) * penalty
+            if best_gain is None or gain > best_gain:
+                best, best_gain = c, gain
+        selected.append(best)
+        pool.remove(best)
+    return selected
+
+
+async def _drop_contradicted(
+    db: AsyncSession, user_id: str, concept_slice: list[RetrievalCandidate],
+) -> list[RetrievalCandidate]:
+    """D2（默认关）：contradicts 读侧降级——互斥概念只保留门控分较高者。"""
+    if len(concept_slice) < 2:
+        return concept_slice
+    ids = [c.id for c in concept_slice]
+    try:
+        result = await db.execute(
+            text("""
+                SELECT source_id, target_id FROM concept_relations
+                WHERE user_id = :u AND relation_type = 'contradicts'
+                  AND source_id = ANY(:ids) AND target_id = ANY(:ids)
+            """),
+            {"u": user_id, "ids": ids},
+        )
+        pairs = [(r[0], r[1]) for r in result.fetchall()]
+    except Exception:
+        logger.debug("contradicts read-side query failed", exc_info=True)
+        return concept_slice
+    if not pairs:
+        return concept_slice
+    by_id = {c.id: c for c in concept_slice}
+    drop: set[str] = set()
+    for a, b in pairs:
+        if a in drop or b in drop:
+            continue
+        if a not in by_id or b not in by_id:
+            continue
+        loser = a if _cand_gate_score(by_id[a]) <= _cand_gate_score(by_id[b]) else b
+        drop.add(loser)
+    return [c for c in concept_slice if c.id not in drop]
+
+
 async def _get_concept_detail(
     db: AsyncSession, concept_id: str, user_id: str, include_expired: bool = False,
 ) -> dict | None:    # §5.2 as-of 历史查询：include_expired 时不过滤 valid_to（失效概念可查，注入时标注）
@@ -710,7 +966,9 @@ async def _stage2_description_expansion(
     stage0: Stage0Result, query_text: str,
 ) -> list[RetrievalCandidate]:
     from app.services.memory_bm25 import get_desc_index
-    from app.services.memory_cluster_service import get_clusters_for_concepts, get_neighbors
+    from app.services.memory_cluster_service import (
+        get_clusters_for_concepts, get_neighbors, edge_read_whitelist,
+    )
 
     ret_cfg = config.memory_retrieval
     query_str = " ".join(stage0.keywords)
@@ -771,21 +1029,27 @@ async def _stage2_description_expansion(
             pass
 
         # §5.2 Stage 2 step 4：关系扩展（1-hop PPR-lite）——种子 top-5 沿 concept_relations 扩邻居
+        # D1（默认关）：读侧白名单 / ρ 重排 / AGPR 二跳；全关时与旧实现逐字节同序
         try:
             seed_top_k = int(ret_cfg.get("stage2_relation_seed_top_k", 5))
             max_neighbors = int(ret_cfg.get("stage2_relation_max_neighbors", 5))
             max_new = int(ret_cfg.get("stage2_relation_max_new", 10))
             score_decay = float(ret_cfg.get("stage2_relation_score_decay", 0.6))
             min_edge_w = float(ret_cfg.get("stage2_relation_min_edge_weight", 0.3))
+            whitelist = edge_read_whitelist()
+            rho_on = bool(ret_cfg.get("expansion_rho_enabled", False))
+            agpr_on = bool(ret_cfg.get("agpr_enabled", False))
 
             seeds = sorted([c for c in candidates if c.tier == "concept"],
                            key=lambda c: c.score, reverse=True)[:seed_top_k]
             existing_ids = {c.id for c in candidates if c.tier == "concept"}
             added = 0
+            first_hop: list[tuple[str, float]] = []
             for seed in seeds:
                 if added >= max_new:
                     break
-                neighbors = await get_neighbors(db, seed.id, min_weight=min_edge_w)
+                neighbors = await get_neighbors(db, seed.id, min_weight=min_edge_w,
+                                                allowed_types=whitelist)
                 for nb in neighbors[:max_neighbors]:
                     if added >= max_new:
                         break
@@ -796,8 +1060,11 @@ async def _stage2_description_expansion(
                     if not detail or not _concept_status_ok(detail, stage0.include_expired):
                         continue
                     edge_w = float(nb.get("weight") or 0.5)
+                    hop_score = seed.score * edge_w * score_decay
+                    if rho_on:
+                        hop_score = _rho_score(seed.score, edge_w)
                     candidates.append(RetrievalCandidate(
-                        id=nb_id, tier="concept", score=seed.score * edge_w * score_decay,
+                        id=nb_id, tier="concept", score=hop_score,
                         content=detail.get("description_short", ""),
                         metadata={"canonical_name": detail.get("canonical_name", ""),
                                   "description_full": detail.get("description_full", ""),
@@ -812,7 +1079,45 @@ async def _stage2_description_expansion(
                                   "source": "relation_expansion"},
                     ))
                     existing_ids.add(nb_id)
+                    first_hop.append((nb_id, hop_score))
                     added += 1
+            # D1 AGPR（默认关）：二跳时域邻域传播（简化：父分 × 边权 × 0.5；有界）
+            if agpr_on and added < max_new:
+                for parent_id, parent_score in first_hop[:3]:
+                    if added >= max_new:
+                        break
+                    try:
+                        hop2 = await get_neighbors(db, parent_id, min_weight=min_edge_w,
+                                                   allowed_types=whitelist)
+                    except Exception:
+                        continue
+                    for nb in hop2[:2]:
+                        if added >= max_new:
+                            break
+                        nb_id = nb["id"]
+                        if nb_id in existing_ids:
+                            continue
+                        detail = await _get_concept_detail(db, nb_id, user_id, include_expired=stage0.include_expired)
+                        if not detail or not _concept_status_ok(detail, stage0.include_expired):
+                            continue
+                        edge_w = float(nb.get("weight") or 0.5)
+                        candidates.append(RetrievalCandidate(
+                            id=nb_id, tier="concept", score=_agpr_decay(parent_score, edge_w),
+                            content=detail.get("description_short", ""),
+                            metadata={"canonical_name": detail.get("canonical_name", ""),
+                                      "description_full": detail.get("description_full", ""),
+                                      "weight": detail.get("weight", 0.5),
+                                      "importance": detail.get("importance", 0.5),
+                                      "source_trust": detail.get("source_trust", ""),
+                                      "memory_type": detail.get("memory_type", ""),
+                                      "aliases": detail.get("aliases", ""),
+                                      "last_recalled_at": detail.get("last_recalled_at"),
+                                      "stability": detail.get("stability"),
+                                      "created_at": detail.get("created_at"),
+                                      "source": "agpr_expansion"},
+                        ))
+                        existing_ids.add(nb_id)
+                        added += 1
         except Exception:
             logger.debug("relation expansion failed", exc_info=True)
 
@@ -1106,6 +1411,18 @@ def _should_skip_ce(ordered: list["RetrievalCandidate"], gap_trigger: float) -> 
     return False
 
 
+def _rerank_auth_key(rerank_ep, config_key: str) -> str:
+    """rerank 调用 Authorization Key（A4.9 Critical 回归测试缝）。
+
+    显式端点（含用户级覆盖）存在时以端点 api_key 为准——空就是空，
+    绝不回落 config 系统 Key（防自定义 URL + 空 Key 外泄系统 Key）；
+    仅端点缺失（legacy 获取失败）时才用 config 兜底。
+    """
+    if rerank_ep is not None:
+        return str(getattr(rerank_ep, "api_key", "") or "")
+    return str(config_key or "")
+
+
 async def _stage4_rerank(
     candidates: list[RetrievalCandidate], query_text: str,
     user_id: str | None = None, db: AsyncSession | None = None, cold_start: bool = False,
@@ -1266,9 +1583,15 @@ async def _stage4_cross_encoder(
     if not docs:
         return ordered
     headers = {"Content-Type": "application/json"}
-    api_key = (_rr_ep.api_key if _rr_ep is not None else "") or config.memory.get("rerank_api_key") or ""
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    # 2026-09-13（A4.9 Critical 修复）：显式端点（含用户覆盖）的 Key 以端点为准，
+    # 空 Key 就是"不发送 Authorization"，绝不回落 config 的系统 rerank Key——
+    # 否则用户可用自定义 URL + 空 Key 让服务端把系统 Key 发往其 URL（外泄）。
+    # registry 合成端点已携带 config.memory.rerank_api_key，fallback 仅服务
+    # _rr_ep 获取失败的 legacy 场景。
+    _cfg_rerank_key = str(config.memory.get("rerank_api_key") or "")
+    auth_key = _rerank_auth_key(_rr_ep, _cfg_rerank_key)
+    if auth_key:
+        headers["Authorization"] = f"Bearer {auth_key}"
     rerank_model = (_rr_ep.model_name if _rr_ep is not None and _rr_ep.model_name else None) \
         or config.memory.get("rerank_model", "bge-reranker-v2-m3")
     timeout_s = float(config.memory_retrieval.get("stage4_cross_encoder_timeout_ms", 800)) / 1000.0
@@ -1444,6 +1767,8 @@ def _select_injected(
 
 
 _boost_tasks: set = set()
+# A4a 遥测任务强引用（防 asyncio GC；A4.9 修复 F1/F2）
+_telemetry_tasks: set = set()
 
 
 async def _apply_recall_boosts_bg(
@@ -1590,6 +1915,18 @@ async def _build_injection_context(
     candidates: list[RetrievalCandidate], stage0: Stage0Result,
     query_text: str = "",
 ) -> str:
+    """兼容入口（返回 ctx 字符串）；C1 统计信息由 _ex 版携带。"""
+    ctx, _meta = await _build_injection_context_ex(
+        db, user_id, candidates, stage0, query_text=query_text)
+    return ctx
+
+
+async def _build_injection_context_ex(
+    db: AsyncSession, user_id: str,
+    candidates: list[RetrievalCandidate], stage0: Stage0Result,
+    query_text: str = "",
+) -> tuple[str, dict]:
+    """构建注入上下文 + C1 元数据（budget/truncated/injected_chars）。"""
     ret_cfg = config.memory_retrieval
     # (priority, text)：按相关性降序注入，预算截断从最低优先段开始，
     # 保证高相关内容（常为 subconscious 原文）不被恒定基底挤掉（A4.6 根因 3）。
@@ -1651,17 +1988,44 @@ async def _build_injection_context(
         "concept": float(ret_cfg.get("injection_min_relevance", 0.35)),
         "subconscious": float(ret_cfg.get("injection_min_relevance_subconscious", 0.30)),
     }
-    epi_slice = [
+    max_epi = int(ret_cfg.get("injection_max_episodic", 2))
+    max_concept = int(ret_cfg.get("injection_max_concept", 4))
+    max_sub = int(ret_cfg.get("injection_max_subconscious", 2))
+    if ret_cfg.get("adaptive_cardinality_enabled", False):
+        # D2（默认关）：自适应基数只减不增——高门控分（≥阈值）保持现值，
+        # 低分收缩到 2/1/1（绝不超出现有预算）
+        top_gate = max((_cand_gate_score(c) for c in candidates), default=0.0)
+        if top_gate < float(ret_cfg.get("adaptive_cardinality_high_score", 0.5)):
+            max_concept = min(max_concept, 2)
+            max_epi = min(max_epi, 1)
+            max_sub = min(max_sub, 1)
+    epi_eligible = [
         c for c in candidates
         if c.tier == "episodic" and c.id not in overview_eids
         and _cand_gate_score(c) >= _floors["episodic"]
-    ][:int(ret_cfg.get("injection_max_episodic", 2))]
-    concept_slice = [
+    ]
+    concept_eligible = [
         c for c in candidates
         if c.tier == "concept" and c.id not in overview_cids
         and _cand_gate_score(c) >= _floors["concept"]
-    ][:int(ret_cfg.get("injection_max_concept", 4))]
-    sub_slice = injected["subconscious"]
+    ]
+    if ret_cfg.get("assembly_mmr_enabled", False):
+        # D2（默认关）：MMR 去冗余（数量选择；预算仍由 _apply_token_budget 执行）；
+        # 向量可得时用 embedding 余弦（缺失回退 Jaccard 代理）
+        _lam = float(ret_cfg.get("assembly_mmr_lambda", 0.5))
+        _mmr_pool = (list(epi_eligible) + list(concept_eligible)
+                     + list(injected["subconscious"]))
+        _mmr_vecs = await _fetch_candidate_vectors(db, user_id, _mmr_pool)
+        epi_slice = _mmr_select(epi_eligible, max_epi, _lam, vectors=_mmr_vecs)
+        concept_slice = _mmr_select(concept_eligible, max_concept, _lam, vectors=_mmr_vecs)
+        sub_slice = _mmr_select(injected["subconscious"], max_sub, _lam, vectors=_mmr_vecs)
+    else:
+        epi_slice = epi_eligible[:max_epi]
+        concept_slice = concept_eligible[:max_concept]
+        sub_slice = injected["subconscious"][:max_sub]
+    if ret_cfg.get("contradicts_read_downgrade_enabled", False) and concept_slice:
+        # D2（默认关）：contradicts 读侧互斥降级（保留高分端点）
+        concept_slice = await _drop_contradicted(db, user_id, concept_slice)
 
     if epi_slice:
         lines = ["[相关事件 Episodic]"]
@@ -1734,17 +2098,73 @@ async def _build_injection_context(
             lines.append(f"- 用户澄清\"{cl['original_text'][:50]}\" → 已修正")
         sections.append((0.1, "\n".join(lines)))
 
+    if ret_cfg.get("assembly_grouping_enabled", False):
+        # D2（默认关）：分组打包——epi/concept/sub 三段合并为一个 [相关记忆] 包，
+        # 条目带 tier 标签；episodic 内按时域序（valid_from 升序）。
+        # 关时 sections 逐字节不变（旧三段格式）。
+        group_headers = {
+            "[相关事件 Episodic]": ("事件", "episodic"),
+            "[相关概念 Concept]": ("概念", "concept"),
+            "[近期原文片段 Subconscious]": ("原文", "subconscious"),
+        }
+        grouped_blocks: list[tuple[str, str, float, list[str]]] = []
+        remaining: list[tuple[float, str]] = []
+        for prio, text in sections:
+            head = text.split("\n", 1)[0]
+            if head in group_headers:
+                tag, tier = group_headers[head]
+                body_lines = [ln for ln in text.split("\n")[1:] if ln.strip()]
+                grouped_blocks.append((tier, tag, prio, body_lines))
+            else:
+                remaining.append((prio, text))
+        if grouped_blocks:
+            order = {"episodic": 0, "concept": 1, "subconscious": 2}
+            grouped_blocks.sort(key=lambda b: order.get(b[0], 9))
+            lines = ["[相关记忆]"]
+            for tier, tag, _prio, body_lines in grouped_blocks:
+                if tier == "episodic":
+                    body_lines = sorted(body_lines)
+                for ln in body_lines:
+                    lines.append(f"{ln} [{tag}]")
+            sections = remaining + [(
+                max(b[2] for b in grouped_blocks), "\n".join(lines))]
+
     # §5.6 注入总预算硬上限（injection_total_token_budget，默认 2000 token；
     # 中文按 1 字≈1 token 保守估算，超预算从最低优先级段开始丢弃）
     sections.sort(key=lambda s: s[0], reverse=True)
     budget = int(ret_cfg.get("injection_total_token_budget", 2000))
-    return _apply_token_budget([s[1] for s in sections], budget)
+    text, truncated, _used = _apply_token_budget_ex([s[1] for s in sections], budget)
+    # E1（默认关）：陷阱缓解——头部确定性使用指令（不计入记忆预算；≤60 字符）
+    if ret_cfg.get("injection_usage_instruction_enabled", False) and text:
+        instruction = str(ret_cfg.get("injection_usage_instruction_text")
+                          or _DEFAULT_USAGE_INSTRUCTION)[:60]
+        text = f"{instruction}\n\n{text}"
+    return text, {"truncated": truncated, "budget_chars": budget,
+                  "injected_chars": len(text)}
+
+
+# C1（2026-09-14）：截断必须显式标注（信息完整性原则；零数字，避免模型把
+# 标注当数据）。标注本身不计入记忆内容预算。
+_TRUNCATION_NOTE = "\n\n（部分记忆因长度预算未完整展示）"
+
+# E1（2026-09-14，默认关）：注入头部使用指令（≤60 字符，零数字）
+_DEFAULT_USAGE_INSTRUCTION = "以上历史记忆可能过时或不适用于当前任务，请结合当前对话判断。"
 
 
 def _apply_token_budget(sections: list[str], budget: int) -> str:
-    """按段优先级保留，累计估算 token ≤ budget；单段超长时截断该段。"""
+    """按段优先级保留，累计估算 token ≤ budget；单段超长时截断该段。
+
+    未截断时输出与旧实现逐字节一致；截断时尾部追加显式标注（C1）。
+    """
+    text, _truncated, _used = _apply_token_budget_ex(sections, budget)
+    return text
+
+
+def _apply_token_budget_ex(sections: list[str], budget: int) -> tuple[str, bool, int]:
+    """_apply_token_budget 的带元数据版本：(text, truncated, used)。"""
     kept: list[str] = []
     used = 0
+    truncated = False
     for section in sections:
         est = len(section)
         if used + est <= budget:
@@ -1753,10 +2173,15 @@ def _apply_token_budget(sections: list[str], budget: int) -> str:
         elif not kept:
             kept.append(section[:budget])
             used = budget
+            truncated = True
             break
         else:
+            truncated = True
             break
-    return "\n\n".join(kept)
+    text = "\n\n".join(kept)
+    if truncated:
+        text += _TRUNCATION_NOTE
+    return text, truncated, used
 
 
 async def _get_latest_dream(db: AsyncSession, user_id: str) -> str | None:
@@ -1862,7 +2287,12 @@ async def _get_profile_summary(db: AsyncSession, user_id: str, max_chars: int = 
     # 恒定注入会污染当前偏好语义（as-of 违背：当前查询 must_not 旧偏好）。
     # 兜底时裁剪变化叙述行——只保留稳定画像（职业/家庭/居住等）。
     # 裁剪判断由 LLM 完成（agentic 原则，原 _CHANGE_RE 正则已删除）。
+    # 2026-09-13（v1 退休，方案 A）：v2 运行时不再用 v1 memory_summary 兜底
+    # （陈旧画像；profile 概念由 sync_profile_concepts 从 v2 产物提炼）。
     if not lines:
+        from app.services.memory_runtime_state import memory_runtime_enabled
+        if memory_runtime_enabled(config):
+            return None
         result = await db.execute(
             text("SELECT memory_summary FROM user_agent_states WHERE user_id = :uid AND memory_summary IS NOT NULL"),
             {"uid": user_id},

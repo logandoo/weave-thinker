@@ -46,6 +46,141 @@ _SEGMENT_PUNCT = "，。！？；、…,.!?;~\n"
 _SAFE_RESUME_BOUNDARIES = _SEGMENT_PUNCT + ")）"
 
 
+# ---- Voice subagent structured output (JSON schema) ----
+# 用户要求（2026-09-13）：语音子代理（分类/判定）采用 JSON schema 回复。供应商
+# 支持不一（DeepSeek 实测 json_schema 400「unavailable」/ json_object OK；其他
+# OpenAI 兼容端点可能支持 json_schema），故走三级阶梯：
+#   schema → json_object → off（无 response_format，靠 prompt 约束 + 容错解析）
+# 被拒档位按 purpose 学习并缓存，同一会话后续调用不再重试被拒档位。
+_RESPONSE_FORMAT_ERROR_HINTS = (
+    "response_format",
+    "json_schema",
+    "json_object",
+    "guided_json",
+)
+# A bare RF token is not enough: OpenAI-compatible gateways sometimes echo the
+# whole request body in ANY 400 message, so a thinking-knob rejection would
+# look like an RF rejection and permanently downgrade the session (A4.9 review
+# Important #2). Require a rejection phrase too, and let thinking/reasoning
+# rejections win the tie (they get the legacy no-structured-output retry).
+_REJECTION_ERROR_HINTS = (
+    "not support",
+    "unsupported",
+    "unavailable",
+    "not available",
+    "invalid",
+    "unknown",
+    "unrecognized",
+    "unexpected",
+    "not allowed",
+    "not permitted",
+    "does not support",
+    "extra inputs",
+)
+_THINKING_ERROR_HINTS = (
+    "thinking",
+    "reasoning",
+    "enable_thinking",
+    "reasoning_effort",
+)
+
+
+class _StructuredOutputRejected(Exception):
+    """Provider rejected the response_format payload (signal for the ladder)."""
+
+
+def _looks_like_thinking_error(msg: str) -> bool:
+    return (
+        any(h in msg for h in _THINKING_ERROR_HINTS)
+        and any(h in msg for h in _REJECTION_ERROR_HINTS)
+    )
+
+
+def _looks_like_response_format_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if not any(h in msg for h in _RESPONSE_FORMAT_ERROR_HINTS):
+        return False
+    if _looks_like_thinking_error(msg):
+        return False
+    return any(h in msg for h in _REJECTION_ERROR_HINTS)
+
+
+def _json_schema_format(name: str, properties: dict, required: list) -> dict:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+_EMOTION_ENUM = ["calm", "interested", "excited", "upset", "broken"]
+
+_INTENT_RESPONSE_FORMAT = _json_schema_format(
+    "voice_intent_verdict",
+    {
+        "should_respond": {"type": "boolean", "description": "是否值得助手开口回应"},
+        "needs_tools": {"type": "boolean", "description": "是否需要调用工具"},
+        "reason": {"type": "string", "description": "简短原因"},
+    },
+    ["should_respond", "needs_tools", "reason"],
+)
+
+_EOT_RESPONSE_FORMAT = _json_schema_format(
+    "voice_eot_verdict",
+    {
+        "complete": {"type": "boolean", "description": "用户语义上是否已说完"},
+        "reason": {"type": "string", "description": "简短原因"},
+    },
+    ["complete", "reason"],
+)
+
+_BARGE_IN_RESPONSE_FORMAT = _json_schema_format(
+    "voice_barge_in_verdict",
+    {
+        "verdict": {
+            "type": "string",
+            "enum": ["interrupt", "defer", "backchannel"],
+            "description": "interrupt=立刻停下回应；defer=不急可等；backchannel=附和/噪音",
+        },
+    },
+    ["verdict"],
+)
+
+_INTERJECTION_RESPONSE_FORMAT = _json_schema_format(
+    "voice_interjection_verdict",
+    {
+        "should_interject": {"type": "boolean", "description": "是否值得插一句话"},
+        "emotion": {"type": "string", "enum": _EMOTION_ENUM, "description": "更新后的情绪"},
+        "interjection_text": {"type": "string", "description": "插话文本（不插话时空串）"},
+        "reason": {"type": "string", "description": "简短原因"},
+    },
+    ["should_interject", "emotion", "interjection_text", "reason"],
+)
+
+_MEMORY_INTERJECTION_RESPONSE_FORMAT = _json_schema_format(
+    "voice_memory_interjection_verdict",
+    {
+        "action": {
+            "type": "string",
+            "enum": ["none", "append", "correct"],
+            "description": "none=不插话；append=补充；correct=自我纠正",
+        },
+        "line": {"type": "string", "description": "插话文本（none 时空串）"},
+        "emotion": {"type": "string", "enum": _EMOTION_ENUM, "description": "插话情绪"},
+        "reason": {"type": "string", "description": "简短原因"},
+    },
+    ["action", "line", "emotion", "reason"],
+)
+
+
 def _norm_barge_compare(text: str) -> str:
     """Normalize a barge-in utterance for comparing the onset-pause partial
     with the EoT-flushed final text (strip leading/trailing punctuation and
@@ -1377,6 +1512,10 @@ def _vmem_budget_clear(uid: Optional[str] = None) -> None:
         _VMEM_BUDGETS.pop(uid, None)
 
 
+# B11（2026-09-14）：语音纠正 shadow 任务强引用（防 asyncio GC）
+_voice_clarification_tasks: set = set()
+
+
 class VoiceDuplexSession:
     """One full-duplex voice session bound to a client WebSocket."""
 
@@ -1465,6 +1604,20 @@ class VoiceDuplexSession:
         # the cooldown stamp shared by arm/convert/fallback (min-gap knob).
         self._last_filler_at = 0.0
         self._filler_prefetch = {"text": "", "phrase": "", "q": None, "task": None}
+        # TTFT-gated filler (2026-09-13): the EoT prefetch converts to a
+        # PENDING phrase (no playback/event/cooldown yet) and the decision moves
+        # to `_filler_ttft_watch`, scheduled when the main generation starts:
+        # the filler plays ONLY if the model produced no content token within
+        # `voice_filler_ttft_threshold_seconds` (AND-gate). Fast turns stay
+        # silent (overuse fix); 0 = legacy immediate play.
+        self._pending_filler = {"phrase": "", "q": None, "task": None}
+        self._filler_watch_task: Optional[asyncio.Task] = None
+        # Epoch of the turn whose first content token has arrived (0 = none
+        # yet); the watch compares it with its own epoch to suppress.
+        self._answer_content_epoch = 0
+        # Structured-output mode learned per subagent purpose ("schema" |
+        # "object" | "off") — see `_quick_classify`.
+        self._json_modes: dict[str, str] = {}
         self._last_backchannel_phrase = ""
         self._recent_backchannel_phrases: list[str] = []
         self._last_backchannel_time = 0.0
@@ -1817,15 +1970,9 @@ class VoiceDuplexSession:
                     # system prompt 因此无需两份记忆基底并存。
                     sections.append(_vmem_wrap(memory_context[:2000]))
                 else:
-                    from app.services.memory_service import build_shared_agent_context
-                    shared = await build_shared_agent_context(self.db, self.user.id)
-                    vmem_parts = []
-                    if shared.memory_summary:
-                        vmem_parts.append("共享长期记忆:\n" + shared.memory_summary.strip()[:2000])
-                    if shared.dream_summary:
-                        vmem_parts.append("近期 dream:\n" + shared.dream_summary.strip()[:2000])
-                    if wrapped := _vmem_wrap(*vmem_parts):
-                        sections.append(wrapped)
+                    # v2 运行时（2026-09-13 v1 退休，方案 A）：检索为空即无记忆
+                    # 注入——不再回落 v1 摘要（陈旧数据）。
+                    logger.debug("voice memory retrieval empty — v1 fallback retired (v2 runtime)")
             else:
                 from app.services.memory_service import build_shared_agent_context
                 shared = await build_shared_agent_context(self.db, self.user.id)
@@ -2325,28 +2472,61 @@ class VoiceDuplexSession:
         return _stamp_query_time(msgs)
 
     # ---- subagents ----
-    async def _quick_classify(self, system: str, user: str, purpose: str = "voice") -> str:
+    async def _quick_classify(
+        self,
+        system: str,
+        user: str,
+        purpose: str = "voice",
+        response_format: Optional[dict] = None,
+    ) -> str:
+        """One-shot subagent call (classifier / judge), thinking forced OFF.
+
+        Structured output (2026-09-13): when the caller passes a JSON-schema
+        `response_format`, the call walks the provider-support ladder
+        ``schema → json_object → off``; a provider rejection of one rung is
+        learned per purpose (`_json_modes`) so later calls skip it. Parsing
+        callers stay tolerant either way (regex JSON extraction)."""
         svc, model = self._build_llm(purpose)
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-        async def _call() -> str:
+        async def _call_subagent(rf: Optional[dict]) -> str:
             # Subagents are classifiers outputting one word / a small JSON —
             # reasoning MUST be off for them regardless of the main model's
             # thinking setting: with thinking on, a 160-token budget is burned
             # entirely by reasoning and the content comes back EMPTY, which
             # silently degrades every classifier to its fail-safe default
             # (observed 2026-07-22: all barge-in judgments -> backchannel).
+            kwargs: dict = {
+                "temperature": 0.1,
+                "max_tokens": 160,
+                "extra_body": self._thinking_off_body(svc),
+            }
+            if rf is not None:
+                kwargs["response_format"] = rf
             try:
-                return await svc.complete_chat(
-                    messages, temperature=0.1, max_tokens=160,
-                    extra_body=self._thinking_off_body(svc),
-                )
-            except Exception:
-                # Provider rejected the thinking knob — retry without it.
-                return await svc.complete_chat(
-                    messages, temperature=0.1, max_tokens=160,
-                    extra_body=self._extra_body(svc)
-                )
+                return await svc.complete_chat(messages, **kwargs)
+            except Exception as exc:
+                if rf is not None and _looks_like_response_format_error(exc):
+                    # Provider rejected this structured-output rung — signal the
+                    # ladder to downgrade instead of masking it as a generic
+                    # provider failure.
+                    raise _StructuredOutputRejected() from exc
+                # Thinking/reasoning rejection (or any other provider error):
+                # retry once through the legacy config-gated path without
+                # structured output. NOTE: `_extra_body` returns the same
+                # thinking-off body while `voice_disable_thinking` is true, so
+                # a provider that rejects the thinking knob itself still
+                # fail-safes (pre-existing behavior, not a regression).
+                kwargs["extra_body"] = self._extra_body(svc)
+                kwargs.pop("response_format", None)
+                return await svc.complete_chat(messages, **kwargs)
+
+        def _rung(mode: str) -> Optional[dict]:
+            if mode == "schema":
+                return response_format
+            if mode == "object":
+                return {"type": "json_object"}
+            return None
 
         # The 6s bound covers the WHOLE subagent operation (gate queue wait +
         # LLM call): the gate is per-session and a long main stream holds one
@@ -2355,7 +2535,29 @@ class VoiceDuplexSession:
         # path. On timeout every classifier fail-safes.
         async def _classify() -> str:
             async with self._llm_gate:
-                return await _call()
+                if response_format is None:
+                    return await _call_subagent(None)
+                learned = self._json_modes.get(purpose)
+                if learned is None:
+                    ladder = ["schema", "object", "off"]
+                elif learned == "off":
+                    ladder = ["off"]
+                else:
+                    ladder = [learned, "off"]
+                for mode in ladder:
+                    try:
+                        return await _call_subagent(_rung(mode))
+                    except _StructuredOutputRejected:
+                        # The rejected rung is unusable for this provider; cache
+                        # the next rung so later calls skip straight to it.
+                        nxt = "object" if mode == "schema" else "off"
+                        self._json_modes[purpose] = nxt
+                        logger.info(
+                            "voice subagent structured output downgraded: purpose=%s %s -> %s",
+                            purpose, mode, nxt,
+                        )
+                        continue
+                return ""
 
         try:
             return await asyncio.wait_for(
@@ -2467,7 +2669,7 @@ class VoiceDuplexSession:
             "插话「哦，这样啊。」→ backchannel\n"
             "插话「妈，我今晚不回去吃饭了。」→ backchannel（对别人说的话）\n"
             "插话「顺便说下我下午要去开会。」→ defer\n"
-            "只输出 interrupt、defer 或 backchannel 之一，不要输出其他任何内容。"
+            "只输出 JSON：{\"verdict\":\"interrupt|defer|backchannel\"}，不要输出其他任何内容。"
         )
         # Build context: recent conversation history + currently spoken text.
         ctx_parts: list[str] = []
@@ -2491,16 +2693,35 @@ class VoiceDuplexSession:
         ctx_parts.append(f"用户插话：{text}")
         ctx_parts.append(_prox_evidence_line(self._prox_evidence_near()))
         user_msg = "\n\n".join(ctx_parts)
-        raw = await self._quick_classify(system, user_msg, "voice.duplex")
+        raw = await self._quick_classify(
+            system, user_msg, "voice.duplex",
+            response_format=_BARGE_IN_RESPONSE_FORMAT,
+        )
         _perf("barge_in_classify", (_now() - self._barge_classify_start) * 1000,
               text_len=len(text), raw_len=len(raw or ""))
-        raw = (raw or "").strip().lower()
-        if "interrupt" in raw:
-            return "interrupt"
-        if "backchannel" in raw:
-            return "backchannel"
-        if "defer" in raw:
-            return "defer"
+        raw = (raw or "").strip()
+        verdict = ""
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                v = str(data.get("verdict", "")).strip().lower()
+                if v in ("interrupt", "defer", "backchannel"):
+                    verdict = v
+            except Exception:
+                pass
+        if not verdict:
+            # Backward compat: a degraded rung (no response_format) may return
+            # the legacy bare word.
+            low = raw.lower()
+            if "interrupt" in low:
+                verdict = "interrupt"
+            elif "backchannel" in low:
+                verdict = "backchannel"
+            elif "defer" in low:
+                verdict = "defer"
+        if verdict:
+            return verdict
         # LLM returned nothing usable. Default to "backchannel" (don't
         # interrupt) so ASR noise never cuts off TTS playback. A real user
         # can always press the stop button to interrupt explicitly.
@@ -2588,7 +2809,10 @@ class VoiceDuplexSession:
                     f"用户：{text}"
                 )
         user_msg = ctx_block if ctx_block else f"用户：{text}"
-        raw = await self._quick_classify(system, user_msg, "voice.intent")
+        raw = await self._quick_classify(
+            system, user_msg, "voice.intent",
+            response_format=_INTENT_RESPONSE_FORMAT,
+        )
         _perf("intent_classify", (_now() - self._intent_classify_start) * 1000,
               text_len=len(text), ctx_msgs=len(recent))
         try:
@@ -2639,7 +2863,10 @@ class VoiceDuplexSession:
             "拿不准时：宁可判 false（继续等，硬阈值兜底会 flush），也不要打断正在思考的用户。"
         )
         user_msg = text
-        raw = await self._quick_classify(system, user_msg, "voice.intent")
+        raw = await self._quick_classify(
+            system, user_msg, "voice.intent",
+            response_format=_EOT_RESPONSE_FORMAT,
+        )
         try:
             m = re.search(r"\{.*\}", raw, re.DOTALL)
             data = json.loads(m.group(0)) if m else {}
@@ -2735,7 +2962,10 @@ class VoiceDuplexSession:
             "愤怒/崩溃时使用，不要轻易破防。"
         )
         user_msg = f"{_ASR_CORRECTION_HINT}\n\n{prior}用户新说完的一句话：{sentence}"
-        raw = await self._quick_classify(system, user_msg, "voice.interjection")
+        raw = await self._quick_classify(
+            system, user_msg, "voice.interjection",
+            response_format=_INTERJECTION_RESPONSE_FORMAT,
+        )
         _perf("interjection_classify", (_now() - self._interjection_classify_start) * 1000,
               sentence_len=len(sentence))
         try:
@@ -2958,7 +3188,10 @@ class VoiceDuplexSession:
             parts.append(f"【用户正在说的话】\n{user_speech.strip()[:300]}")
         parts.append(f"【时机】{window}")
         try:
-            raw = await self._quick_classify(system, "\n\n".join(parts), model)
+            raw = await self._quick_classify(
+                system, "\n\n".join(parts), model,
+                response_format=_MEMORY_INTERJECTION_RESPONSE_FORMAT,
+            )
             m = re.search(r"\{.*\}", raw or "", re.DOTALL)
             data = json.loads(m.group(0)) if m else {}
             action = str(data.get("action", "none")).strip().lower()
@@ -3646,12 +3879,29 @@ class VoiceDuplexSession:
 
     def _drop_filler_prefetch(self) -> None:
         """Cancel and clear a live speculative filler synthesis (text changed,
-        gates flipped, session draining/shutting down)."""
+        gates flipped, session draining/shutting down), plus any pending
+        TTFT-gated phrase/watch from the previous turn."""
         p = self._filler_prefetch
         task = p.get("task")
         if task is not None and not task.done():
             task.cancel()
         self._filler_prefetch = {"text": "", "phrase": "", "q": None, "task": None}
+        self._clear_pending_filler()
+
+    def _clear_pending_filler(self) -> None:
+        """Drop the converted-but-unplayed filler and cancel its TTFT watch
+        (drain / shutdown / generation end / skipped turn). The pre-synthesized
+        queue AND its still-running synth task are discarded — one-shot, like
+        the prefetch it came from (A4.9 review Minor #2)."""
+        pending = self._pending_filler
+        task = pending.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+        self._pending_filler = {"phrase": "", "q": None, "task": None}
+        watch = self._filler_watch_task
+        if watch is not None and not watch.done():
+            watch.cancel()
+        self._filler_watch_task = None
 
     def _register_aux_echo(self, text: str) -> None:
         """Register an aux utterance (filler/backchannel) for mic-echo tail-
@@ -3709,12 +3959,13 @@ class VoiceDuplexSession:
         self._filler_prefetch = {"text": t, "phrase": phrase, "q": q, "task": task}
 
     async def _convert_filler_prefetch(self, flushed: str) -> None:
-        """Convert the armed filler synthesis into a playable aux item at the
-        EoT flush (idle path only, BEFORE `_enqueue_turn`): the consumer plays
-        straight from the pre-synthesized queue, so the filler's audio is ready
-        right as the turn starts (measured E2E: filler PCM ~0.5s after the
-        filler event vs ~1.0s on the old post-persist path) and cuts over to
-        the answer seamlessly.
+        """Convert the armed filler synthesis into a PENDING phrase at the EoT
+        flush (idle path only, BEFORE `_enqueue_turn`). Nothing plays yet: the
+        pre-synthesized queue is held until the TTFT watch scheduled at
+        generation start decides — the filler is audible only when the model
+        has not produced its first content token within
+        `voice_filler_ttft_threshold_seconds` (2026-09-13; fast turns stay
+        silent). The old immediate enqueue made every turn open with a filler.
 
         NO strict text match against the arm-time text: the filler phrase is
         content-independent, and the flushed text is normally LONGER than the
@@ -3726,6 +3977,7 @@ class VoiceDuplexSession:
         p = self._filler_prefetch
         self._filler_prefetch = {"text": "", "phrase": "", "q": None, "task": None}
         q = p.get("q")
+        synth_task = p.get("task")
         phrase = p.get("phrase") or ""
         if q is None or not phrase:
             return
@@ -3736,14 +3988,83 @@ class VoiceDuplexSession:
             and not _is_voice_noise(t)
             and not (_STOP_TASK_RE.search(t) or _STOP_TASK_EXACT_RE.match(t))
         ):
+            if synth_task is not None and not synth_task.done():
+                synth_task.cancel()
             return
-        self._last_filler_phrase = phrase
-        self._last_filler_at = _now()
-        self._register_aux_echo(phrase)
-        await self._send_json({"event": "filler", "text": phrase})
-        self._tts_queue.put_nowait({
-            "text": phrase, "epoch": self._turn_epoch, "aux": True, "pre_q": q,
-        })
+        self._pending_filler = {"phrase": phrase, "q": q, "task": synth_task}
+
+    def _schedule_filler_ttft_watch(self) -> None:
+        """Start the TTFT-gated filler decision for THIS turn (called when the
+        main generation is about to issue its LLM call).
+
+        Consumes `_pending_filler` (EoT prefetch) if present; otherwise the
+        watch's fallback synthesizes on demand (`_speak_filler`) — covers the
+        barge-in/defer path that never went through the idle flush convert.
+        A previous watch is cancelled: only the newest generation owns the
+        decision."""
+        cfg = self.config
+        if not cfg.voice_filler_enabled or self._closed:
+            self._clear_pending_filler()
+            return
+        epoch = self._turn_epoch
+        pending = self._pending_filler
+        self._pending_filler = {"phrase": "", "q": None, "task": None}
+        prev = self._filler_watch_task
+        if prev is not None and not prev.done():
+            prev.cancel()
+        self._filler_watch_task = asyncio.create_task(
+            self._filler_ttft_watch(
+                epoch, pending.get("phrase") or "", pending.get("q"), pending.get("task")
+            )
+        )
+
+    async def _filler_ttft_watch(self, epoch: int, phrase: str, q,
+                                 synth_task: Optional[asyncio.Task] = None) -> None:
+        """AND-gated filler decision: play only when (elapsed >= threshold)
+        AND (no first content this turn) AND (not speaking/paused/interrupted)
+        AND (cooldown passed). OR semantics would degenerate to the old
+        per-turn behavior — elapsed always exceeds the threshold eventually.
+
+        With a pre-synthesized queue the phrase plays instantly (its TTS
+        round-trip already overlapped the EoT window); without one (barge-in
+        path) `_speak_filler` synthesizes on demand — the model is slow
+        anyway, so the extra TTS hop only lands on genuinely slow turns."""
+        played = False
+        try:
+            threshold = self.config.voice_filler_ttft_threshold_seconds
+            if threshold > 0:
+                await asyncio.sleep(threshold)
+            if self._closed or self._turn_epoch != epoch:
+                return
+            if self._answer_content_epoch >= epoch:
+                return  # model already produced its first content token
+            if self._speaking or self._playback_paused or self._interrupt.is_set():
+                return
+            if phrase and q is not None:
+                if _now() - self._last_filler_at < self.config.voice_filler_min_gap_seconds:
+                    return
+                self._last_filler_at = _now()
+                self._register_aux_echo(phrase)
+                await self._send_json({"event": "filler", "text": phrase})
+                self._tts_queue.put_nowait({
+                    "text": phrase, "epoch": epoch, "aux": True, "pre_q": q,
+                })
+                played = True
+            else:
+                await self._speak_filler()
+                played = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("voice filler ttft watch failed: %s", exc)
+        finally:
+            if not played and synth_task is not None and not synth_task.done():
+                # Decision was "no filler": stop the speculative synthesis
+                # instead of letting it fill a queue nobody reads (A4.9
+                # review Minor #2).
+                synth_task.cancel()
+            if self._filler_watch_task is asyncio.current_task():
+                self._filler_watch_task = None
 
     async def _maybe_backchannel(self, silence: float, text: str) -> None:
         """Backchannel (应和): during the USER's speech, in a mid-utterance
@@ -4470,6 +4791,7 @@ class VoiceDuplexSession:
             try:
                 text = await self._coalesce_fragments(text)
                 if not text.strip():
+                    self._clear_pending_filler()
                     continue
                 # A queued turn whose utterance was already judged backchannel
                 # (window/cooldown defer + late pre-classify verdict, or a
@@ -4478,6 +4800,7 @@ class VoiceDuplexSession:
                 # 689f06ec: "嗯，没啥，我再跟你聊聊。" persisted after the
                 # real answer, orphaned).
                 if await self._queued_turn_is_backchannel(text):
+                    self._clear_pending_filler()
                     await self._send_json({"event": "backchannel", "text": text})
                     await self._set_state("speak")
                     continue
@@ -4590,18 +4913,11 @@ class VoiceDuplexSession:
             if self._prefetch.get("turn") is not None:
                 self._prefetch = {"turn": None, "text": None, "task": None}
 
-        # Filler prefix: cover the LLM generation time with a random short
-        # phrase ("我来想想啊"…). Skipped when the answer was prefetched (it is
-        # about to speak immediately — a filler would only add delay). The
-        # phrase is an aux item: the consumer cuts it when the real answer's
-        # first audio chunk is ready, so even a fast answer is not delayed.
-        # Fires BEFORE the user-message DB persist: the DB write must never
-        # delay the waiting phrase (2026-08-25). For turns that arrived via
-        # the idle flush block this is usually a no-op — the flush already
-        # converted the speculative prefetch and stamped the cooldown.
-        if prefetched is None:
-            await self._speak_filler()
-
+        # Filler prefix (TTFT-gated, 2026-09-13): no longer spoken here. The
+        # decision lives in `_filler_ttft_watch`, scheduled by the generation
+        # path: it plays only if the model has produced no first content token
+        # within `voice_filler_ttft_threshold_seconds`. The old immediate
+        # `_speak_filler()` call here made every turn open with a filler.
         await self._persist_message("user", text)
 
         # Snapshot of the recent dialogue (before this turn) for the subagent.
@@ -4762,24 +5078,61 @@ class VoiceDuplexSession:
                 "然后询问用户要不要换个方式重试，还是先聊点别的。"
             )
         try:
-            await self._generate_and_speak(prompt_text, allow_tools=True)
+            # No filler for proactive notices: the user asked nothing, so a
+            # "让我想想" opener would be a non-sequitur (pre-TTFT behavior).
+            await self._generate_and_speak(prompt_text, allow_tools=True, allow_filler=False)
         finally:
             self._turn_active = False
             self._tools_running = False
             if not self._closed:
                 await self._set_state("listen")
 
-    async def _generate_and_speak(self, text: str, allow_tools: bool = False, prefetched: Optional[str] = None) -> None:
+    async def _generate_and_speak(self, text: str, allow_tools: bool = False, prefetched: Optional[str] = None,
+                                  allow_filler: bool = True) -> None:
         try:
-            await self._generate_and_speak_impl(text, allow_tools=allow_tools, prefetched=prefetched)
+            await self._generate_and_speak_impl(text, allow_tools=allow_tools, prefetched=prefetched,
+                                                allow_filler=allow_filler)
         finally:
             # vmem：本轮生成结束信号（正常/取消/异常全部到达；记忆插话仲裁
             # 以 "epoch > 钩子时点" 判本轮，超时封顶，等待永远不挂死）。
             self._vmem_gen_done_epoch = self._turn_epoch
             self._vmem_gen_done.set()
+            # TTFT watch lifecycle (A4.9 review Important #1): a generation
+            # that ends WITHOUT content (provider error / empty reply) must not
+            # leave a watch that fires a filler into the silence or over the
+            # user's next utterance. Generations are serialized per session, so
+            # this cannot cancel a newer turn's watch; a watch that already
+            # fired is done and unaffected.
+            self._clear_pending_filler()
 
-    async def _generate_and_speak_impl(self, text: str, allow_tools: bool = False, prefetched: Optional[str] = None) -> None:
+    async def _clarification_shadow(self, text: str) -> None:
+        """B11（2026-09-14）：语音纠正候选 shadow 记录（applied=False，不应用；
+        独立会话，失败静默）。"""
+        try:
+            from app.db.database import AsyncSessionLocal
+            from app.services.memory_clarification_service import process_clarification
+            uid = getattr(self.user, "id", None)
+            if not uid:
+                return
+            async with AsyncSessionLocal() as db:
+                await process_clarification(db, uid, text, shadow=True)
+        except Exception:
+            logger.debug("voice clarification shadow failed", exc_info=True)
+
+    async def _generate_and_speak_impl(self, text: str, allow_tools: bool = False, prefetched: Optional[str] = None,
+                                       allow_filler: bool = True) -> None:
         self._history.append({"role": "user", "content": text})
+        # B11（2026-09-14）：语音纠正 shadow——语音里的"不对/忘掉"过去完全
+        # 不进 clarification（detect_signal 只在 chat.py）。先 shadow 记录
+        # 候选（applied=False）不应用，供准确率观察后再决定是否启用。
+        try:
+            from app.services.memory_clarification_service import detect_signal
+            if text and self.user is not None and detect_signal(text):
+                task = asyncio.create_task(self._clarification_shadow(text))
+                _voice_clarification_tasks.add(task)
+                task.add_done_callback(_voice_clarification_tasks.discard)
+        except Exception:
+            logger.debug("voice clarification shadow scheduling failed", exc_info=True)
         self._task_cancelled = False
         self._turn_msg_id = None
         # This turn's playback-attribution counters start empty: an interrupt
@@ -4815,6 +5168,8 @@ class VoiceDuplexSession:
 
         # Fast path: prefetched text (no tools) -> speak directly.
         if prefetched:
+            self._clear_pending_filler()
+            self._answer_content_epoch = self._turn_epoch
             await self._set_state("speak")
             clean = strip_voice_tags(prefetched)
             await self._send_json({"event": "assistant_text", "text": clean, "done": False})
@@ -4826,6 +5181,15 @@ class VoiceDuplexSession:
             await self._send_json({"event": "assistant_text", "text": clean, "done": True})
             return
 
+        # TTFT-gated filler: schedule the watch BEFORE the first LLM call so
+        # its clock matches "query sent"; it consumes the EoT prefetch (or
+        # falls back to on-demand synthesis) and plays only if no content
+        # token arrives within the threshold (2026-09-13). Proactive notices
+        # pass allow_filler=False (no user question to cover).
+        if allow_filler:
+            self._schedule_filler_ttft_watch()
+        else:
+            self._clear_pending_filler()
         svc, _ = self._build_llm()
         tools = None
         if allow_tools:
@@ -4908,6 +5272,9 @@ class VoiceDuplexSession:
                                 data = ev["data"]
                                 if not _first_content:
                                     _first_content = True
+                                    # TTFT gate: this turn's first content token
+                                    # arrived — the filler watch must suppress.
+                                    self._answer_content_epoch = self._turn_epoch
                                     _perf("llm_ttft", (_now() - _llm_start) * 1000,
                                           round_no=tool_rounds, turn_ms=(_now() - self._turn_started) * 1000)
                                 reply_text += data

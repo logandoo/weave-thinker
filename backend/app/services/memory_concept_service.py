@@ -17,7 +17,7 @@ from app.db.database import (
     MemoryEpisode,
     ConceptClusterMember,
 )
-from app.services.memory_embedding_service import embed_text, _emb_to_pgvector
+from app.services.memory_embedding_service import embed_text, _emb_to_pgvector, _get_embedding_model
 from app.services.memory_security import scrub_pii, scan_injection
 
 config = get_config()
@@ -98,6 +98,7 @@ async def get_clusters_for_extraction(db: AsyncSession, user_id: str, limit: int
 async def extract_concepts_from_recurrence(
     db: AsyncSession, user_id: str, llm_output: dict, source_unit_ids: list[str],
     raw_texts: list[str],
+    promoted_unit_ids: list[str] | None = None,
 ) -> tuple[list[str], Optional[str]]:
     concept_ids: list[str] = []
     episode_id: Optional[str] = None
@@ -115,6 +116,17 @@ async def extract_concepts_from_recurrence(
     if epic_data and epic_data.get("narrative"):
         episode_id = await _handle_episode_from_extraction(db, user_id, epic_data, source_unit_ids, concept_ids)
 
+    # D1（2026-09-14，默认关）：同源共现的确定性构边（幂等；edge_source='deterministic'；
+    # 读侧白名单门控见 memory_retrieval_service stage2）。开关关时零行为变化。
+    if config.memory_retrieval.get("deterministic_edges_enabled", False) and concept_ids:
+        try:
+            from app.services.memory_cluster_service import build_deterministic_edges
+            await build_deterministic_edges(
+                db, user_id, concept_ids, episode_id=episode_id,
+                source_unit_ids=source_unit_ids)
+        except Exception:
+            logger.debug("deterministic edge build failed", exc_info=True)
+
     # §5.1.d step 4：同步 total_concept_count / total_episode_count
     await db.execute(
         text("""UPDATE user_agent_states SET
@@ -123,6 +135,15 @@ async def extract_concepts_from_recurrence(
             WHERE user_id = :uid"""),
         {"uid": user_id},
     )
+
+    # B3（2026-09-14）：晋升标记与概念/事件在同一事务提交——旧实现在 caller
+    # 于本函数 commit 之后才标记 promoted，中途取消/崩溃会留下"概念已建、
+    # 单元未标"，下轮重复抽取同一单元。
+    if promoted_unit_ids:
+        await db.execute(
+            text("UPDATE subconscious_log SET promoted = TRUE, promoted_at = NOW() WHERE id = ANY(:ids)"),
+            {"ids": promoted_unit_ids},
+        )
 
     await db.commit()
     return concept_ids, episode_id
@@ -148,19 +169,28 @@ async def _handle_episode_from_extraction(
     if merge_with and isinstance(merge_with, str):
         target = await db.get(MemoryEpisode, merge_with)
         if target is not None and target.user_id == user_id:
-            await merge_episode(db, merge_with, narrative, source_unit_ids)
+            await merge_episode(
+                db, merge_with, narrative, source_unit_ids,
+                participants=epic_data.get("participants"),
+                locations=epic_data.get("locations"))
             return merge_with
         logger.warning("merge_with_episode_id rejected (missing or cross-user): %s", merge_with)
 
     # §4.9 merge-first：LLM 未给 merge id 时，按 sim≥0.85 最近邻 in-place 合并
     try:
-        merged_id = await merge_first(db, user_id, narrative, source_unit_ids)
+        merged_id = await merge_first(
+            db, user_id, narrative, source_unit_ids,
+            participants=epic_data.get("participants"),
+            locations=epic_data.get("locations"))
         if merged_id:
             return merged_id
     except Exception:
         logger.debug("merge_first failed, fallback to create", exc_info=True)
 
-    eid = await create_episode(db, user_id, narrative, valid_from, source_unit_ids, concept_ids)
+    eid = await create_episode(
+        db, user_id, narrative, valid_from, source_unit_ids, concept_ids,
+        participants=epic_data.get("participants"),
+        locations=epic_data.get("locations"))
     return eid
 
 
@@ -188,6 +218,17 @@ async def _process_single_concept(
     if scan:
         logger.warning("Concept creation blocked for user %s: %s", user_id, scan)
         return None
+
+    # B8 shadow（2026-09-14）：aliases / cluster_suggestion 旧实现完全不扫——
+    # 先记录命中不拒绝（观察误报率后再决定 enforce）。
+    try:
+        aliases_probe = aliases if isinstance(aliases, str) else json.dumps(aliases, ensure_ascii=False)
+        for _field, _val in (("aliases", aliases_probe), ("cluster_suggestion", str(cluster_suggestion or ""))):
+            _hit = scan_injection(_val)
+            if _hit:
+                logger.warning("memory shadow scan hit (%s) user=%s: %s", _field, user_id, _hit)
+    except Exception:
+        logger.debug("shadow scan failed", exc_info=True)
 
     weight_init = float(config.memory_concept.get("weight_init", 0.5))
     weight_evidence = float(config.memory_concept.get("weight_evidence_boost", 0.03))
@@ -229,8 +270,14 @@ async def _process_single_concept(
                 # §5.3.5 Silent Maturation 路径 #1：窗口内二次 recurrence → 升 active
                 existing.activation_strength = 1.0
                 existing.status = "active"
-            existing.embedding = await _generate_embedding(canonical_name, aliases, desc_safe)
-            existing.embedding_updated_at = now
+            # B7（2026-09-14）：瞬时嵌入失败不得用 NULL 覆盖已有向量——仅在新
+            # 向量可用时替换（旧实现无条件赋值 None + 刷新时间戳 → 概念从
+            # stage3 向量检索消失且无修复路径）。
+            new_emb = await _generate_embedding(canonical_name, aliases, desc_safe)
+            if new_emb:
+                existing.embedding = new_emb
+                existing.embedding_updated_at = now
+                existing.embedding_model = _get_embedding_model()
             existing.updated_at = now
 
             existing_source_ids = _parse_json_array(existing.source_unit_ids)
@@ -275,7 +322,8 @@ async def _process_single_concept(
         recurrence_count=1,
         last_recurrence_at=now,
         embedding=emb,
-        embedding_updated_at=now,
+        embedding_updated_at=now if emb else None,
+        embedding_model=_get_embedding_model() if emb else None,
     )
     db.add(concept)
     await db.flush()
@@ -318,6 +366,49 @@ async def _generate_embedding(name: str, aliases: list, short_desc: str) -> Opti
     aliases_str = " ".join(aliases) if aliases else ""
     text = f"{name} {aliases_str} {short_desc}".strip()
     return await embed_text(text)
+
+
+async def repair_missing_embeddings(db: AsyncSession, user_id: str, limit: int = 20) -> int:
+    """B7（2026-09-14）：补嵌 embedding=NULL 的概念与事件（有界；端点不可用时保留待下轮）。
+
+    旧实现只在复活路径补嵌，merge 失败造成的 NULL 无修复路径（DB 26/1401）。
+    """
+    fixed = 0
+    rows = (await db.execute(
+        text("SELECT id, canonical_name, aliases, description_short FROM memory_concepts "
+             "WHERE user_id = :uid AND embedding IS NULL AND valid_to IS NULL "
+             "ORDER BY created_at ASC LIMIT :lim"),
+        {"uid": user_id, "lim": limit},
+    )).fetchall()
+    for cid, name, aliases_raw, short in rows:
+        emb = await _generate_embedding(name or "", _parse_json_array(aliases_raw), short or "")
+        if not emb:
+            break
+        await db.execute(
+            text("UPDATE memory_concepts SET embedding = CAST(:emb AS vector), "
+                 "embedding_updated_at = NOW(), embedding_model = :m WHERE id = :id"),
+            {"emb": _emb_to_pgvector(emb), "m": _get_embedding_model(), "id": cid},
+        )
+        fixed += 1
+
+    epi_rows = (await db.execute(
+        text("SELECT id, narrative FROM memory_episodes "
+             "WHERE user_id = :uid AND embedding IS NULL AND valid_to IS NULL "
+             "ORDER BY created_at ASC LIMIT :lim"),
+        {"uid": user_id, "lim": limit},
+    )).fetchall()
+    for eid, narrative in epi_rows:
+        if not narrative:
+            continue
+        emb = await embed_text(narrative)
+        if not emb:
+            break
+        await db.execute(
+            text("UPDATE memory_episodes SET embedding = CAST(:emb AS vector), embedding_model = :m WHERE id = :id"),
+            {"emb": _emb_to_pgvector(emb), "m": _get_embedding_model(), "id": eid},
+        )
+        fixed += 1
+    return fixed
 
 
 async def _ensure_cluster_membership(
@@ -414,6 +505,7 @@ async def create_concept(
         importance_evaluated=True,
         embedding=emb,
         embedding_updated_at=datetime.utcnow() if emb else None,
+        embedding_model=_get_embedding_model() if emb else None,
     )
     db.add(concept)
     await db.flush()
@@ -433,6 +525,7 @@ async def update_concept_description(
     if emb:
         concept.embedding = emb
         concept.embedding_updated_at = datetime.utcnow()
+        concept.embedding_model = _get_embedding_model()
         _update_bm25_on_concept_change(concept_id, concept.user_id, concept.canonical_name, concept.aliases or "[]", concept.description_full or "")
     concept.updated_at = datetime.utcnow()
     await db.flush()
@@ -459,6 +552,7 @@ async def merge_concepts(db: AsyncSession, kept_id: str, merged_id: str) -> bool
     if emb:
         kept.embedding = emb
         kept.embedding_updated_at = datetime.utcnow()
+        kept.embedding_model = _get_embedding_model()
 
     merged.valid_to = datetime.utcnow()
     merged.superseded_by = kept_id

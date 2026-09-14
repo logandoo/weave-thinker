@@ -11,10 +11,144 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_config
-from app.services.memory_embedding_service import _emb_from_db, embed_text, _emb_to_pgvector
+from app.services.memory_embedding_service import _emb_from_db, embed_text, _emb_to_pgvector, _get_embedding_model
 
 config = get_config()
 logger = logging.getLogger(__name__)
+
+# B4（2026-09-14）：连续失败上限与重试间隔——未达上限保持水位（到点重试），
+# 达上限推进水位并保留错误记录（防无限重试风暴）
+_MAX_CONSECUTIVE_FAILURES = 3
+_CONSOLIDATION_RETRY_DELAY_MINUTES = 5
+
+
+def _consolidation_failure_action(failures: int, max_failures: int = _MAX_CONSECUTIVE_FAILURES) -> str:
+    """B4 失败处置纯函数："hold"=保持水位重试；"advance"=达上限推进+留错误记录。"""
+    return "hold" if failures < max_failures else "advance"
+
+
+import re as _re
+
+
+def _fast_merge_name_safe(name_a: str, name_b: str) -> bool:
+    """D3 快路径名称安全守卫（2026-09-14 sweep 发现）：数字/日期序列不同的
+    近邻（模板型记忆，如「每日任务执行记录（9月1日）vs（9月3日）」）**不得**
+    无 LLM 直接合并——必须走灰区 LLM 判定。其余要求名称包含或二元组
+    Jaccard ≥ 0.7（近重复名）。"""
+    a, b = str(name_a or "").strip(), str(name_b or "").strip()
+    if not a or not b:
+        return False
+    if _re.findall(r"\d+", a) != _re.findall(r"\d+", b):
+        return False
+    # 去虚词/空白后再比较（「用户的工作偏好」≈「用户工作偏好」）
+    na = _re.sub(r"[的地得\s]+", "", a)
+    nb = _re.sub(r"[的地得\s]+", "", b)
+    if na and nb and (na in nb or nb in na):
+        return True
+    def _grams(s: str) -> set:
+        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 1 else ({s} if s else set())
+    ga, gb = _grams(na), _grams(nb)
+    if not ga or not gb:
+        return False
+    return len(ga & gb) / len(ga | gb) >= 0.7
+
+
+def _d3_fast_path_enabled() -> bool:
+    """D3 门控读取（A4.9 复评 Important：键在 [memory.retrieval]，原读 [memory] 不可达）。"""
+    return bool(config.memory_retrieval.get("merge_fast_path_enabled", False))
+
+
+def _d3_mst_enabled() -> bool:
+    return bool(config.memory_retrieval.get("merge_mst_enabled", False))
+
+
+def _d3_gray_zone_low() -> float:
+    return float(config.memory_retrieval.get("merge_gray_zone_low", 0.03))
+
+
+def _merge_pair_action(dist, low: float, thresh: float) -> str:
+    """D3 灰区路由纯函数（A4.9 Minor）：'fast'（<low，无 LLM）/ 'llm'（灰区）/
+    'skip'（≥thresh，不合并）。dist 为 None 时按最远处理（'skip' 语义外的保守路由）。"""
+    if dist is None:
+        return "skip"
+    try:
+        d = float(dist)
+    except (TypeError, ValueError):
+        return "skip"
+    if d < low:
+        return "fast"
+    if d < thresh:
+        return "llm"
+    return "skip"
+
+
+def _order_pairs_mst(pairs: list, a_idx: int, b_idx: int, dist_idx: int) -> list:
+    """D3（默认关）：候选对 MST 近似排序——优先两端度数之和低的配对（避免 hub
+    合并），同度按 cosine 距离升序（最相似先合并）。纯函数，输入为可下标序列。"""
+    deg: dict = {}
+    for p in pairs:
+        deg[p[a_idx]] = deg.get(p[a_idx], 0) + 1
+        deg[p[b_idx]] = deg.get(p[b_idx], 0) + 1
+
+    def _key(p):
+        try:
+            dist = float(p[dist_idx])
+        except (TypeError, ValueError, IndexError):
+            dist = 1.0
+        return (deg.get(p[a_idx], 0) + deg.get(p[b_idx], 0), dist)
+
+    return sorted(pairs, key=_key)
+
+
+async def _load_meta_locked(db: AsyncSession, user_id: str) -> tuple[str | None, dict]:
+    r = await db.execute(
+        text("SELECT id, metadata_json FROM user_agent_states WHERE user_id = :uid FOR UPDATE"),
+        {"uid": user_id},
+    )
+    row = r.fetchone()
+    if not row:
+        return None, {}
+    try:
+        meta = json.loads(row[1]) if row[1] else {}
+    except (json.JSONDecodeError, TypeError):
+        meta = {}
+    return row[0], meta
+
+
+async def _bump_consolidation_failure(db: AsyncSession, user_id: str) -> int:
+    state_id, meta = await _load_meta_locked(db, user_id)
+    if state_id is None:
+        return 0
+    failures = int(meta.get("consolidation_failures", 0)) + 1
+    meta["consolidation_failures"] = failures
+    meta["consolidation_retry_after"] = (
+        datetime.utcnow() + timedelta(minutes=_CONSOLIDATION_RETRY_DELAY_MINUTES)
+    ).isoformat()
+    meta["consolidation_last_error"] = "step failure (see logs)"
+    await db.execute(
+        text("UPDATE user_agent_states SET metadata_json = :meta WHERE id = :sid"),
+        {"meta": json.dumps(meta, ensure_ascii=False), "sid": state_id},
+    )
+    return failures
+
+
+async def _clear_consolidation_failure(db: AsyncSession, user_id: str, keep_error: bool = False) -> None:
+    state_id, meta = await _load_meta_locked(db, user_id)
+    if state_id is None:
+        return
+    changed = False
+    for key in ("consolidation_failures", "consolidation_retry_after"):
+        if key in meta:
+            meta.pop(key)
+            changed = True
+    if not keep_error and "consolidation_last_error" in meta:
+        meta.pop("consolidation_last_error")
+        changed = True
+    if changed:
+        await db.execute(
+            text("UPDATE user_agent_states SET metadata_json = :meta WHERE id = :sid"),
+            {"meta": json.dumps(meta, ensure_ascii=False), "sid": state_id},
+        )
 
 
 def _sanitize_dream_date(candidate, today: str) -> str:
@@ -74,6 +208,21 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
     if not had_failure:
         # 任一步骤失败即不在部分回滚状态上跑主动 Dreaming（§9.3 隔离原则）
         await _try_active_dreaming(db, user_id)
+        await _clear_consolidation_failure(db, user_id)
+    else:
+        failures = await _bump_consolidation_failure(db, user_id)
+        if _consolidation_failure_action(failures) == "hold":
+            logger.warning(
+                "consolidation had failures (%d consecutive, < %d), watermark kept for retry in %d min",
+                failures, _MAX_CONSECUTIVE_FAILURES, _CONSOLIDATION_RETRY_DELAY_MINUTES,
+            )
+            await db.commit()
+            return result
+        logger.error(
+            "consolidation failed %d consecutive times; advancing watermark with error record",
+            failures,
+        )
+        await _clear_consolidation_failure(db, user_id, keep_error=True)
 
     await db.execute(
         text("UPDATE user_agent_states SET last_consolidation_at = NOW() WHERE user_id = :uid"),
@@ -85,15 +234,35 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
 
 async def _get_agent_state(db: AsyncSession, user_id: str) -> dict | None:
     result = await db.execute(
-        text("SELECT last_consolidation_at, total_concept_count FROM user_agent_states WHERE user_id = :uid"),
+        text("SELECT last_consolidation_at, total_concept_count, metadata_json FROM user_agent_states WHERE user_id = :uid"),
         {"uid": user_id},
     )
     row = result.fetchone()
-    return {"last_consolidation_at": row[0], "total_concept_count": row[1]} if row else None
+    if not row:
+        return None
+    meta: dict = {}
+    if row[2]:
+        try:
+            parsed = json.loads(row[2])
+            meta = parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+    return {"last_consolidation_at": row[0], "total_concept_count": row[1], "meta": meta}
 
 
 async def _should_consolidate(db: AsyncSession, user_id: str, state: dict) -> bool:
-    """§5.5 事件驱动 + 时间兜底：概念变更数 ≥ threshold 或距上次 ≥ 48h。"""
+    """§5.5 事件驱动 + 时间兜底：概念变更数 ≥ threshold 或距上次 ≥ 48h。
+
+    B4（2026-09-14）：失败重试优先——metadata.consolidation_retry_after 到点即
+    返回 True（失败后 5 分钟重试），不再被"≥20 概念/48h"门槛压住。
+    """
+    retry_after = state.get("meta", {}).get("consolidation_retry_after")
+    if retry_after:
+        try:
+            if datetime.utcnow() >= datetime.fromisoformat(retry_after):
+                return True
+        except (ValueError, TypeError):
+            pass
     threshold = int(config.memory.get("consolidation_trigger_threshold", 20))
     max_hours = int(config.memory.get("consolidation_max_interval_hours", 48))
     last = state["last_consolidation_at"]
@@ -125,7 +294,8 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
             SELECT a.id AS a_id, a.canonical_name AS a_name, a.description_short AS a_short,
                    a.source_trust AS a_trust, a.weight AS a_weight,
                    b.id AS b_id, b.canonical_name AS b_name, b.description_short AS b_short,
-                   b.source_trust AS b_trust, b.weight AS b_weight
+                   b.source_trust AS b_trust, b.weight AS b_weight,
+                   (a.embedding <=> b.embedding) AS dist
             FROM memory_concepts a
             CROSS JOIN LATERAL (
                 SELECT id, canonical_name, description_short, source_trust, weight, embedding
@@ -153,7 +323,8 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
     epi_pairs_r = await db.execute(
         text("""
             SELECT a.id AS a_id, a.narrative AS a_narr, a.valid_from AS a_vf,
-                   b.id AS b_id, b.narrative AS b_narr, b.valid_from AS b_vf
+                   b.id AS b_id, b.narrative AS b_narr, b.valid_from AS b_vf,
+                   (a.embedding <=> b.embedding) AS dist
             FROM memory_episodes a
             CROSS JOIN LATERAL (
                 SELECT id, narrative, valid_from, embedding
@@ -174,6 +345,36 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
         {"uid": user_id, "thresh": dedup_thresh},
     )
     epi_pairs = epi_pairs_r.fetchall()
+
+    if not concept_pairs and not epi_pairs:
+        return
+
+    # D3（2026-09-14，默认关）：cosine-gated max-member 快路径——距离 < gray_zone_low
+    # 的对无 LLM 直接合并（保留 trust/weight 较优成员）；灰区对仍走 LLM。
+    if _d3_fast_path_enabled() and concept_pairs:
+        low = _d3_gray_zone_low()
+        from app.services.memory_concept_service import merge_concepts
+        remaining = []
+        for r in concept_pairs:
+            dist = r[10] if r[10] is not None else None
+            if (_merge_pair_action(dist, low, dedup_thresh) == "fast"
+                    and _fast_merge_name_safe(r[1], r[6])):
+                a_trust, a_w, b_trust, b_w = r[3], r[4], r[8], r[9]
+                keep_a = a_trust in ("user_stated", "user_authored") or (a_w or 0) >= (b_w or 0)
+                kept_id, merged_id = (r[0], r[5]) if keep_a else (r[5], r[0])
+                try:
+                    if await merge_concepts(db, kept_id, merged_id):
+                        result["dedup_merged"] += 1
+                        continue
+                except Exception:
+                    logger.debug("fast-path merge failed %s<-%s", kept_id, merged_id, exc_info=True)
+            remaining.append(r)
+        concept_pairs = remaining
+
+    # D3（默认关）：MST 度罚排序（优先低度数端点对，避免 hub 合并；同度按距离升序）
+    if _d3_mst_enabled():
+        concept_pairs = _order_pairs_mst(list(concept_pairs), 0, 5, 10)
+        epi_pairs = _order_pairs_mst(list(epi_pairs), 0, 3, 6)
 
     if not concept_pairs and not epi_pairs:
         return
@@ -206,6 +407,14 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                 resp = "\n".join(l for l in resp.split("\n") if not l.lstrip().startswith("```"))
             parsed = json.loads(resp)
             merges = {m.get("pair"): m for m in parsed.get("merges", []) if isinstance(m, dict)}
+            # A4a（2026-09-14）：写路径 LLM 调用入账（计费类）
+            # A4.9 修复 F2：savepoint 隔离，入账失败不毒化合并事务
+            try:
+                from app.services.memory_cost_governance_service import record_llm_call
+                async with db.begin_nested():
+                    await record_llm_call(db, user_id, "consolidation_dedup", billing_class="write")
+            except Exception:
+                logger.debug("record consolidation_dedup call failed", exc_info=True)
         except Exception:
             logger.warning("concept dedup LLM batch failed", exc_info=True)
             continue
@@ -248,6 +457,14 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                 resp = "\n".join(l for l in resp.split("\n") if not l.lstrip().startswith("```"))
             parsed = json.loads(resp)
             merges = {m.get("pair"): m for m in parsed.get("merges", []) if isinstance(m, dict)}
+            # A4a（2026-09-14）：写路径 LLM 调用入账（计费类）
+            # A4.9 修复 F2：savepoint 隔离，入账失败不毒化合并事务
+            try:
+                from app.services.memory_cost_governance_service import record_llm_call
+                async with db.begin_nested():
+                    await record_llm_call(db, user_id, "consolidation_dedup", billing_class="write")
+            except Exception:
+                logger.debug("record consolidation_dedup call failed", exc_info=True)
         except Exception:
             logger.warning("episode dedup LLM batch failed", exc_info=True)
             continue
@@ -265,7 +482,9 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                 if merged_narr:
                     emb = await embed_text(merged_narr)
                     await db.execute(
-                        text("""UPDATE memory_episodes SET narrative = :n, embedding = CAST(:emb AS vector),
+                        text("""UPDATE memory_episodes SET narrative = :n,
+                                embedding = COALESCE(CAST(:emb AS vector), embedding),
+                                embedding_model = COALESCE(:m, embedding_model),
                                 source_unit_ids = (
                                     SELECT jsonb_agg(DISTINCT x) FROM (
                                         SELECT jsonb_array_elements_text(source_unit_ids::jsonb) AS x
@@ -274,8 +493,15 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                                 )::text,
                                 updated_at = NOW() WHERE id = :kept"""),
                         {"n": merged_narr, "emb": _emb_to_pgvector(emb) if emb else None,
-                         "kept": kept_id, "merged": merged_id},
+                         "kept": kept_id, "merged": merged_id,
+                         "m": _get_embedding_model() if emb else None},
                     )
+                    # B1（2026-09-14）：合并后的叙事更新进 episode BM25 索引
+                    try:
+                        from app.services.memory_bm25 import update_episode_index
+                        update_episode_index(user_id, kept_id, merged_narr)
+                    except Exception:
+                        logger.debug("episode bm25 index update failed", exc_info=True)
                 await db.execute(
                     text("UPDATE memory_episodes SET valid_to = NOW(), superseded_by = :kept, updated_at = NOW() WHERE id = :merged"),
                     {"kept": kept_id, "merged": merged_id},
@@ -408,6 +634,14 @@ async def _update_relations(db: AsyncSession, user_id: str, result: dict) -> Non
         relations = json.loads(resp)
         if not isinstance(relations, list):
             return
+        # A4a（2026-09-14）：写路径 LLM 调用入账（计费类）
+        # A4.9 修复 F2：savepoint 隔离，入账失败不毒化关系提取事务
+        try:
+            from app.services.memory_cost_governance_service import record_llm_call
+            async with db.begin_nested():
+                await record_llm_call(db, user_id, "consolidation_relations", billing_class="write")
+        except Exception:
+            logger.debug("record consolidation_relations call failed", exc_info=True)
     except Exception:
         logger.warning("relation extraction LLM failed", exc_info=True)
         return

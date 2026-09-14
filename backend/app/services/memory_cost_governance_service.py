@@ -22,7 +22,15 @@ _user_degrade_state: dict[str, int] = {}
 async def record_llm_call(
     db: AsyncSession, user_id: str, kind: str, model: str = "",
     prompt_tokens: int = 0, completion_tokens: int = 0,
+    billing_class: str = "write",
 ) -> None:
+    """记录一次记忆 LLM 调用。
+
+    DC1（2026-09-14）：`billing_class` 区分计费/遥测——只有 'write'（写路径，
+    含澄清/画像/合并等真实记忆加工）进入成本治理降级口径；'read'（读热路径
+    如 stage0 查询展开）只落账供观测，不参与降级（否则读路径流量会把用户
+    直接推入降级梯子）。
+    """
     if not config.memory.get("cost_governance_enabled", True):
         return
     call = MemoryLLMCall(
@@ -32,9 +40,28 @@ async def record_llm_call(
         model=model or "",
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        billing_class=billing_class,
     )
     db.add(call)
     await db.flush()
+
+
+async def record_llm_call_bg(user_id: str, kind: str, billing_class: str = "read") -> None:
+    """独立短会话记录（读热路径遥测专用，A4.9 修复 F1/F2，2026-09-14）。
+
+    - F1：读路径所在请求会话在 chat.py 关闭时不提交 → 直接 flush 的遥测行会
+      被丢弃；本函数用独立会话 commit，保证"只落账供观测"真正兑现。
+    - F2：遥测 INSERT 失败不得毒化调用方事务（needs-rollback 会让后续检索
+      查询抛 PendingRollbackError → 记忆注入整段丢失）；独立会话隔离。
+    - 失败静默（遥测不阻塞业务）；调用方负责 create_task 保引用。
+    """
+    try:
+        from app.db.database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await record_llm_call(session, user_id, kind, billing_class=billing_class)
+            await session.commit()
+    except Exception:
+        logger.debug("record_llm_call_bg failed user=%s kind=%s", user_id, kind, exc_info=True)
 
 
 async def _load_cg_meta(db: AsyncSession, user_id: str) -> dict:
@@ -105,14 +132,14 @@ async def check_user_threshold_and_degrade(db: AsyncSession, user_id: str) -> in
     degrade_steps = cg.get("degrade_steps", [])
 
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=rolling_days)},
     )
     total_calls = result.scalar() or 0
     daily_avg = total_calls / rolling_days
 
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=1)},
     )
     today_calls = result.scalar() or 0
@@ -192,12 +219,12 @@ async def get_user_degrade_status(db: AsyncSession, user_id: str) -> dict:
     last_change = cg_meta.get("last_change", "")
 
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=rolling_days)},
     )
     total_calls = result.scalar() or 0
     result = await db.execute(
-        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since"),
+        text("SELECT COUNT(*) FROM memory_llm_calls WHERE user_id = :uid AND created_at >= :since AND COALESCE(billing_class, 'write') = 'write'"),
         {"uid": user_id, "since": datetime.utcnow() - timedelta(days=1)},
     )
     today_calls = result.scalar() or 0

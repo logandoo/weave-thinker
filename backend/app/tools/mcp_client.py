@@ -15,6 +15,24 @@ from app.core.config import get_config
 from app.services.http_client import get_shared_async_client
 
 logger = logging.getLogger(__name__)
+
+# F5/H11（2026-09-14）：stdio 子进程环境白名单（只收紧子进程，不影响主进程）
+_SAFE_ENV_KEYS = (
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+    "TMPDIR", "TEMP", "TMP", "USER", "LOGNAME", "SHELL",
+    "SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+    "NODE_PATH", "VIRTUAL_ENV", "PYTHONUNBUFFERED",
+)
+
+
+def _child_env(extra: dict | None = None) -> dict:
+    """白名单环境 + 服务器显式 env（凭据类变量不随 os.environ 外泄）。"""
+    base = {k: os.environ[k] for k in _SAFE_ENV_KEYS if k in os.environ}
+    if extra:
+        base.update({str(k): str(v) for k, v in extra.items()})
+    return base
 config = get_config()
 
 try:
@@ -146,8 +164,9 @@ class _StdioSession:
         return self.proc is not None and self.proc.returncode is None
 
     async def start(self) -> None:
-        merged_env = dict(os.environ)
-        merged_env.update(self.env)
+        # F5/H11（2026-09-14）：子进程 env 白名单——不再继承整个 os.environ
+        # （防 API key/凭据泄漏进第三方 MCP 进程）；服务器显式 env 仍合并。
+        merged_env = _child_env(self.env)
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 *self.command,

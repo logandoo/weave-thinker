@@ -29,6 +29,8 @@ def _user_response(user) -> UserResponse:
         username=user.username,
         created_at=user.created_at.isoformat(),
         agent_permissions=parse_permissions(user),
+        nickname=getattr(user, "nickname", None) or None,
+        avatar_data=getattr(user, "avatar_data", None) or None,
     )
 
 

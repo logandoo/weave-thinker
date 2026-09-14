@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import json
 import re as _re
 import time as _time
 from typing import Any, Dict, List, Optional
@@ -9,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from app.core.config import get_config
 from app.db.database import Assistant, UserWorkspace
 from app.services.llm_service import LLMService
-from app.services.memory_service import AgentSharedContext, build_shared_agent_context
+from app.services.memory_service import AgentSharedContext
 from app.tools.memory import _get_memory_path, _read_entries
 
 config = get_config()
@@ -156,6 +157,32 @@ def should_use_custom_model(assistant: Optional[Assistant]) -> bool:
     return bool(assistant.use_custom_model)
 
 
+def _memory_injection_sections(shared_context) -> List[str]:
+    """记忆注入段（v2 检索上下文经 memory_summary 字段透传）。
+
+    A3/F1（2026-09-14）：**不在此处截断**——注入预算的唯一权威是检索服务
+    （`memory_retrieval_service._apply_token_budget`，默认 2000）。旧实现
+    `[:1500]` 字符硬截断静默覆盖检索侧预算，违反「信息完整性 > 节省 token」
+    原则（前案 F3 / 本波验收 A3）。v1 兜底路径（`_fallback_context`）在读取
+    侧已各自截 2000 字符。
+    """
+    sections: List[str] = []
+    if shared_context.memory_summary:
+        sections.append("共享长期记忆:\n" + shared_context.memory_summary.strip())
+    if shared_context.dream_summary:
+        sections.append("近期 dream:\n" + shared_context.dream_summary.strip())
+    if shared_context.memory_entries:
+        memory_lines = []
+        for entry in shared_context.memory_entries[: min(config.agent_memory_max_items, 8)]:
+            title = entry.title or entry.source_type
+            content = entry.content.strip()
+            if len(content) > 250:
+                content = content[:250] + "..."
+            memory_lines.append(f"- {title}: {content}")
+        sections.append("可参考的记忆条目（仅当与当前对话主题相关时参考）:\n" + "\n".join(memory_lines))
+    return sections
+
+
 class AgentService:
     _llm_cache: Dict[tuple, LLMService] = {}
 
@@ -237,11 +264,23 @@ class AgentService:
             # A4.9 复审 R2 Minor：同凭据不同格式的端点不得共享缓存实例
             # （endpoint 元数据随首个构建者，provider_type 必须入键）
             (ep.provider_type or ""),
+            # 2026-09-13 A4.9 Critical 修复：params/extra.user_params/is_custom 入键。
+            # 否则"仅覆盖 model/params"的用户端点与系统端点同键——系统实例先建则
+            # 用户参数被静默忽略；用户实例先建则后续无覆盖用户复用其采样参数
+            # （跨用户污染）。缓存实例持有首个构建者的 endpoint 元数据，必须按
+            # 全部行为相关字段区分。
+            json.dumps(ep.params or {}, sort_keys=True, default=str),
+            json.dumps((ep.extra or {}).get("user_params") or {}, sort_keys=True, default=str),
+            bool(ep.is_custom),
         )
         if cache_key not in AgentService._llm_cache:
             AgentService._llm_cache[cache_key] = factory.build_llm_service(
                 ep, preserve_reasoning=_preserve
             )
+            # A4.9 Minor 修复（2026-09-13）：容量上限（用户级覆盖会引入更多
+            # 端点组合；FIFO 淘汰最旧实例，防进程生命周期内无界增长）。
+            while len(AgentService._llm_cache) > 64:
+                AgentService._llm_cache.pop(next(iter(AgentService._llm_cache)), None)
         return AgentService._llm_cache[cache_key]
 
     def create_iteration_llm_service(
@@ -654,22 +693,9 @@ class AgentService:
             f"当前时间: {now.strftime('%Y年%m月%d日 %H:%M:%S')} (北京时间, {now.strftime('%A')})"
         )
 
-        # 记忆注入截断（二期验收达标）：summary/dream 保留 75%（1500 chars），
-        # 条目取前 min(max_items, 8) 条、每条 250 chars。完整记忆仍可由
-        # memory 工具/检索子系统按需获取，注入层只负责最相关摘要。
-        if shared_context.memory_summary:
-            dynamic_sections.append("共享长期记忆:\n" + shared_context.memory_summary.strip()[:1500])
-        if shared_context.dream_summary:
-            dynamic_sections.append("近期 dream:\n" + shared_context.dream_summary.strip()[:1500])
-        if shared_context.memory_entries:
-            memory_lines = []
-            for entry in shared_context.memory_entries[: min(config.agent_memory_max_items, 8)]:
-                title = entry.title or entry.source_type
-                content = entry.content.strip()
-                if len(content) > 250:
-                    content = content[:250] + "..."
-                memory_lines.append(f"- {title}: {content}")
-            dynamic_sections.append("可参考的记忆条目（仅当与当前对话主题相关时参考）:\n" + "\n".join(memory_lines))
+        # 记忆注入（A3/F1，2026-09-14）：预算唯一权威在检索服务，此处不截断；
+        # 条目取前 min(max_items, 8) 条、每条 250 chars（v1 条目层保留）。
+        dynamic_sections.extend(_memory_injection_sections(shared_context))
 
         dynamic_sections.append(f"用户工作区根目录（仅供参考）: {workspace.root_path}")
 

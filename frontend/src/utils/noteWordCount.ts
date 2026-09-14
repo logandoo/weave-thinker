@@ -39,3 +39,26 @@ export function countNoteText(text: string): NoteWordCount {
     latinWords,
   }
 }
+
+/**
+ * Visible editor text for counting (R3, 2026-09-13 audit F-B): innerText
+ * includes KaTeX's visually-hidden MathML + TeX annotation, so a formula
+ * would be counted ~3x. Hide those layers for the synchronous read (restored
+ * immediately) so only the visible rendering contributes. Single source for
+ * both editors — previously duplicated verbatim in NoteEditor and
+ * ZenNotePanel.
+ */
+export function visibleEditorText(container: HTMLElement): string {
+  const hidden: HTMLElement[] = []
+  container.querySelectorAll<HTMLElement>('.katex-mathml, .math-controls').forEach((el) => {
+    hidden.push(el)
+    el.dataset.wcPrevDisplay = el.style.display
+    el.style.display = 'none'
+  })
+  const text = container.innerText || ''
+  hidden.forEach((el) => {
+    el.style.display = el.dataset.wcPrevDisplay || ''
+    delete el.dataset.wcPrevDisplay
+  })
+  return text
+}

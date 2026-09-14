@@ -515,8 +515,9 @@ async def reconcile_migration(db: AsyncSession, user_id: str) -> dict:
             try:
                 if emb:
                     await db.execute(
-                        text("UPDATE memory_concepts SET embedding = CAST(:emb AS vector), embedding_updated_at = NOW() WHERE id = :id"),
-                        {"emb": _emb_to_pgvector(emb), "id": row[0]},
+                        text("UPDATE memory_concepts SET embedding = CAST(:emb AS vector), embedding_updated_at = NOW(), embedding_model = :m WHERE id = :id"),
+                        {"emb": _emb_to_pgvector(emb), "id": row[0],
+                         "m": _get_embedding_model()},
                     )
             except Exception:
                 pass

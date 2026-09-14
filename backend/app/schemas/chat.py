@@ -159,6 +159,9 @@ class UserResponse(BaseModel):
     username: str
     created_at: str
     agent_permissions: Optional[Dict[str, Any]] = None
+    # 用户信息（2026-09-13）：昵称 + 头像 data URL（未设置为 None）。
+    nickname: Optional[str] = None
+    avatar_data: Optional[str] = None
 
 
 class LoginRequest(BaseModel):

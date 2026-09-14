@@ -110,6 +110,15 @@ def apply_hotword_phonetic_correction(text: str, hotwords: Optional[list]) -> st
     return "".join(chars)
 
 
+def _general_auth_headers(api_key: str) -> dict:
+    """通用 HTTP ASR 路径的鉴权头（A4.9 R2 复审修复）。
+
+    自定义 URL 时 api_key = 用户填写或空；空则不发 Authorization。
+    系统通用端点携带自己的端点 Key（同 URL 语义，无外泄）。
+    """
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
 class ASRService:
     @property
     def _asr_config(self) -> dict:
@@ -649,10 +658,15 @@ class ASRService:
         }
         if custom_hotwords:
             data["custom_hotwords"] = json.dumps(custom_hotwords, ensure_ascii=False)
+        # 用户级 ASR 覆盖（2026-09-13 A4.9 复审修复）：通用 HTTP 路径必须按
+        # 端点 Key 发送 Authorization（自定义 URL 时 Key = 用户填写或空；
+        # 空 Key 不发送）。此前该路径恒不发 Key，与覆盖契约相悖。
+        headers = _general_auth_headers(self.api_key)
         response = await client.post(
             f"{self.base_url}/transcribe",
             files=files,
             data=data,
+            headers=headers,
             timeout=float(self._asr_config.get("http_timeout_seconds", 300.0)),
         )
 

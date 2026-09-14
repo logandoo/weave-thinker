@@ -41,11 +41,16 @@ def _local_today() -> datetime:
 def _next_consolidation_action(now_local: datetime, done_date: str | None) -> str:
     """consolidation 循环调度决策（纯函数，可测）。
 
-    - "sleep": 非午夜窗口，直接休眠
-    - "run": 午夜窗口且当日尚未执行 -> 尝试执行（失败重试）
+    - "sleep": 重试窗之外，直接休眠
+    - "run": 重试窗内且当日尚未执行 -> 尝试执行（失败重试）
     - "done-sleep": 当日已成功执行 -> 本夜不再重复
+
+    B5（2026-09-14）：重试窗从"仅 0 点"放宽为 [0, window)（默认 3 小时）——
+    旧实现仅 hour==0 可重试，而 leader 锁被潜意识扫描整轮持有（每用户 ≤120s），
+    跨 0 点即整夜错过，只能等下一个午夜。
     """
-    if now_local.hour != 0:
+    window_hours = max(int(config.memory.get("consolidation_retry_window_hours", 3)), 1)
+    if now_local.hour >= window_hours:
         return "sleep"
     today = now_local.strftime("%Y-%m-%d")
     if done_date == today:
@@ -73,32 +78,85 @@ class MemoryScheduler:
     def __init__(self):
         self._subconscious_task: asyncio.Task | None = None
         self._consolidation_task: asyncio.Task | None = None
+        self._recall_cleanup_task: asyncio.Task | None = None
         self._running = False
+        # A4.9 Minor：恢复探测节流（默认 5 分钟一次，防 60s 循环 × 15s 探测）
+        self._last_recovery_attempt: float = 0.0
 
     @property
     def enabled(self) -> bool:
-        from app.services.memory_runtime_state import memory_runtime_enabled
-        return memory_runtime_enabled(config) and bool(config.memory.get("subconscious_enabled", True))
+        """静态配置开关（B9 2026-09-14）：不再混入运行时 kill-switch——
+        探针禁用时循环仍启动，以便周期重探恢复（旧实现 disabled 即不启动
+        循环，唯一恢复路径是 SIGHUP/重启）。"""
+        return bool(config.memory.get("enabled", False)) and bool(config.memory.get("subconscious_enabled", True))
 
     async def start(self) -> None:
-        if not self.enabled:
-            logger.info("MemoryScheduler: disabled via config (memory.enabled=false or subconscious_enabled=false)")
+        # A4.9 复评 Minor：幂等守卫（重复 start 不得泄漏第二个清理循环）
+        if self._recall_cleanup_task is not None and not self._recall_cleanup_task.done():
             return
+        # A4.9 残余收口（2026-09-14）：召回台账清理独立于记忆运行时——即使
+        # memory/scheduler 关闭（历史行仍在），保留策略照常生效。
         self._running = True
+        self._recall_cleanup_task = asyncio.create_task(self._run_recall_log_cleanup_loop())
+        self._recall_cleanup_task.add_done_callback(_task_done_callback(self, "recall_cleanup"))
+        if not self.enabled:
+            logger.info("MemoryScheduler: memory loops disabled via config; recall-log cleanup still active")
+            return
         self._subconscious_task = asyncio.create_task(self._run_subconscious_scan_loop())
         self._consolidation_task = asyncio.create_task(self._run_consolidation_loop())
         self._subconscious_task.add_done_callback(_task_done_callback(self, "subconscious"))
         self._consolidation_task.add_done_callback(_task_done_callback(self, "consolidation"))
         logger.info("MemoryScheduler: started (worker=%s)", _WORKER_ID)
 
+    async def _attempt_recovery(self) -> None:
+        """B9（2026-09-14）：探针禁用后的周期重探恢复。
+
+        仅当禁用原因是运行时探针（memory_disabled_reason 非空）时尝试；
+        配置显式关闭（memory.enabled=false）不做恢复。成功后 enable_memory，
+        后续循环自然恢复工作。
+        """
+        from app.services.memory_runtime_state import memory_disabled_reason, enable_memory
+        reason = memory_disabled_reason()
+        if not reason:
+            return
+        # A4.9 Minor：节流（5 分钟），防禁用期每分钟一次 15s 探测
+        now_mono = time.monotonic()
+        if now_mono - self._last_recovery_attempt < 300:
+            return
+        self._last_recovery_attempt = now_mono
+        try:
+            from app.services.memory_embedding_service import probe_memory_embedding_on_startup
+            if await probe_memory_embedding_on_startup():
+                enable_memory()
+                logger.warning("MemoryScheduler: memory runtime re-enabled after successful re-probe")
+        except Exception:
+            logger.debug("MemoryScheduler: recovery probe failed", exc_info=True)
+
     async def stop(self) -> None:
         self._running = False
-        for task in (self._subconscious_task, self._consolidation_task):
+        for task in (self._subconscious_task, self._consolidation_task,
+                     self._recall_cleanup_task):
             if task:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
         logger.info("MemoryScheduler: stopped")
+
+    async def _run_recall_log_cleanup_loop(self) -> None:
+        """C1：召回台账保留策略（30 天 + per-user 上限），只作用本表。
+
+        每 6 小时一次；失败静默（台账是观测层，绝不影响其他调度）。
+        """
+        while self._running:
+            try:
+                from app.services.memory_recall_log_service import cleanup_recall_log
+                async with AsyncSessionLocal() as db:
+                    deleted = await cleanup_recall_log(db)
+                    if deleted:
+                        logger.info("MemoryScheduler: recall log cleanup deleted %d rows", deleted)
+            except Exception:
+                logger.debug("MemoryScheduler: recall log cleanup failed", exc_info=True)
+            await asyncio.sleep(6 * 3600)
 
     async def _try_acquire_leader(self, db: AsyncSession) -> bool:
         try:
@@ -148,6 +206,12 @@ class MemoryScheduler:
         # 启动后等待一个 interval 再首次执行，避免启动阶段争抢 DB 连接
         await asyncio.sleep(min(interval, 300))
         while self._running:
+            # B9：运行时被探针禁用时周期重探，恢复后自动继续
+            from app.services.memory_runtime_state import memory_runtime_enabled
+            if not memory_runtime_enabled(config):
+                await self._attempt_recovery()
+                await asyncio.sleep(300)
+                continue
             try:
                 await self._run_subconscious_scan()
             except asyncio.CancelledError:
@@ -207,31 +271,51 @@ class MemoryScheduler:
             ingest_pending_raw_units,
             scan_recurrence,
         )
-        await ingest_pending_raw_units(db, user_id)
-        await db.commit()
-        # §9.10 降级链最重档 subconscious_off：新 raw 仅入存档，暂停 recurrence 扫描升级
+        # 用户级模型供应商覆盖（2026-09-13）：记忆提炼同样按用户上下文解析端点
+        from app.model_gateway.user_overrides import reset_active_user_overrides
         try:
-            from app.services.memory_cost_governance_service import is_step_enabled
-            sub_enabled = await is_step_enabled(user_id, "subconscious_off", db)
+            from app.services.user_model_provider_service import activate_user_overrides
+            await activate_user_overrides(db, user_id)
         except Exception:
-            sub_enabled = True
-        if sub_enabled and config.memory.get("recurrence_trigger_enabled", True):
-            await scan_recurrence(db, user_id)
-            await db.commit()
+            logger.exception("activate_user_overrides failed for memory scan user %s", user_id)
         try:
-            await archive_soft_deprecated(db, user_id)
+            await ingest_pending_raw_units(db, user_id)
             await db.commit()
-        except Exception:
-            logger.debug("subconscious archive failed for user=%s", user_id, exc_info=True)
-        # §2026-08-09 画像事实写路径：每日一次 LLM 提炼 profile 概念入库
-        # （幂等；失败不影响本循环其它步骤）
-        try:
-            if config.memory.get("profile_sync_enabled", True):
-                from app.services.memory_profile_service import sync_profile_concepts
-                await sync_profile_concepts(db, user_id)
+            # §9.10 降级链最重档 subconscious_off：新 raw 仅入存档，暂停 recurrence 扫描升级
+            try:
+                from app.services.memory_cost_governance_service import is_step_enabled
+                sub_enabled = await is_step_enabled(user_id, "subconscious_off", db)
+            except Exception:
+                sub_enabled = True
+            if sub_enabled and config.memory.get("recurrence_trigger_enabled", True):
+                await scan_recurrence(db, user_id)
                 await db.commit()
-        except Exception:
-            logger.debug("profile concept sync failed for user=%s", user_id, exc_info=True)
+            try:
+                await archive_soft_deprecated(db, user_id)
+                await db.commit()
+            except Exception:
+                logger.debug("subconscious archive failed for user=%s", user_id, exc_info=True)
+            # §2026-08-09 画像事实写路径：每日一次 LLM 提炼 profile 概念入库
+            # （幂等；失败不影响本循环其它步骤）
+            try:
+                if config.memory.get("profile_sync_enabled", True):
+                    from app.services.memory_profile_service import sync_profile_concepts
+                    await sync_profile_concepts(db, user_id)
+                    await db.commit()
+            except Exception:
+                logger.debug("profile concept sync failed for user=%s", user_id, exc_info=True)
+            # B7（2026-09-14）：补嵌 NULL 概念/事件（有界；subconscious 的补嵌在
+            # ingest_pending_raw_units 内完成）
+            try:
+                from app.services.memory_concept_service import repair_missing_embeddings
+                fixed = await repair_missing_embeddings(db, user_id)
+                if fixed:
+                    await db.commit()
+                    logger.info("memory embedding repair: user=%s fixed=%d", user_id, fixed)
+            except Exception:
+                logger.debug("concept embedding repair failed for user=%s", user_id, exc_info=True)
+        finally:
+            reset_active_user_overrides()
 
     async def _run_consolidation_loop(self) -> None:
         """午夜 consolidation，带重试窗口（2026-08-10 修复：原实现午夜只试一次，
@@ -239,6 +323,11 @@ class MemoryScheduler:
         done_date: str | None = None
         while self._running:
             await asyncio.sleep(60)
+            # B9：运行时被探针禁用时周期重探（本循环不做事，仅保活恢复）
+            from app.services.memory_runtime_state import memory_runtime_enabled
+            if not memory_runtime_enabled(config):
+                await self._attempt_recovery()
+                continue
             now_local = datetime.now(_get_memory_tz())
             action = _next_consolidation_action(now_local, done_date)
             if action == "sleep":
@@ -339,7 +428,17 @@ class MemoryScheduler:
 
     async def _run_consolidation_for_user(self, db: AsyncSession, user_id: str) -> None:
         from app.services.memory_consolidation_service import run_consolidation
-        await run_consolidation(db, user_id)
+        # 用户级模型供应商覆盖（2026-09-13）：consolidation/dream 同用户上下文解析端点
+        from app.model_gateway.user_overrides import reset_active_user_overrides
+        try:
+            from app.services.user_model_provider_service import activate_user_overrides
+            await activate_user_overrides(db, user_id)
+        except Exception:
+            logger.exception("activate_user_overrides failed for consolidation user %s", user_id)
+        try:
+            await run_consolidation(db, user_id)
+        finally:
+            reset_active_user_overrides()
 
     async def _get_active_users(self, db: AsyncSession) -> list[str]:
         result = await db.execute(

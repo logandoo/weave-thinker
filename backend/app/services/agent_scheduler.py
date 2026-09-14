@@ -226,6 +226,14 @@ class AgentScheduler:
 
         # Phase 2: execute claimed tasks concurrently (respecting max_tasks_per_tick).
         async def _execute_one(task):
+            # 用户级模型供应商覆盖：定时任务与交互请求同等适用（2026-09-13）。
+            # 每任务独立协程（asyncio.gather 创建），finally 清理防串上下文。
+            try:
+                from app.services.user_model_provider_service import activate_user_overrides
+                async with AsyncSessionLocal() as ov_db:
+                    await activate_user_overrides(ov_db, task.user_id)
+            except Exception:
+                logger.exception("activate_user_overrides failed for scheduled task %s", task.id)
             try:
                 await self._execute_scheduled_task(task, now)
             except Exception:
@@ -247,6 +255,9 @@ class AgentScheduler:
                             await fin_db.commit()
                 except Exception:
                     logger.exception("Also failed to finalize scheduled task %s", task.id)
+            finally:
+                from app.model_gateway.user_overrides import reset_active_user_overrides
+                reset_active_user_overrides()
 
         if claimed:
             await asyncio.gather(*(_execute_one(t) for t in claimed), return_exceptions=True)

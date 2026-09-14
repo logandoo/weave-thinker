@@ -4,9 +4,13 @@
 """
 API routes for background agent tasks.
 """
+import json
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, desc
+from sqlalchemy import select, update, desc, text
+from sqlalchemy.exc import DBAPIError
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -148,6 +152,65 @@ async def create_task(
         started_at=None,
         completed_at=None,
     )
+
+
+@router.post("/{task_id}/messages")
+async def append_task_message(
+    task_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """F1/H2（2026-09-14）：向运行中的后台任务追加补充消息（steer）。
+
+    worker 每 5s 轮询 pending_messages 并推入 AgentLoop 的 interjection_queue，
+    在下一迭代边界作为真实 user 消息进入模型。仅 pending/claimed/running 可追加；
+    队列上限 10（与 chat interject 一致）。
+    """
+    # A4.9 I1：行锁串行化追加（与 worker poller 的 FOR UPDATE 互斥），
+    # 防并发读-改-写丢消息；A4.9 残余：lock_timeout 防止长完成事务（媒体本地化
+    # 等）把本请求无限阻塞——超时返回 409，消息未写入需重试。
+    pre = await db.get(AgentTask, task_id)
+    if pre is None or pre.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if pre.status not in ("pending", "claimed", "running"):
+        raise HTTPException(status_code=409, detail=f"Task not running (status '{pre.status}')")
+    try:
+        await db.execute(text("SET LOCAL lock_timeout = '2s'"))
+        result = await db.execute(
+            select(AgentTask)
+            .where(AgentTask.id == task_id)
+            .with_for_update()
+            # A4.9 复评 Important：pre=db.get 已把实例放进 identity map，
+            # 锁定 SELECT 默认不重填未过期属性 → 必须 populate_existing 强制刷新
+            .execution_options(populate_existing=True)
+        )
+        task = result.scalar_one_or_none()
+    except DBAPIError as exc:
+        await db.rollback()
+        if "lock timeout" in str(exc).lower() or "locknotavailable" in str(exc).lower():
+            raise HTTPException(status_code=409, detail="Task busy; retry shortly") from exc
+        raise
+    if task is None or task.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status not in ("pending", "claimed", "running"):
+        raise HTTPException(status_code=409, detail=f"Task not running (status '{task.status}')")
+    content = str(payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="content is required")
+    try:
+        messages = json.loads(task.pending_messages) if task.pending_messages else []
+        if not isinstance(messages, list):
+            messages = []
+    except (json.JSONDecodeError, TypeError):
+        messages = []
+    if len(messages) >= 10:
+        raise HTTPException(status_code=429, detail="Too many pending messages")
+    item = {"id": str(uuid.uuid4()), "content": content, "created_at": datetime.utcnow().isoformat()}
+    messages.append(item)
+    task.pending_messages = json.dumps(messages, ensure_ascii=False)
+    await db.commit()
+    return {"ok": True, "task_id": task_id, "queued": len(messages), "message_id": item["id"]}
 
 
 @router.post("/{task_id}/cancel")

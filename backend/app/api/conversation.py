@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, delete, or_, func, and_, update
+from sqlalchemy import select, desc, delete, or_, func, and_, update, text
 from sqlalchemy.orm import selectinload
 from typing import List, Optional
 import os
@@ -1033,6 +1033,8 @@ class ExportResponse(BaseModel):
 @router.get("/{conversation_id}/messages", response_model=List[MessageResponse])
 async def get_messages(
     conversation_id: str,
+    before_id: str | None = None,
+    limit: int | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1045,6 +1047,46 @@ async def get_messages(
     conversation = result.scalar_one_or_none()
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # F2（2026-09-14）：分页为加法式——不传 limit 时行为与旧实现逐字节一致
+    # （全量按 created_at 升序）；传 limit 时按 (created_at, id) 降序取窗口
+    # 后反转为升序返回；before_id 用 (created_at, id) 游标保证不重不漏。
+    if limit is not None:
+        page_limit = max(1, min(int(limit), 500))
+        params: dict = {"cid": conversation_id, "lim": page_limit}
+        cursor_clause = ""
+        if before_id:
+            cursor_clause = (
+                "AND (created_at, id) < (SELECT created_at, id FROM messages "
+                "WHERE id = :before_id AND conversation_id = :cid)"
+            )
+            params["before_id"] = before_id
+        rows = (await db.execute(
+            text(f"""
+                SELECT id, conversation_id, role, content, reasoning_content,
+                       tool_calls, tool_results, context_info, created_at
+                FROM messages
+                WHERE conversation_id = :cid {cursor_clause}
+                ORDER BY created_at DESC, id DESC
+                LIMIT :lim
+            """),
+            params,
+        )).mappings().all()
+        messages = list(reversed(rows))
+        return [
+            MessageResponse(
+                id=m["id"],
+                conversation_id=m["conversation_id"],
+                role=m["role"],
+                content=m["content"],
+                reasoning_content=m["reasoning_content"],
+                tool_calls=m["tool_calls"],
+                tool_results=m["tool_results"],
+                context_info=m["context_info"],
+                created_at=_utc_iso(m["created_at"])
+            )
+            for m in messages
+        ]
 
     msg_result = await db.execute(
         select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)

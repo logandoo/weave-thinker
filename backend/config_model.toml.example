@@ -42,6 +42,11 @@ model_name = "deepseek-v4-flash"
 display_name = "默认模型"
 # 自包含（2026-08-31）：采样随端点携带，[api] legacy 兜底不再需要
 is_custom = true
+# F5（2026-09-14）：可选端点级上下文窗口（未声明时压缩/守卫回退全局
+# [agent.compression].context_length，绝不猜小）
+# [endpoints.main.extra]
+# context_window = 128000
+# max_output_tokens = 8192
 
 [endpoints.deepseek]
 kind = "llm"

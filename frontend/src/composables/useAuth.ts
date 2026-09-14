@@ -16,6 +16,8 @@ interface User {
   username: string
   created_at: string
   agent_permissions?: Record<string, boolean>
+  nickname?: string | null
+  avatar_data?: string | null
 }
 
 const DEFAULT_PERMISSIONS: Record<string, boolean> = {
@@ -34,6 +36,8 @@ function normalizeUser(data: any): User {
     username: data.username,
     created_at: data.created_at,
     agent_permissions: { ...DEFAULT_PERMISSIONS, ...(data.agent_permissions || {}) },
+    nickname: data.nickname ?? null,
+    avatar_data: data.avatar_data ?? null,
   }
 }
 
@@ -138,6 +142,14 @@ export function useAuth() {
     return normalized
   }
 
+  /** 用户资料（昵称/头像）保存后刷新本地用户对象（跨组件即时生效）。 */
+  function applyProfile(profile: any): User {
+    const normalized = normalizeUser(profile)
+    user.value = normalized
+    localStorage.setItem(USER_KEY, JSON.stringify(normalized))
+    return normalized
+  }
+
   async function checkAuth() {
     if (!token.value) return false
     try {
@@ -183,5 +195,6 @@ export function useAuth() {
     checkAuth,
     refreshSession,
     updatePermissions,
+    applyProfile,
   }
 }

@@ -340,6 +340,29 @@ $$"""),
     # B4 复发轴（A4.9 W2-I1）：归档行携带末次 verify issues（JSON 数组文本），
     # 供 deathmatch_harness_report 的复发问题类聚合；无此列时该轴空转。
     ("deathmatch_harness_runs_issues_json", "ALTER TABLE deathmatch_harness_runs ADD COLUMN IF NOT EXISTS issues_json TEXT"),
+    # 用户信息（2026-09-13）：昵称 + 头像 data URL（256×256 JPEG，服务端重编码）。
+    ("users_nickname", "ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname VARCHAR(100)"),
+    ("users_avatar_data", "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data TEXT"),
+    # 用户级模型供应商覆盖（2026-09-13）：每用户每 kind 至多一行；UNIQUE 防重复。
+    ("create_user_model_providers", """CREATE TABLE IF NOT EXISTS user_model_providers (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind VARCHAR(20) NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        base_url VARCHAR(500),
+        api_key VARCHAR(500),
+        model_name VARCHAR(200),
+        params_json TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (user_id, kind)
+    )"""),
+    # A4.9 Important 修复（2026-09-13）：既有表（create_all 先于迁移建表、
+    # 无 UNIQUE）补唯一性。先去重（同 (user_id, kind) 保留 ctid 最大行=最新）
+    # 再建唯一索引；幂等。
+    ("user_model_providers_dedupe", """DELETE FROM user_model_providers a USING user_model_providers b
+        WHERE a.user_id = b.user_id AND a.kind = b.kind AND a.ctid < b.ctid"""),
+    ("user_model_providers_unique", "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_model_providers_user_kind ON user_model_providers (user_id, kind)"),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (
@@ -494,6 +517,47 @@ $$"""),
     ("idx_mlc_user_ts", "CREATE INDEX IF NOT EXISTS idx_mlc_user_ts ON memory_llm_calls(user_id, created_at DESC)"),
     # UI 偏好（皮肤选择等）：JSON 字符串，见 app/api/skins.py
     ("users_ui_preferences", "ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_preferences TEXT"),
+    # DC2（2026-09-14）：集群向量溯源列（A1 修复时写入；其余向量表 B7 补齐）
+    ("mc_cluster_embedding_model", "ALTER TABLE memory_clusters ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100)"),
+    # DC1（2026-09-14）：记忆 LLM 调用计费分类——read 类调用只做遥测，
+    # 不得进入成本治理降级口径（旧行无值为 write，兼容历史）
+    ("mlc_billing_class", "ALTER TABLE memory_llm_calls ADD COLUMN IF NOT EXISTS billing_class VARCHAR(20) DEFAULT 'write'"),
+    # DC2/B2（2026-09-14）：向量溯源列 + 幂等去重键 + 待补嵌标记
+    ("mc_concept_embedding_model", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100)"),
+    ("me_embedding_model", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100)"),
+    ("sub_embedding_model", "ALTER TABLE subconscious_log ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100)"),
+    ("sub_content_hash", "ALTER TABLE subconscious_log ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)"),
+    ("sub_needs_embedding", "ALTER TABLE subconscious_log ADD COLUMN IF NOT EXISTS needs_embedding BOOLEAN DEFAULT FALSE"),
+    # B2/I3（2026-09-14）：存量 NULL 嵌入（未晋升）标记待补嵌；存量 content_hash
+    # 为空不回溯（幂等去重只对新行生效；存量重复按 DC3 决策不清理）
+    ("sub_flag_missing_embeddings", "UPDATE subconscious_log SET needs_embedding = TRUE WHERE embedding IS NULL AND promoted = FALSE AND needs_embedding = FALSE"),
+    ("idx_sub_content_hash", "CREATE INDEX IF NOT EXISTS idx_sub_content_hash ON subconscious_log(user_id, content_hash)"),
+    # C1（2026-09-14）：逐轮召回台账（观测；只存元数据不存内容；DC7 FK CASCADE）
+    ("mrl_create", """CREATE TABLE IF NOT EXISTS memory_recall_log (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id VARCHAR(36) REFERENCES conversations(id) ON DELETE CASCADE,
+        query_hash VARCHAR(32),
+        candidate_ids TEXT,
+        tier_scores TEXT,
+        gate_score DOUBLE PRECISION DEFAULT 0,
+        budget_chars INTEGER NOT NULL DEFAULT 0,
+        injected_chars INTEGER NOT NULL DEFAULT 0,
+        truncated BOOLEAN NOT NULL DEFAULT FALSE,
+        elapsed_ms INTEGER NOT NULL DEFAULT 0,
+        cache_hit BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("mrl_idx_user_created", "CREATE INDEX IF NOT EXISTS idx_mrl_user_created ON memory_recall_log(user_id, created_at DESC)"),
+    # D1（2026-09-14）：RippleMem P/L/T 线索列（可空；存量行保持 NULL，不回填）
+    ("me_participants", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS participants VARCHAR(1000)"),
+    ("me_locations", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS locations VARCHAR(1000)"),
+    # D1/DC5（2026-09-14）：边来源列（存量行默认 llm 语义；读侧白名单门控）
+    ("cr_edge_source", "ALTER TABLE concept_relations ADD COLUMN IF NOT EXISTS edge_source VARCHAR(20) DEFAULT 'llm'"),
+    # F2/DC9（2026-09-14）：messages 分页复合索引（加法式，可随时建）
+    ("idx_messages_conv_created", "CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at)"),
+    # F1（2026-09-14）：后台任务运行中补充消息（可空 JSON 数组）
+    ("at_pending_messages", "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS pending_messages TEXT"),
 ]
 
 

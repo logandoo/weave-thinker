@@ -1563,7 +1563,8 @@ async def chat_stream(
                     from app.services import memory_retrieval_service
                     async with _AsyncSessionLocal() as mem_db:
                         return await memory_retrieval_service.retrieve_and_build_context(
-                            mem_db, current_user.id, conversation_messages)
+                            mem_db, current_user.id, conversation_messages,
+                            conversation_id=conversation_id)
                 except Exception:
                     logger.exception("New memory retrieval failed, falling back")
                     return None
@@ -1843,8 +1844,15 @@ async def chat_stream(
                     memory_entries=[],
                 )
             else:
-                async with _AsyncSessionLocal() as _sctx_db:
-                    shared_context = await build_shared_agent_context(_sctx_db, current_user.id)
+                from app.services.memory_runtime_state import memory_runtime_enabled as _mem_rt2
+                if _mem_rt2(_config):
+                    # v2 运行时（2026-09-13 v1 退休，方案 A）：检索为空即无记忆
+                    # 注入——不再回落 v1 摘要（陈旧数据；v1 生成在 v2 下已停摆）。
+                    shared_context = SimpleNamespace(
+                        agent_state=None, memory_summary='', dream_summary='', memory_entries=[])
+                else:
+                    async with _AsyncSessionLocal() as _sctx_db:
+                        shared_context = await build_shared_agent_context(_sctx_db, current_user.id)
 
             sys_prompt = await agent_service._build_system_prompt(
                 assistant=assistant,
@@ -1863,7 +1871,8 @@ async def chat_stream(
             # 上下文 token 用量：估算「系统提示词 + 历史 + 工具 schema」的完整
             # 请求量，随流发给前端显示（头部徽章）。压缩事件携带 before/after
             # 对比并在压缩后刷新本值。CJK 感知估算（与压缩决策同源）。
-            _ctx_window = _config.agent_compression_context_length
+            from app.services.agent_loop import _resolve_context_length
+            _ctx_window = _resolve_context_length(getattr(agent_loop, 'llm', None))
             _ctx_tokens = 0
             try:
                 from app.services.context_compressor import estimate_request_tokens_rough

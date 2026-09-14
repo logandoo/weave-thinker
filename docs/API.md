@@ -1,22 +1,22 @@
 <!-- Copyright (c) 2026 Weave Thinker Contributors -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Weave Thinker — Backend API 文档（详版）
+# Weave Thinker— Backend API 文档（详版）
 
 > **文档结构**：
-> - **一、接口明细**：全部 HTTP 接口，由生成器从**运行中后端的 `/openapi.json`** 自动生成
+> - **一、接口明细**：全部 HTTP 接口，由 `tools/gen_api_md.py` 从**运行中后端的 `/openapi.json`** 自动生成
 >   （每接口含 接口名 / 输入表 / 输出表 / 请求示例 / 返回示例；字段类型与必填性以 FastAPI Pydantic 模型为准）。
 > - **二、专项语义**：OpenAPI 表达不了的行为级说明——SSE 事件协议、死磕模式全状态机、记忆检索管线、
 >   语音事件与 WebSocket 帧、provider 语义、皮肤信任模型等（手工策展，与代码仓库同步维护）。
 > - 两部分冲突时：字段级以「一」为准（生成自代码），行为级以「二」为准（生成器不理解业务）。
 >
-> 字段表由后端 OpenAPI 生成；接口行为变化后以生成器重跑再生（见「通用约定」）。
+> 生成器与快照：`tools/gen_api_md.py` · 事实源快照 `tests/license_audit/openapi.json`（更新流程：重启后端后重跑生成器）。
 
 ## 通用约定
 
 - **Base URL**：`http(s)://<host>:8158`（默认端口，见 `backend/config.toml [server]`）
 - **交互式文档**：运行时 `/docs`（Swagger UI）
-- **接口规模**：132 个 HTTP operations（20 个业务模块 + main.py 根路由）+ 2 条 WebSocket
+- **接口规模**：142 个 HTTP operations（21 个业务模块 + main.py 根路由）+ 2 条 WebSocket
 - **认证**：JWT Bearer Token（请求头 `Authorization: Bearer <token>`）。`POST /api/auth/login` 获取，
   有效期 `[security] token_expire_days`（默认 7 天）；`POST /api/auth/refresh` 用仍有效的 Token 滑动续期
   （单条原子 CAS 轮换，登出后其 token 永久不可续期——详见二.1）。WebSocket 以 `?token=<jwt>` 或
@@ -77,7 +77,9 @@ curl -k -X POST "https://<host>:8158/api/auth/login" -H "Content-Type: applicati
     "id": "string",
     "username": "string",
     "created_at": "string",
-    "agent_permissions": null
+    "agent_permissions": null,
+    "nickname": null,
+    "avatar_data": null
   }
 }
 ```
@@ -125,6 +127,8 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `username` | string | 是 |  |
 | `created_at` | string | 是 |  |
 | `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -141,7 +145,9 @@ curl -k -X GET "https://<host>:8158/api/auth/me" -H "Authorization: Bearer $TOKE
   "id": "string",
   "username": "string",
   "created_at": "string",
-  "agent_permissions": {}
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
 }
 ```
 
@@ -166,6 +172,8 @@ curl -k -X GET "https://<host>:8158/api/auth/me" -H "Authorization: Bearer $TOKE
 | `username` | string | 是 |  |
 | `created_at` | string | 是 |  |
 | `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -182,7 +190,9 @@ curl -k -X PUT "https://<host>:8158/api/auth/me/permissions" -H "Authorization: 
   "id": "string",
   "username": "string",
   "created_at": "string",
-  "agent_permissions": {}
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
 }
 ```
 
@@ -191,7 +201,7 @@ curl -k -X PUT "https://<host>:8158/api/auth/me/permissions" -H "Authorization: 
 ### POST `/api/auth/refresh`
 **Refresh Token**
 
-> Sliding-session refresh: a still-valid token mints
+> Sliding-session refresh (2026-08-25 wave-3): a still-valid token mints
 > a fresh token whose window starts now — users who open the app within
 > ``[security] token_expire_days`` are never re-asked for a password.
 > ``get_current_user`` already rejects expired/invalid tokens (401/403), so
@@ -233,7 +243,9 @@ curl -k -X POST "https://<host>:8158/api/auth/refresh" -H "Authorization: Bearer
     "id": "string",
     "username": "string",
     "created_at": "string",
-    "agent_permissions": null
+    "agent_permissions": null,
+    "nickname": null,
+    "avatar_data": null
   }
 }
 ```
@@ -261,6 +273,8 @@ curl -k -X POST "https://<host>:8158/api/auth/refresh" -H "Authorization: Bearer
 | `username` | string | 是 |  |
 | `created_at` | string | 是 |  |
 | `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -277,7 +291,9 @@ curl -k -X POST "https://<host>:8158/api/auth/register" -H "Content-Type: applic
   "id": "string",
   "username": "string",
   "created_at": "string",
-  "agent_permissions": {}
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
 }
 ```
 
@@ -389,6 +405,49 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 ```bash
 curl -k -X POST "https://<host>:8158/api/chat/stream" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"conversation_id": "string", "assistant_id": "string", "messages": [{"role": "user", "content": "string"}], "enable_web_search": false, "regenerate_from_message_id": "string", "edit_message_id": "string", "force_search_results": "string", "temperature": 0.0, "top_p": 0.0, "top_k": 0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": 0, "enable_reasoning": false, "reasoning_effort": "string", "thinking_budget": 0, "deathmatch_mode": false, "deathmatch_action": "string"}
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### POST `/api/chat/stream/interject/{conversation_id}`
+**Interject Agent Stream**
+
+> Submit a user interjection into a RUNNING agent turn.
+> 
+> Iteration-boundary steering (codex pending-input / deepseek-harness
+> next-step inbox): the text is queued on the conversation's active agent
+> state and injected as a real user message at the next tool-loop iteration
+> boundary — the in-flight LLM stream is never aborted. The loop emits an
+> ``interjection_committed`` SSE event when the message enters the model
+> context, and the producer persists it as a normal ``role=user`` message
+> (commit-time persistence — a queued-but-never-consumed interjection is
+> never written to the DB, so…
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/chat.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `conversation_id` | path | string | 是 |  |
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/chat/stream/interject/{conversation_id}" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {}
 ```
 
 **返回示例**
@@ -1265,6 +1324,7 @@ curl -k -X GET "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
       "reasoning_content": null,
       "tool_calls": null,
       "tool_results": null,
+      "context_info": null,
       "created_at": null
     }
   ]
@@ -1370,6 +1430,8 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
 | 字段 | 位置 | 类型 | 必填 | 说明 |
 |---|---|---|---|---|
 | `conversation_id` | path | string | 是 |  |
+| `before_id` | query | string|null | 否 |  |
+| `limit` | query | int|null | 否 |  |
 
 **输出**
 
@@ -1383,6 +1445,7 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
 | `reasoning_content` | ∪string|null | 否（可空） |  |
 | `tool_calls` | ∪string|null | 否（可空） |  |
 | `tool_results` | ∪string|null | 否（可空） |  |
+| `context_info` | ∪string|null | 否（可空） |  |
 | `created_at` | string | 是 |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
@@ -1405,6 +1468,7 @@ curl -k -X GET "https://<host>:8158/api/conversations/{conversation_id}/messages
     "reasoning_content": "string",
     "tool_calls": "string",
     "tool_results": "string",
+    "context_info": "string",
     "created_at": "string"
   }
 ]
@@ -1518,34 +1582,8 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}/move" -H
 |---|---|---|---|
 | `name` | string | 是 |  |
 | `system_prompt` | string | 否 | （默认 ''） |
-| `temperature` | ∪float|null | 否（可空） |  |
-| `top_p` | ∪float|null | 否（可空） |  |
-| `top_k` | ∪int|null | 否（可空） |  |
-| `presence_penalty` | ∪float|null | 否（可空） |  |
-| `frequency_penalty` | ∪float|null | 否（可空） |  |
-| `max_tokens` | ∪int|null | 否（可空） |  |
-| `use_custom_model` | bool | 否 | （默认 False） |
-| `custom_api_url` | ∪string|null | 否（可空） |  |
-| `custom_api_key` | ∪string|null | 否（可空） |  |
-| `custom_model_name` | ∪string|null | 否（可空） |  |
-| `provider_type` | string | 否 | （默认 'deepseek'） |
-| `extra_body` | ∪string|null | 否（可空） |  |
-| `use_subtask_model` | bool | 否 | （默认 False） |
-| `subtask_custom_api_url` | ∪string|null | 否（可空） |  |
-| `subtask_custom_api_key` | ∪string|null | 否（可空） |  |
-| `subtask_custom_model_name` | ∪string|null | 否（可空） |  |
-| `subtask_provider_type` | ∪string|null | 否（可空） |  |
-| `subtask_extra_body` | ∪string|null | 否（可空） |  |
-| `thinking_budget` | ∪int|null | 否（可空） |  |
-| `min_p` | ∪float|null | 否（可空） |  |
-| `repetition_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_temperature` | ∪float|null | 否（可空） |  |
-| `thinking_top_p` | ∪float|null | 否（可空） |  |
-| `thinking_top_k` | ∪int|null | 否（可空） |  |
-| `thinking_min_p` | ∪float|null | 否（可空） |  |
-| `thinking_presence_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_repetition_penalty` | ∪float|null | 否（可空） |  |
-| `preserve_thinking` | ∪bool|null | 否（可空） | （默认 True） |
+| `model_alias` | string | 否 | （默认 ''） |
+| `subtask_model_alias` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1566,34 +1604,8 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
   {
     "name": "string",
     "system_prompt": "string",
-    "temperature": 0.0,
-    "top_p": 0.0,
-    "top_k": 0,
-    "presence_penalty": 0.0,
-    "frequency_penalty": 0.0,
-    "max_tokens": 0,
-    "use_custom_model": false,
-    "custom_api_url": "string",
-    "custom_api_key": "string",
-    "custom_model_name": "string",
-    "provider_type": "string",
-    "extra_body": "string",
-    "use_subtask_model": false,
-    "subtask_custom_api_url": "string",
-    "subtask_custom_api_key": "string",
-    "subtask_custom_model_name": "string",
-    "subtask_provider_type": "string",
-    "subtask_extra_body": "string",
-    "thinking_budget": 0,
-    "min_p": 0.0,
-    "repetition_penalty": 0.0,
-    "thinking_temperature": 0.0,
-    "thinking_top_p": 0.0,
-    "thinking_top_k": 0,
-    "thinking_min_p": 0.0,
-    "thinking_presence_penalty": 0.0,
-    "thinking_repetition_penalty": 0.0,
-    "preserve_thinking": true,
+    "model_alias": "string",
+    "subtask_model_alias": "string",
     "id": "string",
     "user_id": "string",
     "created_at": "string",
@@ -1615,34 +1627,8 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
 |---|---|---|---|
 | `name` | string | 是 |  |
 | `system_prompt` | string | 否 | （默认 ''） |
-| `temperature` | ∪float|null | 否（可空） |  |
-| `top_p` | ∪float|null | 否（可空） |  |
-| `top_k` | ∪int|null | 否（可空） |  |
-| `presence_penalty` | ∪float|null | 否（可空） |  |
-| `frequency_penalty` | ∪float|null | 否（可空） |  |
-| `max_tokens` | ∪int|null | 否（可空） |  |
-| `use_custom_model` | bool | 否 | （默认 False） |
-| `custom_api_url` | ∪string|null | 否（可空） |  |
-| `custom_api_key` | ∪string|null | 否（可空） |  |
-| `custom_model_name` | ∪string|null | 否（可空） |  |
-| `provider_type` | string | 否 | （默认 'deepseek'） |
-| `extra_body` | ∪string|null | 否（可空） |  |
-| `use_subtask_model` | bool | 否 | （默认 False） |
-| `subtask_custom_api_url` | ∪string|null | 否（可空） |  |
-| `subtask_custom_api_key` | ∪string|null | 否（可空） |  |
-| `subtask_custom_model_name` | ∪string|null | 否（可空） |  |
-| `subtask_provider_type` | ∪string|null | 否（可空） |  |
-| `subtask_extra_body` | ∪string|null | 否（可空） |  |
-| `thinking_budget` | ∪int|null | 否（可空） |  |
-| `min_p` | ∪float|null | 否（可空） |  |
-| `repetition_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_temperature` | ∪float|null | 否（可空） |  |
-| `thinking_top_p` | ∪float|null | 否（可空） |  |
-| `thinking_top_k` | ∪int|null | 否（可空） |  |
-| `thinking_min_p` | ∪float|null | 否（可空） |  |
-| `thinking_presence_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_repetition_penalty` | ∪float|null | 否（可空） |  |
-| `preserve_thinking` | ∪bool|null | 否（可空） | （默认 True） |
+| `model_alias` | string | 否 | （默认 'deepseek'） |
+| `subtask_model_alias` | string | 否 | （默认 ''） |
 
 **输出**
 
@@ -1651,34 +1637,8 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
 |---|---|---|---|
 | `name` | string | 是 |  |
 | `system_prompt` | string | 否 | （默认 ''） |
-| `temperature` | ∪float|null | 否（可空） |  |
-| `top_p` | ∪float|null | 否（可空） |  |
-| `top_k` | ∪int|null | 否（可空） |  |
-| `presence_penalty` | ∪float|null | 否（可空） |  |
-| `frequency_penalty` | ∪float|null | 否（可空） |  |
-| `max_tokens` | ∪int|null | 否（可空） |  |
-| `use_custom_model` | bool | 否 | （默认 False） |
-| `custom_api_url` | ∪string|null | 否（可空） |  |
-| `custom_api_key` | ∪string|null | 否（可空） |  |
-| `custom_model_name` | ∪string|null | 否（可空） |  |
-| `provider_type` | string | 否 | （默认 'deepseek'） |
-| `extra_body` | ∪string|null | 否（可空） |  |
-| `use_subtask_model` | bool | 否 | （默认 False） |
-| `subtask_custom_api_url` | ∪string|null | 否（可空） |  |
-| `subtask_custom_api_key` | ∪string|null | 否（可空） |  |
-| `subtask_custom_model_name` | ∪string|null | 否（可空） |  |
-| `subtask_provider_type` | ∪string|null | 否（可空） |  |
-| `subtask_extra_body` | ∪string|null | 否（可空） |  |
-| `thinking_budget` | ∪int|null | 否（可空） |  |
-| `min_p` | ∪float|null | 否（可空） |  |
-| `repetition_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_temperature` | ∪float|null | 否（可空） |  |
-| `thinking_top_p` | ∪float|null | 否（可空） |  |
-| `thinking_top_k` | ∪int|null | 否（可空） |  |
-| `thinking_min_p` | ∪float|null | 否（可空） |  |
-| `thinking_presence_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_repetition_penalty` | ∪float|null | 否（可空） |  |
-| `preserve_thinking` | ∪bool|null | 否（可空） | （默认 True） |
+| `model_alias` | string | 否 | （默认 ''） |
+| `subtask_model_alias` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1689,7 +1649,7 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
 **请求示例**
 
 ```bash
-curl -k -X POST "https://<host>:8158/api/assistants" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "temperature": 0.0, "top_p": 0.0, "top_k": 0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": 0, "use_custom_model": false, "custom_api_url": "string", "custom_api_key": "string", "custom_model_name": "string", "provider_type": "string", "extra_body": "string", "use_subtask_model": false, "subtask_custom_api_url": "string", "subtask_custom_api_key": "string", "subtask_custom_model_name": "string", "subtask_provider_type": "string", "subtask_extra_body": "string", "thinking_budget": 0, "min_p": 0.0, "repetition_penalty": 0.0, "thinking_temperature": 0.0, "thinking_top_p": 0.0, "thinking_top_k": 0, "thinking_min_p": 0.0, "thinking_presence_penalty": 0.0, "thinking_repetition_penalty": 0.0, "preserve_thinking": true}
+curl -k -X POST "https://<host>:8158/api/assistants" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "model_alias": "string", "subtask_model_alias": "string"}
 ```
 
 **返回示例**
@@ -1698,34 +1658,8 @@ curl -k -X POST "https://<host>:8158/api/assistants" -H "Authorization: Bearer $
 {
   "name": "string",
   "system_prompt": "string",
-  "temperature": 0.0,
-  "top_p": 0.0,
-  "top_k": 0,
-  "presence_penalty": 0.0,
-  "frequency_penalty": 0.0,
-  "max_tokens": 0,
-  "use_custom_model": false,
-  "custom_api_url": "string",
-  "custom_api_key": "string",
-  "custom_model_name": "string",
-  "provider_type": "string",
-  "extra_body": "string",
-  "use_subtask_model": false,
-  "subtask_custom_api_url": "string",
-  "subtask_custom_api_key": "string",
-  "subtask_custom_model_name": "string",
-  "subtask_provider_type": "string",
-  "subtask_extra_body": "string",
-  "thinking_budget": 0,
-  "min_p": 0.0,
-  "repetition_penalty": 0.0,
-  "thinking_temperature": 0.0,
-  "thinking_top_p": 0.0,
-  "thinking_top_k": 0,
-  "thinking_min_p": 0.0,
-  "thinking_presence_penalty": 0.0,
-  "thinking_repetition_penalty": 0.0,
-  "preserve_thinking": true,
+  "model_alias": "string",
+  "subtask_model_alias": "string",
   "id": "string",
   "user_id": "string",
   "created_at": "string",
@@ -1782,34 +1716,8 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 |---|---|---|---|
 | `name` | string | 是 |  |
 | `system_prompt` | string | 否 | （默认 ''） |
-| `temperature` | ∪float|null | 否（可空） |  |
-| `top_p` | ∪float|null | 否（可空） |  |
-| `top_k` | ∪int|null | 否（可空） |  |
-| `presence_penalty` | ∪float|null | 否（可空） |  |
-| `frequency_penalty` | ∪float|null | 否（可空） |  |
-| `max_tokens` | ∪int|null | 否（可空） |  |
-| `use_custom_model` | bool | 否 | （默认 False） |
-| `custom_api_url` | ∪string|null | 否（可空） |  |
-| `custom_api_key` | ∪string|null | 否（可空） |  |
-| `custom_model_name` | ∪string|null | 否（可空） |  |
-| `provider_type` | string | 否 | （默认 'deepseek'） |
-| `extra_body` | ∪string|null | 否（可空） |  |
-| `use_subtask_model` | bool | 否 | （默认 False） |
-| `subtask_custom_api_url` | ∪string|null | 否（可空） |  |
-| `subtask_custom_api_key` | ∪string|null | 否（可空） |  |
-| `subtask_custom_model_name` | ∪string|null | 否（可空） |  |
-| `subtask_provider_type` | ∪string|null | 否（可空） |  |
-| `subtask_extra_body` | ∪string|null | 否（可空） |  |
-| `thinking_budget` | ∪int|null | 否（可空） |  |
-| `min_p` | ∪float|null | 否（可空） |  |
-| `repetition_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_temperature` | ∪float|null | 否（可空） |  |
-| `thinking_top_p` | ∪float|null | 否（可空） |  |
-| `thinking_top_k` | ∪int|null | 否（可空） |  |
-| `thinking_min_p` | ∪float|null | 否（可空） |  |
-| `thinking_presence_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_repetition_penalty` | ∪float|null | 否（可空） |  |
-| `preserve_thinking` | ∪bool|null | 否（可空） | （默认 True） |
+| `model_alias` | string | 否 | （默认 ''） |
+| `subtask_model_alias` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1829,34 +1737,8 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 {
   "name": "string",
   "system_prompt": "string",
-  "temperature": 0.0,
-  "top_p": 0.0,
-  "top_k": 0,
-  "presence_penalty": 0.0,
-  "frequency_penalty": 0.0,
-  "max_tokens": 0,
-  "use_custom_model": false,
-  "custom_api_url": "string",
-  "custom_api_key": "string",
-  "custom_model_name": "string",
-  "provider_type": "string",
-  "extra_body": "string",
-  "use_subtask_model": false,
-  "subtask_custom_api_url": "string",
-  "subtask_custom_api_key": "string",
-  "subtask_custom_model_name": "string",
-  "subtask_provider_type": "string",
-  "subtask_extra_body": "string",
-  "thinking_budget": 0,
-  "min_p": 0.0,
-  "repetition_penalty": 0.0,
-  "thinking_temperature": 0.0,
-  "thinking_top_p": 0.0,
-  "thinking_top_k": 0,
-  "thinking_min_p": 0.0,
-  "thinking_presence_penalty": 0.0,
-  "thinking_repetition_penalty": 0.0,
-  "preserve_thinking": true,
+  "model_alias": "string",
+  "subtask_model_alias": "string",
   "id": "string",
   "user_id": "string",
   "created_at": "string",
@@ -1881,34 +1763,8 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 |---|---|---|---|
 | `name` | ∪string|null | 否（可空） |  |
 | `system_prompt` | ∪string|null | 否（可空） |  |
-| `temperature` | ∪float|null | 否（可空） |  |
-| `top_p` | ∪float|null | 否（可空） |  |
-| `top_k` | ∪int|null | 否（可空） |  |
-| `presence_penalty` | ∪float|null | 否（可空） |  |
-| `frequency_penalty` | ∪float|null | 否（可空） |  |
-| `max_tokens` | ∪int|null | 否（可空） |  |
-| `use_custom_model` | ∪bool|null | 否（可空） |  |
-| `custom_api_url` | ∪string|null | 否（可空） |  |
-| `custom_api_key` | ∪string|null | 否（可空） |  |
-| `custom_model_name` | ∪string|null | 否（可空） |  |
-| `provider_type` | ∪string|null | 否（可空） |  |
-| `extra_body` | ∪string|null | 否（可空） |  |
-| `use_subtask_model` | ∪bool|null | 否（可空） |  |
-| `subtask_custom_api_url` | ∪string|null | 否（可空） |  |
-| `subtask_custom_api_key` | ∪string|null | 否（可空） |  |
-| `subtask_custom_model_name` | ∪string|null | 否（可空） |  |
-| `subtask_provider_type` | ∪string|null | 否（可空） |  |
-| `subtask_extra_body` | ∪string|null | 否（可空） |  |
-| `thinking_budget` | ∪int|null | 否（可空） |  |
-| `min_p` | ∪float|null | 否（可空） |  |
-| `repetition_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_temperature` | ∪float|null | 否（可空） |  |
-| `thinking_top_p` | ∪float|null | 否（可空） |  |
-| `thinking_top_k` | ∪int|null | 否（可空） |  |
-| `thinking_min_p` | ∪float|null | 否（可空） |  |
-| `thinking_presence_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_repetition_penalty` | ∪float|null | 否（可空） |  |
-| `preserve_thinking` | ∪bool|null | 否（可空） |  |
+| `model_alias` | ∪string|null | 否（可空） |  |
+| `subtask_model_alias` | ∪string|null | 否（可空） |  |
 
 **输出**
 
@@ -1917,34 +1773,8 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 |---|---|---|---|
 | `name` | string | 是 |  |
 | `system_prompt` | string | 否 | （默认 ''） |
-| `temperature` | ∪float|null | 否（可空） |  |
-| `top_p` | ∪float|null | 否（可空） |  |
-| `top_k` | ∪int|null | 否（可空） |  |
-| `presence_penalty` | ∪float|null | 否（可空） |  |
-| `frequency_penalty` | ∪float|null | 否（可空） |  |
-| `max_tokens` | ∪int|null | 否（可空） |  |
-| `use_custom_model` | bool | 否 | （默认 False） |
-| `custom_api_url` | ∪string|null | 否（可空） |  |
-| `custom_api_key` | ∪string|null | 否（可空） |  |
-| `custom_model_name` | ∪string|null | 否（可空） |  |
-| `provider_type` | string | 否 | （默认 'deepseek'） |
-| `extra_body` | ∪string|null | 否（可空） |  |
-| `use_subtask_model` | bool | 否 | （默认 False） |
-| `subtask_custom_api_url` | ∪string|null | 否（可空） |  |
-| `subtask_custom_api_key` | ∪string|null | 否（可空） |  |
-| `subtask_custom_model_name` | ∪string|null | 否（可空） |  |
-| `subtask_provider_type` | ∪string|null | 否（可空） |  |
-| `subtask_extra_body` | ∪string|null | 否（可空） |  |
-| `thinking_budget` | ∪int|null | 否（可空） |  |
-| `min_p` | ∪float|null | 否（可空） |  |
-| `repetition_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_temperature` | ∪float|null | 否（可空） |  |
-| `thinking_top_p` | ∪float|null | 否（可空） |  |
-| `thinking_top_k` | ∪int|null | 否（可空） |  |
-| `thinking_min_p` | ∪float|null | 否（可空） |  |
-| `thinking_presence_penalty` | ∪float|null | 否（可空） |  |
-| `thinking_repetition_penalty` | ∪float|null | 否（可空） |  |
-| `preserve_thinking` | ∪bool|null | 否（可空） | （默认 True） |
+| `model_alias` | string | 否 | （默认 ''） |
+| `subtask_model_alias` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1955,7 +1785,7 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 **请求示例**
 
 ```bash
-curl -k -X PUT "https://<host>:8158/api/assistants/{assistant_id}" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "temperature": 0.0, "top_p": 0.0, "top_k": 0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": 0, "use_custom_model": true, "custom_api_url": "string", "custom_api_key": "string", "custom_model_name": "string", "provider_type": "string", "extra_body": "string", "use_subtask_model": true, "subtask_custom_api_url": "string", "subtask_custom_api_key": "string", "subtask_custom_model_name": "string", "subtask_provider_type": "string", "subtask_extra_body": "string", "thinking_budget": 0, "min_p": 0.0, "repetition_penalty": 0.0, "thinking_temperature": 0.0, "thinking_top_p": 0.0, "thinking_top_k": 0, "thinking_min_p": 0.0, "thinking_presence_penalty": 0.0, "thinking_repetition_penalty": 0.0, "preserve_thinking": true}
+curl -k -X PUT "https://<host>:8158/api/assistants/{assistant_id}" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "model_alias": "string", "subtask_model_alias": "string"}
 ```
 
 **返回示例**
@@ -1964,34 +1794,8 @@ curl -k -X PUT "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 {
   "name": "string",
   "system_prompt": "string",
-  "temperature": 0.0,
-  "top_p": 0.0,
-  "top_k": 0,
-  "presence_penalty": 0.0,
-  "frequency_penalty": 0.0,
-  "max_tokens": 0,
-  "use_custom_model": false,
-  "custom_api_url": "string",
-  "custom_api_key": "string",
-  "custom_model_name": "string",
-  "provider_type": "string",
-  "extra_body": "string",
-  "use_subtask_model": false,
-  "subtask_custom_api_url": "string",
-  "subtask_custom_api_key": "string",
-  "subtask_custom_model_name": "string",
-  "subtask_provider_type": "string",
-  "subtask_extra_body": "string",
-  "thinking_budget": 0,
-  "min_p": 0.0,
-  "repetition_penalty": 0.0,
-  "thinking_temperature": 0.0,
-  "thinking_top_p": 0.0,
-  "thinking_top_k": 0,
-  "thinking_min_p": 0.0,
-  "thinking_presence_penalty": 0.0,
-  "thinking_repetition_penalty": 0.0,
-  "preserve_thinking": true,
+  "model_alias": "string",
+  "subtask_model_alias": "string",
   "id": "string",
   "user_id": "string",
   "created_at": "string",
@@ -2022,6 +1826,36 @@ curl -k -X PUT "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 
 ```bash
 curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}/conversations" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+
+## 模型列表 Models
+
+前缀 `/api/models`（`app/api/models.py`）
+
+### GET `/api/models`
+**List Models**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/models.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/models" -H "Authorization: Bearer $TOKEN"
 ```
 
 **返回示例**
@@ -3255,6 +3089,44 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 ---
 
+### POST `/api/agent-tasks/{task_id}/messages`
+**Append Task Message**
+
+> F1/H2（2026-09-14）：向运行中的后台任务追加补充消息（steer）。
+> 
+> worker 每 5s 轮询 pending_messages 并推入 AgentLoop 的 interjection_queue，
+> 在下一迭代边界作为真实 user 消息进入模型。仅 pending/claimed/running 可追加；
+> 队列上限 10（与 chat interject 一致）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/agent_tasks.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `task_id` | path | string | 是 |  |
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/agent-tasks/{task_id}/messages" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {}
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
 
 ## 定时任务 Scheduled Tasks
 
@@ -4042,6 +3914,38 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 ```bash
 curl -k -X GET "https://<host>:8158/api/memory/dreams" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/memory/recall_log`
+**List Recall Log**
+
+> C1：逐轮召回台账（元数据；不存记忆内容）。cursor=(created_at,id)。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/memory.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `limit` | query | int | 否 |  |
+| `before_id` | query | string|null | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/memory/recall_log" -H "Authorization: Bearer $TOKEN"
 ```
 
 **返回示例**
@@ -5292,6 +5196,8 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `username` | string | 是 |  |
 | `created_at` | string | 是 |  |
 | `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -5309,7 +5215,9 @@ curl -k -X GET "https://<host>:8158/api/admin/users" -H "Authorization: Bearer $
     "id": "string",
     "username": "string",
     "created_at": "string",
-    "agent_permissions": {}
+    "agent_permissions": {},
+    "nickname": "string",
+    "avatar_data": "string"
   }
 ]
 ```
@@ -5395,6 +5303,8 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `username` | string | 是 |  |
 | `created_at` | string | 是 |  |
 | `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -5411,7 +5321,9 @@ curl -k -X GET "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization
   "id": "string",
   "username": "string",
   "created_at": "string",
-  "agent_permissions": {}
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
 }
 ```
 
@@ -5441,38 +5353,6 @@ curl -k -X GET "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization
 
 ```bash
 curl -k -X PUT "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization: Bearer $TOKEN"
-```
-
-**返回示例**
-
-HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
-
----
-
-
-## 配置 Config
-
-前缀 `/api/config`（`app/api/config.py`）
-
-### GET `/api/config/providers`
-**Get Provider Configs**
-
-> Return provider configurations (without sensitive API keys).
-
-认证：公开　|　源码模块：`app/api/config.py`
-
-**输入**
-
-**输出**
-
-- `200` — 响应体类型 `any`（Successful Response）
-
-> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
-
-**请求示例**
-
-```bash
-curl -k -X GET "https://<host>:8158/api/config/providers"
 ```
 
 **返回示例**
@@ -5517,14 +5397,180 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ---
 
 
-## 用户偏好 Users（Skin 偏好）
+## 用户资料与偏好 Users（资料/头像/模型供应商覆盖/Skin 偏好）
 
-前缀 `/api/users`（`app/api/users.py`）
+前缀 `/api/users`（`app/api/user_settings.py + app/api/skins.py`）
+
+### DELETE `/api/users/me/avatar`
+**Delete Avatar**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
+
+**输入**
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `id` | string | 是 |  |
+| `username` | string | 是 |  |
+| `created_at` | string | 是 |  |
+| `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X DELETE "https://<host>:8158/api/users/me/avatar" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+{
+  "id": "string",
+  "username": "string",
+  "created_at": "string",
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
+}
+```
+
+---
+
+### POST `/api/users/me/avatar`
+**Upload Avatar**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `form.file` | str(binary) — 文件 | 是 |  |
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `id` | string | 是 |  |
+| `username` | string | 是 |  |
+| `created_at` | string | 是 |  |
+| `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/users/me/avatar" -H "Authorization: Bearer $TOKEN" -F "file=<value>"
+```
+
+**返回示例**
+
+```json
+{
+  "id": "string",
+  "username": "string",
+  "created_at": "string",
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
+}
+```
+
+---
+
+### DELETE `/api/users/me/model-provider`
+**Delete Model Provider**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X DELETE "https://<host>:8158/api/users/me/model-provider" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/users/me/model-provider`
+**Get Model Provider**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/users/me/model-provider" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### PUT `/api/users/me/model-provider`
+**Update Model Provider**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X PUT "https://<host>:8158/api/users/me/model-provider" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {}
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
 
 ### GET `/api/users/me/preferences`
 **Get Ui Preferences**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/users.py`
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
 
 **输入**
 
@@ -5556,7 +5602,7 @@ curl -k -X GET "https://<host>:8158/api/users/me/preferences" -H "Authorization:
 ### PUT `/api/users/me/preferences`
 **Update Ui Preferences**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/users.py`
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
 
 **输入**
 
@@ -5584,6 +5630,94 @@ curl -k -X PUT "https://<host>:8158/api/users/me/preferences" -H "Authorization:
 ```json
 {
   "skin_id": "string"
+}
+```
+
+---
+
+### GET `/api/users/me/profile`
+**Get Profile**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
+
+**输入**
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `id` | string | 是 |  |
+| `username` | string | 是 |  |
+| `created_at` | string | 是 |  |
+| `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/users/me/profile" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+{
+  "id": "string",
+  "username": "string",
+  "created_at": "string",
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
+}
+```
+
+---
+
+### PUT `/api/users/me/profile`
+**Update Profile**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/user_settings.py + app/api/skins.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `nickname` | ∪string|null | 否（可空） |  |
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `id` | string | 是 |  |
+| `username` | string | 是 |  |
+| `created_at` | string | 是 |  |
+| `agent_permissions` | ∪object|null | 否（可空） |  |
+| `nickname` | ∪string|null | 否（可空） |  |
+| `avatar_data` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X PUT "https://<host>:8158/api/users/me/profile" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"nickname": "string"}
+```
+
+**返回示例**
+
+```json
+{
+  "id": "string",
+  "username": "string",
+  "created_at": "string",
+  "agent_permissions": {},
+  "nickname": "string",
+  "avatar_data": "string"
 }
 ```
 
@@ -5815,7 +5949,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `message` | `{attachments: [...]}` | 生成的文件附件（下载卡） |
 | `message` | `{permission_request: {request_id, tool_name, description, details}}` | 敏感工具执行前的权限请求（经 `/api/chat/permission/respond` 应答） |
 | `message` | `{deathmatch_verdict: {...}}` | 死磕裁判结论（结构见 2.8） |
-| `message` | `{title_update: {conversation_id, title}}` | 会话标题自动命名（在 done 之后） |
+| `message` | `{title_update: {conversation_id, title}}` | 标题更新（在 done 之后） |
 | `error` | `{error}` | 错误 |
 | `done` | `{conversation_id, message_id, title, tool_results, done: true}` | 终止事件；`tool_results` 为 JSON 字符串：`{rounds, results, search_failed, agent_steps, attachments?, display_sequence?, content_segments?}` |
 
@@ -5836,9 +5970,9 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 ## 2. 会话健壮性说明
 
-- `sort_order` 允许被库级写入置 NULL（ORM 默认值不覆盖显式 NULL INSERT）；启动迁移
+- `sort_order` 允许被库级写入置 NULL（ORM 默认值不覆盖显式 NULL INSERT），曾导致整表 500；启动迁移
   `conversations_sort_order_backfill` / `conversation_groups_sort_order_backfill` 幂等回填 0，
-  响应构造层再做 `None→0` 防御——单行脏数据不引发 500。
+  响应构造层再做 `None→0` 防御——单行脏数据不再引发 500（2026-08-25 起）。
 - `DELETE /api/conversations/{id}` 会连带取消该会话的活跃定时任务。
 - `GET /api/conversations/{id}` 返回前执行死磕僵尸状态修复（见 2.7）。
 
@@ -5849,17 +5983,17 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | wire 值 | 前端显示名 | 语义 |
 |---|---|---|
 | `deepseek` | DeepSeek | OpenAI 兼容 + DeepSeek 思考参数格式（`reasoning_effort`: `low`/`high`/`max`） |
-| `qwen3.8_vllm` | **Qwen3.8(Local)** | 按 modelscope vLLM 部署指南格式调用本地/自托管服务；**地址/密钥/模型名由助手配置**：`custom_api_url`/`custom_api_key`/`custom_model_name` 优先，留空回退服务器 `[providers."qwen3.8_27b"]` 配置 |
+| `qwen3.8_vllm` | **Qwen3.8(Local)**（2026-08-26 改名，原 "Qwen3.8(Local)"） | 按 modelscope vLLM 部署指南格式调用本地/自托管服务；**地址/密钥/模型名由助手配置**：`custom_api_url`/`custom_api_key`/`custom_model_name` 优先，留空回退服务器 `[providers."qwen3.8_27b"]` 配置 |
 | `mimo` | MiMo (Xiaomi) | 小米 MiMo（含 TTS/ASR 供应商链） |
 | `custom` | 自定义 | 任意 OpenAI 兼容端点（可 `extra_body` 直传 JSON） |
-| `zhipu` / `qwen` | — | 后端分支保留兼容，无前端入口 |
+| `zhipu` / `qwen` | （已移除） | 后端分支保留兼容，前端不再提供 |
 
 Qwen3.8(Local) 供应商采样参数分两套（思考/非思考），字段为 NULL 时使用模型卡默认值（思考：
 temperature 1.0 / top_p 0.95 / top_k 20 / min_p 0.0 / presence_penalty 0.0 / repetition_penalty 1.0；
 非思考：0.7 / 0.80 / 20 / 0.0 / 1.5 / 1.0）。`preserve_thinking`（默认 true）经
 `chat_template_kwargs.preserve_thinking` 传给 vLLM；`reasoning_effort` 取 `xhigh`/`medium`/`low` 走
 `chat_template_kwargs`。`reasoning` 请求参数（`enable_reasoning` / `reasoning_effort` / `thinking_budget`）
-全链路继承助手配置（P0：同助手下一切 LLM 行为默认走该助手模型）。
+全链路继承助手配置（P0：同助手下一切 LLM 行为默认走该助手模型，2026-08-21 用户强制要求）。
 
 ## 4. 技能 Skills 行为补充
 
@@ -5895,7 +6029,7 @@ temperature 1.0 / top_p 0.95 / top_k 20 / min_p 0.0 / presence_penalty 0.0 / rep
 | `interjection` | `{"event","text","emotion","raw_text","kind"?}` | 助手主动插话：`kind` 空=追问式；`memory_append`=记忆补充；`memory_correct`=自我纠正（默认关 `memory_correct_enabled=false`） |
 | `tts_*` / `asr_*` | 音频分段与识别状态 | 播放进度/打断偏移量，前端渲染语音条 |
 
-- **记忆插话（L0）**：每用户轮 fire-and-forget 调 `retrieve_with_meta`，结果以哨兵区块
+- **记忆插话（L0，2026-08-19）**：每用户轮 fire-and-forget 调 `retrieve_with_meta`，结果以哨兵区块
   原地替换 identity prompt 记忆段（下轮回答自动接地）；另派仲裁 LLM 判是否值得插话（append/correct/none，
   LLM-only 无关键词分类），门控：`memory_interjection_min_score`(0.5)、预算 `max_append`(3)/`max_correct`(2)、
   冷却 20s、同 candidate-id 去重。插话落库为 assistant 消息（Web 可见、重连可重建）；仲裁输出强制过
@@ -5995,7 +6129,7 @@ API 分布在聊天流（`/api/chat/stream`）、后台任务（`/api/agent-task
 
 ## 8. 记忆检索管线（内部行为，无独立端点；成本治理端点见一部分）
 
-记忆上下文在聊天/语音请求内自动注入系统提示。行为与关键配置：
+记忆上下文在聊天/语音请求内自动注入系统提示。行为与关键配置（2026-08-09/19 修正后）：
 
 - **入口**：`retrieve_and_build_context(db, user_id, messages)`；meta 入口
   `retrieve_with_meta(...) -> (ctx, memory_ids, top_gate_score)`（语音每轮召回用；ctx 与旧入口逐字节一致）。
@@ -6021,7 +6155,7 @@ API 分布在聊天流（`/api/chat/stream`）、后台任务（`/api/agent-task
   每日生成，不受 `dreaming_enabled` 门控）；v1 nightly dream 分离为 `dream_type='nightly'`（不注入）。
 - **会话缓存**：最近 3 轮查询哈希，TTL 5min。
 - **成本治理端点**（`/api/memory/cost_governance/status`、`/api/memory/{user_id}/cost_governance/reset`）：
-  升级当 `today_calls > max(7 日均值 × warn_multiplier, min_today_calls)`（绝对下限默认 8）；
+  升级当 `today_calls > max(7 日均值 × warn_multiplier, min_today_calls)`（2026-08-25 起加绝对下限默认 8）；
   恢复当 `today_calls ≤ 7 日均值 × recovery_ratio`（默认 1.0）。`reason` = 当前降级触发式（降级时保留）；
   `last_change` = 最近一次等级迁移动作记录。
 
@@ -6047,13 +6181,37 @@ API 分布在聊天流（`/api/chat/stream`）、后台任务（`/api/agent-task
 
 ## 11. 认证生命周期（refresh 语义）
 
-`POST /auth/refresh`：持**仍有效**的 Bearer Token 调用，以单条原子 UPDATE
+`POST /auth/refresh`（wave-3，2026-08-25）：持**仍有效**的 Bearer Token 调用，以单条原子 UPDATE
 （`WHERE session_token = <旧 token>`）轮换 `UserSession` 行（新 `jti`，`exp ≈ now + token_expire_days`），
 并刷新 `last_active_at`。该行 logout 后其 token **永久不可续期**（行缺失/并发轮换输家 → 401，不签发）；
 取消/篡改 → 401；用户停用 → 403；无 Authorization 头 → 403（HTTPBearer）。前端应用启动时静默调用，
 `/auth/refresh` 在 401 跳转白名单内。策略：持续活跃可无限续期（无 idle/绝对上限）——自托管单租户场景的
 有意取舍。
 
+## 12. 用户资料与用户级模型供应商覆盖（2026-09-13）
+
+**用户资料**：`GET/PUT /api/users/me/profile`（昵称，≤50 字符，空串/`null` = 清除，展示回落 username）；
+`POST /api/users/me/avatar`（multipart，≤2MB，服务端 Pillow 校验/EXIF 校正/居中裁剪 256×256 → JPEG q85
+data URL 存 `users.avatar_data`，原始字节不落盘）；`DELETE /api/users/me/avatar`。`UserResponse` 在
+login/refresh/me/profile 四处统一携带 `nickname` 与 `avatar_data`。
+
+**模型供应商覆盖**：每用户每 kind（`llm`/`vlm`/`embedding`/`rerank`/`asr`/`tts`）至多一行
+（`user_model_providers`）。`GET` 返回各 kind 覆盖（`has_api_key` + `api_key_tail` 掩码尾 4 位，**永不回显明文**）；
+`PUT` 按 kind 增量保存（未出现的 kind 保持原状，`null` = 删除该 kind；`api_key` 缺省 = 保持原值，`""` = 显式清除）；
+`DELETE` 清空全部。校验：未知 kind / 非 http(s) URL / 未知参数键 / 参数越域 → `400`。参数白名单：
+`temperature`(0-2) · `top_p`(0-1) · `top_k`(≥0 整数) · `max_tokens`(≥0 整数) · `presence_penalty`/`frequency_penalty`(-2..2)，
+`null` = 不覆盖。
+
+**覆盖语义**：覆盖在该用户的任务上下文（HTTP/WS 鉴权、后台任务、定时任务、记忆 per-user 调度）内生效，
+经 `ModelRegistry.get/resolve/endpoint_for_assistant` 统一改写端点；未设置覆盖的用户零行为差异。
+- 自定义 `base_url` 时 API Key 一律按用户填写发送；缺省则发空（`no-key` 哨兵）——**绝不回落系统 Key**；
+  仅覆盖 model/params 时沿用系统 URL 与 Key。
+- 系统级任务（启动迁移、无用户上下文的后台扫描）永远走系统端点。
+- 显式 purpose 路由（judge/vlm/记忆抽取等）同 kind 一并覆盖（用户可只覆盖部分 kind 精细控制）。
+- **ASR 覆盖特例**：自定义 ASR URL 时按通用 HTTP 引擎（`POST {base_url}/transcribe`，携带用户
+  填写的 Key，缺省则不发送）调用；实时语音对话仅支持 DashScope/MiMo 引擎——设置自定义 ASR URL
+  后该用户的语音对话不可用（设置面板已提示此限制）。
+
 ---
 
-*本文档由生成器从运行中后端的 `/openapi.json` 生成；接口行为变化后以运行中后端重跑生成器即可再生。*
+*文档版本：详版（2026-09-14）。OpenAPI 快照 diff 即接口变更清单；`tools/gen_api_md.py` 可重放。*

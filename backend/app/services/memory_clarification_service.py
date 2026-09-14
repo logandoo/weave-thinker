@@ -34,7 +34,10 @@ def detect_signal(user_message: str) -> bool:
 async def process_clarification(
     db: AsyncSession, user_id: str, user_message: str,
     conversation_id: str | None = None, message_id: str | None = None,
+    shadow: bool = False,
 ) -> dict | None:
+    """B11（2026-09-14）：`shadow=True` 时只记录候选不应用（语音纠正先观察
+    准确率；文字路径不受影响）。"""
     from app.services.memory_llm_factory import _memory_llm
 
     result = await db.execute(
@@ -67,6 +70,16 @@ async def process_clarification(
 
         )
         response = (response or "").strip()
+        # A4a（2026-09-14）：写路径 LLM 调用入账（计费类；DC1 隔离读路径遥测）
+        # A4.9 I4 修复：shadow 观察不应推高计费口径（否则语音每次含信号词都
+        # 可能把用户推向降级梯子）→ shadow 记 read
+        try:
+            from app.services.memory_cost_governance_service import record_llm_call
+            async with db.begin_nested():
+                await record_llm_call(db, user_id, "clarify",
+                                      billing_class="read" if shadow else "write")
+        except Exception:
+            logger.debug("record clarify llm call failed", exc_info=True)
         if response.startswith("```"):
             lines = response.split("\n")
             lines = [l for l in lines if not l.startswith("```")]
@@ -81,6 +94,8 @@ async def process_clarification(
 
     confidence = float(parsed.get("confidence", 0))
     auto_threshold = float(config.memory.get("clarification_auto_apply_threshold", 0.8))
+    # B11 shadow：记录 applied=False 候选（不应用、不写 applied_at）
+    will_apply = (not shadow) and confidence >= auto_threshold
 
     clar_id = str(uuid.uuid4())
     clarification = MemoryClarification(
@@ -93,14 +108,19 @@ async def process_clarification(
         affected_concept_ids=json.dumps(parsed.get("affected_concept_ids", [])),
         new_description=parsed.get("new_description", ""),
         confidence=confidence,
-        applied=confidence >= auto_threshold,
-        applied_at=datetime.utcnow() if confidence >= auto_threshold else None,
+        applied=will_apply,
+        applied_at=datetime.utcnow() if will_apply else None,
     )
     db.add(clarification)
 
-    if confidence >= auto_threshold:
+    if will_apply:
         await _apply_clarification(db, parsed, user_id)
         await db.flush()
+    elif shadow:
+        logger.info(
+            "clarification shadow candidate (not applied): user=%s type=%s confidence=%.2f",
+            user_id, parsed.get("correction_type", "negate"), confidence,
+        )
 
     await db.commit()
     return parsed
@@ -224,6 +244,8 @@ async def revert_clarification(db: AsyncSession, user_id: str, clarification_id:
                 if emb:
                     concept.embedding = emb
                     concept.embedding_updated_at = datetime.utcnow()
+                    from app.services.memory_embedding_service import _get_embedding_model
+                    concept.embedding_model = _get_embedding_model()
             except Exception:
                 logger.debug("revert embedding regen failed", exc_info=True)
             concept.updated_at = datetime.utcnow()

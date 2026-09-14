@@ -49,33 +49,42 @@ async def apply_recall_boost(db: AsyncSession, concept_ids: list[str], user_id: 
 
 
 async def _bulk_update_concepts(db: AsyncSession, concept_ids: list[str], boost: float, user_id: str | None = None) -> None:
-    for cid in concept_ids:
-        concept = await db.get(MemoryConcept, cid)
-        if not concept:
-            continue
-        if user_id is not None and concept.user_id != user_id:
-            continue
-        # as-of 历史召回不修改已失效概念的权重/召回记录（历史只读）
-        if concept.valid_to is not None:
-            continue
-        cap = _get_trust_cap(concept.source_trust)
-        concept.weight = min(concept.weight + boost, cap)
-        concept.last_recalled_at = datetime.utcnow()
-        concept.hot_forget_count = 0
-
-        attr = config.memory_fatigue
-        if concept.memory_type == "semantic":
-            growth = float(attr.get("semantic_stability_growth_days", 7))
-            max_stab = float(attr.get("semantic_stability_max_days", 90))
-        elif concept.memory_type == "episodic":
-            growth = float(attr.get("episodic_stability_growth_days", 4))
-            max_stab = float(attr.get("episodic_stability_max_days", 45))
-        else:
-            growth = float(attr.get("semantic_stability_growth_days", 7))
-            max_stab = float(attr.get("semantic_stability_max_days", 90))
-
-        concept.stability = min(concept.stability + growth, max_stab)
-        concept.updated_at = datetime.utcnow()
+    # B10（2026-09-14）：单条原子 UPDATE 替代逐行 read-modify-write——旧实现
+    # `db.get → weight=...` 在请求路径 boost 与后台 decay/resurrect 并发时丢更新。
+    # trust cap / stability 增量均以 SQL CASE 表达，语义与旧实现一致。
+    if not concept_ids:
+        return
+    attr = config.memory_fatigue
+    await db.execute(
+        text("""
+            UPDATE memory_concepts SET
+              weight = LEAST(
+                COALESCE(weight, 0) + CAST(:boost AS double precision),
+                CASE source_trust
+                  WHEN 'agent_inferred' THEN CAST(:cap_ai AS double precision)
+                  WHEN 'external' THEN CAST(:cap_ext AS double precision)
+                  ELSE 1.0 END),
+              last_recalled_at = NOW(),
+              hot_forget_count = 0,
+              stability = LEAST(
+                COALESCE(stability, 14) + CASE WHEN memory_type = 'episodic'
+                  THEN CAST(:grow_epi AS double precision) ELSE CAST(:grow_sem AS double precision) END,
+                CASE WHEN memory_type = 'episodic'
+                  THEN CAST(:max_epi AS double precision) ELSE CAST(:max_sem AS double precision) END),
+              updated_at = NOW()
+            WHERE id = ANY(:ids) AND valid_to IS NULL
+              AND (CAST(:uid AS varchar) IS NULL OR user_id = CAST(:uid AS varchar))
+        """),
+        {
+            "boost": boost, "ids": concept_ids, "uid": user_id,
+            "cap_ai": float(config.memory_concept.get("trust_cap_agent_inferred", 0.7)),
+            "cap_ext": float(config.memory_concept.get("trust_cap_external", 0.5)),
+            "grow_epi": float(attr.get("episodic_stability_growth_days", 4)),
+            "max_epi": float(attr.get("episodic_stability_max_days", 45)),
+            "grow_sem": float(attr.get("semantic_stability_growth_days", 7)),
+            "max_sem": float(attr.get("semantic_stability_max_days", 90)),
+        },
+    )
 
 
 async def apply_episode_recall_boost(db: AsyncSession, episode_ids: list[str], user_id: str | None = None) -> None:
@@ -102,14 +111,25 @@ async def apply_episode_recall_boost(db: AsyncSession, episode_ids: list[str], u
         except (_json.JSONDecodeError, TypeError):
             continue
     for cid in set(concept_ids):
-        concept = await db.get(MemoryConcept, cid)
-        if not concept or concept.user_id != user_id:
-            continue
-        if concept.valid_to is not None:
-            continue
-        cap = _get_trust_cap(concept.source_trust)
-        concept.weight = min((concept.weight or 0) + 0.02, cap)
-        concept.updated_at = datetime.utcnow()
+        # B10：cross-boost 同样原子化（旧逐行 read-modify-write 会丢更新）
+        await db.execute(
+            text("""
+                UPDATE memory_concepts SET
+                  weight = LEAST(
+                    COALESCE(weight, 0) + 0.02,
+                    CASE source_trust
+                      WHEN 'agent_inferred' THEN CAST(:cap_ai AS double precision)
+                      WHEN 'external' THEN CAST(:cap_ext AS double precision)
+                      ELSE 1.0 END),
+                  updated_at = NOW()
+                WHERE id = :cid AND user_id = :uid AND valid_to IS NULL
+            """),
+            {
+                "cid": cid, "uid": user_id,
+                "cap_ai": float(config.memory_concept.get("trust_cap_agent_inferred", 0.7)),
+                "cap_ext": float(config.memory_concept.get("trust_cap_external", 0.5)),
+            },
+        )
 
 
 async def apply_subconscious_recall_boost(db: AsyncSession, unit_ids: list[str]) -> None:
@@ -122,11 +142,6 @@ async def apply_subconscious_recall_boost(db: AsyncSession, unit_ids: list[str])
 
 
 async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_type: str) -> None:
-    concept = await db.get(MemoryConcept, concept_id)
-    if not concept or concept.valid_to is not None:
-        return
-    cap = _get_trust_cap(concept.source_trust)
-
     signal_map = {
         "recall_reference": 0.03,
         "multi_turn_recurrence": 0.05,
@@ -137,11 +152,30 @@ async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_t
         "dreaming_confirmation": 0.05,
     }
     delta = signal_map.get(signal_type, 0)
-    if delta > 0:
-        concept.weight = min(concept.weight + delta, cap)
-    elif delta < 0:
-        concept.weight = max(concept.weight + delta, 0)
-    concept.updated_at = datetime.utcnow()
+    if delta == 0:
+        return
+    # B10（2026-09-14）：原子 UPDATE（旧 read-modify-write 并发丢更新）；
+    # 正向按 trust cap 封顶、负向以 0 为底，语义与旧实现一致
+    await db.execute(
+        text("""
+            UPDATE memory_concepts SET
+              weight = GREATEST(
+                LEAST(
+                  COALESCE(weight, 0) + CAST(:delta AS double precision),
+                  CASE source_trust
+                    WHEN 'agent_inferred' THEN CAST(:cap_ai AS double precision)
+                    WHEN 'external' THEN CAST(:cap_ext AS double precision)
+                    ELSE 1.0 END),
+                0),
+              updated_at = NOW()
+            WHERE id = :id AND valid_to IS NULL
+        """),
+        {
+            "delta": delta, "id": concept_id,
+            "cap_ai": float(config.memory_concept.get("trust_cap_agent_inferred", 0.7)),
+            "cap_ext": float(config.memory_concept.get("trust_cap_external", 0.5)),
+        },
+    )
 
 
 async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
@@ -219,9 +253,12 @@ async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:
         if weight_writeback:
             new_weight = max(effective, floor_w)
             if abs(new_weight - (weight or 0)) > 1e-9:
+                # B10：乐观条件写回——并发 boost 已改 weight 时跳过本轮写回
+                # （不覆盖更新的权重；下轮以新值重算），避免丢更新
                 await db.execute(
-                    text("UPDATE memory_concepts SET weight = :w, weight_decayed_at = NOW() WHERE id = :id"),
-                    {"w": new_weight, "id": cid},
+                    text("UPDATE memory_concepts SET weight = CAST(:w AS double precision), weight_decayed_at = NOW() "
+                         "WHERE id = :id AND COALESCE(weight, 0) = CAST(:old AS double precision)"),
+                    {"w": new_weight, "id": cid, "old": weight or 0},
                 )
             effective = new_weight
 
@@ -280,17 +317,25 @@ async def try_cold_resurrect(db: AsyncSession, user_message: str, user_id: str) 
                 pass
         hit = any(n and n.lower() in msg for n in needles)
         if hit:
+            # A2/DC4（2026-09-14）：复活必须刷新衰减锚 weight_decayed_at，
+            # 否则次夜 run_weight_decay 以数周前的旧锚计算 effective≈0，
+            # 把刚复活的 weight 写回 floor（复活形同虚设）。
+            # 注意：不得写 last_recalled_at——该列语义是"真实召回/注入"，
+            # 复活仅是词法匹配，写它会污染 recency 融合与召回统计。
             if status == "cold_forgotten":
                 weight = float(config.memory_concept.get("cold_resurrect_weight", 0.3))
-                await db.execute(
-                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight = :w, hot_forget_count = 0, updated_at = NOW() WHERE id = :id"),
+                res = await db.execute(
+                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight = :w, hot_forget_count = 0, weight_decayed_at = NOW(), updated_at = NOW() WHERE id = :id AND status = 'cold_forgotten'"),
                     {"w": weight, "id": cid},
                 )
             else:
-                await db.execute(
-                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, updated_at = NOW() WHERE id = :id"),
+                res = await db.execute(
+                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight_decayed_at = NOW(), updated_at = NOW() WHERE id = :id AND status = 'silent'"),
                     {"id": cid},
                 )
+            # A4.9 Minor：条件 UPDATE 未命中（并发改状态）时不算复活
+            if not res.rowcount:
+                continue
             resurrected.append(cid)
             # §5.3.4：embedding 缺失/过期（NULL 或从未生成）时复活即重生成，
             # 否则复活后 Stage 3 embedding 检索仍不可达
@@ -322,8 +367,9 @@ async def _regenerate_embedding_if_stale(db: AsyncSession, concept_id: str) -> N
             async with db.begin_nested():
                 await db.execute(
                     text("UPDATE memory_concepts SET embedding = CAST(:emb AS vector), "
-                         "embedding_updated_at = NOW() WHERE id = :id"),
-                    {"emb": _emb_to_pgvector(vec), "id": concept_id},
+                         "embedding_updated_at = NOW(), embedding_model = :m WHERE id = :id"),
+                    {"emb": _emb_to_pgvector(vec), "id": concept_id,
+                     "m": _get_embedding_model()},
                 )
     except Exception:
         # §9.4：embedding 生成失败不阻塞复活，consolidation 批量补生成兜底

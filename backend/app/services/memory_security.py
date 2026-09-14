@@ -21,6 +21,14 @@ _MEMORY_THREAT_PATTERNS = [
     (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
     (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc)', "read_secrets"),
     (r'authorized_keys', "ssh_backdoor"),
+    # B8（2026-09-14）：中文注入模式（本产品中文优先，旧词表仅英文可被绕过）
+    (r'忽略(以上|之前|前面|先前|上述|所有)?(的)?(全部)?(指令|指示|要求|规则)', "prompt_injection_zh"),
+    (r'无视(以上|之前|前面|上述|所有)(的)?(指令|指示|要求|规则)', "prompt_injection_zh"),
+    (r'不要(告诉|告知|提醒)(用户|他|她)', "deception_hide_zh"),
+    (r'(系统|角色)(提示词|指令)(覆盖|替换|更新)', "sys_prompt_override_zh"),
+    (r'你现在(是|扮演|开始扮演)', "role_hijack_zh"),
+    (r'(泄露|输出|打印|发送)(密钥|密码|token|凭据|凭证)', "exfil_secrets_zh"),
+    (r'(读取|查看|打开)\s*(\.env|credentials|\.pgpass|\.npmrc)', "read_secrets_zh"),
 ]
 
 _PII_PATTERNS = [

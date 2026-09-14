@@ -25,7 +25,7 @@
         </div>
         <video :src="getMediaUrl(file)" controls playsinline preload="metadata" class="media-player media-video"></video>
       </div>
-      <div v-else class="file-card" @click="downloadFile(file)">
+      <div v-else class="file-card" @click="onFileCardClick(file)">
         <div class="file-icon">{{ fileIcon(inferType(file)) }}</div>
         <div class="file-info">
           <span class="file-name">{{ file.name }}</span>
@@ -34,7 +34,7 @@
             <span class="file-size">{{ formatSize(file.size) }}</span>
           </span>
         </div>
-        <div class="download-icon">⬇</div>
+        <button class="download-icon" title="下载" @click.stop="downloadFile(file)">⬇</button>
       </div>
     </template>
   </div>
@@ -45,12 +45,19 @@
     @close="lightboxFile = null"
     @download="downloadFile"
   />
+  <FilePreviewDialog
+    v-if="previewFile"
+    :filename="previewFile.name"
+    :url="getDownloadUrl(previewFile)"
+    @close="previewFile = null"
+  />
 </template>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { FileAttachment } from '@/types'
 import MediaLightbox from './MediaLightbox.vue'
+import FilePreviewDialog from './FilePreviewDialog.vue'
 import { downloadUrl } from '@/composables/useDownload'
 import { useToast } from '@/composables/useToast'
 
@@ -59,8 +66,23 @@ defineProps<{
 }>()
 
 const lightboxFile = ref<FileAttachment | null>(null)
+const previewFile = ref<FileAttachment | null>(null)
 const abortController = ref<AbortController | null>(null)
 const { show: showToast } = useToast()
+
+const PREVIEWABLE_EXT_RE = /\.(pdf|md|markdown|txt|py|ts|js|json|sh|yaml|yml|html|css|sql|go|rs|java)$/i
+
+function isPreviewable(file: FileAttachment): boolean {
+  return PREVIEWABLE_EXT_RE.test(file.name || '') || PREVIEWABLE_EXT_RE.test(file.path || '')
+}
+
+function onFileCardClick(file: FileAttachment) {
+  if (isPreviewable(file)) {
+    previewFile.value = file
+  } else {
+    downloadFile(file)
+  }
+}
 
 const lightboxKind = computed<'image' | 'video'>(() => {
   const f = lightboxFile.value
@@ -343,6 +365,9 @@ async function downloadFile(file: FileAttachment) {
   font-size: 16px;
   color: var(--color-primary);
   opacity: 1;
+  padding: 0 2px;
+  line-height: 1;
+  flex-shrink: 0;
   transition: opacity var(--transition-fast);
 }
 

@@ -8,7 +8,7 @@
 只持有 ModelEndpoint，不再直接读取 config 的模型配置键。
 """
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 KIND_LLM = "llm"
 KIND_EMBEDDING = "embedding"
@@ -36,6 +36,34 @@ class ModelEndpoint:
 
     def with_overrides(self, **kw) -> "ModelEndpoint":
         return replace(self, **kw)
+
+    @property
+    def context_window(self) -> Optional[int]:
+        """F5（2026-09-14）：端点声明的上下文窗口（extra.context_window /
+        extra.context_length）；未声明/非法 → None（调用方回退全局配置，绝不猜小）。"""
+        for key in ("context_window", "context_length"):
+            val = (self.extra or {}).get(key)
+            if val is None:
+                continue
+            try:
+                n = int(val)
+            except (TypeError, ValueError):
+                continue
+            if n > 0:
+                return n
+        return None
+
+    @property
+    def max_output_tokens(self) -> Optional[int]:
+        """F5：端点声明的最大输出 token（extra.max_output_tokens）。"""
+        val = (self.extra or {}).get("max_output_tokens")
+        if val is None:
+            return None
+        try:
+            n = int(val)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
 
     def public_dict(self) -> dict:
         """前端可见视图——绝不包含 base_url / api_key / 真实 model_name。"""

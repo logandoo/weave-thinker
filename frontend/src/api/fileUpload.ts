@@ -25,6 +25,7 @@ export const fileUploadApi = {
     saveToNotebook: boolean,
     onProgress?: (percent: number) => void,
     notebookId?: string,
+    signal?: AbortSignal,
   ): Promise<FileUploadResponse> {
     const formData = new FormData()
     for (const file of files) {
@@ -39,6 +40,7 @@ export const fileUploadApi = {
     const { data } = await api.post<FileUploadResponse>('/files/upload', formData, {
       params,
       headers: { 'Content-Type': 'multipart/form-data' },
+      signal,
       onUploadProgress: (e) => {
         if (onProgress && e.total) {
           onProgress(Math.round((e.loaded / e.total) * 100))

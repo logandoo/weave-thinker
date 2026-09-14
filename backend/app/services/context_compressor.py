@@ -295,6 +295,9 @@ class ContextCompressor:
         self.context_length = 32000
         self.threshold_tokens = int(self.context_length * threshold_percent)
         self.compression_count = 0
+        # A5（2026-09-14）：工具对修复计数（孤儿结果删除/缺失结果占位），
+        # 用于观测切边界修复的真实频率
+        self.tool_pair_repairs = 0
         self._previous_summary: Optional[str] = None
         self._ineffective_count = 0
         self._last_ineffective_msg_count = 0
@@ -633,7 +636,14 @@ class ContextCompressor:
         fallback_cut = n - min_tail
         if cut_idx > fallback_cut:
             cut_idx = fallback_cut
-        return max(cut_idx, head_end + 1)
+        cut_idx = max(cut_idx, head_end + 1)
+        # A5（2026-09-14）：工具对边界平衡——tail 不得以 `tool` 结果开头：
+        # 其 owning assistant(tool_calls) 会被切进 middle，孤儿结果随后被
+        # _sanitize_tool_pairs 删除或补占位（丢精确内容）。向前越过整组
+        # tool 结果（与头部 _align_boundary_forward 同一策略），使 tail 从
+        # 非 tool 消息开始，整组与其 assistant 一起进 middle 被摘要覆盖。
+        cut_idx = self._align_boundary_forward(messages, cut_idx)
+        return cut_idx
 
     def _align_boundary_forward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         while idx < len(messages) and messages[idx].get("role") == "tool":
@@ -668,6 +678,15 @@ class ContextCompressor:
                         if cid in missing:
                             patched.append({"role": "tool", "content": "[Result from earlier conversation — see summary above]", "tool_call_id": cid})
             messages = patched
+        if orphaned or missing:
+            # A5（2026-09-14）：修复计数——切边界对平衡生效后该值应趋近 0；
+            # 持续 >0 说明仍有切断路径（观测用，非错误）
+            self.tool_pair_repairs += 1
+            if not self.quiet:
+                logger.info(
+                    "Tool-pair boundary repair: orphaned=%d missing=%d (total repairs=%d)",
+                    len(orphaned), len(missing), self.tool_pair_repairs,
+                )
         return messages
 
     def _serialize_turns(self, turns: List[Dict[str, Any]]) -> str:

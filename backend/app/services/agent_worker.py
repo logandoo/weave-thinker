@@ -20,7 +20,7 @@ import time as _time
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, text
 
 from app.core.config import get_config
 from app.db.database import AsyncSessionLocal, AgentTask, Conversation, Message, User, Assistant, Notebook, Note
@@ -209,6 +209,9 @@ class AgentWorker:
             logger.exception("Failed to execute background task %s", task_id)
         finally:
             self._running_task_ids.discard(task_id)
+            # 用户级模型供应商覆盖：任务结束必须清上下文（worker 任务复用风险）
+            from app.model_gateway.user_overrides import reset_active_user_overrides
+            reset_active_user_overrides()
 
     async def _run_task(self, task_id: str) -> None:
         now = datetime.utcnow()
@@ -229,9 +232,19 @@ class AgentWorker:
             if task.conversation_id:
                 conversation = await db.get(Conversation, task.conversation_id)
 
+            # 用户级模型供应商覆盖：后台任务与交互请求同等适用（2026-09-13）
+            try:
+                from app.services.user_model_provider_service import activate_user_overrides
+                await activate_user_overrides(db, task.user_id)
+            except Exception:
+                logger.exception("activate_user_overrides failed for background task %s", task_id)
+
             workspace = await ensure_user_workspace(db, task.user_id, user.username if user else None)
 
         logger.info("Background task started: %s (goal: %.80s)", task_id, task.goal or "")
+
+        # F1/H2（2026-09-14）：运行中补充消息轮询器（异常路径可安全取消）
+        _pending_poller: asyncio.Task | None = None
 
         try:
             system_prompt = config.agent.get(
@@ -241,6 +254,20 @@ class AgentWorker:
             if assistant and assistant.system_prompt:
                 system_prompt = assistant.system_prompt
             system_prompt = f"{system_prompt}\n\n{_BACKGROUND_TASK_HINT}"
+
+            # E4（2026-09-14，默认关）：后台任务注入小预算用户记忆（fail-open）
+            try:
+                from app.services import memory_task_context as _mtc
+                if _mtc.background_task_memory_enabled():
+                    async with AsyncSessionLocal() as _mem_db:
+                        _mem_block = await _mtc.build_task_memory_context(
+                            _mem_db, task.user_id, task.goal or "",
+                            budget_chars=int(config.agent.get(
+                                "background_task_memory_budget_chars", 600)))
+                    if _mem_block:
+                        system_prompt = f"{system_prompt}\n\n{_mem_block}"
+            except Exception:
+                logger.debug("background task memory injection failed (fail-open)", exc_info=True)
 
             # P0: canonical client builder — provider-type routing (incl.
             # qwen3.8_vllm's server-side provider fallback) + process cache.
@@ -312,11 +339,17 @@ class AgentWorker:
             _timed_out = False
             _cancelled = False
 
+            # F1/H2：interjection_queue + 5s 轮询 pending_messages（投递后清空列）
+            interjection_queue: asyncio.Queue = asyncio.Queue()
+            _pending_poller = asyncio.create_task(
+                self._poll_pending_messages(task_id, interjection_queue))
+
             async for event in agent_loop.run(
                 messages,
                 user=user,
                 conversation=conversation,
                 assistant=assistant,
+                interjection_queue=interjection_queue,
             ):
                 if deadline and asyncio.get_event_loop().time() > deadline:
                     logger.warning("Background task %s timed out after %ds", task_id, timeout)
@@ -430,6 +463,11 @@ class AgentWorker:
                 if "error" in event:
                     accumulated_response += f"\n\n[Error: {event.get('error', '')}]"
                     break
+
+            if _pending_poller:
+                _pending_poller.cancel()
+                with suppress(asyncio.CancelledError):
+                    await _pending_poller
 
             total_elapsed = asyncio.get_event_loop().time() - started_at_ts
 
@@ -628,27 +666,87 @@ class AgentWorker:
                 logger.debug("voice notify on task completion failed", exc_info=True)
 
         except asyncio.CancelledError:
+            if _pending_poller:
+                _pending_poller.cancel()
+                with suppress(asyncio.CancelledError):
+                    await _pending_poller
             await self._mark_cancelled(task_id)
             raise
         except Exception as exc:
+            if _pending_poller:
+                _pending_poller.cancel()
+                with suppress(asyncio.CancelledError):
+                    await _pending_poller
             logger.exception("Background task %s failed", task_id)
             await self._mark_failed(task_id, str(exc))
+
+    async def _poll_pending_messages(self, task_id: str, queue: asyncio.Queue) -> None:
+        """F1/H2：每 5s 读取 agent_tasks.pending_messages 并推入 interjection_queue。
+
+        投递成功后清空列（已投递消息不再重复推送）。失败静默（steer 是增强，
+        绝不影响任务主流程）。
+        """
+        while True:
+            try:
+                async with AsyncSessionLocal() as db:
+                    # A4.9 I1：行锁（FOR UPDATE）串行化「读-投递-清空」与 API 追加，
+                    # 防止 SELECT 与 UPDATE 之间新追加的 steer 被 NULL 覆盖丢失
+                    row = (await db.execute(
+                        text("SELECT pending_messages FROM agent_tasks WHERE id = :id FOR UPDATE"),
+                        {"id": task_id},
+                    )).fetchone()
+                    if row and row[0]:
+                        try:
+                            messages = json.loads(row[0]) or []
+                        except (json.JSONDecodeError, TypeError):
+                            messages = []
+                        delivered = 0
+                        for m in messages:
+                            if isinstance(m, dict) and str(m.get("content") or "").strip():
+                                queue.put_nowait(str(m["content"]))
+                                delivered += 1
+                        if delivered:
+                            await db.execute(
+                                text("UPDATE agent_tasks SET pending_messages = NULL WHERE id = :id"),
+                                {"id": task_id},
+                            )
+                            await db.commit()
+                            logger.info("Background task %s: delivered %d steering message(s)",
+                                        task_id, delivered)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("pending message poll failed (silent)", exc_info=True)
+            await asyncio.sleep(5)
 
     def _extract_attachments(self, tool_results_accumulated: list[dict]) -> list[dict]:
         """Same policy as chat._transform_tool_loop_results:
 
-        - execute_code/code_execution auto-collection excludes scratch/task_XXXX
-          temp files (intermediates are never deliverables).
+        - F3（2026-09-14）：产物收集改按工具注册元数据 `produces_files` 判定
+          （新工具声明即被收集）；未声明时回退旧名列表（向后兼容）。
+        - 声明产物的工具自动收集，排除 scratch/task_XXXX 临时文件。
         - provide_file entries are the agent's explicit set: kept as-is (no
           scratch filter) and win over auto-collection when present.
         """
+        try:
+            from app.tools.registry import registry as _tool_registry
+        except Exception:
+            _tool_registry = None
         auto_attachments = []
         provided_attachments = []
         seen_paths: set[str] = set()
         for tr in tool_results_accumulated:
             name = tr.get("name", "")
             raw_result = tr.get("result", "")
-            if name in ("execute_code", "code_execution", "provide_file") and raw_result:
+            produces = False
+            if _tool_registry is not None:
+                try:
+                    produces = _tool_registry.tool_produces_files(name)
+                except Exception:
+                    produces = False
+            if not produces and name not in ("execute_code", "code_execution", "provide_file"):
+                continue
+            if raw_result:
                 try:
                     parsed = json.loads(raw_result)
                     gen_files = parsed.get("generated_files", [])

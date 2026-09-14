@@ -327,7 +327,7 @@ JUDGE_SYSTEM_PROMPT = (
      "另外输出 compact 字段：你判断当前子任务已解决、或执行轨迹已收敛"
      "（继续保留全部历史的边际价值已经很低，建议系统压缩上下文）时 compact=true，否则 false。\n\n"
      "只输出一行JSON：\n"
-     '{"verdict": "done|continue|wait|blocked|ask", "reason": "<一句话原因，DONE 时必须含证据引用>", "compact": <true|false>}'
+     '{"verdict": "done|continue|wait|blocked|ask", "reason": "<一句话原因，DONE 时必须含证据引用>", "compact": <true|false>, "taxonomy": "hallucination|domain|wrong-tool|other（仅 continue/blocked 失败归因时可选）"}'
 )
 
 JUDGE_USER_PROMPT_TEMPLATE = (
@@ -535,6 +535,51 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [截断]"
 
 
+# E2/CAST（2026-09-14）：失败 taxonomy（推理侧 4 条之一）——可选字段，
+# 旧判词无该字段时解析行为逐字节不变。共享常量见 eval_metrics。
+from app.services.eval_metrics import TAXONOMY_VALUES as JUDGE_TAXONOMY_VALUES  # noqa: E402
+
+
+def _extract_judge_taxonomy(raw: str) -> Optional[str]:
+    """从判词 JSON 提取可选 taxonomy（非法/缺失 → None，绝不影响 verdict 解析）。"""
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:]
+    data: Optional[Dict[str, Any]] = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        match = _JSON_OBJECT_RE.search(text)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        return None
+    val = str(data.get("taxonomy") or "").strip().lower()
+    return val if val in JUDGE_TAXONOMY_VALUES else None
+
+
+def _resolve_dm_context_length(manager) -> int:
+    """A4.9 I4：死磕遥测用上下文窗口——端点声明优先（缓存一次 LLM 客户端），
+    未声明回退全局配置。"""
+    try:
+        llm = getattr(manager, "_ctx_window_llm", None)
+        if llm is None:
+            llm = manager._make_llm()
+            manager._ctx_window_llm = llm
+        from app.services.agent_loop import _resolve_context_length
+        return _resolve_context_length(llm)
+    except Exception:
+        return config.agent_compression_context_length
+
+
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, bool]:
     """Parse the judge reply into (verdict, reason, parse_failed, compact).
 
@@ -596,10 +641,10 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, bool]:
     return ("done" if done else "continue"), reason, False, bool(data.get("compact"))
 
 
-async def _call_judge_llm(goal: str, last_response: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT, judge_llm: Any = None, evidence: str = "") -> Tuple[str, str, bool, bool, bool]:
+async def _call_judge_llm(goal: str, last_response: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT, judge_llm: Any = None, evidence: str = "") -> Tuple[str, str, bool, bool, bool, Optional[str]]:
     """Call an LLM to judge whether the goal is satisfied. Fail-open: return continue.
 
-    Returns (verdict, reason, parse_failed, infra_failed, compact).
+    Returns (verdict, reason, parse_failed, infra_failed, compact, taxonomy).
     ``infra_failed`` is
     True for judge infrastructure failures (timeout / LLM error / call
     exception) — P1-7: those must feed the stall counter via the caller,
@@ -610,9 +655,9 @@ async def _call_judge_llm(goal: str, last_response: str, *, timeout: float = DEF
     <environment_evidence> section when non-empty.
     """
     if not goal.strip():
-        return "skipped", "empty goal", False, False, False
+        return "skipped", "empty goal", False, False, False, None
     if not last_response.strip():
-        return "continue", "empty response (nothing to evaluate)", False, False, False
+        return "continue", "empty response (nothing to evaluate)", False, False, False, None
 
     prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
         goal=_truncate(goal, 2000),
@@ -726,22 +771,23 @@ async def _call_judge_llm(goal: str, last_response: str, *, timeout: float = DEF
                 logger.warning("deathmatch judge fallback retry failed: %s", exc)
         if had_error:
             logger.info("deathmatch judge: LLM error — falling through to continue")
-            return "continue", err_msg, False, True, False
+            return "continue", err_msg, False, True, False, None
         if not raw:
-            return "continue", "judge returned empty response", True, False, False
+            return "continue", "judge returned empty response", True, False, False, None
     except asyncio.TimeoutError:
         logger.info(
             "deathmatch judge: timed out after %.1fs — falling through to continue",
             timeout,
         )
-        return "continue", f"judge timed out after {timeout:.0f}s", False, True, False
+        return "continue", f"judge timed out after {timeout:.0f}s", False, True, False, None
     except Exception as exc:
         logger.info("deathmatch judge: call failed (%s) — falling through to continue", exc)
-        return "continue", f"judge error: {type(exc).__name__}", False, True, False
+        return "continue", f"judge error: {type(exc).__name__}", False, True, False, None
 
     verdict, reason, parse_failed, compact = _parse_judge_response(raw)
-    logger.info("deathmatch judge: verdict=%s reason=%s", verdict, _truncate(reason, 120))
-    return verdict, reason, parse_failed, False, compact
+    taxonomy = _extract_judge_taxonomy(raw)
+    logger.info("deathmatch judge: verdict=%s taxonomy=%s reason=%s", verdict, taxonomy, _truncate(reason, 120))
+    return verdict, reason, parse_failed, False, compact, taxonomy
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1750,7 +1796,7 @@ class DeathmatchManager:
         # evaluate_after_turn; absent → the line is omitted (unit paths).
         ctx_line = ""
         _ctx_est = int(getattr(self, "_ctx_estimate_tokens", 0) or 0)
-        _ctx_window = int(config.agent_compression_context_length or 0)
+        _ctx_window = int(_resolve_dm_context_length(self) or 0)
         if _ctx_est > 0 and _ctx_window > 0:
             _ctx_pct = _ctx_est * 100 // _ctx_window
             ctx_line = (
@@ -2441,6 +2487,18 @@ intent 只能是以下之一：
             history_text=self._format_history_for_prompt(),
             previous_context=previous_context,
         )
+
+        # E4（2026-09-14，默认关）：grilling 前注入小预算用户记忆（fail-open）
+        try:
+            from app.services import memory_task_context as _mtc
+            if _mtc.deathmatch_memory_enabled():
+                _mem_block = await _mtc.build_task_memory_context(
+                    db, user_id, query,
+                    budget_chars=int(config.deathmatch.get("memory_injection_budget_chars", 600)))
+                if _mem_block:
+                    prompt = f"{_mem_block}\n\n{prompt}"
+        except Exception:
+            logger.debug("deathmatch grilling memory injection failed (fail-open)", exc_info=True)
 
         MAX_RETRIES = 3
         questions = []
@@ -4644,11 +4702,18 @@ intent 只能是以下之一：
                 _judge_evidence = self._build_judge_evidence(workspace_path, tool_results)
             except Exception as exc:
                 logger.debug("judge evidence build failed (non-blocking): %s", exc)
-        verdict, reason, parse_failed, infra_failed, compact = await _call_judge_llm(
+        _judge_result = await _call_judge_llm(
             _goal_with_subgoals, last_response,
             judge_llm=self._make_llm(),
             evidence=_judge_evidence,
         )
+        # E2：新契约为 6 元组（含 taxonomy）；兼容旧 5 元组桩（测试 monkeypatch）
+        if len(_judge_result) == 6:
+            verdict, reason, parse_failed, infra_failed, compact, taxonomy = _judge_result
+        else:
+            verdict, reason, parse_failed, infra_failed, compact = _judge_result
+            taxonomy = None
+        self._last_judge_taxonomy = taxonomy
         # P2-11: rubric compaction signal from the judge (consumed by the
         # agent loop's forced-compression gate).
         self._last_judge_compact = bool(compact)
@@ -5874,6 +5939,8 @@ intent 只能是以下之一：
             "last_verification": self._conv.deathmatch_last_verification_result,
             "human_gate": self._conv.deathmatch_human_gate,
             "final_attachments": list(self._final_attachments or []),
+            # E2（2026-09-14）：可选失败 taxonomy（hallucination/domain/wrong-tool/other）
+            "taxonomy": getattr(self, "_last_judge_taxonomy", None),
         }
 
     @classmethod

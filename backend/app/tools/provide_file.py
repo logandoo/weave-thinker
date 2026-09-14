@@ -171,6 +171,8 @@ async def provide_file(args: Dict[str, Any], **kwargs) -> str:
 registry.register(
     name="provide_file",
     toolset="files",
+    # F3（2026-09-14）：显式提供文件（收集器按元数据收集）
+    produces_files=True,
     schema={
         "name": "provide_file",
         "description": (

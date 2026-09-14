@@ -35,7 +35,7 @@ _GREETING_TRIVIAL_PROMPT = (
 )
 
 
-async def _filter_trivial_texts(texts: list[str]) -> set[int]:
+async def _filter_trivial_texts(texts: list[str], timeout: float = 120.0) -> set[int]:
     """LLM-judged triviality filter (agentic principle — the former greeting
     regexes could not generalize to arbitrary small-talk phrasings).
 
@@ -72,7 +72,10 @@ async def _filter_trivial_texts(texts: list[str]) -> set[int]:
                 f"消息列表：\n{numbered}\n\n只输出JSON。",
                 task="triviality",
                 default=None,
-                timeout=120.0,
+                # B6（2026-09-14）：超时可传入剩余预算——旧实现固定 120s 与调度器
+                # 每用户整轮 wait_for(120s) 相等，一次慢判定即吃光预算、本轮零提交
+                # 且水位不动，15min 后无限重复。
+                timeout=timeout,
             )
             if isinstance(parsed, dict):
                 for idx in parsed.get("trivial_indices") or []:
@@ -129,6 +132,19 @@ def _unit_source_trust(unit_kind: str, source_ids: list[str] | None = None) -> s
     return trust
 
 
+_DUPLICATE_SENTINEL = "__duplicate__"
+# B6（2026-09-14）：单轮 ingest 预算（调度器每用户 wait_for(120s)）——给
+# 琐碎判定留出上限，保证失败/慢判定时仍能提交已成功单元
+_INGEST_BUDGET_SECONDS = 110.0
+
+
+def _unit_content_hash(unit_kind: str, raw_text: str, source_ids: list[str]) -> str:
+    """B2（2026-09-14）：内容去重键（kind+文本+来源），防水位重放重复入账。"""
+    import hashlib
+    payload = f"{unit_kind}\x00{raw_text}\x00{','.join(source_ids)}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:32]
+
+
 async def ingest_raw_unit(
     db: AsyncSession, user_id: str, unit_kind: str, raw_text: str, source_ids: list[str],
 ) -> Optional[str]:
@@ -137,10 +153,19 @@ async def ingest_raw_unit(
     # 琐碎/寒暄预筛在调用方批量完成（LLM 判断，_filter_trivial_texts）
     clean_text, _ = scrub_pii(raw_text[:1000])
 
-    emb = await embed_text(clean_text)
-    if not emb:
-        return None
+    # B2：幂等去重（同 kind+文本+来源已入账 → 视为成功但跳过，不再重复写）
+    content_hash = _unit_content_hash(unit_kind, clean_text, source_ids)
+    exists = await db.execute(
+        text("SELECT 1 FROM subconscious_log WHERE user_id = :uid AND content_hash = :h LIMIT 1"),
+        {"uid": user_id, "h": content_hash},
+    )
+    if exists.fetchone():
+        return _DUPLICATE_SENTINEL
 
+    emb = await embed_text(clean_text)
+    # B2：嵌入失败不再返回 None（旧实现把水位钉死 → 整窗每 15min 重复抽取）——
+    # 落 NULL 行 + needs_embedding 标记，水位正常推进，由修复 pass 有界补嵌。
+    from app.services.memory_embedding_service import _get_embedding_model
     unit_id = str(uuid.uuid4())
     unit = SubconsciousLog(
         id=unit_id,
@@ -149,10 +174,46 @@ async def ingest_raw_unit(
         raw_text=clean_text,
         source_ids=json.dumps(source_ids, ensure_ascii=False),
         embedding=emb,
+        embedding_model=_get_embedding_model() if emb else None,
+        content_hash=content_hash,
+        needs_embedding=not emb,
     )
     db.add(unit)
     await db.flush()
+    # B1（2026-09-14）：subconscious BM25 索引增量维护（旧实现首建后冻结）
+    if emb:
+        try:
+            from app.services.memory_bm25 import update_sub_index
+            update_sub_index(user_id, unit_id, clean_text)
+        except Exception:
+            logger.debug("sub bm25 index update failed", exc_info=True)
     return unit_id
+
+
+async def repair_missing_embeddings(db: AsyncSession, user_id: str, limit: int = 20) -> int:
+    """B2/B7（2026-09-14）：补嵌 needs_embedding 单元（有界；端点不可用时保留标记）。"""
+    from app.services.memory_embedding_service import _emb_to_pgvector, _get_embedding_model
+    rows = (await db.execute(
+        text("SELECT id, raw_text FROM subconscious_log WHERE user_id = :uid AND needs_embedding = TRUE ORDER BY created_at ASC LIMIT :lim"),
+        {"uid": user_id, "lim": limit},
+    )).fetchall()
+    fixed = 0
+    for unit_id, raw_text in rows:
+        emb = await embed_text(raw_text)
+        if not emb:
+            break  # 端点仍不可用：保留标记，下轮再试
+        await db.execute(
+            text("UPDATE subconscious_log SET embedding = CAST(:emb AS vector), needs_embedding = FALSE, embedding_model = :m WHERE id = :id"),
+            {"emb": _emb_to_pgvector(emb), "m": _get_embedding_model(), "id": unit_id},
+        )
+        # B1：补嵌后进入 BM25 索引（保持"仅 embedded 单元可检索"的过滤语义）
+        try:
+            from app.services.memory_bm25 import update_sub_index
+            update_sub_index(user_id, unit_id, raw_text)
+        except Exception:
+            logger.debug("sub bm25 index update failed", exc_info=True)
+        fixed += 1
+    return fixed
 
 
 async def ingest_pending_raw_units(db: AsyncSession, user_id: str) -> int:
@@ -168,6 +229,8 @@ async def ingest_pending_raw_units(db: AsyncSession, user_id: str) -> int:
     state_id = row[0]
     t0 = datetime.utcnow()
     count = 0
+    import time as _time
+    started = _time.monotonic()
 
     for kind, col_name in [
         ("message", "last_message_processed_at"),
@@ -180,17 +243,19 @@ async def ingest_pending_raw_units(db: AsyncSession, user_id: str) -> int:
 
         raw_units = await _load_raw_by_kind(db, user_id, kind, old_watermark, t0)
         # 琐碎/寒暄批量预筛（§5.1.a step 2，LLM 判断）：跳过但不阻塞水位线
-        trivial_idx = await _filter_trivial_texts([rt for rt, _ in raw_units])
+        # B6：超时=剩余预算（下限 10s），慢判定走宽松回退且已成功单元仍提交
+        remaining = max(10.0, _INGEST_BUDGET_SECONDS - (_time.monotonic() - started))
+        trivial_idx = await _filter_trivial_texts([rt for rt, _ in raw_units], timeout=remaining)
         kind_ok = True
         for unit_idx, (raw_text, source_ids) in enumerate(raw_units):
             if unit_idx in trivial_idx:
                 continue
             try:
                 uid = await ingest_raw_unit(db, user_id, kind, raw_text, source_ids)
-                if uid:
-                    count += 1
-                else:
-                    kind_ok = False
+                # B2：重复（幂等跳过）与空文本不算失败，水位可正常推进
+                if uid == _DUPLICATE_SENTINEL or uid is None:
+                    continue
+                count += 1
             except Exception:
                 kind_ok = False
                 logger.exception("ingest_raw_unit failed for user=%s kind=%s", user_id, kind)
@@ -205,6 +270,14 @@ async def ingest_pending_raw_units(db: AsyncSession, user_id: str) -> int:
                 "ingest incomplete for user=%s kind=%s; watermark kept for retry",
                 user_id, kind,
             )
+
+    # B2/B7：补嵌 pass（有界；失败不影响本轮计数与水位）
+    try:
+        fixed = await repair_missing_embeddings(db, user_id)
+        if fixed:
+            logger.info("subconscious embedding repair: user=%s fixed=%d", user_id, fixed)
+    except Exception:
+        logger.debug("repair_missing_embeddings failed for user=%s", user_id, exc_info=True)
     return count
 
 
@@ -291,6 +364,14 @@ async def _load_file_memory_units(db: AsyncSession, user_id: str) -> list[tuple[
             continue
         entries = [e.strip() for e in content.split("\n§\n") if e.strip()]
         for entry in entries[:200]:
+            # B8 shadow（2026-09-14）：文件记忆条目过去不扫注入——记录不拒绝
+            try:
+                from app.services.memory_security import scan_injection as _scan
+                _hit = _scan(entry)
+                if _hit:
+                    logger.warning("memory shadow scan hit (file_memory) user=%s: %s", user_id, _hit)
+            except Exception:
+                logger.debug("file_memory shadow scan failed", exc_info=True)
             entry_hash = hashlib.sha1(entry.encode("utf-8")).hexdigest()[:16]
             source_id = f"file_memory:{target.replace('.md', '')}:{entry_hash}"
             exists = await db.execute(
@@ -445,7 +526,7 @@ async def _call_extraction_llm(
             "procedural 概念是'做某类任务的有效方法'，必须带触发条件。来源于 agent 自我观察/工作方法。procedural 免衰减。\n\n"
             + gate_hint +
             "输出 JSON 格式：\n"
-            '{"episodic": {"narrative": "<500 token 事件叙事>", "valid_from": "ISO8601或null", "merge_with_episode_id": "已有episode ID或null"}, '
+            '{"episodic": {"narrative": "<500 token 事件叙事>", "valid_from": "ISO8601或null", "merge_with_episode_id": "已有episode ID或null", "participants": ["涉及的人/角色"], "locations": ["涉及的地点"]}, '
             '"concepts": [{"canonical_name": "...", "description_short": "≤80中文字", "description_full": "≤1000 token详版", '
             '"aliases": [...], "match_existing_id": "已有概念ID或null", "cluster_suggestion": "集合名", '
             '"source_trust": "user_stated|user_authored|agent_inferred", "memory_type": "semantic|episodic|procedural", '
@@ -498,14 +579,13 @@ async def _execute_promotion(
     from app.services.memory_concept_service import extract_concepts_from_recurrence, reconcile_concept_sources
     source_unit_ids = [u["id"] for u in cluster_units]
     raw_texts = [u["raw_text"] for u in cluster_units]
+    # B3（2026-09-14）：promoted 标记移入 extract_concepts_from_recurrence 的
+    # 同一事务（在其唯一 commit 前）——旧实现 concepts 先 commit、caller 之后
+    # 才标 promoted，中间取消/崩溃 → 概念在、单元未标，下轮重复抽取。
     concept_ids, episode_id = await extract_concepts_from_recurrence(
         db, user_id, llm_output, source_unit_ids, raw_texts,
+        promoted_unit_ids=source_unit_ids,
     )
-    for u in cluster_units:
-        await db.execute(
-            text("UPDATE subconscious_log SET promoted = TRUE, promoted_at = NOW() WHERE id = :id"),
-            {"id": u["id"]},
-        )
     # §5.1.d step 3：对账 pass——来源全部失效的概念标 needs_review
     try:
         await reconcile_concept_sources(db, user_id)
@@ -519,11 +599,22 @@ async def archive_soft_deprecated(db: AsyncSession, user_id: str) -> int:
     archive_ret = int(ret_cfg.get("subconscious_archive_retention_days", 90))
     now = datetime.utcnow()
 
+    # B1：归档（embedding 置 NULL）的单元移出 BM25 索引，保持"仅 embedded 可检索"
+    archived_ids = (await db.execute(
+        text("SELECT id FROM subconscious_log WHERE user_id = :uid AND promoted = FALSE AND created_at < :cutoff AND embedding IS NOT NULL"),
+        {"uid": user_id, "cutoff": now - timedelta(days=retention)},
+    )).fetchall()
     result = await db.execute(
-        text("UPDATE subconscious_log SET promoted = TRUE, embedding = NULL WHERE user_id = :uid AND promoted = FALSE AND created_at < :cutoff AND embedding IS NOT NULL"),
+        text("UPDATE subconscious_log SET promoted = TRUE, embedding = NULL, needs_embedding = FALSE WHERE user_id = :uid AND promoted = FALSE AND created_at < :cutoff AND embedding IS NOT NULL"),
         {"uid": user_id, "cutoff": now - timedelta(days=retention)},
     )
     soft_count = result.rowcount
+    try:
+        from app.services.memory_bm25 import remove_sub_index
+        for (archived_id,) in archived_ids:
+            remove_sub_index(user_id, archived_id)
+    except Exception:
+        logger.debug("sub bm25 index remove failed", exc_info=True)
 
     result = await db.execute(
         text("DELETE FROM subconscious_log WHERE user_id = :uid AND embedding IS NULL AND created_at < :cutoff"),

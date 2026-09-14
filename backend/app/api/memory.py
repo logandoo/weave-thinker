@@ -353,3 +353,62 @@ async def forget_concept(
         raise HTTPException(status_code=404, detail="Concept not found")
     await db.commit()
     return {"forgotten": concept_id}
+
+
+def _decode_recall_json(raw):
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/recall_log")
+async def list_recall_log(
+    limit: int = 50,
+    before_id: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """C1：逐轮召回台账（元数据；不存记忆内容）。cursor=(created_at,id)。"""
+    limit = max(1, min(int(limit or 50), 200))
+    params = {"uid": current_user.id, "limit": limit}
+    cursor_clause = ""
+    if before_id:
+        cursor_clause = (
+            "AND (created_at, id) < (SELECT created_at, id FROM memory_recall_log "
+            "WHERE id = :before_id AND user_id = :uid)")
+        params["before_id"] = before_id
+    result = await db.execute(
+        text(f"""
+            SELECT id, conversation_id, query_hash, candidate_ids, tier_scores,
+                   gate_score, budget_chars, injected_chars, truncated,
+                   elapsed_ms, cache_hit, created_at
+            FROM memory_recall_log
+            WHERE user_id = :uid {cursor_clause}
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+        """),
+        params,
+    )
+    rows = result.mappings().all()
+    total = (await db.execute(
+        text("SELECT COUNT(*) FROM memory_recall_log WHERE user_id = :uid"),
+        {"uid": current_user.id},
+    )).scalar() or 0
+    items = [{
+        "id": r["id"],
+        "conversation_id": r["conversation_id"],
+        "query_hash": r["query_hash"],
+        "candidate_ids": _decode_recall_json(r["candidate_ids"]),
+        "tier_scores": _decode_recall_json(r["tier_scores"]),
+        "gate_score": r["gate_score"],
+        "budget_chars": r["budget_chars"],
+        "injected_chars": r["injected_chars"],
+        "truncated": r["truncated"],
+        "elapsed_ms": r["elapsed_ms"],
+        "cache_hit": r["cache_hit"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+    } for r in rows]
+    return {"items": items, "total": int(total)}

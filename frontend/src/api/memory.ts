@@ -17,6 +17,23 @@ export interface MemoryConcept {
   valid_from: string | null
   valid_to: string | null
   created_at: string | null
+  aliases?: string[] | null
+  recurrence_count?: number | null
+}
+
+export interface MemoryRecallLogItem {
+  id: string
+  conversation_id: string | null
+  query_hash: string | null
+  candidate_ids: string[] | null
+  tier_scores: Record<string, [string, number][]> | null
+  gate_score: number
+  budget_chars: number
+  injected_chars: number
+  truncated: boolean
+  elapsed_ms: number
+  cache_hit: boolean
+  created_at: string | null
 }
 
 export interface MemoryDream {
@@ -73,8 +90,19 @@ export const memoryApi = {
     return data.clarifications || []
   },
 
+  async getRecallLog(limit = 50, beforeId?: string): Promise<{ items: MemoryRecallLogItem[]; total: number }> {
+    const { data } = await api.get<{ items: MemoryRecallLogItem[]; total: number }>('/memory/recall_log', {
+      params: beforeId ? { limit, before_id: beforeId } : { limit }
+    })
+    return { items: data.items || [], total: data.total || 0 }
+  },
+
   async deleteConcept(conceptId: string): Promise<void> {
     await api.delete(`/memory/concepts/${conceptId}`)
+  },
+
+  async forgetConcept(conceptId: string): Promise<void> {
+    await api.post(`/memory/concepts/${conceptId}/forget`)
   },
 
   async revertClarification(clarificationId: string): Promise<void> {

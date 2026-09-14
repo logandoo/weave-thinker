@@ -22,6 +22,8 @@ name = "<YOUR-DB-NAME>"
 
 [agent]
 name = "共享智能体"
+background_task_memory_injection_enabled = false
+background_task_memory_budget_chars = 600
 memory_max_items = 12
 note_context_limit = 12
 conversation_context_limit = 40
@@ -94,6 +96,7 @@ call_timeout_seconds = 600
 revision_min_similarity = 0.45
 reject_budget_search = 4
 max_evidence_tokens = 128000
+full_evidence_max_tokens = 0
 soft_reject_limit = 3
 draft_selection_enabled = true
 selection_timeout_seconds = 480
@@ -311,6 +314,7 @@ interjection_cooldown_seconds = 3.0
 interjection_max_per_turn = 3
 emotion_enabled = true
 filler_enabled = true
+filler_ttft_threshold_seconds = 0.7
 filler_phrases = ["我来看看啊", "我来想想啊", "等下啊，我琢磨一下", "嗯，我想想", "让我捋一捋哈", "稍等，我查查看", "好，我这就看", "嗯，我看下哈"]
 backchannel_enabled = true
 backchannel_phrases = ["嗯", "嗯嗯", "哦", "对", "嗯哼", "对啊", "好", "明白"]
@@ -336,6 +340,8 @@ tts_enabled = true
 
 [deathmatch]
 enabled = true
+memory_injection_enabled = false
+memory_injection_budget_chars = 600
 max_consecutive_failures = 5
 tool_loop_max_iterations = 999
 verify_enabled = true
@@ -405,6 +411,10 @@ stage4_llm_trigger_score_gap = 0.1
 rerank_mode = "cross_encoder"
 stage4_ce_skip_strong_top_sim = 0.7
 profile_sync_enabled = true
+recall_log_enabled = true
+recall_log_retention_days = 30
+recall_log_max_per_user = 20000
+recall_log_sample_rate = 1.0
 [memory.concept]
 weight_init = 0.5
 weight_recall_boost = 0.03
@@ -511,18 +521,30 @@ fusion_subconscious_recency = 0.6
 recency_tau_days_concept = 14
 recency_tau_days_episodic = 21
 recency_tau_days_subconscious = 7
-total_timeout_ms = 1500
-stage0_timeout_ms = 80
-stage0_llm_timeout_ms = 1000
-stage1_timeout_ms = 80
-stage2_timeout_ms = 100
-stage3_timeout_ms = 500
-stage4_score_only_timeout_ms = 10
+stage0_hard_ceiling_ms = 0
 stage4_llm_timeout_ms = 500
 stage4_cross_encoder_timeout_ms = 800
 bm25_k1 = 1.5
 bm25_b = 0.75
 bm25_tokenizer = "jieba"
+expansion_rho_enabled = false
+agpr_enabled = false
+deterministic_edges_enabled = false
+edge_read_whitelist_enabled = false
+assembly_mmr_enabled = false
+assembly_mmr_lambda = 0.5
+assembly_grouping_enabled = false
+contradicts_read_downgrade_enabled = false
+adaptive_cardinality_enabled = false
+adaptive_cardinality_high_score = 0.5
+text_cross_turn_dedup_enabled = false
+merge_fast_path_enabled = false
+merge_mst_enabled = false
+merge_gray_zone_low = 0.03
+injection_usage_instruction_enabled = false
+injection_usage_instruction_text = "以上历史记忆可能过时或不适用于当前任务，请结合当前对话判断。"
+listwise_verifier_enabled = false
+listwise_verifier_timeout_ms = 8000
 
 
 [secrets]

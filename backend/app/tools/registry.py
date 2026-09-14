@@ -65,6 +65,9 @@ class ToolEntry:
     description: str = ""
     emoji: str = ""
     permission_key: Optional[str] = None
+    # F3（2026-09-14）：产物声明——带该元数据的工具结果会被附件收集器收集
+    # （不再按工具名硬编码；新工具自动被收集）
+    produces_files: bool = False
 
 
 class ToolRegistry:
@@ -79,6 +82,11 @@ class ToolRegistry:
     def get_tool_usage_stats(self) -> Dict[str, int]:
         """Return {tool_name: dispatch_count} for successfully-dispatched calls."""
         return dict(self._usage_counter)
+
+    def tool_produces_files(self, name: str) -> bool:
+        """F3：工具是否声明产物（附件收集器的元数据判据）。"""
+        entry = self._tools.get(name)
+        return bool(entry and entry.produces_files)
 
     def _snapshot_entries(self) -> List[ToolEntry]:
         return list(self._tools.values())
@@ -102,6 +110,7 @@ class ToolRegistry:
         description: str = "",
         emoji: str = "",
         permission_key: Optional[str] = None,
+        produces_files: bool = False,
     ):
         existing = self._tools.get(name)
         if existing:
@@ -120,6 +129,7 @@ class ToolRegistry:
             description=description,
             emoji=emoji,
             permission_key=permission_key,
+            produces_files=produces_files,
         )
         logger.debug("Registered tool '%s' in toolset '%s'", name, toolset)
 

@@ -24,6 +24,29 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
 MAX_DELEGATION_DEPTH = 2
 
 
+def _collect_generated_files(raw_result, seen_paths: set) -> list:
+    """F3（A4.9 I3）：从工具结果 JSON 收集产物条目。
+
+    非 dict JSON（数组/标量）、非 JSON、缺 generated_files 均安全返回 []；
+    只接受 {path, ...} 字典且路径去重。
+    """
+    if not raw_result:
+        return []
+    try:
+        parsed = json.loads(raw_result)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    out = []
+    for f in (parsed.get("generated_files") or []):
+        if (isinstance(f, dict) and f.get("path")
+                and f["path"] not in seen_paths):
+            seen_paths.add(f["path"])
+            out.append(f)
+    return out
+
+
 def _get_default_child_max_iterations():
     from app.core.config import get_config
     return get_config().agent_delegation_default_child_max_iterations
@@ -152,6 +175,9 @@ async def _run_child_agent(
         )
 
         assistant_content = ""
+        # F3（2026-09-14）：收集子代理产物（tool_result 事件的 generated_files）
+        child_files: list[dict] = []
+        seen_child_paths: set[str] = set()
         async for event in loop.run(
             messages,
             user=kwargs.get("user"),
@@ -164,12 +190,17 @@ async def _run_child_agent(
                 assistant_content = ""
             if event.get("content"):
                 assistant_content += event.get("content", "")
+            tr = event.get("tool_result")
+            if isinstance(tr, dict):
+                for f in _collect_generated_files(tr.get("result"), seen_child_paths):
+                    child_files.append(f)
 
         duration = asyncio.get_running_loop().time() - child_start
         return {
             "child_id": child_id,
             "status": "completed",
             "summary": assistant_content.strip() or "(no output)",
+            "generated_files": child_files,
             "duration_seconds": round(duration, 2),
         }
     except Exception as e:
@@ -194,6 +225,7 @@ async def _run_child_agent(
             "status": "completed",
             "summary": content or "",
             "reasoning": reasoning or "",
+            "generated_files": [],
             "duration_seconds": round(duration, 2),
         }
     except Exception as e:

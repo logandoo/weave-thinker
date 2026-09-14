@@ -102,6 +102,13 @@ class LLMService:
         # 非 custom 端点走下方 [defaults] 全局默认，行为与 legacy 一致）。
         _ep = getattr(self, "endpoint", None)
         _ep_params = dict((_ep.params if (_ep is not None and self.is_custom_provider) else {}) or {})
+        # 用户级模型供应商覆盖（2026-09-13）：用户在「系统设置 → 模型供应商」
+        # 显式设置的采样参数优先级最高——注入 kwargs 覆盖 per-call 硬编码
+        # （主回复 temperature=0.7、审计 0.0 等）。仅非 None 值生效。
+        if _ep is not None:
+            for _uk, _uv in dict(_ep.extra.get("user_params") or {}).items():
+                if _uv is not None:
+                    kwargs[_uk] = _uv
         # A4.9 R3 Minor①修复：max_tokens 前置归一化——0/""/"0" 与 kwargs 同义
         # （视为未设置），从端点参数中剔除使其自然回落 [defaults]。
         # 2026-08-31 W-2 Imp-3：同样的归一化扩展到 extra_body 扩展参数——
@@ -109,7 +116,12 @@ class LLMService:
         # 调用的 wire 上携带 extra_body={"top_k": ""}，类型严格的 backend
         # （vLLM）会 400。
         for _norm_key in ("max_tokens", "top_k", "min_p", "repetition_penalty"):
-            if _ep_params.get(_norm_key) in (None, "", 0, "0"):
+            # min_p=0.0 是真实数据不是哨兵（Qwen3.8 模型卡预设；R5，2026-09-13
+            # 审计 F-E）——与下方 kwargs 侧（`min_p in (None, "", "0")`）统一：
+            # 端点 params 里的显式 0/0.0 必须送达 wire（llama.cpp 未设 min_p
+            # 时用服务端非零默认）。其余键维持 0 视为未设置。
+            _sentinel = (None, "", "0") if _norm_key == "min_p" else (None, "", 0, "0")
+            if _ep_params.get(_norm_key) in _sentinel:
                 _ep_params.pop(_norm_key, None)
         # PHASE 1B (A2, 2026-08-21): preserve-thinking providers keep the
         # CURRENT turn's assistant reasoning_content (everything after the

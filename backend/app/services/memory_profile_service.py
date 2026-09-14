@@ -1,16 +1,15 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""用户画像事实写路径（2026-08-09）：把 v1 每日摘要中的 profile 事实
-提炼为 memory_type='profile' 的概念入库，使画像信息走正常 v2 检索管线。
+"""用户画像事实写路径（2026-08-09，2026-09-13 输入源改为 v2 产物）：把用户
+近期的 v2 情景记忆（memory_episodes.narrative，冷启动兜底 extracted 概念
+描述）中的 profile 事实提炼为 memory_type='profile' 的概念入库，使画像信息
+走正常 v2 检索管线。
 
-背景（A4.6 根因 4）：迁移未跑时，家庭/孩子/年龄等 profile 事实只存在于
-`user_agent_states.memory_summary` 与 `agent_memories.daily-summary`，v2
-检索管线从不查询——用户问"给孩子选书"时孩子信息永不出现。上一版修复在
-读路径做了运行时关键字扫描 + 行级 embedding（魔法数字 + 每请求 ≤8 次
-embed 调用）。本模块把该逻辑移到**写路径**：调度器每日一次用 LLM 从
-近 14 天 daily-summary 提炼结构化 profile 事实，upsert 为概念，读路径
-退化为查概念 + 恒定基底注入（见 `_get_profile_summary` 简化版）。
+历史：原实现读 v1 `agent_memories.daily-summary`——v2 运行时 v1 生成已停摆
+（60 实证：2026-07-29 后零新增 → profile_sync 自 2026-08-12 永久空转）。
+2026-09-13 方案 A 退休 v1：输入源改为 v2 自身产物（v1 生成/回落注入在 v2
+运行时一并停用；v1 代码保留为 v2 关闭时的回滚网）。
 """
 import json
 import logging
@@ -93,14 +92,32 @@ async def _mark_synced(db: AsyncSession, user_id: str) -> None:
 
 
 async def _load_recent_summaries(db: AsyncSession, user_id: str, limit: int = 10) -> list[str]:
-    """近 14 天 daily-summary 文本（最新在前）。"""
+    """近 14 天 v2 情景记忆原文（最新在前）——v1 daily-summary 退休后的输入源。
+
+    2026-09-13（v1 退休，方案 A）：v2 运行时 v1 daily-summary 已停摆
+    （60 实证 2026-07-29 后零新增 → profile_sync 自 2026-08-12 空转）。
+    profile 提炼改读 v2 自身产物；冷启动（无情景记忆）兜底近 14 天
+    extracted 概念描述。
+    """
     result = await db.execute(
         text("""
-            SELECT content FROM agent_memories
-            WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid)
-              AND source_type = 'daily-summary' AND content IS NOT NULL
+            SELECT narrative FROM memory_episodes
+            WHERE user_id = :uid AND narrative IS NOT NULL AND valid_to IS NULL
               AND created_at >= now() - interval '14 days'
             ORDER BY created_at DESC LIMIT :lim
+        """),
+        {"uid": user_id, "lim": limit},
+    )
+    rows = [r[0].strip() for r in result.fetchall() if r[0] and r[0].strip()]
+    if rows:
+        return rows
+    result = await db.execute(
+        text("""
+            SELECT description_full FROM memory_concepts
+            WHERE user_id = :uid AND source_type = 'extracted' AND valid_to IS NULL
+              AND status = 'active' AND description_full IS NOT NULL
+              AND created_at >= now() - interval '14 days'
+            ORDER BY importance DESC LIMIT :lim
         """),
         {"uid": user_id, "lim": limit},
     )
@@ -132,7 +149,7 @@ async def _extract_profile_facts(llm, summaries: list[str]) -> list[dict]:
         return []
     now_str = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("Asia/Shanghai")).isoformat()
     prompt = (
-        "你是用户画像事实提炼助手。从用户近期的每日记忆摘要中，提取**稳定的个人画像事实**："
+        "你是用户画像事实提炼助手。从用户近期的情景记忆与概念摘要中，提取**稳定的个人画像事实**："
         "家庭情况（配偶/孩子/父母）、年龄、职业身份、居住地、长期偏好、重要个人事件。\n"
         "规则：\n"
         "1. 只提取与用户个人生活相关的稳定事实，不要提取工作项目细节、技术方案、一次性的对话内容\n"
@@ -195,6 +212,14 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
     llm = _memory_llm("concept_extraction")
     try:
         facts = await _extract_profile_facts(llm, summaries)
+        # A4a（2026-09-14）：写路径 LLM 调用入账（计费类）
+        # A4.9 修复 F2：savepoint 隔离，入账失败不毒化画像事务
+        try:
+            from app.services.memory_cost_governance_service import record_llm_call
+            async with db.begin_nested():
+                await record_llm_call(db, user_id, "profile_sync", billing_class="write")
+        except Exception:
+            logger.debug("record profile_sync llm call failed", exc_info=True)
     except Exception:
         logger.exception("profile fact extraction failed for user=%s", user_id)
         return {"error": "extraction_failed"}

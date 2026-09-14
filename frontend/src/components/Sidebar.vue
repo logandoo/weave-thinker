@@ -700,8 +700,11 @@
     <div class="sidebar-footer">
       <div class="user-info-wrapper" v-if="auth.user.value">
         <div ref="userInfoRef" class="user-info" @click.stop="showUserMenu = !showUserMenu">
-          <span class="user-avatar">{{ auth.user.value.username.charAt(0).toUpperCase() }}</span>
-          <span class="user-name">{{ auth.user.value.username }}</span>
+          <span class="user-avatar">
+            <img v-if="auth.user.value.avatar_data" :src="auth.user.value.avatar_data" alt="" />
+            <template v-else>{{ auth.user.value.username.charAt(0).toUpperCase() }}</template>
+          </span>
+          <span class="user-name">{{ auth.user.value.nickname || auth.user.value.username }}</span>
         </div>
         <Teleport to="body">
           <div v-if="showUserMenu" class="user-menu-overlay" @click="showUserMenu = false">
@@ -4156,6 +4159,14 @@ const emit = defineEmits<{
   color: var(--color-text-light);
   font-size: 12px;
   font-weight: 500;
+  overflow: hidden;
+}
+
+.user-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .user-name {

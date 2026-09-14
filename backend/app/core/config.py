@@ -800,6 +800,24 @@ class Config:
             return 3.0
 
     @property
+    def voice_filler_ttft_threshold_seconds(self) -> float:
+        """Seconds after the main LLM call starts before the filler may play.
+
+        The filler is a latency cover, not a per-turn ritual: it plays ONLY
+        when the model has not produced its first content token within this
+        window (AND-gate: elapsed >= threshold AND no first content AND not
+        speaking/paused/interrupted AND cooldown passed). A fast turn never
+        hears a filler. 0.7s sits just above the ~600-700ms silent-gap
+        tolerance threshold (Roberts & Francis 2013) and inside the
+        500-1500ms industry band for fixed-time fillers (Agora). 0 = legacy
+        immediate play; negative values are clamped to 0. Config-level
+        rollback net: `[voice] filler_ttft_threshold_seconds = 0`."""
+        try:
+            return max(0.0, float(self.voice.get("filler_ttft_threshold_seconds", 0.7)))
+        except (TypeError, ValueError):
+            return 0.7
+
+    @property
     def voice_backchannel_enabled(self) -> bool:
         """Whether the agent utters short listening acks (嗯/哦…) during the
         user's mid-utterance pauses. Kept intentionally short so the phrase
@@ -1873,6 +1891,20 @@ class Config:
         在 128k 上下文 provider 上整体超限 400 → fail-open 绕过
         「截断→unverifiable」优雅路径。provider 上下文更大时可调高。"""
         return int(self.agent_audit.get("evidence_context_ceiling_tokens", 128000))
+
+    @property
+    def agent_audit_full_evidence_max_tokens(self) -> int:
+        """确定性全量语料（full_text）的可选预算上限（tokens；≤0=不限，默认 0）。
+
+        残余①（2026-09-13，A4.9 R1 修复版语义）：M1 修复后确定性闸门消费未
+        裁剪全量语料——默认必须保持无上限（信息完整性 > token；任何上限都
+        可能重建「证据在窗外→不可满足」类）。本键仅给受约束部署（内存/延迟
+        预算）一个显式的、有标注的降级阀：按**条目粒度 token 预算**执行
+        （同一估算器，整块保留；首块即超限时二分头部前缀），超限追加无数字
+        标注（标注文本会进确定性闸门，数字可能被误当锚点），绝不静默。
+        生产默认 0。
+        """
+        return int(self.agent_audit.get("full_evidence_max_tokens", 0))
 
     # ---- PTC (Programmatic Tool Calling) ----
 

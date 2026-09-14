@@ -16,7 +16,7 @@ logging.basicConfig(
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
 )
 
-from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api
+from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api, user_settings
 from app.db.database import init_db, AsyncSessionLocal
 from app.core.config import get_config, clear_config_cache
 from app.services.agent_scheduler import agent_scheduler
@@ -84,6 +84,7 @@ app.include_router(system.router)
 app.include_router(memory_api.router)
 app.include_router(memory_api.admin_router)
 app.include_router(skins_api.router)
+app.include_router(user_settings.router)
 
 
 async def _memory_reprobe_after_reload() -> None:

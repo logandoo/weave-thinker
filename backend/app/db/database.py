@@ -3,7 +3,7 @@
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, Float, Integer, JSON
+from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, Float, Integer, JSON, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from pgvector.sqlalchemy import Vector
 from datetime import datetime
@@ -34,6 +34,9 @@ class User(Base):
     last_login_ip = Column(String(45), nullable=True)
     agent_permissions = Column(Text, nullable=True)
     ui_preferences = Column(Text, nullable=True)
+    # 用户信息（2026-09-13）：昵称与头像（data URL，256×256 JPEG，服务端重编码）。
+    nickname = Column(String(100), nullable=True)
+    avatar_data = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -47,6 +50,37 @@ class User(Base):
     workspace = relationship("UserWorkspace", back_populates="user", uselist=False, cascade="all, delete-orphan")
     asr_hotwords = relationship("UserAsrHotword", back_populates="user", cascade="all, delete-orphan")
     skills = relationship("UserSkill", back_populates="user", cascade="all, delete-orphan")
+    model_providers = relationship("UserModelProvider", back_populates="user", cascade="all, delete-orphan")
+
+
+class UserModelProvider(Base):
+    """用户级模型供应商覆盖（2026-09-13）。
+
+    每用户每 kind（llm/vlm/embedding/rerank/asr/tts）至多一行；行存在且
+    enabled=true 且（base_url/model_name/params 任一非空）时，该用户上下文内
+    所有该 kind 的端点解析被覆盖（model_gateway.user_overrides.apply_user_override）。
+    api_key 仅写不读（GET 只回掩码）；自定义 base_url + 空 key → 发空（no-key 哨兵）。
+    """
+    __tablename__ = "user_model_providers"
+    # 每用户每 kind 至多一行（A4.9 Important 修复：create_all 先于迁移执行，
+    # 唯一性必须由 ORM 声明；迁移侧另有 CREATE UNIQUE INDEX IF NOT EXISTS
+    # 覆盖既有表）。
+    __table_args__ = (
+        UniqueConstraint("user_id", "kind", name="uq_user_model_providers_user_kind"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind = Column(String(20), nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True)
+    base_url = Column(String(500), nullable=True)
+    api_key = Column(String(500), nullable=True)
+    model_name = Column(String(200), nullable=True)
+    params_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="model_providers")
 
 
 class Assistant(Base):
@@ -322,6 +356,8 @@ class MemoryConcept(Base):
     superseded_by = Column(String(36), nullable=True)
     embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
     embedding_updated_at = Column(DateTime, nullable=True)
+    # DC2（2026-09-14）：向量溯源
+    embedding_model = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -335,6 +371,8 @@ class MemoryCluster(Base):
     summary = Column(Text, nullable=True)
     weight = Column(Float, nullable=False, default=0.5)
     embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
+    # DC2（2026-09-14）：向量溯源——记录生成该向量的模型名，防跨模型混空间
+    embedding_model = Column(String(100), nullable=True)
     member_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -357,6 +395,9 @@ class ConceptRelation(Base):
     relation_type = Column(String(50), nullable=False)
     description = Column(Text, nullable=True)
     weight = Column(Float, nullable=False, default=0.5)
+    # D1（2026-09-14）：边来源（'llm'=LLM 抽取 / 'deterministic'=确定性构边）；
+    # 存量行为 NULL，读侧按 'llm' 语义兼容（DC5 门控）
+    edge_source = Column(String(20), nullable=True, default="llm")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -386,6 +427,10 @@ class SubconsciousLog(Base):
     raw_text = Column(Text, nullable=False)
     source_ids = Column(Text, nullable=False)
     embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
+    # DC2/B2（2026-09-14）：向量溯源 + 幂等去重键 + 待补嵌标记
+    embedding_model = Column(String(100), nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    needs_embedding = Column(Boolean, nullable=False, default=False)
     promoted = Column(Boolean, nullable=False, default=False)
     promoted_at = Column(DateTime, nullable=True)
     recurrence_count = Column(Integer, nullable=False, default=0)
@@ -406,9 +451,14 @@ class MemoryEpisode(Base):
     valid_to = Column(DateTime, nullable=True)
     superseded_by = Column(String(36), nullable=True)
     embedding = Column(Vector(1024), nullable=True)  # 维度须与 [endpoints.embedding].extra.dim 一致（Wave D）
+    # DC2（2026-09-14）：向量溯源
+    embedding_model = Column(String(100), nullable=True)
     merged_from = Column(String(36), nullable=True)
     last_recalled_at = Column(DateTime, nullable=True)
     source_type = Column(String(50), default="extracted")  # 'extracted' | 'migration'
+    # D1（2026-09-14）：RippleMem 式 P/L/T 线索（可空，JSON 数组字符串；存量行保持 NULL）
+    participants = Column(String(1000), nullable=True)
+    locations = Column(String(1000), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -422,6 +472,34 @@ class MemoryLLMCall(Base):
     model = Column(String(100), nullable=True)
     prompt_tokens = Column(Integer, nullable=False, default=0)
     completion_tokens = Column(Integer, nullable=False, default=0)
+    # DC1（2026-09-14）：'write'=计费（进入成本治理降级口径）/'read'=遥测
+    # （读热路径调用，只入账不参与降级）
+    billing_class = Column(String(20), nullable=True, default="write")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class MemoryRecallLog(Base):
+    """C1/N16（2026-09-14）：逐轮召回台账。
+
+    只存元数据（候选 ids/分层分/门控/预算/字符/截断/耗时/缓存命中），
+    **不存任何记忆内容**（帕累托 D6 隐私约束）。异步 fire-and-forget 写，
+    失败静默——台账永不阻塞或影响检索主流程。FK CASCADE 对齐用户/会话
+    （DC7）；保留策略（30 天 + per-user 上限）只作用本表。
+    """
+    __tablename__ = "memory_recall_log"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True)
+    query_hash = Column(String(32), nullable=True)
+    candidate_ids = Column(Text, nullable=True)
+    tier_scores = Column(Text, nullable=True)
+    gate_score = Column(Float, nullable=True, default=0.0)
+    budget_chars = Column(Integer, nullable=False, default=0)
+    injected_chars = Column(Integer, nullable=False, default=0)
+    truncated = Column(Boolean, nullable=False, default=False)
+    elapsed_ms = Column(Integer, nullable=False, default=0)
+    cache_hit = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -538,6 +616,9 @@ class AgentTask(Base):
     intermediate_steps = Column(Text, nullable=True)
     output_conversation_id = Column(String(36), nullable=True)
     output_note_id = Column(String(36), nullable=True)
+    # F1（2026-09-14）：运行中补充消息（JSON 数组 [{id, content, created_at}]，
+    # worker 每 5s 轮询推入 interjection_queue 并在投递后清空；可空）
+    pending_messages = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

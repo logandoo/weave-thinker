@@ -461,6 +461,8 @@ async def generate_and_execute_code(args: dict, **kwargs) -> str:
 registry.register(
     name="execute_code",
     toolset="code",
+    # F3（2026-09-14）：产物声明——收集器按元数据收集（不再按名硬编码）
+    produces_files=True,
     schema={
         "name": "execute_code",
         "description": (

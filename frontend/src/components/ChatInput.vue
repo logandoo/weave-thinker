@@ -43,6 +43,13 @@
       @uploaded="handleFileUploaded"
     />
 
+    <FilePreviewDialog
+      v-if="previewingFile"
+      :filename="previewingFile.filename"
+      :url="getFilePreviewUrl(previewingFile)"
+      @close="previewingFile = null"
+    />
+
     <!-- Drafts drawer: user's parked queries with note refs preserved -->
     <div class="drafts-panel" v-if="showDrafts">
       <div class="drafts-header">
@@ -105,12 +112,25 @@
       <div class="drafts-empty" v-else>草稿箱为空。输入内容后点击工具栏的 💾 按钮，或在此面板头部点击「存入」保存为草稿。</div>
     </div>
 
+    <!-- Upload progress (cancel aborts the in-flight request only) -->
+    <div v-if="uploadStore.uploading" class="upload-status-area">
+      <span class="upload-status-text">上传中...</span>
+      <button class="upload-cancel-btn" @click="uploadStore.cancelUpload()">取消</button>
+    </div>
+
     <!-- Uploaded file previews (floating above input) -->
     <div v-if="uploadedFiles.length > 0" class="uploaded-files-area">
-      <div v-for="(f, idx) in uploadedFiles" :key="idx" class="uploaded-file-chip">
+      <div
+        v-for="(f, idx) in uploadedFiles"
+        :key="idx"
+        class="uploaded-file-chip"
+        :class="{ previewable: isPreviewableFilename(f.filename) }"
+        :title="isPreviewableFilename(f.filename) ? '点击预览' : f.filename"
+        @click="onChipClick(f)"
+      >
         <span class="chip-icon">{{ getFileChipIcon(f.filename) }}</span>
         <span class="chip-name">{{ f.filename }}</span>
-        <button class="chip-remove" @click="removeUploadedFile(idx)">&times;</button>
+        <button class="chip-remove" @click.stop="removeUploadedFile(idx)">&times;</button>
       </div>
     </div>
 
@@ -400,6 +420,7 @@ import { computed, ref, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useChatStore } from '@/stores/chat'
 import { useAssistantStore } from '@/stores/assistant'
 import { useDraftsStore } from '@/stores/drafts'
+import { useUploadStore } from '@/stores/upload'
 import { notesApi } from '@/api/notes'
 import { renderMarkdownToHtml } from '@/composables/useMarkdown'
 import { useAsrStreaming } from '@/composables/useAsrStreaming'
@@ -408,6 +429,7 @@ import { useToast } from '@/composables/useToast'
 import { useMediaQuery } from '@/composables/useMediaQuery'
 import NotePicker from './NotePicker.vue'
 import FileUploadDialog from './FileUploadDialog.vue'
+import FilePreviewDialog from './FilePreviewDialog.vue'
 import { skillsApi } from '@/api/skills'
 import type { Skill } from '@/types'
 import { fileUploadApi, type FileParseResult } from '@/api/fileUpload'
@@ -415,6 +437,7 @@ import { fileUploadApi, type FileParseResult } from '@/api/fileUpload'
 const chatStore = useChatStore()
 const assistantStore = useAssistantStore()
 const draftsStore = useDraftsStore()
+const uploadStore = useUploadStore()
 const { show: showToast } = useToast()
 const { hotwords: asrHotwords } = useAsrHotwords()
 // 语音录入时保留录音前已手动输入的文字：partial/final 都写成 base+转写。
@@ -505,7 +528,11 @@ const isMobileVoiceMode = ref(false)
 const showNotePicker = ref(false)
 const showDrafts = ref(false)
 const showFileUpload = ref(false)
-const uploadedFiles = ref<FileParseResult[]>([])
+// Uploaded attachments live in the global upload store so chips survive
+// ChatInput remounts (conversation switches, pane refreshes).
+const uploadedFiles = computed(() => uploadStore.files)
+const previewingFile = ref<FileParseResult | null>(null)
+const PREVIEWABLE_EXT_RE = /\.(pdf|md|markdown|txt|py|ts|js|json|sh|yaml|yml|html|css|sql|go|rs|java)$/i
 // Paste-image / drag-drop upload: drag depth guards the flicker between
 // child-element dragenter/dragleave pairs. Only file drags are intercepted —
 // text/link drags keep the contenteditable's native drop behavior.
@@ -1110,7 +1137,7 @@ async function handleSend() {
   referencedNotes.value = []
   previewingNoteIdx.value = null
   editMessageId.value = null
-  uploadedFiles.value = []
+  uploadStore.clear()
   sessionStorage.removeItem(DRAFT_KEY)
 
   if (currentEditMessageId) {
@@ -1156,7 +1183,7 @@ function handleFileUploaded(results: FileParseResult[], _saveToNotebook: boolean
   showFileUpload.value = false
   const successful = results.filter(r => r.success && r.file_path)
   if (successful.length > 0) {
-    uploadedFiles.value = [...uploadedFiles.value, ...successful]
+    uploadStore.addFiles(successful)
   }
 }
 
@@ -1167,11 +1194,12 @@ async function uploadIncomingFiles(files: File[]) {
     ...files.filter(f => f.type.startsWith('image/')),
     ...files.filter(f => !f.type.startsWith('image/')),
   ]
+  const controller = uploadStore.startUpload()
   try {
-    const response = await fileUploadApi.uploadFiles(ordered, false)
+    const response = await fileUploadApi.uploadFiles(ordered, false, undefined, undefined, controller.signal)
     const successful = response.results.filter(r => r.success && r.file_path)
     if (successful.length > 0) {
-      uploadedFiles.value = [...uploadedFiles.value, ...successful]
+      uploadStore.addFiles(successful)
       showToast(successful.length === 1 ? `已上传 ${successful[0].filename}` : `已上传 ${successful.length} 个文件`)
     }
     const failed = response.results.filter(r => !r.success)
@@ -1179,7 +1207,12 @@ async function uploadIncomingFiles(files: File[]) {
       showToast(`上传失败：${failed[0]?.error || '未知错误'}`, 'error')
     }
   } catch (err) {
+    // 用户主动取消：不发错误 toast，已上传的文件保持不动
+    if (controller.signal.aborted) return
+    uploadStore.error = err instanceof Error ? err.message : '文件上传失败'
     showToast(err instanceof Error ? err.message : '文件上传失败', 'error')
+  } finally {
+    uploadStore.finishUpload()
   }
 }
 
@@ -1223,7 +1256,23 @@ function onDrop(e: DragEvent) {
 }
 
 function removeUploadedFile(idx: number) {
-  uploadedFiles.value.splice(idx, 1)
+  uploadStore.removeFile(idx)
+}
+
+function isPreviewableFilename(filename: string): boolean {
+  return PREVIEWABLE_EXT_RE.test(filename || '')
+}
+
+/** Same URL mechanism as FileAttachment.vue (token in query for iframe/fetch). */
+function getFilePreviewUrl(file: FileParseResult): string {
+  const token = localStorage.getItem('chatllm_token')
+  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : ''
+  return `/api/files/download?path=${encodeURIComponent(file.file_path || '')}${tokenParam}`
+}
+
+function onChipClick(file: FileParseResult) {
+  if (!file.file_path || !isPreviewableFilename(file.filename)) return
+  previewingFile.value = file
 }
 
 function getFileChipIcon(filename: string): string {
@@ -3141,6 +3190,38 @@ defineExpose({ setEditContent })
   transform: translateY(-1px);
 }
 
+.upload-status-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 6px;
+  margin-bottom: 2px;
+  position: relative;
+  z-index: 10;
+}
+
+.upload-status-text {
+  font-size: 11px;
+  color: var(--color-text-light);
+}
+
+.upload-cancel-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-error) 16%, transparent);
+  border-radius: 999px;
+  transition: background-color var(--transition-fast);
+}
+
+.upload-cancel-btn:hover {
+  background: color-mix(in srgb, var(--color-error) 16%, transparent);
+}
+
 .uploaded-files-area {
   display: flex;
   flex-wrap: wrap;
@@ -3165,6 +3246,15 @@ defineExpose({ setEditContent })
   color: var(--color-primary);
   max-width: 160px;
   box-shadow: var(--shadow-sm);
+}
+
+.uploaded-file-chip.previewable {
+  cursor: pointer;
+}
+
+.uploaded-file-chip.previewable:hover {
+  border-color: var(--panel-border-strong);
+  background: var(--color-hover);
 }
 
 .chip-icon {

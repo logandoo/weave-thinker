@@ -214,21 +214,7 @@
             </svg>
           </button>
           <div class="toolbar-spacer"></div>
-          <button
-            ref="wordCountBtnRef"
-            class="toolbar-btn word-count-btn"
-            :class="{ active: showWordCount }"
-            @mousedown.prevent
-            @click="toggleWordCount"
-            title="字数统计"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-              <line x1="4" y1="9" x2="20" y2="9"/>
-              <line x1="4" y1="15" x2="20" y2="15"/>
-              <line x1="10" y1="3" x2="8" y2="21"/>
-              <line x1="16" y1="3" x2="14" y2="21"/>
-            </svg>
-          </button>
+          <WordCountButton ref="wordCountRef" :get-text="wordCountSourceText" />
         </div>
       </div>
 
@@ -336,17 +322,6 @@
           </div>
         </div>
         <div class="table-picker-label">{{ tablePickerHoverRow > 0 ? `${tablePickerHoverRow} × ${tablePickerHoverCol}` : '选择大小' }}</div>
-      </div>
-    </Teleport>
-    <Teleport to="body">
-      <div v-if="showWordCount" class="word-count-teleport" :style="wordCountStyle" @click.stop>
-        <div class="wc-title">字数统计</div>
-        <div class="wc-row"><span>字数</span><b>{{ wordCountStats.wordCount }}</b></div>
-        <div class="wc-row"><span>字符数</span><b>{{ wordCountStats.charCount }}</b></div>
-        <div class="wc-row"><span>字符数（不含空格）</span><b>{{ wordCountStats.charCountNoSpaces }}</b></div>
-        <div class="wc-row"><span>行数</span><b>{{ wordCountStats.lineCount }}</b></div>
-        <div class="wc-row"><span>段落数</span><b>{{ wordCountStats.paragraphCount }}</b></div>
-        <div class="wc-sub">中文 {{ wordCountStats.cjkChars }} · 英文 {{ wordCountStats.latinWords }}</div>
       </div>
     </Teleport>
     <Teleport to="body">
@@ -550,8 +525,9 @@ import { useAsrHotwords } from '@/composables/useAsrHotwords'
 import { renderMarkdownToHtml, renderMermaidBlocks, renderSingleMermaidBlock, fixLostMermaidBlocks, renderEchartsBlocks, fixLostEchartsBlocks, attachMathEditListeners, katexModule } from '@/composables/useMarkdown'
 import ExportProgressDialog from './ExportProgressDialog.vue'
 import WysiwygEditor from './WysiwygEditor.vue'
+import WordCountButton from './WordCountButton.vue'
 import { resolveImageUrl, uploadImage, uploadMedia } from '@/api/imageUpload'
-import { countNoteText, type NoteWordCount } from '@/utils/noteWordCount'
+import { visibleEditorText } from '@/utils/noteWordCount'
 
 const props = defineProps<{
   notebookId: string
@@ -585,57 +561,12 @@ const wysiwygEditorRef = ref<InstanceType<typeof WysiwygEditor> | null>(null)
 const imageUploadInputRef = ref<HTMLInputElement | null>(null)
 const mediaUploadInputRef = ref<HTMLInputElement | null>(null)
 const pendingMediaKind = ref<'audio' | 'video'>('audio')
-// 字数统计（工具栏最右）：从编辑器可见文本计算，CJK 感知与后端 word_count 工具一致。
-const wordCountBtnRef = ref<HTMLButtonElement | null>(null)
-const showWordCount = ref(false)
-const wordCountStats = ref<NoteWordCount>(countNoteText(''))
-const wordCountStyle = computed(() => {
-  const btn = wordCountBtnRef.value
-  if (!btn) return {}
-  const rect = btn.getBoundingClientRect()
-  return {
-    position: 'fixed' as const,
-    top: `${rect.bottom + 4}px`,
-    right: `${Math.max(8, window.innerWidth - rect.right)}px`,
-    zIndex: 9999,
-  }
-})
-
-function visibleEditorText(container: HTMLElement): string {
-  // innerText includes KaTeX's visually-hidden MathML + TeX annotation, so a
-  // formula would be counted ~3x. Hide those layers for the synchronous read
-  // (restored immediately) so only the visible rendering contributes.
-  const hidden: HTMLElement[] = []
-  container.querySelectorAll<HTMLElement>('.katex-mathml, .math-controls').forEach((el) => {
-    hidden.push(el)
-    el.dataset.wcPrevDisplay = el.style.display
-    el.style.display = 'none'
-  })
-  const text = container.innerText || ''
-  hidden.forEach((el) => {
-    el.style.display = el.dataset.wcPrevDisplay || ''
-    delete el.dataset.wcPrevDisplay
-  })
-  return text
-}
-
-function refreshWordCount() {
+// 字数统计（R3，2026-09-13 审计 F-B）：UI/逻辑收口到 WordCountButton.vue；
+// 这里只提供「当前编辑器可见文本」取文函数（点击时才读 DOM）。
+const wordCountRef = ref<InstanceType<typeof WordCountButton> | null>(null)
+function wordCountSourceText(): string {
   const container = wysiwygEditorRef.value?.editorRef || previewRef.value
-  const text = container ? visibleEditorText(container as HTMLElement) : (noteContent.value || '')
-  wordCountStats.value = countNoteText(text)
-}
-
-function toggleWordCount() {
-  if (showWordCount.value) {
-    showWordCount.value = false
-    return
-  }
-  refreshWordCount()
-  showWordCount.value = true
-}
-
-function closeWordCount() {
-  if (showWordCount.value) showWordCount.value = false
+  return container ? visibleEditorText(container as HTMLElement) : (noteContent.value || '')
 }
 
 async function handleImageUpload(file: File): Promise<string> {
@@ -1257,7 +1188,7 @@ function closeExportDialog() {
 }
 
 function onDocumentClick(e: MouseEvent) {
-  if (!showHeadingMenu.value && !showFontColorPicker.value && !showHighlightColorPicker.value && !showTablePicker.value && !showWordCount.value) return
+  if (!showHeadingMenu.value && !showFontColorPicker.value && !showHighlightColorPicker.value && !showTablePicker.value) return
   const target = e.target as HTMLElement
   // Don't close menus when clicking TOC button (TOC is not mutually exclusive)
   if (target.closest('button[title="目录"]')) return
@@ -1277,10 +1208,6 @@ function onDocumentClick(e: MouseEvent) {
     if (target.closest('.table-picker-teleport') || target.closest('.table-picker-wrap')) return
     showTablePicker.value = false
   }
-  if (showWordCount.value) {
-    if (target.closest('.word-count-teleport') || target.closest('.word-count-btn')) return
-    showWordCount.value = false
-  }
 }
 
 function onSelectionChange() {
@@ -1290,8 +1217,6 @@ function onSelectionChange() {
 onMounted(() => {
   document.addEventListener('click', onDocumentClick)
   document.addEventListener('selectionchange', onSelectionChange)
-  window.addEventListener('resize', closeWordCount)
-  window.addEventListener('scroll', closeWordCount, true)
   autoSaveTimer = setInterval(async () => {
     if (hasChanges.value && props.noteId && !saving.value) {
       saving.value = true
@@ -1344,8 +1269,6 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener('click', onDocumentClick)
   document.removeEventListener('selectionchange', onSelectionChange)
-  window.removeEventListener('resize', closeWordCount)
-  window.removeEventListener('scroll', closeWordCount, true)
   if (autoSaveTimer) {
     clearInterval(autoSaveTimer)
     autoSaveTimer = null
@@ -1784,9 +1707,7 @@ function onContentChange() {
     computeMatches()
   }
   // Keep the open word-count popover live while typing
-  if (showWordCount.value) {
-    refreshWordCount()
-  }
+  wordCountRef.value?.refresh()
 }
 
 async function createNewNote() {
@@ -2189,52 +2110,6 @@ defineExpose({ hasChanges, saveNote, isDeleting })
 .toolbar-spacer {
   flex: 1 1 auto;
   min-width: 8px;
-}
-
-.word-count-btn {
-  position: sticky;
-  right: 0;
-  z-index: 2;
-  background-color: var(--color-white);
-  box-shadow: -8px 0 8px -8px color-mix(in srgb, var(--color-text) 22%, transparent);
-}
-
-.word-count-teleport {
-  min-width: 190px;
-  padding: 10px 12px;
-  background-color: var(--color-white);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-md);
-  color: var(--color-text);
-  font-size: 13px;
-}
-
-.wc-title {
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-
-.wc-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 18px;
-  line-height: 1.9;
-}
-
-.wc-row b {
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-  color: var(--color-primary);
-}
-
-.wc-sub {
-  margin-top: 6px;
-  padding-top: 6px;
-  border-top: 1px dashed var(--color-border);
-  font-size: 11px;
-  color: var(--color-text-light);
 }
 
 .toolbar-divider {

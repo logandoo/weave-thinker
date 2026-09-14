@@ -26,7 +26,17 @@
                 @click="activeTab = tab.key"
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <template v-if="tab.key === 'hotwords'">
+                  <template v-if="tab.key === 'user-info'">
+                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                    <circle cx="12" cy="7" r="4"/>
+                  </template>
+                  <template v-else-if="tab.key === 'model-provider'">
+                    <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+                    <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+                    <line x1="6" y1="6" x2="6.01" y2="6"/>
+                    <line x1="6" y1="18" x2="6.01" y2="18"/>
+                  </template>
+                  <template v-else-if="tab.key === 'hotwords'">
                     <path d="M12 2a8 8 0 0 0-8 8c0 3.4 2.1 6.3 5 7.5V20h6v-2.5c2.9-1.2 5-4.1 5-7.5a8 8 0 0 0-8-8z"/>
                     <line x1="9" y1="23" x2="15" y2="23"/>
                   </template>
@@ -56,7 +66,15 @@
             </div>
 
             <div class="settings-tab-content">
-              <div v-if="activeTab === 'hotwords'" class="tab-panel">
+              <div v-if="activeTab === 'user-info'" class="tab-panel">
+                <UserInfoPanel embedded />
+              </div>
+
+              <div v-else-if="activeTab === 'model-provider'" class="tab-panel">
+                <ModelProviderPanel embedded />
+              </div>
+
+              <div v-else-if="activeTab === 'hotwords'" class="tab-panel">
                 <AsrHotwordsPanel
                   embedded
                   @close="close"
@@ -111,6 +129,8 @@ import PermissionSettingsPanel from './PermissionSettingsPanel.vue'
 import SkillsPanel from './SkillsPanel.vue'
 import MemoryPanel from './MemoryPanel.vue'
 import SkinPanel from './SkinPanel.vue'
+import UserInfoPanel from './UserInfoPanel.vue'
+import ModelProviderPanel from './ModelProviderPanel.vue'
 import type { HotwordItem } from '@/api/asr'
 
 interface Permissions {
@@ -140,6 +160,8 @@ const activeTab = ref('hotwords')
 const skillsPanelRef = ref<InstanceType<typeof SkillsPanel> | null>(null)
 
 const tabs = [
+  { key: 'user-info', label: '用户信息' },
+  { key: 'model-provider', label: '模型供应商' },
   { key: 'hotwords', label: '热词配置' },
   { key: 'permissions', label: '权限管理' },
   { key: 'skills', label: '技能管理' },

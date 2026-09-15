@@ -18,6 +18,8 @@ import { useAssistantStore } from '@/stores/assistant'
 import { useNotesStore } from '@/stores/notes'
 import { mergeReplayIntoSequence, pickStreamText, shouldApplyRefresh, dropDraftTextAfterLastTool } from '@/stores/streamReducer'
 import { abortPredecessor, isNoneReplayTransient } from '@/stores/streamConnection'
+import { compareConversationsBySidebarOrder, reconcilePendingPromotions, rollbackPendingPromotion, serverCaughtUp, serverLastUserMessageMs } from '@/stores/conversationOrder'
+import type { PendingPromotion } from '@/stores/conversationOrder'
 import { estimateTextTokens } from '@/composables/useContextTokens'
 import { loadContextInfoStorage, persistContextInfoStorage, pickLatestContextInfo } from '@/composables/useContextTokens'
 
@@ -519,7 +521,9 @@ export const useChatStore = defineStore('chat', () => {
     return ids
   })
 
-  async function refreshConversation(conversationId: string) {
+  /** @returns true = 服务端快照已成功取得（追平判定可信）；false = 请求失败
+   *  （调用方不得据此做盲回滚，见 busy-final 的 refresh→rollback 序列）。 */
+  async function refreshConversation(conversationId: string): Promise<boolean> {
     const epochAtStart = messagesEpoch[conversationId] || 0
     const seqAtStart = (refreshSeqs[conversationId] || 0) + 1
     refreshSeqs[conversationId] = seqAtStart
@@ -592,6 +596,17 @@ export const useChatStore = defineStore('chat', () => {
       if (conv) {
         conv.title = conversation.title
         conv.updated_at = conversation.updated_at
+        // 置顶字段自愈（A4.9 Important-1）：仅当服务端快照追平本地乐观置顶时
+        // 清除标记、应用权威 sort_order / last_user_message_at 并重排 ——
+        // 常规 refresh（无 pending）不触碰排序字段，避免旧 GET 把刚拖拽的顺序
+        // 打回（A4.9 R2 new-Minor）。追平判定纯服务端时间戳互比（Minor-2）。
+        const pending = _pendingPromotions[conversationId]
+        if (pending && serverCaughtUp(conversation, pending)) {
+          delete _pendingPromotions[conversationId]
+          if (typeof conversation.sort_order === 'number') conv.sort_order = conversation.sort_order
+          if (conversation.last_user_message_at) conv.last_user_message_at = conversation.last_user_message_at
+          conversations.value = [...conversations.value].sort(compareConversationsBySidebarOrder)
+        }
         conv.deathmatch_mode = conversation.deathmatch_mode
         conv.deathmatch_status = conversation.deathmatch_status
         conv.deathmatch_goal = conversation.deathmatch_goal
@@ -627,8 +642,10 @@ export const useChatStore = defineStore('chat', () => {
         deathmatchMode.value = conversation.deathmatch_status !== 'done'
         _streamVersion.value++
       }
+      return true
     } catch (e) {
       console.error('Failed to refresh conversation:', e)
+      return false
     }
   }
 
@@ -1045,6 +1062,50 @@ export const useChatStore = defineStore('chat', () => {
       }))
   }
 
+  // 继续旧会话后置顶（2026-09-15）：侧栏顺序 = 后端 list_conversations 的
+  // ORDER BY —— (sort_order asc, 最近一条用户消息 desc)，纯函数见
+  // stores/conversationOrder.ts（单测 frontend/tests/workflows/test_conversation_order.cjs）。
+  // 发送新消息时把该会话提升到 sort_order=0 并刷新 last_user_message_at，使其
+  // 立刻跳到所在分组/时间分类的最上方；后端在写入用户消息时做同样的持久化提升
+  // （chat.py），因此刷新后顺序保持一致。
+  //
+  // _pendingPromotions：本地乐观置顶的 convId → 前值快照。并发快照
+  // （loadConversations / refreshConversation 的 GET）可能在本次发送的服务端提交
+  // 之前生成、之后才到达 —— 旧快照不得把刚置顶的会话打回原位（A4.9 Important-1）；
+  // 追平判定只用服务端时间戳互比（客户端时钟偏差不影响，A4.9 Minor-2）；
+  // 发送被最终拒绝时按快照回滚（A4.9 Minor-3）。
+  const _pendingPromotions: Record<string, PendingPromotion> = {}
+
+  function promoteConversationToTop(conversationId: string) {
+    const conv = conversations.value.find(c => c.id === conversationId)
+    if (!conv) return
+    // 前值快照只记一次（busy 重试会再次 promote，不得用乐观值覆盖前值）。
+    if (!_pendingPromotions[conversationId]) {
+      _pendingPromotions[conversationId] = {
+        promotedAt: Date.now(),
+        previousActivityMs: serverLastUserMessageMs(conv),
+        previousSortOrder: conv.sort_order ?? 0,
+        previousLastUserMessageAt: conv.last_user_message_at ?? null,
+      }
+    }
+    const pending = _pendingPromotions[conversationId]
+    conv.last_user_message_at = new Date(pending.promotedAt).toISOString()
+    conv.sort_order = 0
+    conversations.value = [...conversations.value].sort(compareConversationsBySidebarOrder)
+  }
+
+  /** 发送未送达（busy 最终拒绝）→ 回滚乐观置顶，恢复提升前的列表位置。 */
+  function rollbackPromotion(conversationId: string) {
+    const conv = conversations.value.find(c => c.id === conversationId)
+    if (!conv) {
+      delete _pendingPromotions[conversationId]
+      return
+    }
+    if (rollbackPendingPromotion(conv, _pendingPromotions)) {
+      conversations.value = [...conversations.value].sort(compareConversationsBySidebarOrder)
+    }
+  }
+
   // Stale-response guard: loadConversations can be fired concurrently from
   // several places (assistant switch, voice exit, deep links, sidebar mount)
   // and the HTTP responses may resolve OUT OF ORDER — e.g. a slow voice
@@ -1058,6 +1119,9 @@ export const useChatStore = defineStore('chat', () => {
       const result = await chatApi.getConversations(assistantId)
       if (seq !== conversationsLoadSeq) return // superseded by a newer load
       conversations.value = result
+      // 旧快照（生成于本次发送提交之前）不得打回本地乐观置顶 —— 见
+      // _pendingPromotions 注释；服务端已追平的条目在此清除。
+      reconcilePendingPromotions(conversations.value, _pendingPromotions)
     } catch (e) {
       if (seq !== conversationsLoadSeq) return
       console.error('Failed to load conversations:', e)
@@ -1916,6 +1980,7 @@ export const useChatStore = defineStore('chat', () => {
 
     if (!messages.value[conversationId]) messages.value[conversationId] = []
     messages.value[conversationId].push(userMessage)
+    promoteConversationToTop(conversationId)
     addContextTokenDelta(conversationId, content)
     beginStreaming(conversationId)
 
@@ -2016,6 +2081,13 @@ export const useChatStore = defineStore('chat', () => {
               // Attached but resend cap exhausted — never drop the user's
               // intent silently; surface it so they can resend manually.
               currentError.value = '消息未能送达：当前回答占用时间过长，请稍后重新发送。'
+            }
+            // 消息未送达 → 回滚乐观置顶（A4.9 Minor-3；重试成功路径不回滚）。
+            // 回滚前先取服务端权威：若同会话另一次发送已送达，refresh 会追平并清除
+            // pending 标记 → 回滚自动 no-op，不会覆盖那次成功发送的置顶（A4.9 R3 Minor）。
+            // refresh 失败（false）→ 无法判定，宁可保留乐观置顶也不盲回滚（A4.9 R4 Minor）。
+            if (await refreshConversation(conversationId)) {
+              rollbackPromotion(conversationId)
             }
           }
           return
@@ -2291,6 +2363,7 @@ export const useChatStore = defineStore('chat', () => {
       created_at: new Date().toISOString(),
     }
     messages.value[convId].push(userMessage)
+    promoteConversationToTop(convId)
 
     beginStreaming(convId)
     const abortController = new AbortController()
@@ -2366,6 +2439,12 @@ export const useChatStore = defineStore('chat', () => {
           messages.value[convId] = preEditMessages
           currentError.value = '该会话已有正在进行的回答，请稍后重试。'
           endStreaming(convId)
+          // 消息未送达 → 回滚乐观置顶（A4.9 Minor-3）。先 refresh 取服务端权威：
+          // 同会话另一次发送已送达时追平清标记 → 回滚 no-op（A4.9 R3 Minor）；
+          // refresh 失败则保留乐观置顶不盲回滚（A4.9 R4 Minor）。
+          if (await refreshConversation(convId)) {
+            rollbackPromotion(convId)
+          }
           return
         }
       }

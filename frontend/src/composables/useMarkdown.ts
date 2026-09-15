@@ -9,6 +9,7 @@ import katex from 'katex'
 import DOMPurify from 'dompurify'
 import 'katex/dist/katex.min.css'
 import { nextTick } from 'vue'
+import { fixMissingTableSeparators, fixMarkdownTables } from './markdownTableRepair'
 
 // Preserve data-mermaid-source through DOMPurify sanitization.
 // DOMPurify strips attributes whose decoded values contain "-->" (HTML
@@ -540,44 +541,6 @@ function createMathExtension() {
   }
 }
 
-function fixMarkdownTables(text: string): string {
-  const lines = text.split('\n')
-  const result: string[] = []
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-
-    // Detect table separator line: contains only |, -, :, and spaces, with at least one ---
-    if (/^[\s|:-]+$/.test(line) && /---/.test(line) && /\|/.test(line)) {
-      // Look back for the table header (previous non-empty line)
-      let headerIdx = i - 1
-      while (headerIdx >= 0 && !lines[headerIdx].trim()) {
-        headerIdx--
-      }
-
-      if (headerIdx >= 0) {
-        const headerLine = lines[headerIdx]
-        const headerInner = headerLine.trim().replace(/^\||\|$/g, '')
-        const headerCellCount = headerInner.split('|').length
-
-        const sepInner = line.trim().replace(/^\||\|$/g, '')
-        const sepCellCount = sepInner.split('|').length
-
-        // If mismatch, rebuild separator with correct number of columns
-        if (headerCellCount !== sepCellCount && headerCellCount > 0) {
-          const fixedSep = '|' + '---|'.repeat(headerCellCount)
-          result.push(fixedSep)
-          continue
-        }
-      }
-    }
-
-    result.push(line)
-  }
-
-  return result.join('\n')
-}
-
 /**
  * When a heading line contains table-like pipe characters and is immediately
  * followed by a table separator line, the heading fix (adding space after #)
@@ -756,6 +719,10 @@ function normalizeMarkdownSpacing(text: string): string {
 
   // Replace segment_split comments with blank lines (tool-call segment separator)
   out = out.replace(/<!--\s*segment_split\s*-->/g, '\n\n')
+
+  // Synthesize a missing GFM delimiter row (model slip — table would render
+  // as raw pipes; see markdownTableRepair.ts) before the column-count repair.
+  out = fixMissingTableSeparators(out)
 
   // Fix markdown tables where separator column count doesn't match header
   out = fixMarkdownTables(out)
@@ -1165,6 +1132,10 @@ export function processIncompleteMarkdown(content: string): string {
 
   // Replace segment_split comments with blank lines (tool-call segment separator)
   processed = processed.replace(/<!--\s*segment_split\s*-->/g, '\n\n')
+
+  // Synthesize a missing GFM delimiter row (model slip — table would render
+  // as raw pipes; see markdownTableRepair.ts) before the column-count repair.
+  processed = fixMissingTableSeparators(processed)
 
   // Fix markdown tables where separator column count doesn't match header
   processed = fixMarkdownTables(processed)

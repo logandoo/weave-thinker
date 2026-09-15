@@ -5970,6 +5970,11 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 ## 2. 会话健壮性说明
 
+- **列表排序契约（2026-09-15）**：`GET /api/conversations` 按 `coalesce(sort_order,0) ASC`、
+  `coalesce(last_user_message_at, updated_at) DESC` 排序（NULL `sort_order` 与响应契约 `sort_order or 0`
+  同口径）。用户发送消息时服务端把该会话 `sort_order` 置 0 并刷新其最近用户消息时间——**继续旧会话即
+  置顶到所在分组/时间分类最上方**（前端同口径乐观置顶，刷新后由服务端持久化顺序保持一致）。
+  `GET /api/conversations/{id}` 返回同口径的 `last_user_message_at`（由已加载消息计算，无额外查询）。
 - `sort_order` 允许被库级写入置 NULL（ORM 默认值不覆盖显式 NULL INSERT），曾导致整表 500；启动迁移
   `conversations_sort_order_backfill` / `conversation_groups_sort_order_backfill` 幂等回填 0，
   响应构造层再做 `None→0` 防御——单行脏数据不再引发 500（2026-08-25 起）。

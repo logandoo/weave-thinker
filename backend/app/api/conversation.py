@@ -278,7 +278,10 @@ async def list_conversations(
     if assistant_id:
         query = query.where(Conversation.assistant_id == assistant_id)
     query = query.order_by(
-        Conversation.sort_order.asc(),
+        # COALESCE：响应契约把 NULL 映射为 0（`sort_order or 0`），排序必须同口径
+        # ——裸 ASC 在 PostgreSQL 里 NULL 排最后，会让 NULL 行与前端本地重排
+        # （sort_order ?? 0）不一致（继续会话置顶 2026-09-15）。
+        func.coalesce(Conversation.sort_order, 0).asc(),
         desc(func.coalesce(last_msg_subq.c.last_user_message_at, Conversation.updated_at))
     )
     result = await db.execute(query)
@@ -854,6 +857,14 @@ async def get_conversation(
     )
     messages = msg_result.scalars().all()
 
+    # last_user_message_at 与 list_conversations 同口径（MAX(role='user')），
+    # 由已加载消息计算，零额外查询——刷新单会话时侧栏顺序/时间分类可用同一
+    # 权威时间戳（2026-09-15 继续会话置顶）。
+    last_user_message_at = max(
+        (m.created_at for m in messages if m.role == "user" and m.created_at),
+        default=None,
+    )
+
     return ConversationWithMessages(
         id=conversation.id,
         title=conversation.title,
@@ -862,6 +873,7 @@ async def get_conversation(
         sort_order=conversation.sort_order or 0,
         created_at=_utc_iso(conversation.created_at),
         updated_at=_utc_iso(conversation.updated_at),
+        last_user_message_at=_utc_iso(last_user_message_at),
         deathmatch_mode=conversation.deathmatch_mode or False,
         deathmatch_status=conversation.deathmatch_status or "inactive",
         deathmatch_reason=conversation.deathmatch_reason,

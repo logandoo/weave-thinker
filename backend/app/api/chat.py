@@ -1043,6 +1043,10 @@ async def chat_stream(
             content=request.messages[-1].content
         )
         conversation.updated_at = datetime.utcnow()
+        # 继续旧会话后置顶（2026-09-15）：新用户消息 = 会话成为「最新活动」。
+        # sort_order 置 0 使其在 (sort_order asc, 最近用户消息 desc) 排序下跳到
+        # 所在分组/时间分类最上方（前端乐观置顶 + 刷新后由本写入保持一致）。
+        conversation.sort_order = 0
         db.add(user_message)
         await db.commit()
         conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
@@ -1053,6 +1057,7 @@ async def chat_stream(
             content=request.messages[-1].content
         )
         conversation.updated_at = datetime.utcnow()
+        conversation.sort_order = 0
         db.add(user_message)
         await db.commit()
         conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)

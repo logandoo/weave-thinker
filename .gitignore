@@ -27,6 +27,9 @@ backend/Fonts/
 user_workspaces/
 backend/agent_memories/*
 !backend/agent_memories/changelog.md
+# 产品文档引用的截图随仓发布（changelog.md 相对路径 screenshots/func_doc/*.png）
+!backend/agent_memories/screenshots/
+!backend/agent_memories/screenshots/**
 backend/audio_files/
 backend/output_files/
 backend/skins_custom/

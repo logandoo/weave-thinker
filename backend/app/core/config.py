@@ -1457,8 +1457,12 @@ class Config:
         """PHASE 4: per-iteration wall-clock timeout (seconds). Iterations
         exceeding this abort and let the outer loop continue to the next
         round (or grace-call). ``0`` disables the timeout.
+
+        用户决定（2026-09-15）：默认 600 → **1800**（30 分钟）——长研究型
+        子任务（delegate_task 子代理的整轮上限与主循环单迭代上限共用此键）
+        在 10 分钟口径下频繁触顶；1800 与生产 config 现值对齐。
         """
-        return float(self.agent_tool_loop.get("subtask_iteration_timeout_seconds", 600))
+        return float(self.agent_tool_loop.get("subtask_iteration_timeout_seconds", 1800))
 
     # ──────────────────────────────────────────────────────────────────
     # Deathmatch (死磕) mode — typed properties for [deathmatch] section.
@@ -1852,6 +1856,63 @@ class Config:
         这类打回不消耗 reject_budget（conv a67faa04：截断导致的误判不应把
         拒绝预算烧光导致失败文本）；达到本上限后同样走有界 salvage。默认 3。"""
         return int(self.agent_audit.get("soft_reject_limit", 3))
+
+    @property
+    def agent_audit_stall_cut_family_repeats(self) -> int:
+        """同族审计失败 stall cut 阈值（2026-09-15，conv f2553c58）：连续 N 次
+        同族（agent_loop._audit_problem_family 确定性分类：截断/矛盾/无依据/
+        悬空/citation/…；npg 与 other 豁免）审计失败 → 视同预算耗尽直接进入
+        salvage，不再整稿重发。生产实证：截断族 4 连拒 + salvage + selection
+        共 18 分钟 7 次生成仍兜底发货（SOTA：迭代精修 2-3 轮后收益饱和甚至
+        倒退）。默认 2；0 = 关闭（回退纯预算行为，与兄弟开关 0=off 一致）。"""
+        return int(self.agent_audit.get("stall_cut_family_repeats", 2))
+
+    @property
+    def agent_audit_visibility_accept_enabled(self) -> bool:
+        """可见性接收闸门开关（2026-09-15，conv f2553c58；A4.9 R1 Important-4）。
+
+        开启时：审计判决为 unverifiable / 可见性族 needs_evidence，且本轮台账
+        存在「截断」条目，且审计点名 token 全部存在于全量语料 → 接收草稿
+        （审计盲区而非草稿缺陷，不再重生成）。默认 true；false = 回退旧行为
+        （4 连软拒 + salvage + selection 链），作为线上误接收的一键回滚阀
+        （与 numeric_provenance_gate_mode 等兄弟开关同哲学）。"""
+        return bool(self.agent_audit.get("visibility_accept_enabled", True))
+
+    @property
+    def agent_audit_segmented_verify_enabled(self) -> bool:
+        """分段声称核对开关（2026-09-15，用户拍板；SOTA：AgentAuditor 局部
+        证据包 / 验证优先双代理 / MAVEN 解耦）。
+
+        开启时：可见性族判决（截断证据「看不到」）→ 确定性 claim→span 对齐 +
+        并行轻量验证调用（每包只带声称 + 相关证据切片，独立上下文）→ 任一
+        fail（span 直接矛盾）软拒点名；无 fail 接收。默认 true；
+        false = 回退既有可见性存在性闸门（旧行为，一键回滚阀）。"""
+        return bool(self.agent_audit.get("segmented_verify_enabled", True))
+
+    @property
+    def agent_audit_segmented_verify_max_packs(self) -> int:
+        """分段核对最大验证包数（并行验证调用上限；生产草稿的不可见声称
+        通常 ≤8 条）。默认 8。"""
+        return int(self.agent_audit.get("segmented_verify_max_packs", 8))
+
+    @property
+    def agent_audit_segmented_verify_pack_tokens(self) -> int:
+        """单个验证包的证据切片 token 预算（claim→span 窗口拼接，默认 4000）。"""
+        return int(self.agent_audit.get("segmented_verify_pack_tokens", 4000))
+
+    @property
+    def agent_audit_segmented_verify_max_concurrency(self) -> int:
+        """分段核对并行度（验证调用并发上限，默认 4）。"""
+        return int(self.agent_audit.get("segmented_verify_max_concurrency", 4))
+
+    @property
+    def agent_audit_segmented_verify_timeout_seconds(self) -> float:
+        """分段核对**聚合总超时**（秒；默认 120，0=不设限）。
+
+        A4.9 R1 Important-5：并发 4 × 每调用 600s 的最坏墙钟 1200s 不可接受
+        ——超过该预算即放弃分段核对并回退存在性闸门（fail-open，不阻塞轮次）。
+        """
+        return float(self.agent_audit.get("segmented_verify_timeout_seconds", 120))
 
     @property
     def agent_audit_draft_selection_enabled(self) -> bool:

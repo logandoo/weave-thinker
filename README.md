@@ -184,7 +184,7 @@ cd ..
 | 浏览器操作 | `browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type` / `browser_scroll` / `browser_press` / `browser_back` / `browser_extract` / `browser_execute_js` / `browser_screenshot` | 交互式会话全套操作（10 件套） |
 | 代码执行 | `execute_code` | Python 代码沙箱（自动修复循环、中文字体内置、超时长任务自检引导） |
 | 计算 | `calculate` | AST 白名单安全计算 |
-| 视觉 | `vision_interpret` | VLM 图片解读（purpose `vlm`，未配置返回友好错误） |
+| 视觉 | `vision_interpret` | VLM 图片解读（purpose `vlm` 优先；未配置时探测主模型视觉能力） |
 | 终端 | `terminal` | 受控 shell 命令执行（敏感操作走审批） |
 | 文档查询 | `context7_resolve_library_id` / `context7_query_docs` | Context7 库 ID 解析与官方文档查询 |
 | 笔记 | `notes` | 笔记本与笔记的列表、读取、创建、修改、删除 |

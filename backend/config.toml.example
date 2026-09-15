@@ -114,6 +114,7 @@ compress_min_ratio = 0.6
 [agent.citation]
 disambiguate_timeout_seconds = 60.0
 disambiguate_retries = 1
+remand_min_chars = 200
 
 [agent.auxiliary]
 judge_default_timeout_seconds = 120.0

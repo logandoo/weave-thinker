@@ -152,7 +152,7 @@ def should_use_custom_model(assistant: Optional[Assistant]) -> bool:
             if alias != "deepseek":
                 return True
     pt = getattr(assistant, "provider_type", "deepseek")
-    if pt in ("custom", "qwen3.8_vllm", "qwen3.8_next"):
+    if pt in ("custom", "qwen3.8_vllm"):
         return True
     return bool(assistant.use_custom_model)
 

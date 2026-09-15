@@ -8,7 +8,7 @@
     </div>
 
     <p class="mp-hint">
-      为你自己的账号覆盖系统模型供应商（URL / 模型名 / API Key / 采样参数）。留空即使用系统默认；设置仅对你自己生效，不影响其他用户。
+      为你自己的账号覆盖系统模型供应商（URL / 模型名 / API Key / 采样参数）。留空即使用系统默认（保持 config_model 的默认配置）；设置仅对你自己生效，不影响其他用户。
     </p>
 
     <div class="mp-kinds">
@@ -16,13 +16,29 @@
         v-for="k in kinds"
         :key="k.key"
         class="mp-kind"
-        :class="{ active: activeKind === k.key, overridden: hasOverride(k.key) }"
+        :class="{ active: activeKind === k.key, overridden: kindHasOverride(k.key) }"
         @click="activeKind = k.key"
       >
         {{ k.label }}
-        <span v-if="hasOverride(k.key)" class="mp-dot" title="已覆盖"></span>
+        <span v-if="kindHasOverride(k.key)" class="mp-dot" title="已覆盖"></span>
       </button>
     </div>
+
+    <div v-if="activeKind === 'llm' && llmProviders.length" class="mp-providers">
+      <button
+        v-for="p in llmProviders"
+        :key="p.alias"
+        class="mp-provider"
+        :class="{ active: activeProvider === p.alias, overridden: hasOverride(`llm:${p.alias}`) }"
+        @click="activeProvider = p.alias"
+      >
+        {{ p.display_name }}
+        <span v-if="hasOverride(`llm:${p.alias}`)" class="mp-dot" title="已覆盖"></span>
+      </button>
+    </div>
+    <p v-if="activeKind === 'llm' && raw?.overrides?.llm" class="mp-note mp-legacy-note">
+      存在旧版「全局大语言模型」覆盖（对所有未单独覆盖的供应商生效）。使用「清除全部覆盖」可移除。
+    </p>
 
     <div v-if="loading" class="mp-loading">加载中…</div>
 
@@ -31,17 +47,20 @@
         自定义 URL 仅用于一次性转写（POST /transcribe，按填写的 Key 发送，缺省则不发送）。
         语音对话（实时流式）需要 DashScope/MiMo 引擎——设置自定义 ASR URL 后语音对话将不可用。
       </p>
+      <p v-else-if="activeKind === 'llm' && activeProvider" class="mp-note mp-kind-note">
+        正在覆盖供应商「{{ activeProviderLabel }}」；留空即保持系统 config_model 的默认配置。
+      </p>
 
       <div class="mp-form">
         <label class="mp-row mp-row-check">
           <input type="checkbox" v-model="form.enabled" />
-          <span>启用此类型的覆盖</span>
+          <span>{{ activeKind === 'llm' && activeProvider ? '启用此供应商的覆盖' : '启用此类型的覆盖' }}</span>
         </label>
 
         <div class="mp-row">
-          <label class="mp-label" :for="`mp-url-${activeKind}`">供应商 URL</label>
+          <label class="mp-label" :for="`mp-url-${activeSlug}`">供应商 URL</label>
           <input
-            :id="`mp-url-${activeKind}`"
+            :id="`mp-url-${activeSlug}`"
             v-model="form.base_url"
             type="text"
             class="mp-input"
@@ -50,10 +69,10 @@
         </div>
 
         <div class="mp-row">
-          <label class="mp-label" :for="`mp-key-${activeKind}`">API Key</label>
+          <label class="mp-label" :for="`mp-key-${activeSlug}`">API Key</label>
           <div class="mp-key-wrap">
             <input
-              :id="`mp-key-${activeKind}`"
+              :id="`mp-key-${activeSlug}`"
               v-model="form.api_key"
               type="password"
               class="mp-input"
@@ -78,9 +97,9 @@
         </div>
 
         <div class="mp-row">
-          <label class="mp-label" :for="`mp-model-${activeKind}`">模型名称</label>
+          <label class="mp-label" :for="`mp-model-${activeSlug}`">模型名称</label>
           <input
-            :id="`mp-model-${activeKind}`"
+            :id="`mp-model-${activeSlug}`"
             v-model="form.model_name"
             type="text"
             class="mp-input"
@@ -92,9 +111,9 @@
           <span class="mp-label">采样参数</span>
           <div class="mp-params">
             <div v-for="p in PARAM_FIELDS" :key="p.key" class="mp-param">
-              <label class="mp-param-label" :for="`mp-param-${activeKind}-${p.key}`">{{ p.label }}</label>
+              <label class="mp-param-label" :for="`mp-param-${activeSlug}-${p.key}`">{{ p.label }}</label>
               <input
-                :id="`mp-param-${activeKind}-${p.key}`"
+                :id="`mp-param-${activeSlug}-${p.key}`"
                 v-model="form.params[p.key]"
                 type="text"
                 inputmode="decimal"
@@ -111,9 +130,11 @@
 
       <div class="mp-actions">
         <button class="mp-btn danger" :disabled="saving" @click="clearAll">清除全部覆盖</button>
-        <button class="mp-btn" :disabled="saving" @click="clearCurrent">清除此类型</button>
+        <button class="mp-btn" :disabled="saving" @click="clearCurrent">
+          {{ activeKind === 'llm' && activeProvider ? '清除此供应商' : '清除此类型' }}
+        </button>
         <button class="mp-btn primary" :disabled="saving" @click="saveCurrent">
-          {{ saving ? '保存中…' : '保存此类型' }}
+          {{ saving ? '保存中…' : (activeKind === 'llm' && activeProvider ? '保存此供应商' : '保存此类型') }}
         </button>
       </div>
     </template>
@@ -187,8 +208,15 @@ interface KindForm {
   params: Record<string, string>
 }
 
+interface LlmProvider {
+  alias: string
+  display_name: string
+}
+
 const kinds = KINDS
 const activeKind = ref('llm')
+const activeProvider = ref('')
+const llmProviders = ref<LlmProvider[]>([])
 const loading = ref(true)
 const saving = ref(false)
 const statusMsg = ref('')
@@ -199,7 +227,20 @@ const loaded = ref(false)
 const raw = ref<ModelProviderStatus | null>(null)
 const forms = ref<Record<string, KindForm>>({})
 
-const form = computed<KindForm | null>(() => forms.value[activeKind.value] || null)
+// 覆盖键：LLM 逐供应商（llm:<alias>）；其余按类型。无供应商列表时回落 legacy llm 键。
+const activeFormKey = computed(() => {
+  if (activeKind.value === 'llm' && activeProvider.value) return `llm:${activeProvider.value}`
+  return activeKind.value
+})
+// DOM id 安全化（别名含点号，如 qwen3.8 → qwen3-8；CSS 选择器不接受裸点）
+const activeSlug = computed(() => activeFormKey.value.replace(/[^a-zA-Z0-9_-]/g, '-'))
+
+const form = computed<KindForm | null>(() => forms.value[activeFormKey.value] || null)
+
+const activeProviderLabel = computed(() => {
+  const p = llmProviders.value.find(x => x.alias === activeProvider.value)
+  return p?.display_name || activeProvider.value
+})
 
 const keyPlaceholder = computed(() => {
   const f = form.value
@@ -214,6 +255,14 @@ function hasOverride(key: string): boolean {
   // A4.9 Minor 修复：params-only 覆盖也要显示"已覆盖"标记
   return !!ov.base_url || !!ov.model_name || ov.has_api_key
     || Object.values(ov.params || {}).some(v => v !== null && v !== undefined)
+}
+
+function kindHasOverride(key: string): boolean {
+  if (key === 'llm') {
+    if (hasOverride('llm')) return true
+    return llmProviders.value.some(p => hasOverride(`llm:${p.alias}`))
+  }
+  return hasOverride(key)
 }
 
 function buildForm(ov: ProviderOverride | null): KindForm {
@@ -236,9 +285,17 @@ function buildForm(ov: ProviderOverride | null): KindForm {
 
 function applyStatus(status: ModelProviderStatus) {
   raw.value = status
+  llmProviders.value = status.llm_providers || []
+  if (!llmProviders.value.some(p => p.alias === activeProvider.value)) {
+    activeProvider.value = llmProviders.value[0]?.alias || ''
+  }
   const next: Record<string, KindForm> = {}
   for (const k of KINDS) {
     next[k.key] = buildForm(status.overrides?.[k.key] || null)
+  }
+  for (const p of llmProviders.value) {
+    const key = `llm:${p.alias}`
+    next[key] = buildForm(status.overrides?.[key] || null)
   }
   forms.value = next
 }
@@ -312,7 +369,7 @@ async function saveCurrent() {
   saving.value = true
   try {
     const body: Record<string, ProviderOverridePayload | null> = {}
-    body[activeKind.value] = payload
+    body[activeFormKey.value] = payload
     const { data } = await userSettingsApi.updateModelProvider(body)
     applyStatus(data)
     setStatus(payload === null ? '已恢复系统默认' : '已保存')
@@ -327,10 +384,10 @@ async function clearCurrent() {
   saving.value = true
   try {
     const body: Record<string, null> = {}
-    body[activeKind.value] = null
+    body[activeFormKey.value] = null
     const { data } = await userSettingsApi.updateModelProvider(body)
     applyStatus(data)
-    setStatus('已清除该类型覆盖')
+    setStatus(activeKind.value === 'llm' && activeProvider.value ? '已清除该供应商覆盖' : '已清除该类型覆盖')
   } catch (e: any) {
     setStatus(e?.response?.data?.detail || '清除失败', 'error')
   } finally {
@@ -419,6 +476,43 @@ onMounted(load)
 
 .mp-kind.overridden {
   color: var(--color-text);
+}
+
+.mp-providers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: center;
+  width: 100%;
+  margin: -6px 0 14px 0;
+}
+
+.mp-provider {
+  position: relative;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px dashed var(--panel-border);
+  background: transparent;
+  color: var(--color-text-light);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.mp-provider.active {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  border-style: solid;
+}
+
+.mp-provider.overridden {
+  color: var(--color-text);
+}
+
+.mp-legacy-note {
+  margin: -6px 0 12px 0;
+  text-align: center;
+  width: 100%;
 }
 
 .mp-dot {

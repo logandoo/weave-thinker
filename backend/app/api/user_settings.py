@@ -110,13 +110,22 @@ async def delete_avatar(
 
 # ---------------- 模型供应商覆盖 ----------------
 
+def _llm_provider_list() -> list:
+    """系统 LLM 供应商（公共别名 + 显示名；不含 URL/Key/真实模型名）。"""
+    from app.model_gateway.registry import get_model_registry
+    return [
+        {"alias": ep["alias"], "display_name": ep["display_name"]}
+        for ep in get_model_registry().public_aliases(kind="llm")
+    ]
+
+
 @router.get("/api/users/me/model-provider")
 async def get_model_provider(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     rows = await provider_svc.list_user_provider_rows(db, user.id)
-    return provider_svc.serialize_status(rows)
+    return {**provider_svc.serialize_status(rows), "llm_providers": _llm_provider_list()}
 
 
 @router.put("/api/users/me/model-provider")
@@ -125,21 +134,25 @@ async def update_model_provider(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    known_aliases = {p["alias"] for p in _llm_provider_list()}
     try:
-        parsed = provider_svc.parse_overrides_payload(payload)
+        parsed = provider_svc.parse_overrides_payload(payload, known_llm_aliases=known_aliases)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
     result = await db.execute(
         select(UserModelProvider).where(UserModelProvider.user_id == user.id)
     )
-    existing = {row.kind: row for row in result.scalars().all()}
-    # A4.9 Important 修复：改 pg upsert（ON CONFLICT (user_id, kind)）——
+    existing = {
+        provider_svc.override_key_for_row(row): row
+        for row in result.scalars().all()
+    }
+    # A4.9 Important 修复：改 pg upsert（ON CONFLICT (user_id, kind, provider)）——
     # 唯一索引下并发双 PUT 不再产生重复行/IntegrityError。
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-    for kind, cfg in parsed.items():
-        row = existing.get(kind)
+    for key, cfg in parsed.items():
+        row = existing.get(key)
         if cfg is None:
             if row is not None:
                 await db.delete(row)
@@ -157,10 +170,12 @@ async def update_model_provider(
             if row is not None:
                 await db.delete(row)
             continue
+        kind, provider = provider_svc.split_override_key(key)
         values = {
             "id": row.id if row is not None else str(uuid.uuid4()),
             "user_id": user.id,
             "kind": kind,
+            "provider": provider,
             "enabled": cfg["enabled"],
             "base_url": cfg["base_url"],
             "model_name": cfg["model_name"],
@@ -181,7 +196,9 @@ async def update_model_provider(
         if cfg["api_key"] is not None:
             update_cols["api_key"] = stmt.excluded["api_key"]
         await db.execute(
-            stmt.on_conflict_do_update(index_elements=["user_id", "kind"], set_=update_cols)
+            stmt.on_conflict_do_update(
+                index_elements=["user_id", "kind", "provider"], set_=update_cols,
+            )
         )
     await db.commit()
     # Core upsert 不经 ORM identity map；session expire_on_commit=False 时
@@ -192,7 +209,7 @@ async def update_model_provider(
     provider_svc.invalidate_user_overrides(uid)
     db.expire_all()
     rows = await provider_svc.list_user_provider_rows(db, uid)
-    return provider_svc.serialize_status(rows)
+    return {**provider_svc.serialize_status(rows), "llm_providers": _llm_provider_list()}
 
 
 @router.delete("/api/users/me/model-provider")

@@ -538,6 +538,82 @@ def _audit_reject_budget_for(state: "AgentLoopState") -> int:
 _GUARDRAIL_EPHEMERAL = frozenset({"response_audit", "search_demand", "tool_demand"})
 
 
+# 审计客户端进程级缓存（A4.9 R2 Minor）：审计每轮一次调用，但 AgentLoop 每请求
+# 构造——不缓存则每请求新建 AsyncOpenAI/连接池。键覆盖用户覆盖层（2026-09-13）
+# 的全部行为字段（url/key hash/model/params/user_params/provider/is_custom），
+# 跨用户不串（同 AgentService._llm_cache 的键纪律）。
+_AUDIT_LLM_CACHE: Dict[tuple, "LLMService"] = {}
+_AUDIT_LLM_CACHE_MAX = 8
+
+
+def _audit_llm_cache_key(ep: Any) -> tuple:
+    import hashlib
+
+    return (
+        getattr(ep, "alias", "") or "",
+        getattr(ep, "base_url", "") or "",
+        hashlib.sha256((getattr(ep, "api_key", "") or "").encode()).hexdigest()[:16],
+        getattr(ep, "model_name", "") or "",
+        getattr(ep, "provider_type", "") or "",
+        bool(getattr(ep, "is_custom", False)),
+        json.dumps(getattr(ep, "params", None) or {}, sort_keys=True, default=str),
+        json.dumps(
+            ((getattr(ep, "extra", None) or {}).get("user_params")) or {},
+            sort_keys=True,
+            default=str,
+        ),
+    )
+
+
+def _resolve_audit_llm() -> Optional["LLMService"]:
+    """Explicit auditor model via ``[routing] "agent.audit"`` (2026-09-15,
+    conv 174182bc).
+
+    The pre-send auditor inherited the assistant's main model (P0 助手全链路
+    继承, feedback 2026-08-21) — when the writer is a weak local model its
+    zero-citation drafts slipped through the auditor twice (cited=0,
+    ledger=18/20). This purpose is an EXPLICIT operator opt-in: only a
+    ``[routing] "agent.audit"`` entry in config_model.toml routes the audit
+    to an independent (stronger) endpoint; unset → None → inherit the
+    coordinator/main client exactly as before. Any resolution failure is
+    fail-safe (inherit), never blocks a turn.
+
+    A4.9 R2 Minors: clients are process-cached (key = every behavior-relevant
+    endpoint field incl. user overrides) and an explicitly-configured alias
+    that is NOT in the registry logs a warning (a typo must not be
+    indistinguishable from "unconfigured").
+    """
+    try:
+        from app.model_gateway import factory
+        from app.model_gateway.registry import get_model_registry
+
+        reg = get_model_registry()
+        if not reg.has_explicit_routing("agent.audit"):
+            return None
+        _target = reg.routing_target("agent.audit")
+        _alias = _target.get("alias") if isinstance(_target, dict) else _target
+        if isinstance(_alias, str) and _alias and not reg.has(_alias):
+            logger.warning(
+                "agent.audit routing alias %r not in registry — falling back to the main endpoint",
+                _alias,
+            )
+        ep = reg.resolve("agent.audit")
+        key = _audit_llm_cache_key(ep)
+        llm = _AUDIT_LLM_CACHE.get(key)
+        if llm is None:
+            llm = factory.build_llm_service(ep)
+            if len(_AUDIT_LLM_CACHE) >= _AUDIT_LLM_CACHE_MAX:
+                _AUDIT_LLM_CACHE.pop(next(iter(_AUDIT_LLM_CACHE)), None)
+            _AUDIT_LLM_CACHE[key] = llm
+        return llm
+    except Exception:
+        logger.warning(
+            "agent.audit routing resolution failed — inheriting coordinator model",
+            exc_info=True,
+        )
+        return None
+
+
 def _build_citation_mapping_view(state: "AgentLoopState", draft: str) -> str:
     """Citation-id → source mapping for the auditor (conv 4e95acc0, 2026-09-12).
 
@@ -1268,6 +1344,11 @@ class AgentLoopState:
     # final answer are unambiguous (cross-round collision fix) and verifiable
     # (sanitize removes ids that do not exist in the ledger).
     citation_ledger: Optional["CitationLedger"] = None
+    # One-shot deterministic zero-citation remand (2026-09-15, conv 174182bc):
+    # set when `_citation_remand_verdict` sent the draft back once for missing
+    # [N] markers; further zero-citation drafts in the same turn fall back to
+    # the LLM auditor instead of burning the soft-reject budget.
+    citation_remanded: bool = False
     # Per-turn memory-read dedup (conv dfc40619 2026-08-09): (action, target)
     # pairs of SUCCESSFUL memory reads this turn. The coordinator turn-focus
     # directive persists across all iterations and the system prompt's
@@ -2004,6 +2085,83 @@ class AuditVerdict:
     source: str = "llm"
 
 
+def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[AuditVerdict]:
+    """Deterministic zero-citation gate at the audit exit (2026-09-15, conv
+    174182bc). Validator-enforces pair with the LLM template clause
+    【有检索但零引用】 (unreliable: the same weak model wrote AND audited the
+    draft — cited=0 + ledger=18/20 was accepted twice in production).
+
+    Mechanical trigger: this turn ran web_search (non-empty citation ledger),
+    the draft references no VALID [N] (CitationLedger.verify semantics: code
+    fences masked, out-of-range ids are not citations), the draft is
+    substantive (>= ``[agent.citation] remand_min_chars``; 0 = gate
+    DISABLED, consistent with sibling knobs where 0 = off), and this turn
+    has not already been remanded. Returns a one-shot needs_evidence verdict
+    with a copy-edit guidance (add markers only, never rewrite; explicit
+    "search results unused" / "user forbade markers" outs) — the existing
+    soft-reject machinery regenerates the draft. One-shot by design: a model
+    that still cannot cite falls back to the LLM auditor, not to a
+    budget-burning loop.
+    """
+    ledger = getattr(state, "citation_ledger", None)
+    if ledger is None or ledger.size <= 0:
+        return None
+    if state.citation_remanded:
+        return None
+    draft = draft or ""
+    _min_chars = int(getattr(config, "agent_citation_remand_min_chars", 200) or 0)
+    if _min_chars <= 0:
+        return None  # 0/负 = 守卫关闭（与兄弟开关 0=off 一致）
+    if len(draft) < _min_chars:
+        return None
+    report = ledger.verify(draft)
+    if report.cited:
+        return None
+    state.citation_remanded = True
+    logger.info(
+        "audit_metric outcome=needs_evidence citation=remand cited=%d unknown=%d ledger=%d draft_chars=%d",
+        len(report.cited), len(report.unknown), ledger.size, len(draft),
+    )
+    _range = f"[1]-[{ledger.size}]"
+    # 未知编号稿（只有越界 [N]）不得被描述为「通篇无 [N]」——文案区分两种形态，
+    # 并显式列出越界编号（A4.9 R2 Minor）。
+    _unknown_sorted = sorted(report.unknown)
+    if _unknown_sorted:
+        _unknown_view = "、".join(f"[{n}]" for n in _unknown_sorted[:10])
+        problem = (
+            f"本轮已检索（台账 {ledger.size} 条，有效引用编号 {_range}）但草稿未引用任何"
+            f"有效编号（出现台账外编号：{_unknown_view}）"
+        )
+        _unknown_clause = (
+            f"草稿中的 {_unknown_view} 不在本轮台账范围内，请改为有效编号或删除，"
+            "不得保留无效编号。\n"
+        )
+    else:
+        problem = (
+            f"本轮已检索（台账 {ledger.size} 条，有效引用编号 {_range}）但草稿通篇无 [N] 引用标记"
+        )
+        _unknown_clause = ""
+    guidance = (
+        f"你刚才生成的回答草稿（本轮）没有标注任何本轮检索结果的 [N] 引用，"
+        f"但本轮已实际调用 web_search 并获得编号检索结果（有效引用编号范围 {_range}）。\n"
+        + _unknown_clause
+        + "【引用补标】请为草稿中来自本轮检索结果的具体事实（法规条文/数据/结论/案例等）"
+        "补上对应的 [N] 编号：在每个这类事实陈述之后紧跟 [N]"
+        "（只补标，其余正文逐字保留，严禁整篇重写）。\n"
+        "如果草稿确实没有使用本轮检索结果（仅基于对话历史或常识），"
+        "或用户已明确要求不要标注来源编号，保持无引用即可；"
+        "若属于前者，请在回答开头用一句话说明「本轮检索结果未被采用」。"
+        "严禁编造编号、严禁引用未使用的来源。"
+        + "\n" + _AUDIT_GUIDANCE_INDEPENDENCE_CLAUSE
+    )
+    return AuditVerdict(
+        verdict="needs_evidence",
+        source="citation",
+        problem=problem,
+        guidance=guidance,
+    )
+
+
 def _npg_soft_reject_no_progress(
     flags_history: Sequence[int],
     tool_calls_history: Sequence[int],
@@ -2177,17 +2335,22 @@ class AgentLoop:
         session_factory: Any = None,
         identity_context: Optional[str] = None,
         coordinator_llm: Optional[LLMService] = None,
+        audit_llm: Optional[LLMService] = None,
         canary_marker: Optional[str] = None,
         lazy_tools: Optional[List[str]] = None,
     ):
         self.llm = llm
         self.coordinator_llm = coordinator_llm or llm
+        # Pre-send auditor client: explicit argument > `[routing] "agent.audit"`
+        # (operator opt-in, 2026-09-15) > coordinator/main (P0 继承).
+        self.audit_llm = audit_llm or _resolve_audit_llm() or self.coordinator_llm
         # JSON-mode (response_format={"type": "json_object"}) for structured
         # coordinator/auditor calls. DeepSeek, DashScope (OpenAI-compatible
-        # mode) and MiMo all accept the identical parameter; providers that
-        # reject it are detected at runtime and it is disabled for the rest
-        # of this loop's lifetime.
-        self._json_mode_supported = True
+        # mode) and MiMo all accept the identical parameter; a provider that
+        # rejects it is detected at runtime and disabled PER CLIENT (A4.9 R2
+        # Minor: with an independent `agent.audit` endpoint, a rejection by
+        # one client must not silently downgrade the other's JSON mode).
+        self._json_mode_disabled: Set[int] = set()
         # PHASE 3: iteration_llm is the (potentially cheaper / non-thinking)
         # client used for tool-calling iterations. _final_thinking always
         # uses self.llm so the user-facing synthesis still goes through the
@@ -3514,8 +3677,21 @@ class AgentLoop:
             if _hinted:
                 _msgs = audit_messages + [{"role": "user", "content": _AUDIT_RETRY_BREVITY_HINT}]
             try:
-                raw = await self._complete_json(_msgs, temperature=0.0)
+                # `getattr` keeps __new__-constructed loops (test harnesses,
+                # legacy callers) on the pre-routing coordinator behavior.
+                _audit_llm = (
+                    getattr(self, "audit_llm", None)
+                    or getattr(self, "coordinator_llm", None)
+                )
+                raw = await self._complete_json(_msgs, temperature=0.0, llm=_audit_llm)
             except Exception as exc:
+                # Deterministic zero-citation gate runs on accept-class exits
+                # too (A4.9 R1 Important-1): the guard is independent of the
+                # auditor's availability — a broken/weak auditor must not
+                # reopen the hole this fix closes.
+                _remand = _citation_remand_verdict(state, draft)
+                if _remand is not None:
+                    return _remand
                 # fail-open stays (a broken auditor must never block a good
                 # answer) but it is no longer SILENT — an un-audited ship during
                 # a provider outage is exactly the condition worth alerting on.
@@ -3538,15 +3714,27 @@ class AgentLoop:
                 _hinted = True
                 logger.warning("audit_metric outcome=bad_json_retry — retrying with brevity hint")
                 continue
+            _remand = _citation_remand_verdict(state, draft)
+            if _remand is not None:
+                return _remand
             logger.warning("audit_metric outcome=fail_open reason=bad_json raw=%s — accepting draft", raw[:160])
             return None
         if not isinstance(result, dict):
+            _remand = _citation_remand_verdict(state, draft)
+            if _remand is not None:
+                return _remand
             logger.warning("audit_metric outcome=fail_open reason=non_dict — accepting draft")
             return None
         ok_val = result.get("ok")
         ok = ok_val if isinstance(ok_val, bool) else str(ok_val).strip().lower() in {"true", "yes", "1"}
         verdict = str(result.get("verdict") or "").strip().lower()
         if ok or verdict == "accept":
+            # Deterministic zero-citation gate (2026-09-15, conv 174182bc):
+            # the LLM clause proved unreliable (same weak model wrote and
+            # audited) — a mechanical remand overrides the accept ONCE.
+            _citation_remand = _citation_remand_verdict(state, draft)
+            if _citation_remand is not None:
+                return _citation_remand
             logger.info("audit_metric outcome=accept draft_chars=%d", len(draft))
             return None
         if verdict not in ("reject", "unverifiable", "needs_evidence"):
@@ -3554,6 +3742,9 @@ class AgentLoop:
             verdict = "reject"
         problem = str(result.get("problem") or "").strip()
         if not problem:
+            _remand = _citation_remand_verdict(state, draft)
+            if _remand is not None:
+                return _remand
             logger.info("audit_metric outcome=accept draft_chars=%d (reject without problem text)", len(draft))
             return None
         _claims = result.get("unsupported_claims") or []
@@ -3992,6 +4183,7 @@ class AgentLoop:
         *,
         temperature: float,
         max_tokens: Optional[int] = None,
+        llm: Optional["LLMService"] = None,
     ) -> str:
         """complete_chat with JSON Output mode (response_format json_object).
 
@@ -4001,29 +4193,38 @@ class AgentLoop:
         response_format) disables the mode for this AgentLoop instance and
         the call is retried without it. max_tokens=None (2026-08-18 user
         directive): unset == provider default max output — no cap by default.
+
+        ``llm``: explicit client override (auditor via `[routing]
+        "agent.audit"`, 2026-09-15); None keeps the coordinator client (P0).
         """
+        _llm = llm or self.coordinator_llm
         kwargs: Dict[str, Any] = {"temperature": temperature}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        kwargs["extra_body"] = build_thinking_extra_body(self.provider_type, False, thinking_budget=self.thinking_budget)
-        if self._json_mode_supported:
+        # thinking-off wire shape must match the CLIENT's vendor (an audit
+        # endpoint on a different provider must not receive the main
+        # provider's chat_template_kwargs).
+        _pt = getattr(getattr(_llm, "endpoint", None), "provider_type", "") or self.provider_type
+        kwargs["extra_body"] = build_thinking_extra_body(_pt, False, thinking_budget=self.thinking_budget)
+        _client_id = id(_llm)
+        if _client_id not in self._json_mode_disabled:
             kwargs["response_format"] = {"type": "json_object"}
         try:
             _audit_to = config.agent_audit_call_timeout_seconds
             if _audit_to and _audit_to > 0:
                 return await asyncio.wait_for(
-                    self.coordinator_llm.complete_chat(messages=messages, **kwargs),
+                    _llm.complete_chat(messages=messages, **kwargs),
                     timeout=_audit_to,
                 )
-            return await self.coordinator_llm.complete_chat(messages=messages, **kwargs)
+            return await _llm.complete_chat(messages=messages, **kwargs)
         except Exception as exc:
             if "response_format" in kwargs and "response_format" in str(exc):
                 logger.info(
-                    "Provider rejects response_format — disabling JSON mode for this loop"
+                    "Provider rejects response_format — disabling JSON mode for this client"
                 )
-                self._json_mode_supported = False
+                self._json_mode_disabled.add(_client_id)
                 kwargs.pop("response_format")
-                return await self.coordinator_llm.complete_chat(messages=messages, **kwargs)
+                return await _llm.complete_chat(messages=messages, **kwargs)
             raise
 
     async def _coordinate(

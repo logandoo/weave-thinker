@@ -29,18 +29,18 @@ _VLM_TIMEOUT_SECONDS = 120.0
 _MAX_ISSUES = 6
 
 
-def _vlm_endpoint():
-    """Resolve the dedicated multimodal endpoint; None when unconfigured
-    (placeholder endpoint with empty base_url/model_name, or resolution
-    failure)."""
-    try:
-        from app.model_gateway.registry import get_model_registry
-        ep = get_model_registry().resolve("vlm")
-        if not (ep.base_url or "") or not (ep.model_name or ""):
-            return None
-        return ep
-    except Exception:
-        return None
+async def _resolve_vlm(assistant_llm=None) -> Optional[object]:
+    """视觉端点解析（vlm 已配置 → 用它；未配置 → 主模型能力探针 → 无则 None）。
+
+    2026-09-15：vlm 未配置时不再直接跳过——主模型探针有视觉则用主模型做版式
+    批评（需求：视觉任务优先探针主模型）。``assistant_llm``（死磕回合的助手
+    模型客户端）持有 .endpoint 时优先探它，否则 registry 主端点。"""
+    from app.model_gateway.vision_probe import resolve_vision_endpoint
+    main_ep = getattr(assistant_llm, "endpoint", None)
+    ep, reason = await resolve_vision_endpoint(main_endpoint=main_ep)
+    if ep is None and reason not in ("no_vision",):
+        logger.info("visual_critic: vision endpoint unavailable (%s)", reason)
+    return ep
 
 
 def _screenshot_html(file_path: str) -> Optional[bytes]:
@@ -117,11 +117,12 @@ async def critique_visual_artifacts(
     goal: str,
     *,
     workspace_path: str = "",
+    assistant_llm=None,
 ) -> Optional[Dict[str, Any]]:
     """Critique the first visual artifact among `files` (this turn's new/changed
     files). Returns {"layout_ok": bool, "issues": [...]} or None (fail-open:
     disabled / unconfigured / not visual / any error)."""
-    ep = _vlm_endpoint()
+    ep = await _resolve_vlm(assistant_llm)
     if ep is None:
         return None
     target = None

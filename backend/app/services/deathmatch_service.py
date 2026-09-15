@@ -4379,6 +4379,7 @@ intent 只能是以下之一：
                 _vc = await critique_visual_artifacts(
                     new_files, current_step, self._conv.deathmatch_goal or "",
                     workspace_path=workspace_path,
+                    assistant_llm=getattr(self, "_assistant_llm", None),
                 )
                 if _vc:
                     _vc_issues = [

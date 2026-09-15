@@ -10,8 +10,10 @@ URL / API Key / model_name / 采样参数（design/FLOW_DESIGN_user_settings_202
 `ModelRegistry` 的 get/resolve/endpoint_for_assistant 三个出口统一经过
 `apply_user_override`。
 
-语义（用户 Gate A 决策）：
-- 覆盖所有模型类型（llm/vlm/embedding/rerank/asr/tts）；VLM 端点在注册表中
+语义（用户 Gate A 决策；2026-09-15 逐供应商扩展）：
+- 覆盖所有模型类型（llm/vlm/embedding/rerank/asr/tts）；LLM 按供应商别名隔离
+  （键 "llm:<alias>"，如 llm:qwen3.8 / llm:doubao）；provider='' 的存量行作为
+  legacy 全局 llm 回落（仅当该别名无专属行时生效）。VLM 端点在注册表中
   kind=llm，按别名（vlm/deathmatch.vlm）路由到 "vlm" 覆盖键，与 llm 隔离。
 - 自定义 base_url 时 API Key 一律按用户填写发送；缺省则发空（消费层
   "no-key" 哨兵），**绝不回落系统 Key**。
@@ -46,9 +48,13 @@ def get_active_user_overrides() -> Optional[Dict[str, Dict[str, Any]]]:
 
 
 def override_key_for(ep: ModelEndpoint) -> str:
-    """端点 → 覆盖键。VLM 在注册表中 kind=llm（purpose 端点），按别名归 "vlm"。"""
+    """端点 → 覆盖键。VLM 在注册表中 kind=llm（purpose 端点），按别名归 "vlm"；
+    其余 LLM 端点按供应商别名归 "llm:<alias>"（逐供应商覆写，2026-09-15）；
+    非 LLM 类型按 kind。"""
     if ep.kind == KIND_LLM and ep.alias in _VLM_ALIASES:
         return "vlm"
+    if ep.kind == KIND_LLM:
+        return f"llm:{ep.alias}"
     return ep.kind
 
 
@@ -57,7 +63,12 @@ def apply_user_override(ep: ModelEndpoint) -> ModelEndpoint:
     active = _ACTIVE.get()
     if not active:
         return ep
-    ov = active.get(override_key_for(ep))
+    key = override_key_for(ep)
+    ov = active.get(key)
+    if ov is None and key.startswith("llm:"):
+        # legacy 全局回落（provider 维度之前的存量行，provider=''）：
+        # 仅当该供应商无专属行时生效；专属行存在（即使 disabled/空）不回落。
+        ov = active.get("llm")
     if not ov or not ov.get("enabled", True):
         return ep
 

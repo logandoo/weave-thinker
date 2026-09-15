@@ -12,7 +12,7 @@ from typing import Dict
 
 from app.model_gateway.profiles.base import ThinkingProfile
 from app.model_gateway.profiles.deepseek import DeepSeekProfile
-from app.model_gateway.profiles.qwen3_8_next import Qwen38NextProfile
+from app.model_gateway.profiles.doubao import DoubaoProfile
 from app.model_gateway.profiles.qwen3_8_vllm import Qwen38VllmProfile
 from app.model_gateway.profiles.qwen_dashscope import QwenDashscopeProfile
 from app.model_gateway.profiles.vendors import (
@@ -29,7 +29,7 @@ _PROFILES: Dict[str, ThinkingProfile] = {
     for p in (
         DeepSeekProfile(),
         Qwen38VllmProfile(),
-        Qwen38NextProfile(),
+        DoubaoProfile(),
         QwenDashscopeProfile(),
         ZhipuProfile(),
         MiMoProfile(),
@@ -46,10 +46,6 @@ def sniff_thinking_profile(base_url: str, model_name: str) -> ThinkingProfile:
     if "dashscope" in url or "aliyuncs" in url:
         return _PROFILES["qwen"]
     _model = (model_name or "").lower()
-    if "flash-next" in _model:
-        # Qwen3.8-Flash-Next：无 thinking_budget 变量——llm_service 的
-        # extra_body 归一化按模型名 sniff，budget 剥离必须在此命中。
-        return _PROFILES["qwen3.8_next"]
     if "qwen" in _model:
         return _PROFILES["qwen3.8_vllm"]
     return _CUSTOM_COMPAT

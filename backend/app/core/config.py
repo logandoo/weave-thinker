@@ -1744,6 +1744,16 @@ class Config:
         Default 1. Total failure stays fail-open (markers kept, documented)."""
         return int(self.agent_citation.get("disambiguate_retries", 1))
 
+    @property
+    def agent_citation_remand_min_chars(self) -> int:
+        """Deterministic zero-citation remand gate (2026-09-15, conv 174182bc):
+        minimum draft length (chars) before the auditor's mechanical
+        「台账非空 + 零有效 [N]」打回 fires. Shorter drafts (a brief follow-up
+        after a search) are left to the LLM auditor's clause. 0 or negative
+        DISABLES the gate (consistent with sibling knobs where 0 = off —
+        A4.9 R2 Minor)."""
+        return int(self.agent_citation.get("remand_min_chars", 200))
+
     # ---- Response auditor (发送前质量审计) ----
 
     @property

@@ -54,24 +54,32 @@ class User(Base):
 
 
 class UserModelProvider(Base):
-    """用户级模型供应商覆盖（2026-09-13）。
+    """用户级模型供应商覆盖（2026-09-13；逐供应商维度 2026-09-15）。
 
-    每用户每 kind（llm/vlm/embedding/rerank/asr/tts）至多一行；行存在且
-    enabled=true 且（base_url/model_name/params 任一非空）时，该用户上下文内
-    所有该 kind 的端点解析被覆盖（model_gateway.user_overrides.apply_user_override）。
+    LLM 类型按供应商（registry 别名）各至多一行：kind='llm' + provider=<alias>
+    （如 qwen3.8/doubao/main）→ 覆盖键 "llm:<alias>"；provider='' 的 llm 行为
+    legacy 全局回落（仅当该别名无专属行时生效）。其余 kind（vlm/embedding/
+    rerank/asr/tts）每用户至多一行、provider 恒 ''，语义不变。
+    行存在且 enabled=true 且（base_url/model_name/params 任一非空）时，该用户
+    上下文内对应端点解析被覆盖（model_gateway.user_overrides.apply_user_override）。
     api_key 仅写不读（GET 只回掩码）；自定义 base_url + 空 key → 发空（no-key 哨兵）。
     """
     __tablename__ = "user_model_providers"
-    # 每用户每 kind 至多一行（A4.9 Important 修复：create_all 先于迁移执行，
-    # 唯一性必须由 ORM 声明；迁移侧另有 CREATE UNIQUE INDEX IF NOT EXISTS
-    # 覆盖既有表）。
+    # 每用户每 (kind, provider) 至多一行（A4.9 Important 修复：create_all 先于
+    # 迁移执行，唯一性必须由 ORM 声明；迁移侧另有 CREATE UNIQUE INDEX
+    # IF NOT EXISTS 覆盖既有表）。
     __table_args__ = (
-        UniqueConstraint("user_id", "kind", name="uq_user_model_providers_user_kind"),
+        UniqueConstraint(
+            "user_id", "kind", "provider",
+            name="uq_user_model_providers_user_kind_provider",
+        ),
     )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     kind = Column(String(20), nullable=False)
+    # LLM 供应商别名（其余类型恒 ''）；默认 '' 使存量行语义不变。
+    provider = Column(String(64), nullable=False, default="", server_default="")
     enabled = Column(Boolean, nullable=False, default=True)
     base_url = Column(String(500), nullable=True)
     api_key = Column(String(500), nullable=True)

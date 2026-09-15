@@ -8,8 +8,11 @@ anywhere vision is needed — screenshots, error dialogs, charts, UI mockups,
 scanned documents, uploaded images. The calling model never changes: the
 image bytes go only to the vision endpoint and the text answer comes back
 as the tool result. The deathmatch visual critic and the memory multimodal
-service use the same purpose route; an unconfigured vlm endpoint yields a
-friendly error JSON instead of an exception.
+service use the same purpose route.
+
+2026-09-15 视觉能力探针：`[endpoints.vlm]` 未单独配置时，先对当前主模型
+（助手端点优先）做行为探针——有视觉 → 主模型充当视觉模型；无视觉 → 返回
+明确的「无视觉能力」错误（绝不假装看过图片）。见 model_gateway.vision_probe。
 """
 import base64
 import json
@@ -31,25 +34,12 @@ _MIME_BY_EXT = {
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 
-def _vlm_endpoint():
-    """Resolve the multimodal endpoint.
+async def _resolve_vision(assistant=None):
+    """视觉端点解析（vlm 已配置 → 用它；未配置 → 主模型能力探针）。
 
-    Returns ``(ep, None)`` when configured; ``(None, "unconfigured")`` for
-    the empty placeholder; ``(None, "error: <msg>")`` when the registry
-    itself fails (a DIFFERENT user-facing condition — 缓办收尾 2026-08-31:
-    a corrupt config must not be reported as "未配置", and the log carries
-    exc_info for diagnosis)."""
-    try:
-        from app.model_gateway.registry import get_model_registry
-        ep = get_model_registry().resolve("vlm")
-        if not (ep.base_url or "") or not (ep.model_name or ""):
-            return None, "unconfigured"
-        return ep, None
-    except Exception as exc:
-        logger.warning(
-            "vision_interpret: vlm endpoint resolution failed: %s", exc, exc_info=True,
-        )
-        return None, f"error:{exc}"
+    返回 (ep | None, reason)；reason ∈ configured / main_model / no_vision / error:<msg>。"""
+    from app.model_gateway.vision_probe import resolve_vision_endpoint
+    return await resolve_vision_endpoint(assistant)
 
 
 async def vision_interpret(args: dict, **kwargs) -> str:
@@ -72,13 +62,14 @@ async def vision_interpret(args: dict, **kwargs) -> str:
             {"error": f"不支持的图片类型 {ext}（支持: {', '.join(sorted(_IMAGE_EXTS))}）", "success": False},
             ensure_ascii=False,
         )
-    ep, vlm_err = _vlm_endpoint()
+    ep, vlm_err = await _resolve_vision(kwargs.get("assistant"))
     if ep is None:
-        if vlm_err == "unconfigured":
+        if vlm_err == "no_vision":
             return json.dumps({
-                "error": "视觉模型（vlm）未配置：请在模型配置的 [endpoints.vlm] 填入 "
-                         "base_url/api_key/model_name 后重试。",
-                "success": False, "configured": False,
+                "error": "当前主模型不具备视觉能力，且未配置独立视觉模型（vlm）："
+                         "请在模型配置的 [endpoints.vlm] 填入 base_url/api_key/model_name，"
+                         "或切换到支持视觉的主模型后重试。",
+                "success": False, "configured": False, "vision_capable": False,
             }, ensure_ascii=False)
         return json.dumps({
             "error": f"视觉模型配置加载失败：{str(vlm_err)[6:]}（请检查模型配置文件后重试）",
@@ -154,9 +145,10 @@ registry.register(
             "（对话中的 [file-ref] 标记给出文件路径）、browser_screenshot 保存的截图。\n"
             "传入工作区相对路径（如 uploads/xxx.png、media/abc.png）或工作区内绝对路径，"
             "以及你想问的问题（如「提取图中全部文字」「这个图表的趋势是什么」）。\n"
-            "返回视觉模型的文字解读；若返回「视觉模型未配置」则说明服务端尚未接入 vlm 端点，"
-            "如实告知用户，不要假装看过图片。仅支持 png/jpg/jpeg/webp/gif/bmp，"
-            "单文件 ≤20MB；detail=high 用于需要看清小字/细节的场合。"
+            "返回视觉模型的文字解读；若返回「不具备视觉能力」，说明独立视觉模型未配置"
+            "且当前主模型经探针确认无视觉能力——如实告知用户，不要假装看过图片。"
+            "仅支持 png/jpg/jpeg/webp/gif/bmp，单文件 ≤20MB；detail=high 用于需要看清"
+            "小字/细节的场合。"
         ),
         "parameters": {
             "type": "object",

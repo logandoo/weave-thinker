@@ -55,15 +55,16 @@ _CAPABILITIES_BY_PROVIDER = {
             "low": {"label": "low", "desc": "轻量快速推理"},
         },
     },
-    # Qwen3.8-Flash-Next（modelscope 模型卡）：档位/默认与 27B 相同
-    # （xhigh 默认），模板无 thinking_budget——差异只在 profile wire 层。
-    "qwen3.8_next": {
+    # Doubao（火山方舟 Ark）：thinking{type} + 顶层 reasoning_effort；
+    # minimal=不思考（与 low 区分）；无 thinking_budget（profile 剥除）。
+    "doubao": {
         "supports_reasoning": True,
-        "reasoning_efforts": ["xhigh", "medium", "low"],
+        "reasoning_efforts": ["high", "medium", "low", "minimal"],
         "effort_meta": {
-            "xhigh": {"label": "xhigh", "desc": "最强推理深度"},
-            "medium": {"label": "medium", "desc": "均衡速度与深度"},
-            "low": {"label": "low", "desc": "轻量快速推理"},
+            "high": {"label": "high", "desc": "深度分析，处理复杂问题"},
+            "medium": {"label": "medium", "desc": "均衡模式，兼顾速度与深度", "default": True},
+            "low": {"label": "low", "desc": "轻量思考，侧重快速响应"},
+            "minimal": {"label": "minimal", "desc": "关闭思考，直接回答"},
         },
     },
 }
@@ -451,6 +452,12 @@ class ModelRegistry:
         语音子用途的「专门设置例外」判定（助手全链路继承反馈 2026-08-21）。"""
         return purpose in self._explicit_routing_keys
 
+    def routing_target(self, purpose: str) -> Any:
+        """该 purpose 的原始 [routing] 目标（未解析、可为 str/dict；未配置
+        → None）。诊断/误配告警用（2026-09-15 agent.audit：显式别名不在
+        端点池时 resolve() 会静默回落 main，调用方据此告警）。"""
+        return self._routing.get(purpose)
+
     def _finalize_vlm_routing(self) -> None:
         """Legacy compat (2026-08-31): a deployment that explicitly configured
         [endpoints."deathmatch.vlm"] (pre-canonical) keeps working — when the
@@ -578,7 +585,7 @@ class ModelRegistry:
 
         if provider_type == "custom":
             url, key, model = row_url, row_key, row_model
-        elif provider_type in ("qwen3.8_vllm", "qwen3.8_next"):
+        elif provider_type == "qwen3.8_vllm":
             cfg = self._provider_cfg(provider_type)
             url = row_url or cfg["base_url"]
             key = row_key or cfg["api_key"]

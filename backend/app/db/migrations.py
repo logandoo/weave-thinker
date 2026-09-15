@@ -313,6 +313,12 @@ $$"""),
         WHERE model_alias = 'qwen3.8_27b'"""),
     ("assistants_rename_subtask_model_alias_qwen38", """UPDATE assistants SET subtask_model_alias = 'qwen3.8'
         WHERE subtask_model_alias = 'qwen3.8_27b'"""),
+    # Qwen3.8-Next 退役（2026-09-15）：调用/回复结构与 Qwen3.8(Local) 同构，
+    # 池中仅保留 Qwen3.8(Local)（用户指令）。存量行重映射到 qwen3.8。
+    ("assistants_remap_model_alias_qwen38_next", """UPDATE assistants SET model_alias = 'qwen3.8'
+        WHERE model_alias = 'qwen3.8_next'"""),
+    ("assistants_remap_subtask_model_alias_qwen38_next", """UPDATE assistants SET subtask_model_alias = 'qwen3.8'
+        WHERE subtask_model_alias = 'qwen3.8_next'"""),
     # ---- Memory & Dreaming v2: pgvector + schema（以下块依赖 pgvector，缺失时整体跳过）----
     # P1-5 (2026-08-30): per-goal settled-verdict ledger — step completions and
     # reconcile overturns are persisted so the judge/verifier cannot flip-flop
@@ -363,6 +369,26 @@ $$"""),
     ("user_model_providers_dedupe", """DELETE FROM user_model_providers a USING user_model_providers b
         WHERE a.user_id = b.user_id AND a.kind = b.kind AND a.ctid < b.ctid"""),
     ("user_model_providers_unique", "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_model_providers_user_kind ON user_model_providers (user_id, kind)"),
+    # 逐供应商 LLM 覆写（2026-09-15）：加 provider 列（存量行 ''=legacy 全局
+    # llm 回落）；旧 (user_id, kind) 唯一索引必须换成 (user_id, kind, provider)
+    # ——否则每 kind 仍只能一行、逐供应商覆写写不进去。
+    ("user_model_providers_provider", "ALTER TABLE user_model_providers ADD COLUMN IF NOT EXISTS provider VARCHAR(64)"),
+    ("user_model_providers_provider_fill", "UPDATE user_model_providers SET provider = '' WHERE provider IS NULL"),
+    # A4.9 Critical 修复（2026-09-15）：全新库 create_all 先生成 ORM
+    # UniqueConstraint → 旧唯一性是「约束型索引」，DROP INDEX 会报
+    # "cannot drop index ... because constraint ... requires it" 并炸启动。
+    # 必须先 DROP CONSTRAINT（独立索引场景为 no-op），再 DROP INDEX。
+    ("user_model_providers_drop_kind_constraint", "ALTER TABLE user_model_providers DROP CONSTRAINT IF EXISTS uq_user_model_providers_user_kind"),
+    ("user_model_providers_drop_kind_unique", "DROP INDEX IF EXISTS uq_user_model_providers_user_kind"),
+    ("user_model_providers_dedupe_provider", """DELETE FROM user_model_providers a USING user_model_providers b
+        WHERE a.user_id = b.user_id AND a.kind = b.kind
+          AND COALESCE(a.provider, '') = COALESCE(b.provider, '') AND a.ctid < b.ctid"""),
+    ("user_model_providers_unique_provider", "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_model_providers_user_kind_provider ON user_model_providers (user_id, kind, provider)"),
+    # provider 列收敛为 NOT NULL DEFAULT ''（新库 create_all 已是 NOT NULL；
+    # 旧库补列后必须显式收敛，防 NULL 在唯一索引中「互不相等」的重复行漏洞）。
+    ("user_model_providers_provider_not_null", """UPDATE user_model_providers SET provider = '' WHERE provider IS NULL"""),
+    ("user_model_providers_provider_default", "ALTER TABLE user_model_providers ALTER COLUMN provider SET DEFAULT ''"),
+    ("user_model_providers_provider_not_null_enforce", "ALTER TABLE user_model_providers ALTER COLUMN provider SET NOT NULL"),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (

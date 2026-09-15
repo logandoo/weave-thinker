@@ -23,8 +23,16 @@ export interface ProviderOverride {
 
 export type ProviderOverrides = Record<string, ProviderOverride | null>
 
+export interface LlmProvider {
+  alias: string
+  display_name: string
+}
+
 export interface ModelProviderStatus {
   kinds: string[]
+  /** 系统 LLM 供应商（公共别名 + 显示名；不含 URL/Key/真实模型名） */
+  llm_providers: LlmProvider[]
+  /** 键：`llm:<alias>`（逐供应商）· `vlm`/`embedding`/`rerank`/`asr`/`tts`（类型级） */
   overrides: ProviderOverrides
 }
 

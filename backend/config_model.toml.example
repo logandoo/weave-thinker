@@ -73,15 +73,16 @@ display_name = "Qwen3.8(Local)"
 is_custom = true
 provider_type = "qwen3.8_vllm"
 
-# Qwen3.8-Flash-Next（Qwen4Exp；thinking 模板同构 27B，无 thinking_budget）
-[endpoints."qwen3.8_next"]
+# Doubao（火山方舟 Ark，OpenAI 兼容）：thinking{type} + 顶层 reasoning_effort
+# （high/medium/low/minimal）；无 thinking_budget。模型需先在方舟控制台开通。
+[endpoints.doubao]
 kind = "llm"
-base_url = "http://YOUR-LLAMACPP-HOST:8000/v1"
-api_key = ""
-model_name = "qwen3.8-flash-next"
-display_name = "Qwen3.8-Next"
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+api_key = ""              # ← 填入 Ark API Key
+model_name = "doubao-seed-evolving"
+display_name = "Doubao"
 is_custom = true
-provider_type = "qwen3.8_next"
+provider_type = "doubao"
 
 # ── VLM（视觉语言；purpose "vlm"：agent vision_interpret 工具 + 死磕视觉批评）──
 [endpoints.vlm]
@@ -148,6 +149,11 @@ main = "main"
 judge = { alias = "main", is_custom = true }
 "deathmatch.judge" = { alias = "deepseek", is_custom = true }
 coordinator = "main"
+# 发送前审计（pre-send audit）独立模型：显式配置才生效（operator opt-in），
+# 缺省不配置 = 继承 coordinator/主模型（P0 助手全链路继承语义不变）。
+# 用途：写入模型弱时（本地小模型零 [N] 引用稿）让强模型审计兜底——
+# 2026-09-15 conv 174182bc 事故（cited=0 ledger=18/20 被同弱模型 accept 两次）。
+# "agent.audit" = { alias = "deepseek", is_custom = true }
 "aux.compression" = "main"
 "aux.search_decision" = "main"
 "aux.title" = "main"
@@ -195,21 +201,26 @@ desc = "均衡速度与深度"
 label = "low"
 desc = "轻量快速推理"
 
-[endpoints."qwen3.8_next".capabilities]
+[endpoints.doubao.capabilities]
 supports_reasoning = true
-reasoning_efforts = [ "xhigh", "medium", "low",]
+reasoning_efforts = [ "high", "medium", "low", "minimal",]
 
-[endpoints."qwen3.8_next".capabilities.effort_meta.xhigh]
-label = "xhigh"
-desc = "最强推理深度"
+[endpoints.doubao.capabilities.effort_meta.high]
+label = "high"
+desc = "深度分析，处理复杂问题"
 
-[endpoints."qwen3.8_next".capabilities.effort_meta.medium]
+[endpoints.doubao.capabilities.effort_meta.medium]
 label = "medium"
-desc = "均衡速度与深度"
+desc = "均衡模式，兼顾速度与深度"
+default = true
 
-[endpoints."qwen3.8_next".capabilities.effort_meta.low]
+[endpoints.doubao.capabilities.effort_meta.low]
 label = "low"
-desc = "轻量快速推理"
+desc = "轻量思考，侧重快速响应"
+
+[endpoints.doubao.capabilities.effort_meta.minimal]
+label = "minimal"
+desc = "关闭思考，直接回答"
 
 [endpoints.deepseek.capabilities]
 supports_reasoning = true

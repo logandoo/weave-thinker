@@ -721,6 +721,174 @@ def _build_citation_mapping_view(state: "AgentLoopState", draft: str) -> str:
     return block
 
 
+# ── 跨轮引用沿用守卫（2026-09-16，conv f2553c58 生产复发，A 件套）────────────
+# 生产回放管线 neutralize_historical_citations（tool_history.py:100）会剥掉历史
+# 回答的全部 [N] 标记——但历史回答的**文字**（论文细节、旧结论）原样保留，
+# 写手照样采矿业史细节并给它们按本轮编号错误对号入座（生产实证：本轮 [5]=
+# GitHub issue、写手引作 2607.12227 → 审计判「指向错误来源」连拒）。因此检测面
+# 必须是「历史存在 assistant 回答」（A4.9 R1 Critical-1：依赖 [N] 可见性的
+# 检测在生产恒 False、机制零触发），提醒在本轮首次检索结果尾部注入一次。
+_CROSS_TURN_CITATION_NOTE = (
+    "【跨轮引用纪律（系统注入）】对话历史回答的文字内容（含其中提到的具体数值、"
+    "论文细节、以及任何曾出现的 [N] 引用语义）均属于其产生的那一轮——历史轮次的"
+    "引用编号与证据对本轮一律无效：禁止凭历史回答给本轮事实对号引用编号，可引用"
+    "的只有上方本轮检索结果中的编号。历史轮次核实过的事实若要在本轮引用，须在"
+    "本轮重新检索/浏览获得证据后按本轮编号标注。来源的具体细节（作者数、页数、"
+    "图表数、DOI、发布/收录状态等）只有出现在本轮工具结果中才可写；不在本轮"
+    "证据中的细节：用 browser 打开原文取得本轮证据，或不要写。"
+)
+
+
+def _has_prior_turn_assistant(state: "AgentLoopState") -> bool:
+    """本轮用户最新消息之前是否存在历史 assistant 回答（继续会话判定）。
+
+    A4.9 R1 Critical-1：生产回放会中性化历史 [N]，检测面不能依赖标记可见性；
+    以「最后一条真实 user 消息之前存在 assistant 消息」为据。本轮草稿（最后
+    user 之后 append 的 assistant）不计入。插话消息（_interjection，刻意非
+    synthetic，A4.9 R2 N-2）不推移边界——其前的本轮草稿不得误判为历史。
+    """
+    msgs = state.messages
+    last_user_idx = -1
+    for i in range(len(msgs) - 1, -1, -1):
+        if (
+            msgs[i].get("role") == "user"
+            and not msgs[i].get("synthetic")
+            and not msgs[i].get("_interjection")
+        ):
+            last_user_idx = i
+            break
+    if last_user_idx <= 0:
+        return False
+    return any(m.get("role") == "assistant" for m in msgs[:last_user_idx])
+
+
+# ── 审计对照表假判词确定性闸门（2026-09-16，conv f2553c58 生产，B 件套）──────
+# 审计员在大上下文里「看不到」明明已渲染进其上下文的引用编号对照表（生产实证：
+# audit_citation_map cited=16 unknown=0 ledger=46 日志在案，判词却称「本轮无
+# 引用编号对照表」）——lost-in-the-middle 稀释。假判词引导写手修本来就合法的
+# 编号（无效改动），真问题无人修，循环空转。前提可确定性证伪 → 闸门介入。
+_AUDIT_MAP_ABSENT_MARKERS = (
+    "无引用编号对照表", "没有引用编号对照表", "缺少引用编号对照表",
+    "无对照表", "对照表不存在", "对照表缺失",
+)
+# 「对照表未列出」须绑定**编号有效性**语境（A4.9 R1 Important-2 + R2 N-1）：
+# 「对照表未列出各论文页数/作者数」「对照表未列出编号对应的页数」都是真命题
+# （对照表本就只含 id/标题/URL），不得命中假判词闸门——可证伪的只有「编号
+# 无法核对」一种前提。
+_AUDIT_MAP_ABSENT_RE = _re.compile(
+    r"对照表未列出[^\n。；，,]{0,16}"
+    r"(?:引用编号|编号对应关系|编号映射|编号条目|编号来源|编号清单|编号有效性)")
+# 其他问题族标记（A4.9 R1 Important-2：对剔除假判词从句后的剩余文本跑**完整**
+# 词表，含「无法核实/无法核对」——真问题也可能落在这两个词上，如「47% 营收
+# 数据无法核实」；增补「不完整/省略」覆盖草稿完整性抱怨；R4：自足族「独立」
+# 对称入列，与矛盾一样阻断纯接收）。
+_AUDIT_MAP_GATE_OTHER_MARKERS = (
+    "矛盾", "不一致", "无依据", "无证据", "凭空", "编造",
+    "截断", "未展示", "无法核对", "无法核实", "片段", "无对应", "无相应",
+    "悬空", "指代", "上一版", "被拒草稿", "自足", "独立",
+    "不完整", "省略",
+)
+# 假判词从句的**黏连词**（A4.9 R2 N-1 + R3 N-1 残余 + R4）：「无法核实/无法核对」
+# 既是编号有效性抱怨的自身措辞，也是 truncation 族真问题的高频措辞——只有
+# 绑定编号语境（±12 字符内出现 编号/对照表/有效性）才允许作为黏连词随从句
+# 剔除；且语境判定必须先在从句中**抹除 marker 文本**（R4：marker 自带
+# 「对照表/编号」会让窗口锚错——「无对照表，47% 数据无法核实。」的语境命中
+# 全部来自 marker 自身）。
+_AUDIT_MAP_GATE_GLUE_MARKERS = ("无法核实", "无法核对")
+_AUDIT_MAP_GATE_GLUE_CONTEXT = ("编号", "对照表", "有效性")
+_AUDIT_MAP_GATE_HARD_MARKERS = tuple(
+    m for m in _AUDIT_MAP_GATE_OTHER_MARKERS
+    if m not in _AUDIT_MAP_GATE_GLUE_MARKERS
+)
+
+
+def _erase_map_absent_markers(clause: str) -> str:
+    """抹除从句中的对照表缺失 marker 文本（语境判定的锚定基准，A4.9 R4）。"""
+    out = clause or ""
+    for m in _AUDIT_MAP_ABSENT_MARKERS:
+        out = out.replace(m, " ")
+    return _AUDIT_MAP_ABSENT_RE.sub(" ", out)
+
+
+def _glue_has_citation_context(text: str, pos: int, window: int = 12) -> bool:
+    """黏连词出现位置 ±window 字符内是否含编号语境（A4.9 R3；调用方须先抹除
+    marker 文本——R4：否则语境命中全部来自 marker 自身，短混合从句被误吞）。"""
+    s = max(0, pos - window)
+    e = min(len(text), pos + window + 4)
+    seg = text[s:e]
+    return any(k in seg for k in _AUDIT_MAP_GATE_GLUE_CONTEXT)
+
+
+def _is_map_absent_clause(clause: str) -> bool:
+    """单条判词从句是否为「对照表缺失」假判词从句（供剔除）。
+
+    fail-closed（A4.9 R2/R3/R4 三连残余）：从句在**抹除 marker 文本后**仍含
+    硬族问题标记、或含非编号语境的黏连词时保留——宁可多留一句无效措辞，
+    绝不把真问题随从句剔除（闸门永不吞掉矛盾/truncation/自足族）。
+    """
+    if not (
+        any(k in clause for k in _AUDIT_MAP_ABSENT_MARKERS)
+        or _AUDIT_MAP_ABSENT_RE.search(clause)
+    ):
+        return False
+    rest = _erase_map_absent_markers(clause)
+    if any(k in rest for k in _AUDIT_MAP_GATE_HARD_MARKERS):
+        return False
+    for m in _re.finditer(r"无法核实|无法核对", rest):
+        if not _glue_has_citation_context(rest, m.start()):
+            return False
+    return True
+
+
+def _strip_map_absent_clauses(problem: str) -> str:
+    """剔除对照表假判词从句（A4.9 R1 Minor-1：「请重新核对引用编号」类无效
+    指令随从句整体移除，不再与闸门说明自相矛盾）。按 。；; 切分，保序拼接。"""
+    clauses = _re.split(r"(?<=[。；;])", problem or "")
+    kept = [c for c in clauses if c.strip() and not _is_map_absent_clause(c)]
+    return "".join(kept).strip()
+
+
+def _citation_map_false_premise(
+    problem: str, state: "AgentLoopState", draft: str,
+) -> "Tuple[bool, int]":
+    """对照表假判词检测。返回 (是否命中, 台账条数)；未命中 (False, 0)。
+
+    命中条件：problem 含对照表缺失类措辞（编号语境）∧ 本轮引用台账非空 ∧
+    草稿全部 [N] 编号合法（verify.unknown 为空）——此时「无法核对编号」的
+    前提被证伪（对照表已渲染进审计上下文）。「指向错误来源」类语义指控
+    **不在**本闸门范围（确定性不可判，保持原判）；草稿确有越界编号 →
+    审计有合法理由，不介入（与存在性闸门同 fail-closed 哲学）。
+    """
+    p = problem or ""
+    if not any(k in p for k in _AUDIT_MAP_ABSENT_MARKERS) and not _AUDIT_MAP_ABSENT_RE.search(p):
+        return False, 0
+    ledger = getattr(state, "citation_ledger", None)
+    if ledger is None or ledger.size <= 0:
+        return False, 0
+    report = ledger.verify(draft)
+    if report.unknown:
+        return False, 0
+    return True, ledger.size
+
+
+def _map_gate_has_other_issues(problem: str) -> bool:
+    """（剔除假判词从句后的）判词中是否还有其他问题族——决定接收还是改写。"""
+    p = problem or ""
+    return any(k in p for k in _AUDIT_MAP_GATE_OTHER_MARKERS)
+
+
+# 「细节无据」类指导语自救路径（2026-09-16，C 件套）：细节来自历史轮次全文
+# 浏览、本轮只有摘要级证据时，写手往往不知道还能 browser 重开原文取本轮证据。
+# A4.9 R1 Minor-4：触发词收紧——「无证据表明 X」类普通措辞不触发。
+_AUDIT_GUIDANCE_EVIDENCE_RESCUE_MARKERS = (
+    "无对应", "无法核实", "无法核对", "无证据支撑", "缺乏证据",
+)
+_AUDIT_GUIDANCE_EVIDENCE_RESCUE_CLAUSE = (
+    "\n若被点名的细节/声称确实存在于来源但不在本轮证据中：优先用 browser 打开对应"
+    "原文页面取得本轮证据（随后按本轮编号引用），无法取得时再删除/弱化。"
+)
+
+
 def _settled_items_view(state: "AgentLoopState", limit: int = 6, evidence_text: Optional[str] = None) -> str:
     """Compact list of settled rejection problems (conv efaf8f9c 2026-08-20).
 
@@ -1689,6 +1857,9 @@ class AgentLoopState:
     # degraded（基础设施失败回退存在性闸门）或 uncovered（声称超覆盖上限）。
     # _audit_response 入口复位、接收时置位；出货点消费一次（追加说明后清零）。
     audit_low_confidence: bool = False
+    # 2026-09-16（conv f2553c58，A 件套）：本轮首次 web_search 结果已注入跨轮
+    # 引用纪律提醒（历史存在 assistant 回答时）——每轮最多一次，防重复注入稀释。
+    cross_turn_citation_warned: bool = False
     budget: Optional[IterationBudget] = None
     budget_grace_call: bool = False
     completed_normally: bool = False
@@ -3196,7 +3367,25 @@ class AgentLoop:
             queries = (r.arguments or {}).get("queries") if isinstance(r.arguments, dict) else None
             query = queries[0] if isinstance(queries, list) and queries else None
             ids = state.citation_ledger.register_hits(hits, query=query)
-            payload["formatted"] = state.citation_ledger.format_hits(ids)
+            formatted = state.citation_ledger.format_hits(ids)
+            # 跨轮引用纪律（2026-09-16，conv f2553c58）：历史存在 assistant
+            # 回答时在本轮首次检索结果尾部注入提醒——历史文字（论文细节/旧
+            # 结论）不是本轮证据，禁止凭历史给本轮编号对号入座（生产实证：
+            # 写手采矿业史细节并按本轮编号错引 → 「指向错误来源」连拒）。
+            # 尾部注入保持结果条目优先（UI 工具卡/模型都先见条目）。
+            # 开关 cross_turn_citation_note_enabled（默认 true）。
+            if (
+                not state.cross_turn_citation_warned
+                and config.agent_cross_turn_citation_note_enabled
+                and _has_prior_turn_assistant(state)
+            ):
+                formatted = formatted + "\n\n" + _CROSS_TURN_CITATION_NOTE
+                state.cross_turn_citation_warned = True
+                logger.info(
+                    "audit_metric cross_turn_citation note=injected hits=%d",
+                    len(hits),
+                )
+            payload["formatted"] = formatted
             r.result = json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
@@ -4501,6 +4690,36 @@ class AgentLoop:
                      if verdict == _verdict_before_gates else "")
         logger.info("audit_metric outcome=%s taxonomy=%s draft_chars=%d problem=%s",
                     verdict, _taxonomy or "-", len(draft), problem[:160])
+        # 对照表假判词确定性闸门（2026-09-16，conv f2553c58 生产，B 件套）：
+        # 审计声称「无对照表/对照表未列出」而台账非空且草稿编号全部合法 →
+        # 前提可证伪（对照表已渲染进审计上下文，audit_citation_map 为证；
+        # 大上下文稀释是审计盲区，非草稿缺陷）。纯假判词 → 直接接收；
+        # 混合判词 → 剔除「修编号」无效指令（写手不再空转），保留其余真问题。
+        # 开关 citation_map_gate_enabled（默认 true）。
+        if config.agent_audit_citation_map_gate_enabled:
+            _map_fp, _map_size = _citation_map_false_premise(problem, state, draft)
+            if _map_fp:
+                _map_remaining = _strip_map_absent_clauses(problem)
+                if not _map_gate_has_other_issues(_map_remaining):
+                    # A4.9 R1 Important-1：接收路径不得绕过零引用 remand 闸
+                    # （与另两条接收路径同契约）。
+                    _map_remand = _citation_remand_verdict(state, draft)
+                    if _map_remand is not None:
+                        return _map_remand
+                    logger.info(
+                        "audit_metric outcome=accept_map_gate verdict=%s ledger=%d draft_chars=%d",
+                        verdict, _map_size, len(draft),
+                    )
+                    return None
+                problem = (
+                    f"【对照表核对闸门】草稿的 [N] 引用编号经确定性核对全部合法"
+                    f"「对照表共 {_map_size} 条，全部命中、无越界」，编号本身无需改动；"
+                    "请仅针对以下其余问题修正：" + _map_remaining
+                )
+                logger.info(
+                    "audit_metric outcome=map_gate_corrected verdict=%s ledger=%d draft_chars=%d",
+                    verdict, _map_size, len(draft),
+                )
         # 证据侦察（2026-09-13 conv 5abef2bf）：审计失败即触发一次有界侦察，
         # 把草稿声称对应的证据切片补进后续审计窗口（每轮 ≤1；失败无操作）。
         if not state.scout_used:
@@ -4519,6 +4738,11 @@ class AgentLoop:
                 f"{_settled_prefix}你刚才生成的回答草稿（本轮）证据不足：{problem}\n"
                 "请立即调用工具（memory/workspace_read/web_search 等）补充真实证据后再作答；"
                 "若确实无法获取，如实说明“我无法获知”，不要编造。"
+                + (
+                    _AUDIT_GUIDANCE_EVIDENCE_RESCUE_CLAUSE
+                    if any(k in problem for k in _AUDIT_GUIDANCE_EVIDENCE_RESCUE_MARKERS)
+                    else ""
+                )
                 + "\n" + _AUDIT_GUIDANCE_LOCALIZED_CLAUSE
                 + "\n" + _AUDIT_GUIDANCE_INDEPENDENCE_CLAUSE
             )
@@ -4527,6 +4751,11 @@ class AgentLoop:
                 f"{_settled_prefix}你刚才生成的回答草稿（本轮）存在无法核实的声称（证据被截断或证据中不存在）：{problem}\n"
                 "请删除无法核实的声称，或补充读取证据后再作答；"
                 "若证据确实不足，如实说明“我无法获知”，不要编造。"
+                + (
+                    _AUDIT_GUIDANCE_EVIDENCE_RESCUE_CLAUSE
+                    if any(k in problem for k in _AUDIT_GUIDANCE_EVIDENCE_RESCUE_MARKERS)
+                    else ""
+                )
                 + "\n" + _AUDIT_GUIDANCE_LOCALIZED_CLAUSE
                 + "\n" + _AUDIT_GUIDANCE_INDEPENDENCE_CLAUSE
             )

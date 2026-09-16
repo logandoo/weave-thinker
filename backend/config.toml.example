@@ -29,6 +29,7 @@ note_context_limit = 12
 conversation_context_limit = 40
 memory_refresh_note_limit = 20
 memory_refresh_message_limit = 60
+cross_turn_citation_note_enabled = true
 scheduled_task_system_prompt = """你是一个智能助手，正在执行用户设定的定时任务。请根据任务要求完成操作并给出结果。你可以使用 web_search 联网搜索最新信息，使用 browser 浏览网页深入获取内容，使用 execute_code 执行代码。当你不确定某个事实或需要最新信息时，必须主动搜索而不是猜测。
 
 Markdown格式要求（严格遵守，否则渲染会出错）：
@@ -108,6 +109,7 @@ segmented_verify_timeout_seconds = 120
 segmented_verify_max_claims = 40
 segmented_verify_retry_window_chars = 1500
 low_confidence_note_enabled = true
+citation_map_gate_enabled = true
 draft_selection_enabled = true
 selection_timeout_seconds = 480
 salvage_timeout_seconds = 240

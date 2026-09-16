@@ -966,6 +966,16 @@ class Config:
         return int(self.agent.get("memory_refresh_message_limit", 60))
 
     @property
+    def agent_cross_turn_citation_note_enabled(self) -> bool:
+        """跨轮引用纪律时机注入（2026-09-16，conv f2553c58 生产复发）。
+
+        对话历史含 [N] 引用时，在本轮首次 web_search 结果前注入提醒——历史
+        编号按轮次独立、对本轮无效，禁止沿用；论文细节不在本轮证据中的要么
+        browser 重开原文、要么不写。默认 true；false = 回退纯系统提示约束。
+        """
+        return bool(self.agent.get("cross_turn_citation_note_enabled", True))
+
+    @property
     def sub_agent(self) -> dict:
         return self._config.get("sub_agent", {})
 
@@ -1944,6 +1954,17 @@ class Config:
         默认 true；false = 旧静默行为（与兄弟开关同哲学的一键回滚阀）。
         """
         return bool(self.agent_audit.get("low_confidence_note_enabled", True))
+
+    @property
+    def agent_audit_citation_map_gate_enabled(self) -> bool:
+        """对照表假判词确定性闸门（2026-09-16，conv f2553c58 生产复发）。
+
+        审计判词声称「无对照表/对照表未列出」而台账非空且草稿全部编号合法
+        → 前提可证伪（对照表已渲染进审计上下文，大上下文稀释是审计盲区）：
+        纯假判词 → 直接接收；混合判词 → 剔除「修编号」无效指令、保留其余
+        真问题。默认 true；false = 一键回退旧行为（假判词照原样烧预算）。
+        """
+        return bool(self.agent_audit.get("citation_map_gate_enabled", True))
 
     @property
     def agent_audit_draft_selection_enabled(self) -> bool:

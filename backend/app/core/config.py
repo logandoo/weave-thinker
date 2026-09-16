@@ -1915,6 +1915,37 @@ class Config:
         return float(self.agent_audit.get("segmented_verify_timeout_seconds", 120))
 
     @property
+    def agent_audit_segmented_verify_max_claims(self) -> int:
+        """分段核对候选声称上限（句子级，默认 40）。
+
+        超出上限的声称只做存在性核对并计入 uncovered（出货附低置信说明，
+        C4 评估残余风险②）；0 = 关闭分段核对（与兄弟开关 0=off 一致）。
+        """
+        return int(self.agent_audit.get("segmented_verify_max_claims", 40))
+
+    @property
+    def agent_audit_segmented_verify_retry_window_chars(self) -> int:
+        """unverifiable 包宽窗重试的证据窗口（字符，默认 1500；0=关闭重试）。
+
+        C4 评估残余风险③（2026-09-16）：首轮 ±600 窗口对错段落/上下文不足
+        时验证器只能判 unverifiable（查了等于没查）——以更宽窗口重试一次
+        转为真实 pass/fail；重试仍在聚合总超时内（超时 → degraded 回退 +
+        低置信说明）。
+        """
+        return int(self.agent_audit.get("segmented_verify_retry_window_chars", 1500))
+
+    @property
+    def agent_audit_low_confidence_note_enabled(self) -> bool:
+        """低置信出货说明开关（2026-09-16，C4 评估残余风险①②）。
+
+        分段核对 degraded（核对服务异常/超时回退存在性闸门）或 uncovered
+        （声称超出逐条核对覆盖上限）的接收，不再静默——在回答末尾追加一句
+        透明说明（引用数值/名称已确认存在于来源资料，逐条复核未全部完成）。
+        默认 true；false = 旧静默行为（与兄弟开关同哲学的一键回滚阀）。
+        """
+        return bool(self.agent_audit.get("low_confidence_note_enabled", True))
+
+    @property
     def agent_audit_draft_selection_enabled(self) -> bool:
         """审计耗尽 best-of 选优兜底开关（conv 7dc7a0d5，2026-08-18）。
         开启时：salvage 仍失败（被拒/空/异常/超时）后，由独立选优调用综合

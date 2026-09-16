@@ -416,6 +416,28 @@ _AUDIT_SELECTION_CAVEAT = (
     "最接近可用的版本，请谨慎核对关键数字与事实依据。）\n\n"
 )
 
+# 低置信出货说明（2026-09-16，C4 评估残余风险①②，用户拍板处理）：分段核对
+# degraded（核对服务异常/超时回退存在性闸门）或 uncovered（声称超出逐条核对
+# 覆盖上限）的接收，在回答**末尾**追加——透明但不恐慌（存在性核对已确认
+# 引用数值/名称在来源资料中有出处；与 _AUDIT_SELECTION_CAVEAT 的警示级区分）。
+_AUDIT_LOW_CONFIDENCE_NOTE = (
+    "\n\n---\n（说明：受来源资料篇幅或自动核对服务状态限制，本回答中部分具体数值/名称"
+    "未能完成逐条二次复核；所引用的数字与名称均已确认在来源资料中有出处，关键数据仍建议对照原文。）"
+)
+
+
+def _draft_ships_as_final(live: bool, enable_reasoning: bool, retry_thinking_off: bool) -> bool:
+    """草稿即最终稿（不经合成 pass）的出货模式（A4.9 R1 Important-1，2026-09-16）。
+
+    三种模式草稿直接成为用户可见最终回答：live 流式（边生成边出货）·
+    非 reasoning（无合成 pass——_need_synthesis 内层被 enable_reasoning 门槛
+    整体跳过；agent_worker/agent_scheduler 硬编码此模式）· retry_thinking_off
+    （关思考重试的有内容路径跳过合成）。其余（非 live + reasoning 正常路径）
+    草稿被合成稿取代——其 accept 在合成审计点判定，草稿 accept 是中间态。
+    低置信说明在「草稿即最终稿」时必须在 draft 审计点消费，否则该模式静默出货。
+    """
+    return live or not enable_reasoning or retry_thinking_off
+
 
 # Appended to every audit-rejection guidance (conv 7dc7a0d5 evening wave):
 # the regenerated draft MUST be complete and standalone — the user never sees
@@ -1250,19 +1272,22 @@ def _is_phantom_token(t: str, sentence: str) -> bool:
 def _select_invisible_claims(
     draft: str, display_text: Optional[str], full_text: Optional[str],
     max_claims: int = 40,
-) -> "List[Tuple[str, List[str]]]":
-    """[(声称句, 不可见 token 列表)]——token 存在于全量语料但显示窗不可见。
+) -> "Tuple[List[Tuple[str, List[str]]], int]":
+    """([(声称句, 不可见 token 列表)], 候选总数)——token 存在于全量语料但显示窗不可见。
 
     显示窗已可见的声称由原审计员正常核对，无需重复；全量语料也没有的 token
     属真实缺失（既有 unverifiable 语义），也不进入分段核对。
+    候选总数含被 max_claims 截掉的声称（覆盖计数 uncovered 需要——超出上限的
+    声称只做存在性核对，出货附低置信说明，2026-09-16 C4 评估残余风险②）。
     """
     ev_full = full_text or ""
     if not ev_full:
-        return []
+        return [], 0
     ev_full_lower = ev_full.lower()
     disp = display_text or ""
     disp_lower = disp.lower()
     out: List[Tuple[str, List[str]]] = []
+    total = 0
     for sent in _draft_claim_sentences(draft):
         toks = _claim_tokens_with_units(sent)
         if not toks:
@@ -1279,10 +1304,10 @@ def _select_invisible_claims(
         invisible = sorted(
             t for t in present if not _claim_token_hit(t, disp, disp_lower))
         if invisible:
-            out.append((sent, invisible))
-        if len(out) >= max_claims:
-            break
-    return out
+            total += 1
+            if len(out) < max_claims:
+                out.append((sent, invisible))
+    return out, total
 
 
 
@@ -1353,12 +1378,36 @@ class ClaimPack:
 
 @dataclass
 class SegmentedClaimVerdict:
-    """分段核对聚合结果：accept=True 且 failed 为空 = 无矛盾（可接收）。"""
+    """分段核对聚合结果：accept=True 且 failed 为空 = 无矛盾（可接收）。
+
+    uncovered（2026-09-16 C4 评估残余风险②）：候选声称总数 − 已建验证包数
+    ——只做存在性核对的声称数（超 max_claims/max_packs/空包丢弃）。
+    degraded（同①）：基础设施失败（map 异常/聚合超时/gather 异常/全部验证
+    调用失败）的 fail-open 回退——区别于「无声称可验」的 None，接收时须置
+    低置信标记，不再静默。
+    """
     accept: bool = False
     failed: List[Tuple[str, str]] = field(default_factory=list)
     packs: int = 0
     failed_calls: int = 0
     unverifiable: int = 0
+    uncovered: int = 0
+    degraded: bool = False
+
+
+def _spans_within_budget(spans: List[str], pack_tokens: int) -> List[str]:
+    """证据切片按包预算截留（分段核对首轮打包与宽窗重试共用，2026-09-16）。"""
+    from app.services.context_compressor import estimate_text_tokens_rough
+
+    kept: List[str] = []
+    used = 0
+    for sp in spans:
+        tk = estimate_text_tokens_rough(sp)
+        if used + tk > pack_tokens:
+            break
+        kept.append(sp)
+        used += tk
+    return kept
 
 
 def _build_claim_packs(
@@ -1369,8 +1418,6 @@ def _build_claim_packs(
 
     排序：不可见 token 多的声称优先（风险最高），同分保持草稿序——确定性。
     """
-    from app.services.context_compressor import estimate_text_tokens_rough
-
     ordered = sorted(
         enumerate(claims), key=lambda it: (-len(it[1][1]), it[0]),
     )
@@ -1379,14 +1426,7 @@ def _build_claim_packs(
         if len(packs) >= max_packs:
             break
         spans = _find_token_spans(full_text, toks)
-        kept: List[str] = []
-        used = 0
-        for sp in spans:
-            tk = estimate_text_tokens_rough(sp)
-            if used + tk > pack_tokens:
-                break
-            kept.append(sp)
-            used += tk
+        kept = _spans_within_budget(spans, pack_tokens)
         if not kept:
             continue
         packs.append(ClaimPack(claim=sent, tokens=list(toks), spans=kept))
@@ -1645,6 +1685,10 @@ class AgentLoopState:
     # 工具轮，用户看到多份正式回答）。SOTA：连贯且审计通过的回答漏标 =
     # 警告记录继续，不重答。
     audit_accepted: bool = False
+    # 2026-09-16（C4 评估残余风险①②）：本轮最终稿为「低置信接收」——分段核对
+    # degraded（基础设施失败回退存在性闸门）或 uncovered（声称超覆盖上限）。
+    # _audit_response 入口复位、接收时置位；出货点消费一次（追加说明后清零）。
+    audit_low_confidence: bool = False
     budget: Optional[IterationBudget] = None
     budget_grace_call: bool = False
     completed_normally: bool = False
@@ -3789,10 +3833,13 @@ class AgentLoop:
     ) -> Optional[SegmentedClaimVerdict]:
         """分段声称核对（2026-09-15，用户拍板；SOTA 见模块级注释）。
 
-        返回 None = 不适用/不可判定（未启用/无不可见声称/无包/全包调用失败/
-        超时）——调用方回退既有可见性存在性闸门（fail-open 不升级）。返回结果
-        时：failed 非空 → 调用方按 **reject** 打回（source=claim_verify，A4.9 R1
-        Important-3）；否则由闸门判定接收。
+        返回 None = 不适用（未启用/无不可见声称）——调用方回退既有可见性
+        存在性闸门（旧行为，非失败）。返回结果时：failed 非空 → 调用方按
+        **reject** 打回（source=claim_verify，A4.9 R1 Important-3）；否则由
+        闸门判定接收。degraded=True（map 异常/聚合超时/gather 异常/全部验证
+        调用失败）= 基础设施 fail-open 回退存在性语义——调用方置低置信标记，
+        不再静默（2026-09-16 C4 评估残余风险①）。uncovered>0 = 声称超出
+        覆盖上限只做存在性核对（同②）。
 
         物理隔离（验证优先双代理要求）：每个验证调用只带「声称 + 相关证据
         切片」（≤ pack_tokens），不共享写手/审计会话上下文。验证模型优先
@@ -3805,10 +3852,12 @@ class AgentLoop:
             return None
         _max_packs = int(config.agent_audit_segmented_verify_max_packs)
         _pack_tokens = int(config.agent_audit_segmented_verify_pack_tokens)
-        if _max_packs <= 0 or _pack_tokens <= 0:
+        _max_claims = int(config.agent_audit_segmented_verify_max_claims)
+        if _max_packs <= 0 or _pack_tokens <= 0 or _max_claims <= 0:
             return None  # 0/负 = 关闭（与兄弟开关 0=off 一致，A4.9 R1 Minor-8）
         try:
-            claims = _select_invisible_claims(draft, display_text, full_text)
+            claims, total_claims = _select_invisible_claims(
+                draft, display_text, full_text, max_claims=_max_claims)
             if not claims:
                 return None
             packs = _build_claim_packs(
@@ -3816,30 +3865,60 @@ class AgentLoop:
                 max_packs=_max_packs, pack_tokens=_pack_tokens,
             )
             if not packs:
-                return None
+                # 有候选声称但全部无法成包（span 超预算丢弃）——覆盖缺口，
+                # 按 uncovered 接收并置低置信标记（不再静默回退）。
+                return SegmentedClaimVerdict(accept=True, uncovered=total_claims)
         except Exception:
-            # A4.9 R1 Minor-10：map 异常不得破坏审计 fail-open 契约
-            logger.warning("claim_verify map failed — fallback to visibility gate", exc_info=True)
-            return None
+            # A4.9 R1 Minor-10：map 异常不得破坏审计 fail-open 契约——
+            # 但 fail-open 不再静默：degraded 标记驱动低置信出货说明。
+            logger.warning("claim_verify map failed — degraded fallback to visibility gate", exc_info=True)
+            return SegmentedClaimVerdict(accept=True, degraded=True)
         _llm = getattr(self, "audit_llm", None) or getattr(self, "coordinator_llm", None)
         _sem = asyncio.Semaphore(
             max(1, int(config.agent_audit_segmented_verify_max_concurrency)))
+        _retry_win = int(config.agent_audit_segmented_verify_retry_window_chars)
 
         async def _one(pack: ClaimPack) -> Optional[Tuple[str, str]]:
             async with _sem:
-                msgs = [
-                    {"role": "system", "content": _CLAIM_VERIFY_SYSTEM},
-                    {"role": "user", "content": (
-                        f"声称：{pack.claim}\n\n证据片段（全文摘录）：\n"
-                        + "\n---\n".join(pack.spans)
-                    )},
-                ]
-                try:
+
+                async def _call(spans: List[str]) -> Optional[Tuple[str, str]]:
+                    msgs = [
+                        {"role": "system", "content": _CLAIM_VERIFY_SYSTEM},
+                        {"role": "user", "content": (
+                            f"声称：{pack.claim}\n\n证据片段（全文摘录）：\n"
+                            + "\n---\n".join(spans)
+                        )},
+                    ]
                     raw = await self._complete_json(msgs, temperature=0.0, llm=_llm)
+                    return _parse_claim_verify(raw)
+
+                try:
+                    res = await _call(pack.spans)
                 except Exception:
                     logger.info("claim_verify call failed — pack skipped (fail-open)")
                     return None
-                return _parse_claim_verify(raw)
+                # 宽窗重试（2026-09-16 C4 评估残余风险③）：首轮 unverifiable
+                # 多为窗口对错段落/上下文不足（验证器只能判「不足以判断」）——
+                # 以更宽窗口重试一次，把「查了等于没查」转为真实 pass/fail；
+                # 仍在聚合总超时内（超时由外层 wait_for 界住 → degraded）。
+                if (
+                    res is not None and res[0] == "unverifiable" and _retry_win > 0
+                ):
+                    try:
+                        wider = _spans_within_budget(
+                            _find_token_spans(full_text, pack.tokens, window=_retry_win),
+                            _pack_tokens,
+                        )
+                    except Exception:
+                        wider = []
+                    if wider and wider != pack.spans:
+                        try:
+                            res2 = await _call(wider)
+                            if res2 is not None:
+                                return res2
+                        except Exception:
+                            pass  # 重试失败保留首轮 unverifiable（fail-open 不升级）
+                return res
 
         # 总超时（A4.9 R1 Important-5）：并发 4 × 每调用 600s 的最坏 1200s
         # 墙钟不可接受——加聚合预算（默认 120s，0=不设限），超时回退闸门。
@@ -3851,25 +3930,43 @@ class AgentLoop:
                 if _total_to > 0 else _gather
             )
         except asyncio.TimeoutError:
+            # A4.9 R1 Minor-1：degraded 保留覆盖信息（uncovered = 从未成包的
+            # 声称数）并留指标行——50 候选超时与 1 候选超时不应同形。
             logger.warning(
-                "claim_verify timed out after %.2fs — fallback to visibility gate",
+                "claim_verify timed out after %.2fs — degraded fallback to visibility gate",
                 _total_to,
             )
-            return None
+            logger.info(
+                "audit_metric claim_verify degraded=timeout packs=%d uncovered=%d",
+                len(packs), max(0, total_claims - len(packs)),
+            )
+            return SegmentedClaimVerdict(
+                accept=True, degraded=True, packs=len(packs),
+                uncovered=max(0, total_claims - len(packs)),
+            )
         except Exception:
             logger.warning(
-                "claim_verify gather failed — fallback to visibility gate",
+                "claim_verify gather failed — degraded fallback to visibility gate",
                 exc_info=True,
             )
-            return None
+            logger.info(
+                "audit_metric claim_verify degraded=gather_error packs=%d uncovered=%d",
+                len(packs), max(0, total_claims - len(packs)),
+            )
+            return SegmentedClaimVerdict(
+                accept=True, degraded=True, packs=len(packs),
+                uncovered=max(0, total_claims - len(packs)),
+            )
         agg = _aggregate_claim_verdicts(results, [p.claim for p in packs])
+        agg.uncovered = max(0, total_claims - len(packs))
         logger.info(
-            "audit_metric claim_verify packs=%d failed=%d unverifiable=%d failed_calls=%d tokens=%d",
+            "audit_metric claim_verify packs=%d failed=%d unverifiable=%d failed_calls=%d uncovered=%d tokens=%d",
             agg.packs, len(agg.failed), agg.unverifiable, agg.failed_calls,
-            sum(len(p.tokens) for p in packs),
+            agg.uncovered, sum(len(p.tokens) for p in packs),
         )
         if agg.failed_calls >= agg.packs:
-            return None  # 全部调用失败 → 回退存在性闸门（等价旧行为）
+            # 全部调用失败 → degraded 回退存在性闸门（等价旧行为 + 低置信标记）
+            agg.degraded = True
         return agg
 
     async def _audit_response(
@@ -3897,6 +3994,9 @@ class AgentLoop:
         """
         if not draft.strip():
             return None
+        # 低置信标记入口复位（2026-09-16）：每次审计只携带本轮判定结果——
+        # degraded/uncovered 接收置位，出货点消费一次后清零，杜绝陈旧标记串稿。
+        state.audit_low_confidence = False
         context_parts = [f"用户最新消息：{last_user_msg[:800]}"]
         # 用户背景事实注入（2026-08-21 复盘, conv efaf8f9c）：审计员上下文
         # 只有最新消息+工具台账，看不到早期轮次用户自己陈述的事实（如
@@ -4350,16 +4450,29 @@ class AgentLoop:
             _remand = _citation_remand_verdict(state, draft)
             if _remand is not None:
                 return _remand
-            if _seg is not None:
+            if _seg is not None and not _seg.degraded:
                 logger.info(
-                    "audit_metric outcome=accept_claim_verify verdict=%s packs=%d unverifiable=%d draft_chars=%d",
-                    verdict, _seg.packs, _seg.unverifiable, len(draft),
+                    "audit_metric outcome=accept_claim_verify verdict=%s packs=%d unverifiable=%d uncovered=%d draft_chars=%d",
+                    verdict, _seg.packs, _seg.unverifiable, _seg.uncovered, len(draft),
                 )
             else:
                 logger.info(
-                    "audit_metric outcome=accept_visibility verdict=%s draft_chars=%d problem=%s",
-                    verdict, len(draft), problem[:120],
+                    "audit_metric outcome=accept_visibility verdict=%s degraded=%s uncovered=%d draft_chars=%d problem=%s",
+                    verdict,
+                    _seg is not None and _seg.degraded,
+                    _seg.uncovered if _seg is not None else 0,
+                    len(draft), problem[:120],
                 )
+            # 低置信标记（2026-09-16 C4 评估残余风险①②，用户拍板处理）：
+            # degraded（核对基础设施失败回退存在性闸门）或 uncovered（声称超出
+            # 逐条核对覆盖上限）的接收不再静默——出货点在回答末尾追加说明
+            # （_AUDIT_LOW_CONFIDENCE_NOTE）；开关 low_confidence_note_enabled。
+            if (
+                _seg is not None
+                and (_seg.degraded or _seg.uncovered > 0)
+                and config.agent_audit_low_confidence_note_enabled
+            ):
+                state.audit_low_confidence = True
             return None
         _settled_guidance = _settled_items_view(state, evidence_text=_evidence_full)
         _settled_prefix = ""
@@ -4525,6 +4638,10 @@ class AgentLoop:
                 for _r in _reason_parts:
                     yield {"reasoning_content": _r, "phase": "final"}
                 yield {"content": salvaged}
+                # 低置信接收（degraded/uncovered）→ 回答末尾透明说明一次
+                if state.audit_low_confidence:
+                    state.audit_low_confidence = False
+                    yield {"content": _AUDIT_LOW_CONFIDENCE_NOTE}
                 return
             # A4.9 I1 (conv 7dc7a0d5): the rejected salvage is often the
             # STRONGEST selection candidate (fresh generation from a
@@ -4683,6 +4800,10 @@ class AgentLoop:
                 for _r in _reason_parts:
                     yield {"reasoning_content": _r, "phase": "final"}
                 yield {"content": selected}
+                # 低置信接收（degraded/uncovered）→ 回答末尾透明说明一次
+                if state.audit_low_confidence:
+                    state.audit_low_confidence = False
+                    yield {"content": _AUDIT_LOW_CONFIDENCE_NOTE}
                 return
             logger.warning(
                 "audit_metric outcome=selection_rejected verdict=%s %s — deterministic fallback",
@@ -7077,6 +7198,19 @@ class AgentLoop:
                                 )
                                 continue
                             guidance = await self._audit_response(state, _audit_target, _last_user_msg)
+                        if guidance is None and assistant_content.strip():
+                            # 低置信接收（degraded/uncovered）→ 回答末尾透明说明
+                            # 一次（A4.9 R1 Important-1）：「草稿即最终稿」的三种
+                            # 模式（live/非 reasoning/retry_thinking_off）没有
+                            # 后续合成审计消费点——必须在此消费，否则该类轮次
+                            # 静默出货（agent_worker/scheduler 硬编码非 reasoning）。
+                            if state.audit_low_confidence and _draft_ships_as_final(
+                                self._live_thinking_enabled(),
+                                self.enable_reasoning,
+                                state.retry_thinking_off,
+                            ):
+                                state.audit_low_confidence = False
+                                yield {"content": _AUDIT_LOW_CONFIDENCE_NOTE}
                         if guidance is None and assistant_content.strip() and self._live_thinking_enabled():
                             # 审计 accept（guidance None = 通过/软放行）——标记
                             # 本轮最终稿可信，canary trip 不得重答。仅 live 模式
@@ -7274,6 +7408,10 @@ class AgentLoop:
                             _synth_guidance = await self._audit_response(state, _final_content, _last_user_msg)
                             if _synth_guidance is None and _final_content.strip():
                                 state.audit_accepted = True
+                                # 低置信接收（degraded/uncovered）→ 回答末尾透明说明一次
+                                if state.audit_low_confidence:
+                                    state.audit_low_confidence = False
+                                    yield {"content": _AUDIT_LOW_CONFIDENCE_NOTE}
                             if _synth_guidance:
                                 if _synth_guidance.verdict == "reject":
                                     state.audit_rejections += 1

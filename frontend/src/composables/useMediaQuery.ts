@@ -13,13 +13,17 @@ import { computed, readonly, ref } from 'vue'
 
 export const MOBILE_BREAKPOINT = 767
 
-const isMobile = ref(
-  typeof window !== 'undefined' ? window.innerWidth <= MOBILE_BREAKPOINT : false,
-)
+// matchMedia 只在跨断点时触发，避免每像素 resize 都执行回调（响应式性能）。
+const mobileQuery =
+  typeof window !== 'undefined'
+    ? window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT}px)`)
+    : null
 
-if (typeof window !== 'undefined') {
-  window.addEventListener('resize', () => {
-    isMobile.value = window.innerWidth <= MOBILE_BREAKPOINT
+const isMobile = ref(mobileQuery ? mobileQuery.matches : false)
+
+if (mobileQuery) {
+  mobileQuery.addEventListener('change', (event) => {
+    isMobile.value = event.matches
   })
 }
 

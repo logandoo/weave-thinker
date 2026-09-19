@@ -375,7 +375,18 @@ const stackedColumns = computed(() => {
 })
 const notebooksListRef = ref<HTMLElement | null>(null)
 
+// rAF 合帧：连续 resize/RO 回调只在下一帧计算一次，且值不变时不写入响应式状态。
+let cardsCalcRaf = 0
+
 function calculateCardsPerColumn() {
+  if (cardsCalcRaf) return
+  cardsCalcRaf = requestAnimationFrame(() => {
+    cardsCalcRaf = 0
+    applyCardsPerColumn()
+  })
+}
+
+function applyCardsPerColumn() {
   const listEl = notebooksListRef.value
   if (!listEl) return
   const listHeight = listEl.clientHeight
@@ -385,11 +396,12 @@ function calculateCardsPerColumn() {
   if (!listHeight) return
   const contentHeight = listHeight - LIST_PADDING_TOP - LIST_PADDING_BOTTOM
   if (contentHeight < CARD_HEIGHT) {
-    cardsPerColumn.value = 1
+    if (cardsPerColumn.value !== 1) cardsPerColumn.value = 1
     return
   }
   const n = Math.floor((contentHeight - CARD_HEIGHT) / (CARD_HEIGHT - CARD_OVERLAP)) + 1
-  cardsPerColumn.value = Math.max(1, n)
+  const next = Math.max(1, n)
+  if (cardsPerColumn.value !== next) cardsPerColumn.value = next
 }
 
 function goToPage(page: number) {

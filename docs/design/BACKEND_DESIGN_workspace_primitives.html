@@ -1,0 +1,86 @@
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>BACKEND_DESIGN — workspace 原语（P0+P1）</title></head>
+<body>
+<h1>BACKEND_DESIGN — workspace 原语（内部 agent 工具面）</h1>
+<p>本设计不新增 HTTP 端点；交付物为工具 schema + 服务接口 + 配置键。HTTP 面仅
+<code>GET /api/system/capabilities</code>（现有）会列出新工具。</p>
+
+<h2>1. 模块与接口</h2>
+<table border="1" cellpadding="4">
+<tr><th>模块</th><th>接口（Produces）</th></tr>
+<tr><td><code>app/services/workspace_file_state.py</code></td>
+<td><code>read_tracker.record_read(user_id, path, mtime_ns, size)</code> ·
+<code>read_tracker.check(user_id, path, mtime_ns, size) -&gt; str|None</code> ·
+<code>read_tracker.forget(user_id, path)</code>（容量 1024 FIFO）</td></tr>
+<tr><td><code>app/services/workspace_snapshot_service.py</code></td>
+<td><code>async create_snapshot(user_id, workspace_path, reason="") -&gt; dict</code> ·
+<code>async list_snapshots(user_id, workspace_path, limit=20) -&gt; dict</code> ·
+<code>async restore_snapshot(user_id, workspace_path, snapshot_id) -&gt; dict</code></td></tr>
+<tr><td><code>app/services/process_session_service.py</code></td>
+<td><code>process_manager.start/write/read/kill/list/shutdown_all</code>（async，除 list）</td></tr>
+<tr><td><code>app/tools/workspace_write.py</code></td>
+<td>注册 <code>workspace_write</code> · <code>workspace_edit</code>（toolset files）</td></tr>
+<tr><td><code>app/tools/workspace_snapshot.py</code></td>
+<td>注册 <code>workspace_snapshot</code>（toolset files；restore 自门控 workspace_restore）</td></tr>
+<tr><td><code>app/tools/process_tool.py</code></td>
+<td>注册 <code>process</code>（toolset system；start/write/kill 自门控 terminal_execution）</td></tr>
+</table>
+
+<h2>2. 工具 schema（节选）</h2>
+<pre>
+workspace_write { path*, content*, mode: overwrite|append|create_only }
+  → { success, path, created, bytes_written, lines, diff_summary, diff, snapshot_id|snapshot_error }
+workspace_edit  { path*, old_string*, new_string*, replace_all? }
+  → { success, replacements, diff_summary, diff, snapshot_id|snapshot_error } | { error, count }
+workspace_snapshot { action*: create|list|restore, snapshot_id?, label? }
+  → create: { success, snapshot_id, created_at }
+  → list:   { success, snapshots:[{snapshot_id, created_at, reason}] }
+  → restore:{ success, restored_files, newer_files_kept, snapshot_id }
+process { action*: start|write|read|kill|list, session_id?, command?, cwd?, data?, newline?,
+          wait_ms?, max_chars? }
+  → start: { success, session_id, pid, cwd, output, cursor }
+  → read:  { success, stdout, stderr, cursor, running, exit_code, dropped_bytes }
+  → 其他:  { success, ... }
+</pre>
+
+<h2>3. 配置键（config.toml，行为配置）</h2>
+<pre>
+[workspace]
+snapshots_enabled = true
+snapshots_max_file_mb = 10
+snapshots_retention = 50
+
+[agent.process]
+max_sessions_per_user = 4
+idle_timeout_seconds = 1800
+max_buffer_bytes = 262144
+max_read_chars = 20000
+</pre>
+<p>properties：<code>config.workspace_snapshots_enabled</code> / <code>..._max_file_mb</code> /
+<code>..._retention</code> · <code>config.agent_process_max_sessions</code> /
+<code>..._idle_timeout_seconds</code> / <code>..._max_buffer_bytes</code> / <code>..._max_read_chars</code>。
+全部有代码默认值——60 远端 config.toml 不被部署覆盖，缺键即默认行为，无需远端改配置。</p>
+
+<h2>4. 权限与可观测性</h2>
+<ul>
+  <li><code>agent_permissions.DEFAULT_AGENT_PERMISSIONS</code>：<code>workspace_write=True</code> ·
+  <code>workspace_restore=False</code>；<code>permission_key_for_tool_request("process", {action})</code> →
+  <code>terminal_execution</code>（start/write/kill）。</li>
+  <li>registry 超时：现有 <code>agent_tool_loop_tool_call_timeout</code> 覆盖全部新工具（进程 read 的
+  <code>wait_ms</code> 上限 30s，远小于工具超时）。</li>
+  <li>工具结果预算：write/edit/snapshot 加入 <code>tool_result_budget._UNLIMITED_TOOLS</code>（小结果）。</li>
+</ul>
+
+<h2>5. 非目标</h2>
+<ul>
+  <li>PTY/终端渲染（本版管道；依赖 TTY 的程序输出可能不完整，文档说明）。</li>
+  <li>跨服务重启的会话持久化。</li>
+  <li>apply_patch freeform 语法（模型无关 edit 已覆盖；后续可按模型切换）。</li>
+  <li>UI 变更（无前端改动）。</li>
+</ul>
+</body>
+</html>

@@ -177,7 +177,13 @@ def _resolve_working_dir(args: dict, kwargs: dict) -> tuple[str, Optional[str]]:
 def _command_accesses_outside_workspace(command: str, cwd: str, workspace_path: str) -> Optional[str]:
     if config.super_admin_bypass:
         return None
-    workspace_root = config.workspace_root.resolve()
+    # A4.9 fix-round 2: honor the caller-provided workspace (process passes the
+    # user workspace explicitly; terminal passes the global root) instead of
+    # silently ignoring the argument.
+    if workspace_path:
+        workspace_root = Path(workspace_path).resolve()
+    else:
+        workspace_root = config.workspace_root.resolve()
     cwd_path = Path(cwd).resolve()
     if not _is_within_workspace(cwd_path, workspace_root):
         return cwd

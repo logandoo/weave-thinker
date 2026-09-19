@@ -584,6 +584,12 @@ $$"""),
     ("idx_messages_conv_created", "CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at)"),
     # F1（2026-09-14）：后台任务运行中补充消息（可空 JSON 数组）
     ("at_pending_messages", "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS pending_messages TEXT"),
+    # ── 死磕 DAG 波次 W0-W2（2026-09-18）─────────────────────────────
+    ("conversations_deathmatch_acceptance_criteria", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_acceptance_criteria JSON"),
+    ("conversations_deathmatch_failed_directions", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_failed_directions JSON"),
+    ("conversations_deathmatch_pause_state", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_pause_state JSON"),
+    ("conversations_deathmatch_events", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_events JSON"),
+    ("conversations_deathmatch_no_progress_replans", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_no_progress_replans INTEGER DEFAULT 0"),
 ]
 
 

@@ -763,6 +763,7 @@
       @close="closeModal"
       @save="handleSaveAssistant"
       @batch-export="handleAssistantBatchExport"
+      @batch-import="handleAssistantBatchImport"
       @batch-delete="handleAssistantBatchDelete"
     />
 
@@ -2126,6 +2127,26 @@ function handleAssistantBatchDelete() {
   const targetId = editingAssistant.value?.id ?? null
   closeModal()
   void openBatchDelete(targetId)
+}
+
+async function handleAssistantBatchImport(files: File[]) {
+  const targetId = editingAssistant.value?.id ?? null
+  closeModal()
+  if (!targetId || files.length === 0) return
+  try {
+    const res = await chatApi.importConversations(targetId, files)
+    if (res.errors?.length) {
+      showToast(`已导入 ${res.created} 个会话，${res.errors.length} 条提示`, 'info')
+    } else {
+      showToast(`已导入 ${res.created} 个会话`, 'success')
+    }
+    if (assistantStore.currentAssistantId === targetId) {
+      await loadConversationsForAssistant()
+    }
+  } catch (e: any) {
+    const msg = e?.response?.data?.detail || e?.message || '操作失败'
+    showToast(`导入失败: ${msg}`, 'error')
+  }
 }
 
 async function handleSaveAssistant(data: AssistantFormData) {

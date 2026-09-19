@@ -484,3 +484,15 @@ export interface SkillFormData {
   content: string
   is_active?: boolean
 }
+
+export interface ImportedConversationInfo {
+  id: string
+  title: string
+  messages: number
+}
+
+export interface ImportResult {
+  created: number
+  conversations: ImportedConversationInfo[]
+  errors: string[]
+}

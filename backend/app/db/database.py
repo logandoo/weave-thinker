@@ -201,6 +201,26 @@ class Conversation(Base):
     deathmatch_wall_time_used_seconds = Column(Integer, default=0)  # cumulative across resume cycles (C1)
     deathmatch_bible_draft = Column(JSON, nullable=True)  # story-bible draft written right after grilling (creative goals)
     deathmatch_subgoals = Column(JSON, default=list)  # user-appended acceptance criteria mid-loop (D3)
+    # ── 死磕 DAG 波次 W0-W2（2026-09-18）契约/机械化/恢复层 ──────────────
+    # W1a: first-class acceptance criteria [{id,text,type:mechanical|judgmental,
+    # source:system|user,check:{kind:file|gate|none,...}}] — synthesized after
+    # grilling, append-only, injected into judge/verifier/continuation/handoff
+    # and executed mechanically by the goal comparator at finalize.
+    deathmatch_acceptance_criteria = Column(JSON, nullable=True)
+    # W2b: failed-direction memory [{family,reason,count,forbidden,ts}] —
+    # injected into continuation/replan so a direction recorded as failed
+    # (>= threshold) is never retried without a new insight.
+    deathmatch_failed_directions = Column(JSON, nullable=True)
+    # W2c: PAUSED resume packet {gate,question,options,default_if_continue,state}
+    # written on every human_gate / crash normalization, cleared on resume.
+    deathmatch_pause_state = Column(JSON, nullable=True)
+    # W2c: append-only decision/event log (capped by [deathmatch] events_cap):
+    # plan_audit / comparator / local_patch / replan / statement_violation /
+    # human_gate / finalized_without_step_evidence / ...
+    deathmatch_events = Column(JSON, nullable=True)
+    # W2b: consecutive no-progress replans (global convergence circuit breaker;
+    # reset on any progress). Cap -> resumable human_gate.
+    deathmatch_no_progress_replans = Column(Integer, default=0)
     # P1-5 (2026-08-30): settled-verdict ledger — step completions and
     # reconcile overturns; injected into judge/verifier prompts with the
     # no-flip-without-new-evidence rule. MUST be ORM-mapped (A4.9 W2-C1:

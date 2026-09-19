@@ -37,6 +37,14 @@
                 </svg>
                 批量导出会话
               </button>
+              <button class="btn btn-batch-import" @click="importInputRef?.click()">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/>
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                批量导入对话
+              </button>
               <button class="btn btn-batch-delete" @click="emit('batch-delete')">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <polyline points="3 6 5 6 21 6"/>
@@ -45,6 +53,14 @@
                 批量删除会话
               </button>
             </div>
+            <input
+              ref="importInputRef"
+              class="batch-import-input"
+              type="file"
+              accept=".csv,.zip"
+              multiple
+              @change="onImportFilesChange"
+            />
           </div>
 
           <div class="form-group">
@@ -108,8 +124,18 @@ const emit = defineEmits<{
   close: []
   save: [data: AssistantFormData]
   'batch-export': []
+  'batch-import': [files: File[]]
   'batch-delete': []
 }>()
+
+const importInputRef = ref<HTMLInputElement | null>(null)
+
+function onImportFilesChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files || [])
+  if (files.length) emit('batch-import', files)
+  input.value = ''
+}
 
 const aliases = ref<ModelAlias[]>([])
 const defaultAlias = ref('')
@@ -479,6 +505,85 @@ function handleSave() {
   cursor: not-allowed;
 }
 
+.batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.btn-batch-export {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-primary);
+  background: rgba(53, 133, 197, 0.08);
+  border: 1px solid var(--color-primary);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.btn-batch-export:hover {
+  background: rgba(53, 133, 197, 0.14);
+}
+
+.btn-batch-export:active {
+  transform: scale(0.96);
+}
+
+.btn-batch-import {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-primary-dark, var(--color-primary));
+  background: var(--surface-panel-subtle);
+  border: 1px solid var(--panel-border-strong, var(--panel-border));
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.btn-batch-import:hover {
+  background: var(--color-hover);
+}
+
+.btn-batch-import:active {
+  transform: scale(0.96);
+}
+
+.batch-import-input {
+  display: none;
+}
+
+.btn-batch-delete {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-error);
+  background: rgba(229, 62, 62, 0.08);
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.btn-batch-delete:hover {
+  background: rgba(229, 62, 62, 0.14);
+}
+
+.btn-batch-delete:active {
+  transform: scale(0.96);
+}
+
 @media (max-width: 767px) {
   .modal-overlay {
     padding: 0;
@@ -512,58 +617,7 @@ function handleSave() {
     margin-bottom: 20px;
   }
 
-.batch-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.btn-batch-export {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-primary);
-  background: rgba(53, 133, 197, 0.08);
-  border: 1px solid var(--color-primary);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: background-color var(--transition-fast), transform var(--transition-fast);
-}
-
-.btn-batch-export:hover {
-  background: rgba(53, 133, 197, 0.14);
-}
-
-.btn-batch-export:active {
-  transform: scale(0.96);
-}
-
-.btn-batch-delete {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-error);
-  background: rgba(229, 62, 62, 0.08);
-  border: 1px solid var(--color-error);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: background-color var(--transition-fast), transform var(--transition-fast);
-}
-
-.btn-batch-delete:hover {
-  background: rgba(229, 62, 62, 0.14);
-}
-
-.btn-batch-delete:active {
-  transform: scale(0.96);
-}
-
-.btn {
+  .btn {
     padding: 10px 16px;
     font-size: 13px;
   }

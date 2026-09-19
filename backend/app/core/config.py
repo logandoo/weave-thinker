@@ -1179,6 +1179,42 @@ class Config:
     def workspace_create_readme(self) -> bool:
         return bool(self.workspace.get("create_readme", True))
 
+    # P1a（2026-09-19）：工作区影子 git 快照。默认开启；`snapshots_max_file_mb`
+    # 以上的文件不进入快照（列入 skipped_large_files）；retention 为保留快照数。
+    @property
+    def workspace_snapshots_enabled(self) -> bool:
+        return bool(self.workspace.get("snapshots_enabled", True))
+
+    @property
+    def workspace_snapshots_max_file_mb(self) -> int:
+        return int(self.workspace.get("snapshots_max_file_mb", 10))
+
+    @property
+    def workspace_snapshots_retention(self) -> int:
+        return int(self.workspace.get("snapshots_retention", 50))
+
+    # P1b（2026-09-19）：持久进程会话（process 工具）。每用户并发会话上限、
+    # 空闲回收秒数、每流环形缓冲字节上限、单次 read 返回字符上限。
+    @property
+    def agent_process(self) -> dict:
+        return self.agent.get("process", {})
+
+    @property
+    def agent_process_max_sessions(self) -> int:
+        return int(self.agent_process.get("max_sessions_per_user", 4))
+
+    @property
+    def agent_process_idle_timeout_seconds(self) -> int:
+        return int(self.agent_process.get("idle_timeout_seconds", 1800))
+
+    @property
+    def agent_process_max_buffer_bytes(self) -> int:
+        return int(self.agent_process.get("max_buffer_bytes", 262144))
+
+    @property
+    def agent_process_max_read_chars(self) -> int:
+        return int(self.agent_process.get("max_read_chars", 20000))
+
     # ---- Browser skill ----
 
     @property
@@ -1586,12 +1622,58 @@ class Config:
         return bool(self.deathmatch.get("verify_command_gate_enabled", False))
 
     @property
-    def deathmatch_plan_exploration_enabled(self) -> bool:
-        return bool(self.deathmatch.get("plan_exploration_enabled", True))
+    def deathmatch_criteria_enabled(self) -> bool:
+        """W1a (DAG wave): synthesize first-class acceptance criteria after
+        grilling (id/type/source/check), freeze them append-only, and inject
+        into judge/verifier/continuation/handoff. Fail-open: synthesis failure
+        degrades to the legacy prose-goal behavior. Default ON."""
+        return bool(self.deathmatch.get("criteria_enabled", True))
 
     @property
-    def deathmatch_plan_exploration_max_steps(self) -> int:
-        return int(self.deathmatch.get("plan_exploration_max_steps", 5))
+    def deathmatch_plan_audit_enabled(self) -> bool:
+        """W1d: independent plan-core audit after plan generation — checks
+        coverage/fidelity/scope/dependency soundness against goal+criteria+Q&A
+        before the goal loop starts (Prove2Me captain-audit analogue).
+        One extra non-hot-path LLM call per goal. Default ON; fail-open."""
+        return bool(self.deathmatch.get("plan_audit_enabled", True))
+
+    @property
+    def deathmatch_plan_audit_model(self) -> str:
+        """Optional independent model alias for the plan-core audit (empty =
+        assistant's main model via _make_llm). Logged for visibility."""
+        return str(self.deathmatch.get("plan_audit_model", "") or "")
+
+    @property
+    def deathmatch_goal_comparator_enabled(self) -> bool:
+        """W1e: deterministic goal comparator — mechanical acceptance criteria
+        (file existence/size, optional gate commands) are executed before a
+        judge=done finalize is accepted. File checks always run; gate checks
+        additionally require verify_command_gate_enabled. Default ON."""
+        return bool(self.deathmatch.get("goal_comparator_enabled", True))
+
+    @property
+    def deathmatch_node_recovery_max_retries(self) -> int:
+        """W2a: per-node local retries (same step, diagnosis-carrying) before
+        a local_patch (single-step rewrite) and then the legacy stall ladder."""
+        return int(self.deathmatch.get("node_recovery_max_retries", 2))
+
+    @property
+    def deathmatch_failed_direction_forbidden_threshold(self) -> int:
+        """W2b: after N recordings of the same failed direction family, the
+        direction becomes forbidden for this goal (retry requires new
+        insight)."""
+        return int(self.deathmatch.get("failed_direction_forbidden_threshold", 3))
+
+    @property
+    def deathmatch_no_progress_replan_cap(self) -> int:
+        """W2b: consecutive no-progress replans before a resumable human_gate
+        (global convergence circuit breaker). 0 = disabled."""
+        return int(self.deathmatch.get("no_progress_replan_cap", 3))
+
+    @property
+    def deathmatch_events_cap(self) -> int:
+        """W2c: append-only deathmatch event log cap per conversation."""
+        return int(self.deathmatch.get("events_cap", 50))
 
     @property
     def deathmatch_reflection_memory_max_items(self) -> int:
@@ -1773,6 +1855,25 @@ class Config:
     @property
     def agent_audit(self) -> dict:
         return self.agent.get("audit", {})
+
+    @property
+    def agent_audit_policy(self) -> str:
+        """审计判决处置策略（2026-09-18 结构性重构，conv f831486f）。
+
+        "advisory"（默认）：LLM 软判决（unverifiable / needs_evidence，source=llm）
+        只作建议——不触发重生成、不消耗预算、不进入 salvage/selection/警示语；
+        确定性可行动判决（source ∈ {npg, citation}）与硬 reject 至多触发一次
+        定向修复；存在未通过判决时以低置信说明透明标注后出货。
+        依据：20+ 波次补丁后警示语仍复发（生产 49 条）+ SOTA（VRR-Stop /
+        judge-not-oracle / GAUGE）+ opencode/codex/hermes 均无阻塞式语义质检
+        （research: memory/eval_audit_architecture_20260918.md）。
+
+        "legacy"：旧行为（软/硬预算 + 同族 stall + salvage + selection +
+        确定性兜底警示语）原样保留，一键热回滚阀；Phase 2（生产 soak 后）删除。
+        非法值一律回退 "advisory"。
+        """
+        value = str(self.agent_audit.get("policy", "advisory")).strip().lower()
+        return value if value in ("advisory", "legacy") else "advisory"
 
     @property
     def agent_audit_reject_budget(self) -> int:

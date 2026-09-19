@@ -4,7 +4,7 @@
 import api from './client'
 import { downloadBlob, type DownloadResult } from '@/composables/useDownload'
 import { clearStoredAuth } from '@/composables/useAuth'
-import type { Conversation, Message, ChatRequest, ConversationUpdate, BulkDeleteResult, ConversationSearchResult } from '@/types'
+import type { Conversation, Message, ChatRequest, ConversationUpdate, BulkDeleteResult, ConversationSearchResult, ImportResult } from '@/types'
 import { dispatchStreamPayload, type StreamHandlers, type ResumeHandlers, type StreamStatusResult, type ReplayPayload } from './streamDispatch'
 
 export { dispatchStreamPayload } from './streamDispatch'
@@ -110,6 +110,18 @@ export const chatApi = {
       if (match) filename = match[1]
     }
     return await downloadBlob(blob, filename, 'application/zip')
+  },
+
+  async importConversations(assistantId: string, files: File[]): Promise<ImportResult> {
+    const formData = new FormData()
+    formData.append('assistant_id', assistantId)
+    for (const file of files) {
+      formData.append('files', file)
+    }
+    const { data } = await api.post('/conversations/import', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    })
+    return data
   },
 
   async getStreamStatus(conversationId: string): Promise<StreamStatusResult> {

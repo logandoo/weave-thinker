@@ -1,0 +1,77 @@
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>FLOW_DESIGN — workspace 原语（P0+P1）</title></head>
+<body>
+<h1>FLOW_DESIGN — workspace 写/编辑 · 快照回滚 · 进程会话</h1>
+<p>日期：2026-09-19 · 范围：新增 4 个 agent 工具（<code>workspace_write</code> / <code>workspace_edit</code> /
+<code>workspace_snapshot</code> / <code>process</code>）· 零 HTTP 端点变更 · 零 DB schema 变更。</p>
+
+<h2>1. workspace_write / workspace_edit（P0）</h2>
+<pre class="mermaid">
+sequenceDiagram
+  participant M as 模型
+  participant R as registry.dispatch
+  participant T as workspace_write/edit handler
+  participant S as workspace_snapshot_service
+  participant FS as 工作区文件
+  M->>R: tool_call(path, content / old_string,new_string)
+  R->>T: args + user/db/workspace_path + permission_context
+  T->>T: 路径解析（工作区内；.git 拒绝；大小上限）
+  alt edit
+    T->>T: read_tracker.check(user,path,mtime,size)
+    T-->>M: 未读/已变更 → {error: 请先 workspace_read}
+  end
+  T->>FS: 读旧内容（计算 diff）
+  T->>S: create_snapshot(user, workspace, reason=before write)
+  S-->>T: snapshot_id（失败→snapshot_error，不阻断）
+  T->>FS: 原子写（临时文件+rename）
+  T->>T: read_tracker.record_read(新 mtime/size)
+  T-->>M: {success, diff_summary, diff, snapshot_id}
+</pre>
+<p>规则：先读后写（edit 强制）；精确匹配、多匹配拒绝（除 replace_all）；写前自动快照；结果携 diff 供审计与回显。</p>
+
+<h2>2. workspace_snapshot（P1a）</h2>
+<pre class="mermaid">
+flowchart LR
+  A[create] --> G[shadow git: add -A → write-tree → commit-tree → update-ref refs/snapshots/&lt;ts-tree&gt;]
+  B[list] --> G2[for-each-ref 按时间倒序 + retention 裁剪]
+  C[restore snapshot_id] --> P{permission: workspace_restore}
+  P -- 未允许 --> N[_permission_needed → 用户确认]
+  P -- 允许/重入 --> S2[先自动 capture 当前状态]
+  S2 --> R2[read-tree --reset -u &lt;tree&gt;]
+  R2 --> O[报告 restored_files + newer_files_kept（快照后新增文件不删）]
+</pre>
+<p>存储：<code>{workspace_root}/.snapshots/{user}-{hash8}/</code>（git_dir），
+work-tree=用户工作区；<code>.snapshots</code> 在用户工作区之外，不污染工作区。
+快照失败（git 缺失/超时）不阻断写操作，结果带 <code>snapshot_error</code>。</p>
+
+<h2>3. process 会话（P1b）</h2>
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> running: start（校验命令/cwd/会话上限/权限）
+  running --> running: write（stdin，newline 可选）
+  running --> running: read（增量消费 buffer，等待 wait_ms ≤ 30s；可重复调用）
+  running --> exited: 进程自然退出（reader tasks 收尾，exit_code 可读）
+  running --> killed: kill（SIGTERM→宽限→SIGKILL，进程组）
+  exited --> [*]: 空闲 1800s 或 kill/list 惰性清理
+  idle --> [*]: 空闲 1800s 惰性清理
+</pre>
+<p>语义：一次性 <code>terminal</code> 保持不变；长任务/交互式（dev server、测试循环、REPL、构建）用
+<code>process</code>。stdout/stderr 分别 256KB 有界环形缓冲（丢头记账 <code>dropped_bytes</code>），
+read 默认自上次消费游标增量返回，避免重复灌入上下文。会话按用户隔离，上限 4；
+start/write/kill 受 <code>terminal_execution</code> 权限门控（read/list 免门控）。
+本版为管道（非 PTY）——依赖 TTY 的交互程序（少数 REPL/进度条）不保证输出渲染，
+文档如实说明；PTY 留待后续。</p>
+
+<h2>4. 失败模式与边界</h2>
+<ul>
+  <li>路径逃逸：realpath 后必须位于工作区；<code>.git/**</code> 一律拒写。</li>
+  <li>并发写同一文件：tracker 的 mtime/size 校验使「读后被外部改」的编辑失败并要求重读；同进程顺序工具调用无竞态。</li>
+  <li>进程泄漏：按用户上限 + 空闲清理 + kill 进程组；服务重启后会话丢失（文档说明）。</li>
+  <li>快照磁盘增长：retention=50 自动裁剪旧 ref；tree 复用 git 对象库去重。</li>
+</ul>
+</body>
+</html>

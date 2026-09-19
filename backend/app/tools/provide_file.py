@@ -171,7 +171,7 @@ async def provide_file(args: Dict[str, Any], **kwargs) -> str:
 registry.register(
     name="provide_file",
     toolset="files",
-    # F3（2026-09-14）：显式提供文件（收集器按元数据收集）
+    # 显式提供文件：下载卡片的唯一来源（2026-09-18 用户指令；不再有自动收集兜底）
     produces_files=True,
     schema={
         "name": "provide_file",

@@ -3282,6 +3282,15 @@ defineExpose({ setEditContent })
   color: var(--color-error);
 }
 
+/* 小尺寸平板横屏（如 908×594）：桌面布局但垂直空间紧张 */
+@media (min-width: 768px) and (max-height: 660px) {
+  .chat-input-container {
+    height: auto;
+    min-height: 132px;
+    max-height: 34vh;
+  }
+}
+
 @media (max-width: 767px) {
   .chat-input-wrapper {
     padding: 4px 12px 2px;

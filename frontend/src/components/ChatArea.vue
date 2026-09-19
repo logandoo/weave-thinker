@@ -134,28 +134,15 @@
 
     <div class="message-list" ref="messageListRef" role="log" aria-live="polite" aria-atomic="false" aria-label="消息列表">
       <div v-if="!chatStore.currentConversationId || (chatStore.currentMessages.length === 0 && !chatStore.isStreamingCurrentConversation && !chatStore.currentStreamingContent)" class="empty-state">
-        <div class="empty-icon">
-          <LogoIcon :size="80" class="empty-logo" />
-        </div>
-        <div class="empty-brand">
-          <p class="empty-brand-title">Weave Thinker</p>
-          <p class="empty-brand-subtitle">Weave Thinker</p>
-        </div>
-        <p class="empty-lead">一个会思考、能调研、记得住你的 AI 伙伴</p>
-        <div class="empty-try">试试这些：</div>
-        <div class="empty-suggest-grid">
-          <button
-            v-for="(sg, i) in emptySuggestions"
-            :key="i"
-            class="empty-suggest-card"
-            type="button"
-            @click="onEmptySuggest(sg.q)"
-          >
-            <i class="es-no">{{ String(i + 1).padStart(2, '0') }}</i>
-            <svg class="es-ico" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" v-html="sg.icon"></svg>
-            <span class="es-cat">{{ sg.cat }}</span>
-            <span class="es-q">{{ sg.q }}</span>
-          </button>
+        <div class="empty-inner">
+          <div class="empty-icon">
+            <LogoIcon :size="80" class="empty-logo" />
+          </div>
+          <div class="empty-brand">
+            <p class="empty-brand-title">Weave Thinker</p>
+            <p class="empty-brand-subtitle">Weave Thinker</p>
+          </div>
+          <p class="empty-lead">一个会思考、能调研、记得住你的 AI 伙伴</p>
         </div>
       </div>
       <template v-else>
@@ -805,15 +792,6 @@ const virtualMessageTotalSize = computed(() => messageVirtualizer.value.getTotal
 
 const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
 
-const emptySuggestions = [
-  { cat: '写作', q: '帮我写一封本周工作周报', icon: '<path d="M17 3a2.83 2.83 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5z"/>' },
-  { cat: '学习', q: '用费曼技巧解释量子纠缠', icon: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>' },
-  { cat: '代码', q: '调试一段 Python 报错', icon: '<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>' },
-  { cat: '调研', q: '对比三款旗舰手机的影像系统', icon: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>' },
-]
-function onEmptySuggest(q: string) {
-  chatInputRef.value?.setEditContent(q)
-}
 const saveBarRightRef = ref<HTMLElement | null>(null)
 // Shared with ChatLayout's mobile header button (icon-only entry point there).
 const saveMode = computed({
@@ -1611,10 +1589,17 @@ watch(
 .empty-state {
   height: 100%;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
+}
+
+/* 卡片视觉承载层：与「容器垂直居中」解耦，皮肤改此层即可 */
+.empty-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   gap: 16px;
+  max-width: 100%;
 }
 
 .empty-icon {
@@ -1689,72 +1674,6 @@ watch(
   font-size: 13.5px;
   color: var(--color-text-light);
   line-height: 1.7;
-}
-
-.empty-try {
-  margin-top: 22px;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--color-primary-dark);
-  letter-spacing: 2px;
-}
-
-.empty-suggest-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  width: 100%;
-  max-width: 660px;
-  margin-top: 12px;
-}
-
-.empty-suggest-card {
-  position: relative;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  grid-template-rows: auto auto;
-  column-gap: 11px;
-  row-gap: 3px;
-  align-items: start;
-  padding: 14px 16px;
-  text-align: left;
-  font-family: inherit;
-  cursor: pointer;
-  border-radius: 18px;
-  border: 1px solid #dfe7d8;
-  background: #ffffff;
-  box-shadow: 0 1px 2px rgba(45, 59, 36, 0.06);
-  transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
-}
-
-.empty-suggest-card:hover {
-  transform: translateY(-3px);
-  border-color: #cfdbc4;
-  background: #f8faf6;
-}
-
-.empty-suggest-card .es-ico {
-  grid-row: span 2;
-  width: 19px;
-  height: 19px;
-  color: #5d7c44;
-}
-
-.empty-suggest-card .es-cat {
-  font-size: 13.5px;
-  font-weight: 700;
-  color: var(--color-text);
-}
-
-.empty-suggest-card .es-q {
-  grid-column: 2;
-  font-size: 12px;
-  color: var(--color-text-light);
-  line-height: 1.6;
-}
-
-.empty-suggest-card .es-no {
-  display: none;
 }
 
 .streaming-message {
@@ -2821,5 +2740,36 @@ watch(
   0% { background: #f59e0b; color: #fff; }
   50% { background: var(--color-primary); color: #fff; }
   100% { background: rgba(122, 163, 90, 0.2); color: inherit; }
+}
+
+/* 小尺寸平板（如 908×594 横屏）：桌面布局但高度/宽度吃紧 */
+@media (min-width: 768px) and (max-width: 1100px) {
+  .message-list {
+    padding: 12px 24px 12px 0;
+  }
+
+  .empty-lead {
+    margin-top: 2px;
+  }
+}
+
+@media (min-width: 768px) and (max-height: 660px) {
+  .empty-inner {
+    gap: 8px;
+  }
+
+  .empty-icon svg,
+  .empty-logo {
+    width: 52px;
+    height: 52px;
+  }
+
+  .empty-brand-title {
+    font-size: 20px;
+  }
+
+  .empty-lead {
+    display: none;
+  }
 }
 </style>

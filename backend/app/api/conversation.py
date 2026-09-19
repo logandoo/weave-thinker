@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +15,7 @@ import re
 import io
 import zipfile
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 from app.db.database import get_db, Conversation, Message, ChatSession, User, Assistant, ScheduledTask, ConversationGroup
@@ -1129,6 +1129,290 @@ def sanitize_filename(name: str) -> str:
     return name[:100]
 
 
+# Excel 单格硬上限 32767（超出会把余文挤进后续单元格 = 表格错位）+ 单格换行上限 253。
+# 30000/250 留出安全余量；超限内容切成 part=k/n 连续行，导入端按 part 无损重连。
+# 注意按 UTF-16 码元计数（Excel/JS 口径），emoji 等增补平面字符算 2。
+_CSV_CELL_MAX_CHARS = 30000
+_CSV_CELL_MAX_NEWLINES = 250
+_CSV_PART_HEADER = "part"
+_CSV_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# 公式注入防护：Excel 会把 = + - @ 开头的单元格当公式执行（LLM/检索内容不可信）。
+_CSV_FORMULA_PREFIXES = "=+-@"
+
+
+def _sanitize_csv_text(text: str) -> str:
+    """Normalize line endings and drop control chars that break CSV parsers/Excel."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _CSV_CONTROL_RE.sub("", text)
+
+
+def _needs_formula_escape(text: str) -> bool:
+    """True when *text* (after stripping leading apostrophes) starts like a formula."""
+    i = 0
+    while i < len(text) and text[i] == "'":
+        i += 1
+    return i < len(text) and text[i] in _CSV_FORMULA_PREFIXES
+
+
+def _escape_csv_formula(text: str) -> str:
+    return "'" + text if _needs_formula_escape(text) else text
+
+
+def _unescape_csv_formula(text: str) -> str:
+    if text.startswith("'") and _needs_formula_escape(text[1:]):
+        return text[1:]
+    return text
+
+
+def _utf16_len(text: str) -> int:
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def _utf16_cut(text: str, start: int, max_units: int) -> int:
+    """Largest end index so text[start:end] fits *max_units* UTF-16 units."""
+    units = 0
+    i = start
+    n = len(text)
+    while i < n:
+        u = 2 if ord(text[i]) > 0xFFFF else 1
+        if units + u > max_units:
+            break
+        units += u
+        i += 1
+    return i
+
+
+def _split_cell_text(text: str) -> list[str]:
+    """Split *text* into chunks each within UTF-16 char/newline limits.
+
+    Lossless by contract: ''.join(result) == text.
+    """
+    if _utf16_len(text) <= _CSV_CELL_MAX_CHARS and text.count("\n") <= _CSV_CELL_MAX_NEWLINES:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = _utf16_cut(text, start, _CSV_CELL_MAX_CHARS)
+        limit = end
+        newlines = 0
+        for i in range(start, end):
+            if text[i] == "\n":
+                newlines += 1
+                if newlines > _CSV_CELL_MAX_NEWLINES:
+                    limit = i
+                    break
+        if limit <= start:  # defensive: always make progress
+            limit = max(end, start + 1)
+        chunks.append(text[start:limit])
+        start = limit
+    return chunks
+
+
+def _build_conversation_csv(rows: list[dict]) -> str:
+    """Build one conversation CSV text.
+
+    Always quoted (QUOTE_ALL), CRLF records, leading UTF-8 BOM for Excel.
+    Cells over the Excel limits become continuation rows carrying `part=k/n`.
+    Formula-like leading characters are apostrophe-escaped (import unescapes).
+    """
+    buf = io.StringIO()
+    writer = csv.writer(
+        buf, quoting=csv.QUOTE_ALL, lineterminator="\r\n"
+    )
+    writer.writerow(["query", "answer", _CSV_PART_HEADER])
+    for row in rows:
+        query = _escape_csv_formula(_sanitize_csv_text(row.get("query") or ""))
+        answer = _escape_csv_formula(_sanitize_csv_text(row.get("answer") or ""))
+        q_chunks = _split_cell_text(query)
+        a_chunks = _split_cell_text(answer)
+        total = max(len(q_chunks), len(a_chunks))
+        for i in range(total):
+            q = q_chunks[i] if i < len(q_chunks) else ""
+            a = a_chunks[i] if i < len(a_chunks) else ""
+            part = f"{i + 1}/{total}" if total > 1 else ""
+            writer.writerow([q, a, part])
+    return "\ufeff" + buf.getvalue()
+
+
+_IMPORT_TITLE_FALLBACK = "导入的会话"
+_IMPORT_TITLE_MAX = 100
+_IMPORT_MAX_FILE_BYTES = 50 * 1024 * 1024
+_IMPORT_MAX_ZIP_MEMBERS = 500
+_IMPORT_MAX_MEMBER_BYTES = 50 * 1024 * 1024
+_IMPORT_MAX_TOTAL_UNCOMPRESSED = 200 * 1024 * 1024
+_IMPORT_MAX_ROWS_PER_CSV = 20000
+_IMPORT_MAX_CSV_RECORDS = 100000
+_IMPORT_MAX_TOTAL_MESSAGES = 200000
+_IMPORT_MAX_CONVERSATIONS = 200
+_IMPORT_MAX_FILES = 50
+_CSV_PART_RE = re.compile(r"^(\d+)\s*/\s*(\d+)$")
+_CSV_PART_MAX_DIGITS = 6
+_UUID_SUFFIX_RE = re.compile(
+    r"_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_TITLE_CONTROL_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+
+def _read_zip_member_limited(
+    zf: zipfile.ZipFile, info: zipfile.ZipInfo, max_bytes: int
+) -> bytes | None:
+    """Stream one zip member, aborting as soon as it exceeds *max_bytes*.
+
+    Never trusts the declared uncompressed size — a crafted header must not be
+    able to force unbounded decompression memory.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    with zf.open(info) as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _conversation_title_from_filename(filename: str) -> str:
+    """`标题_<uuid>.csv` → `标题`（与导出文件名对偶）。"""
+    base = os.path.basename(filename or "")
+    if base.lower().endswith(".csv"):
+        base = base[:-4]
+    base = _UUID_SUFFIX_RE.sub("", base)
+    base = _TITLE_CONTROL_RE.sub("", base).strip()
+    return (base or _IMPORT_TITLE_FALLBACK)[:_IMPORT_TITLE_MAX]
+
+
+def _parse_export_csv(text: str) -> tuple[list[dict], list[str]]:
+    """Parse an exported (or hand-made) conversation CSV.
+
+    Returns (rows, errors) where each row is {"query": str, "answer": str}.
+    Handles BOM, quoted newlines, optional `part=k/n` continuation rows and
+    legacy two-column files. Malformed input never raises.
+    """
+    errors: list[str] = []
+    text = (text or "").lstrip("\ufeff")
+    if not text.strip():
+        return [], ["空 CSV 文件"]
+    reader = csv.reader(io.StringIO(text))
+    try:
+        first = next(reader, None)
+    except csv.Error as e:  # 超长字段等解析器硬错误
+        return [], [f"CSV 解析失败: {e}"]
+    if first is None:
+        return [], ["空 CSV 文件"]
+
+    header = [c.strip().lstrip("\ufeff").lower() for c in first]
+    if "query" in header and "answer" in header:
+        qi = header.index("query")
+        ai = header.index("answer")
+        pi = header.index("part") if "part" in header else None
+    else:
+        qi, ai, pi = 0, 1, None
+
+    def _iter_data_records():
+        if "query" not in header or "answer" not in header:
+            yield first
+        yield from reader
+
+    rows: list[dict] = []
+    current: dict | None = None
+    record_count = 0
+    data_row_count = 0
+
+    def _finalize_row(cur: dict) -> dict:
+        return {
+            "query": "".join(cur["query_parts"]),
+            "answer": "".join(cur["answer_parts"]),
+        }
+
+    try:
+        for rec in _iter_data_records():
+            record_count += 1
+            if record_count > _IMPORT_MAX_CSV_RECORDS:
+                errors.append(f"记录数超过 {_IMPORT_MAX_CSV_RECORDS}")
+                break
+            q_raw = rec[qi] if qi < len(rec) else ""
+            a_raw = rec[ai] if ai < len(rec) else ""
+            part = (rec[pi] if pi is not None and pi < len(rec) else "").strip()
+            if not q_raw and not a_raw:
+                continue
+            data_row_count += 1
+            if data_row_count > _IMPORT_MAX_ROWS_PER_CSV:
+                errors.append(f"行数超过 {_IMPORT_MAX_ROWS_PER_CSV}")
+                break
+            m = _CSV_PART_RE.match(part) if part else None
+            if m and (len(m.group(1)) > _CSV_PART_MAX_DIGITS or len(m.group(2)) > _CSV_PART_MAX_DIGITS):
+                errors.append(f"分片标记过大: {part!r}")
+                m = None
+            elif m and int(m.group(1)) < 1:
+                errors.append(f"分片序号无效: {part!r}")
+                m = None
+            elif part and not m:
+                errors.append(f"无法识别的分片标记: {part!r}")
+            k = int(m.group(1)) if m else 1
+            n = int(m.group(2)) if m else 1
+            if current is not None and m and k > 1:
+                if k == current["k"] + 1 and n == current["n"]:
+                    # 续片按原文拼接；公式转义前缀只可能出现在单元格首片
+                    current["query_parts"].append(q_raw)
+                    current["answer_parts"].append(a_raw)
+                    current["k"] = k
+                else:
+                    errors.append(f"分片序号不连续: {part!r}")
+                    rows.append(_finalize_row(current))
+                    current = {
+                        "query_parts": [_unescape_csv_formula(q_raw)],
+                        "answer_parts": [_unescape_csv_formula(a_raw)],
+                        "k": k,
+                        "n": n,
+                    }
+            else:
+                if current is not None:
+                    rows.append(_finalize_row(current))
+                current = {
+                    "query_parts": [_unescape_csv_formula(q_raw)],
+                    "answer_parts": [_unescape_csv_formula(a_raw)],
+                    "k": k,
+                    "n": n,
+                }
+    except csv.Error as e:  # 迭代中遇到超长字段等解析器硬错误
+        errors.append(f"CSV 解析失败: {e}")
+    if current is not None:
+        rows.append(_finalize_row(current))
+    return rows, errors
+
+
+
+def _messages_to_rows(messages: list) -> list[dict]:
+    """Pair messages into query/answer rows.
+
+    Orphan assistant messages (no preceding user message) are preserved with an
+    empty query so export→import round-trips them instead of dropping them.
+    """
+    rows: list[dict] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        if msg.role == 'user':
+            query = _strip_media_tags(msg.content or "")
+            answer = ''
+            if i + 1 < n and messages[i + 1].role == 'assistant':
+                answer = _strip_media_tags(messages[i + 1].content or "")
+                i += 1
+            rows.append({'query': query, 'answer': answer})
+        elif msg.role == 'assistant':
+            answer = _strip_media_tags(msg.content or "")
+            if answer:
+                rows.append({'query': '', 'answer': answer})
+        i += 1
+    return rows
+
+
 @router.post("/export")
 async def export_conversations(
     export_data: ExportRequest,
@@ -1163,18 +1447,7 @@ async def export_conversations(
     conv_data = []
     for conv in conversations:
         messages = sorted(conv.messages, key=lambda m: m.created_at)
-        rows = []
-        i = 0
-        while i < len(messages):
-            msg = messages[i]
-            if msg.role == 'user':
-                query = _strip_media_tags(msg.content or "")
-                answer = ''
-                if i + 1 < len(messages) and messages[i + 1].role == 'assistant':
-                    answer = _strip_media_tags(messages[i + 1].content or "")
-                    i += 1
-                rows.append({'query': query, 'answer': answer})
-            i += 1
+        rows = _messages_to_rows(messages)
         conv_data.append({
             'title': conv.title,
             'id': conv.id,
@@ -1187,16 +1460,11 @@ async def export_conversations(
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for cd in conv_data:
                 filename = f"{sanitize_filename(cd['title'])}_{cd['id']}.csv"
+                csv_text = _build_conversation_csv(cd['rows'])
                 filepath = os.path.join(output_dir, filename)
-                with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.DictWriter(f, fieldnames=['query', 'answer'])
-                    writer.writeheader()
-                    writer.writerows(cd['rows'])
-                csv_buffer = io.StringIO()
-                writer = csv.DictWriter(csv_buffer, fieldnames=['query', 'answer'])
-                writer.writeheader()
-                writer.writerows(cd['rows'])
-                zf.writestr(filename, csv_buffer.getvalue().encode('utf-8-sig'))
+                with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                    f.write(csv_text)
+                zf.writestr(filename, csv_text.encode('utf-8'))
                 exported_files.append(filename)
         return zip_buffer.getvalue(), exported_files
 
@@ -1212,6 +1480,201 @@ async def export_conversations(
             "Content-Disposition": f"attachment; filename=\"export.zip\"; filename*=UTF-8''{encoded_filename}"
         }
     )
+
+
+@router.post("/import")
+async def import_conversations(
+    assistant_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch-import conversations from exported `.csv` / `.zip` files.
+
+    Each CSV becomes one conversation under *assistant_id*; `part=k/n`
+    continuation rows are merged back losslessly. Per-file failures are
+    reported in `errors` without aborting the rest.
+    """
+    result = await db.execute(
+        select(Assistant).where(
+            Assistant.id == assistant_id,
+            Assistant.user_id == current_user.id
+        )
+    )
+    assistant = result.scalar_one_or_none()
+    if not assistant:
+        raise HTTPException(status_code=404, detail="Assistant not found")
+    if len(files) > _IMPORT_MAX_FILES:
+        raise HTTPException(status_code=413, detail=f"一次最多导入 {_IMPORT_MAX_FILES} 个文件")
+
+    created_info: list[dict] = []
+    errors: list[str] = []
+    total_created = 0
+    total_messages = 0
+    zip_budget_used = 0
+
+    async def _create_conversation(title: str, rows: list[dict]) -> None:
+        nonlocal total_created, total_messages
+        if total_created >= _IMPORT_MAX_CONVERSATIONS:
+            errors.append(f"{title}: 超过单次导入会话上限 {_IMPORT_MAX_CONVERSATIONS}")
+            return
+        payload = [r for r in rows if (r.get("query") or r.get("answer"))]
+        if not payload:
+            errors.append(f"{title}: 没有可导入的内容")
+            return
+        pending_messages = sum(
+            (1 if r.get("query") else 0) + (1 if r.get("answer") else 0) for r in payload
+        )
+        if total_messages + pending_messages > _IMPORT_MAX_TOTAL_MESSAGES:
+            errors.append(f"{title}: 超过单次导入消息上限 {_IMPORT_MAX_TOTAL_MESSAGES}")
+            return
+        conv = Conversation(
+            user_id=current_user.id,
+            title=title,
+            assistant_id=assistant_id,
+        )
+        db.add(conv)
+        await db.flush()
+        base = datetime.utcnow()
+        message_count = 0
+        for i, row in enumerate(payload):
+            query = row.get("query") or ""
+            answer = row.get("answer") or ""
+            if query:
+                db.add(Message(
+                    conversation_id=conv.id,
+                    role="user",
+                    content=query,
+                    created_at=base + timedelta(seconds=2 * i),
+                ))
+                message_count += 1
+            if answer:
+                db.add(Message(
+                    conversation_id=conv.id,
+                    role="assistant",
+                    content=answer,
+                    created_at=base + timedelta(seconds=2 * i + 1),
+                ))
+                message_count += 1
+        total_created += 1
+        total_messages += message_count
+        created_info.append({"id": conv.id, "title": title, "messages": message_count})
+
+    async def _read_upload_limited(upload: UploadFile) -> bytes | None:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _IMPORT_MAX_FILE_BYTES:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    for upload in files:
+        name = upload.filename or ""
+        try:
+            data = await _read_upload_limited(upload)
+        except Exception:  # noqa: BLE001
+            logger.exception("conversation import: read failed for %s", name)
+            errors.append(f"{name}: 读取失败")
+            continue
+        if data is None:
+            errors.append(f"{name}: 文件超过 50MB")
+            continue
+
+        entries: list[tuple[str, bytes]] = []
+        lower = name.lower()
+        try:
+            if lower.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    all_members = [
+                        i for i in zf.infolist()
+                        if not i.is_dir()
+                        and not i.filename.startswith("__MACOSX/")
+                        and not os.path.basename(i.filename).startswith(".")
+                        and i.filename.lower().endswith(".csv")
+                    ]
+                    # bz2/lzma 解压器在 zipfile 内一次性展开整块（无法按字节预算中断），
+                    # 拒绝非 STORED/DEFLATED，避免小体积上传放大为 GB 级内存分配。
+                    members = [
+                        i for i in all_members
+                        if i.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                    ]
+                    if len(members) < len(all_members):
+                        errors.append(
+                            f"{name}: 跳过 {len(all_members) - len(members)} 个不支持的压缩成员"
+                        )
+                    if len(members) > _IMPORT_MAX_ZIP_MEMBERS:
+                        errors.append(f"{name}: zip 成员数超过 {_IMPORT_MAX_ZIP_MEMBERS}，已截断")
+                        members = members[:_IMPORT_MAX_ZIP_MEMBERS]
+                    for info in members:
+                        budget = min(
+                            _IMPORT_MAX_MEMBER_BYTES,
+                            _IMPORT_MAX_TOTAL_UNCOMPRESSED - zip_budget_used,
+                        )
+                        if budget <= 0:
+                            errors.append(f"{name}: 解压总量超过限制，剩余成员已跳过")
+                            break
+                        try:
+                            member_bytes = _read_zip_member_limited(zf, info, budget)
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "conversation import: member read failed for %s", info.filename
+                            )
+                            errors.append(f"{name}: 成员 {info.filename} 读取失败，已跳过")
+                            continue
+                        if member_bytes is None:
+                            errors.append(f"{name}: 成员 {info.filename} 解压后过大，已跳过")
+                            continue
+                        zip_budget_used += len(member_bytes)
+                        entries.append((info.filename, member_bytes))
+            elif lower.endswith(".csv"):
+                entries.append((name, data))
+            else:
+                errors.append(f"{name}: 仅支持 .csv / .zip")
+                continue
+        except zipfile.BadZipFile:
+            errors.append(f"{name}: zip 文件损坏")
+            continue
+        except Exception:  # noqa: BLE001
+            logger.exception("conversation import: unpack failed for %s", name)
+            errors.append(f"{name}: 无法解析文件")
+            continue
+        if not entries:
+            errors.append(f"{name}: 未找到可导入的 CSV")
+            continue
+
+        file_info_start = len(created_info)
+        file_created_start = total_created
+        file_messages_start = total_messages
+        try:
+            for member_name, member_bytes in entries:
+                try:
+                    text = member_bytes.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    errors.append(f"{member_name}: 非 UTF-8 编码")
+                    continue
+                rows, parse_errors = _parse_export_csv(text)
+                if len(rows) > _IMPORT_MAX_ROWS_PER_CSV:
+                    errors.append(f"{member_name}: 行数超过 {_IMPORT_MAX_ROWS_PER_CSV}，已截断")
+                    rows = rows[:_IMPORT_MAX_ROWS_PER_CSV]
+                errors.extend(f"{member_name}: {e}" for e in parse_errors)
+                await _create_conversation(
+                    _conversation_title_from_filename(member_name), rows
+                )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            del created_info[file_info_start:]
+            total_created = file_created_start
+            total_messages = file_messages_start
+            logger.exception("conversation import: commit failed for %s", name)
+            errors.append(f"{name}: 入库失败，已回滚该文件")
+
+    return {"created": total_created, "conversations": created_info, "errors": errors}
 
 
 def _render_messages_pdf(title: str, content: str, created_at: str = "", workspace_root: str | None = None) -> bytes:

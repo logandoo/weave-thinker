@@ -36,9 +36,19 @@ function getParentRoute(): string | null {
 /**
  * Called from Android WebView's onBackPressed.
  * Always returns true so Android never exits directly.
+ *
+ * First dispatches a cancelable `weaver:android-back` event so open overlays
+ * (citation card, note/file previews, dialogs, lightboxes) can consume the
+ * back press; only when nothing consumes it does route-level navigation run.
  * Shows exit confirmation dialog when at root route.
  */
 export function handleAndroidBack(): boolean {
+  const backEvent = new CustomEvent('weaver:android-back', { cancelable: true })
+  window.dispatchEvent(backEvent)
+  if (backEvent.defaultPrevented) {
+    return true
+  }
+
   const parent = getParentRoute()
   if (parent === null || parent === router.currentRoute.value.path) {
     // At root — show exit confirmation

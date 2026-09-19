@@ -15,6 +15,7 @@ from typing import Any, Dict
 
 from app.tools.registry import registry
 from app.core.config import get_config
+from app.services.workspace_file_state import read_tracker
 
 config = get_config()
 logger = logging.getLogger(__name__)
@@ -150,6 +151,15 @@ async def workspace_read(args: Dict[str, Any], **kwargs) -> str:
     result["type"] = ext
 
     if result.get("success"):
+        # P0 读后写契约（2026-09-19）：记录本文件 (mtime_ns, size)，供
+        # workspace_edit 的 stale-edit guard 校验。
+        try:
+            stat = os.stat(resolved)
+            read_tracker.record_read(
+                getattr(user, "id", ""), resolved, stat.st_mtime_ns, stat.st_size
+            )
+        except OSError:
+            logger.debug("workspace_read: stat failed for edit-tracking: %s", resolved)
         logger.info("workspace_read: read %s (%d chars, %d lines)", name,
                      result.get("total_chars", 0), result.get("total_lines", 0))
 

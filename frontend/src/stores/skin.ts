@@ -22,6 +22,14 @@ export type SkinMode = 'light' | 'dark'
 const SKIN_STORAGE_KEY = 'wt-skin'
 const MODE_STORAGE_KEY = 'theme'
 const CSS_LINK_PREFIX = 'wt-skin-css-'
+/** 主题切换抑制类世代号：连续切换时只允许最新一次清理。 */
+let themeSwitchGeneration = 0
+/** 看门狗：即使 ViewTransition.finished 不结算也不让抑制类常驻。 */
+const THEME_SWITCH_WATCHDOG_MS = 500
+
+interface ThemeSwitchHandle {
+  done: () => void
+}
 
 /**
  * 皮肤状态唯一入口：skin（皮肤）× mode（明暗）双轴。
@@ -219,36 +227,86 @@ export const useSkinStore = defineStore('skin', () => {
     if (wasCurrent) void persistRemote()
   }
 
-  function setMode(next: SkinMode): void {
-    if (mode.value === next) return
+  /** 开始一次主题切换：加 `theme-switching`（暂停全站元素级过渡），
+   *  返回 done() 供动画结束提前收尾；500ms 看门狗兜底防止类常驻。
+   *  世代号保证连续切换只有最新一次能移除。 */
+  function _beginThemeSwitch(): ThemeSwitchHandle {
+    const gen = ++themeSwitchGeneration
+    const el = document.documentElement
+    el.classList.add('theme-switching')
+    const timer = window.setTimeout(() => {
+      if (gen === themeSwitchGeneration) el.classList.remove('theme-switching')
+    }, THEME_SWITCH_WATCHDOG_MS)
+    return {
+      done: () => {
+        window.clearTimeout(timer)
+        if (gen !== themeSwitchGeneration) return
+        el.classList.remove('theme-switching')
+      },
+    }
+  }
+
+  function _applyMode(next: SkinMode): void {
     mode.value = next
     localStorage.setItem(MODE_STORAGE_KEY, next)
     applyToDom()
     notifyNativeBridge()
   }
 
-  /** View Transition 涟漪切换明暗（自 Sidebar.toggleTheme 迁移，行为不变）。 */
+  function setMode(next: SkinMode): void {
+    if (mode.value === next) return
+    const switchHandle = _beginThemeSwitch()
+    _applyMode(next)
+    // 无 View Transition 的直选路径：两帧内样式重算+绘制完成即恢复过渡；
+    // 看门狗仍是后台标签页等 rAF 被节流场景的兜底。
+    requestAnimationFrame(() => requestAnimationFrame(() => switchHandle.done()))
+  }
+
+  /** View Transition 涟漪切换明暗（自 Sidebar.toggleTheme 迁移）。
+   *
+   *  效率策略（2026-09-18 用户要求保留特效、只优化效率）：
+   *  - 涟漪动画照常走 `startViewTransition`（整页变化由合成器快照动画完成）；
+   *  - 过渡期间在 `<html>` 上加 `theme-switching`，全站 CSS transition/animation
+   *    暂停——真正昂贵的是数百条元素级 transition 同时起跑，而非快照本身；
+   *  - `transition.finished` 后立即移除抑制类（看门狗兜底）；
+   *  - 仅 `prefers-reduced-motion` 或不支持 View Transition 时回退常规切换。 */
   function toggleMode(event?: MouseEvent): void {
     const next: SkinMode = mode.value === 'dark' ? 'light' : 'dark'
+    const prefersReduced =
+      window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true
+    const canRipple =
+      typeof event !== 'undefined' &&
+      typeof (document as any).startViewTransition === 'function' &&
+      !prefersReduced
 
-    if (typeof event !== 'undefined') {
-      const x = event.clientX
-      const y = event.clientY
-      const endRadius = Math.hypot(
-        Math.max(x, window.innerWidth - x),
-        Math.max(y, window.innerHeight - y)
-      )
+    if (!canRipple) {
+      setMode(next)
+      return
+    }
 
-      if (!(document as any).startViewTransition) {
-        setMode(next)
-        return
-      }
+    const x = event.clientX
+    const y = event.clientY
+    const endRadius = Math.hypot(
+      Math.max(x, window.innerWidth - x),
+      Math.max(y, window.innerHeight - y)
+    )
 
-      const transition = (document as any).startViewTransition(() => {
-        setMode(next)
+    const transition = (document as any).startViewTransition(() => {
+      _applyMode(next)
+    })
+    const switchHandle = _beginThemeSwitch()
+
+    const finished: Promise<unknown> = transition.finished || Promise.resolve()
+    finished
+      .catch(() => {
+        // 被后续切换跳过/中断：忽略，抑制类由最新一次/看门狗负责清理
+      })
+      .finally(() => {
+        switchHandle.done()
       })
 
-      transition.ready.then(() => {
+    transition.ready
+      .then(() => {
         document.documentElement.animate(
           {
             clipPath: [
@@ -263,10 +321,9 @@ export const useSkinStore = defineStore('skin', () => {
           }
         )
       })
-      return
-    }
-
-    setMode(next)
+      .catch(() => {
+        // View Transition 被跳过/中断：主题已切换，忽略动画失败
+      })
   }
 
   return {

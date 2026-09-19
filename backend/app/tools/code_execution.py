@@ -92,7 +92,7 @@ _CODE_GENERATION_PROMPT = """\
     - 对于 reportlab: `pdfmetrics.registerFont(TTFont('CNFont', _cn_font_path))` 然后 `canvas.setFont('CNFont', 12)`
     - 对于 PIL/Pillow: `ImageFont.truetype(_cn_font_path, size)`
     - 如果 `_cn_font_path` 为 None，则输出 "NEED_FONT: 系统缺少中文字体" 并优雅降级（使用英文标注或无文字）
-13. 文件交付规范：本次调用在**用户工作区根目录**写出的文件会自动成为展示给用户的下载卡片；cwd（scratch/task_XXXX 临时目录）内的文件不会出现在卡片中。因此：中间草稿、调试统计、日志、临时数据等辅助文件一律写入当前 cwd（scratch 临时目录）即可；只有**最终需要交付给用户下载的文件**才写入工作区根目录（用绝对路径），避免把无关文件混入交付列表。
+13. 文件交付规范：写出到**用户工作区根目录**的文件不会自动成为下载卡片——需要把文件提供给用户下载时，必须显式调用 provide_file（file_path=绝对路径）。cwd（scratch/task_XXXX 临时目录）用于中间草稿、调试统计、日志、临时数据；**最终需要交付的文件**写到工作区根目录（绝对路径）后再调用 provide_file，避免把无关文件混入交付。
 
 用户工作目录: {workspace_path}
 """
@@ -157,7 +157,7 @@ _CODE_GENERATION_PROMPT_PTC = """\
     - 对于 reportlab: `pdfmetrics.registerFont(TTFont('CNFont', _cn_font_path))` 然后 `canvas.setFont('CNFont', 12)`
     - 对于 PIL/Pillow: `ImageFont.truetype(_cn_font_path, size)`
     - 如果 `_cn_font_path` 为 None，则输出 "NEED_FONT: 系统缺少中文字体" 并优雅降级
-13. 文件交付规范：本次调用在**用户工作区根目录**写出的文件会自动成为展示给用户的下载卡片；cwd（scratch/task_XXXX 临时目录）内的文件不会出现在卡片中。因此：中间草稿、调试统计、日志、临时数据等辅助文件一律写入当前 cwd（scratch 临时目录）即可；只有**最终需要交付给用户下载的文件**才写入工作区根目录（用绝对路径），避免把无关文件混入交付列表。
+13. 文件交付规范：写出到**用户工作区根目录**的文件不会自动成为下载卡片——需要把文件提供给用户下载时，必须显式调用 provide_file（file_path=绝对路径）。cwd（scratch/task_XXXX 临时目录）用于中间草稿、调试统计、日志、临时数据；**最终需要交付的文件**写到工作区根目录（绝对路径）后再调用 provide_file，避免把无关文件混入交付。
 
 用户工作目录: {workspace_path}
 """

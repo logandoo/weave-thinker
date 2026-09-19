@@ -827,3 +827,20 @@ input::placeholder, textarea::placeholder {
 .mermaid-error {
   background: var(--danger-tint);
 }
+
+/* ══════════ 小尺寸平板（如 908×594 横屏）：窄侧栏，避免聊天列被挤压 ══════════ */
+@media (min-width: 768px) and (max-width: 1100px) {
+  :root {
+    --sidebar-width: 240px;
+  }
+}
+
+/* ══════════ 主题切换进行中：暂停全局 transition/animation（避免数百元素同时起跑） ══════════ */
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition: none !important;
+  animation-duration: 0.01ms !important;
+  animation-delay: 0s !important;
+  animation-iteration-count: 1 !important;
+}

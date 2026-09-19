@@ -1043,12 +1043,11 @@ html[data-skin="mono-brutal"] .spotlight-input {
   border-radius: 0;
 }
 
-/* 空态：FLUSH（ec 语言）+ .no 角标 + ec-try 3px 线号两侧 */
-html[data-skin="mono-brutal"] .empty-state {
-  height: auto;
+/* 空态：FLUSH（ec 语言）+ .no 角标 + ec-try 3px 线号两侧；
+   视觉挂 .empty-inner，容器垂直居中由基座 .empty-state 负责 */
+html[data-skin="mono-brutal"] .empty-inner {
   width: auto;
   max-width: 760px;
-  margin: 8vh auto 40px;
   border: none;
   background: none;
   box-shadow: none;
@@ -2063,3 +2062,4 @@ html[data-skin="mono-brutal"][data-theme="dark"] .np-swipe-action.delete { backg
   html[data-skin="mono-brutal"] .export-confirm-btn,
   html[data-skin="mono-brutal"] .create-btn { border-radius: 0; border: 2px solid var(--skin-line); font-weight: 700; }
 }
+

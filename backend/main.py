@@ -137,6 +137,21 @@ async def startup_event():
     os.makedirs(fonts_dir, exist_ok=True)
     await init_db()
 
+    # 死磕 DAG 波次 W2d：进程重启后残留的 active 目标循环不可能存活（SSE
+    # 驱动随进程消失）——统一停泊为 paused + PAUSED 包，避免幽灵 active 状态。
+    try:
+        from app.services.deathmatch_service import recover_stale_active_deathmatch
+        async with AsyncSessionLocal() as _dm_session:
+            _dm_recovered = await recover_stale_active_deathmatch(_dm_session)
+            if _dm_recovered:
+                await _dm_session.commit()
+                logger.info(
+                    "deathmatch: normalized %d stale active conversation(s) to paused",
+                    _dm_recovered,
+                )
+    except Exception as exc:
+        logger.warning("deathmatch stale-active recovery failed: %s", exc)
+
     # Phase 5.5: Wire DB backend for multi-instance shared state
     from app.services.shared_state import configure_db_backend
     configure_db_backend(AsyncSessionLocal)
@@ -241,6 +256,13 @@ async def shutdown_event():
     try:
         from app.services.interactive_browser_service import InteractiveBrowserService
         await InteractiveBrowserService.get_instance().shutdown()
+    except Exception:
+        pass
+    # A4.9 I-2: 进程会话的 OS 子进程在 start_new_session 下独立于服务进程，
+    # 服务退出/重启时必须显式清理，否则成为无法再被 kill 的孤儿进程。
+    try:
+        from app.services.process_session_service import process_manager
+        await process_manager.shutdown_all()
     except Exception:
         pass
     await close_shared_async_client()

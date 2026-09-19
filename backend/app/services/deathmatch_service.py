@@ -25,6 +25,7 @@ Design invariants (from hermes-agent goals.py):
 from __future__ import annotations
 
 import asyncio
+import copy as _copy
 import hashlib
 import json
 import logging
@@ -846,7 +847,593 @@ def _validate_plan_protocol(plan: Any, valid_tool_names: Optional[set] = None) -
                     break
         if "delegable" in s and not isinstance(s.get("delegable"), bool):
             issues.append(f"步骤 {sid or i + 1} 的 delegable 不是布尔值")
+    # ── v2（死磕 DAG 波次 W1b）：步骤契约 + 依赖图校验 ──────────────────
+    issues.extend(_validate_step_graph(steps))
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get("id") or "").strip() or f"#{i + 1}"
+        kind = s.get("kind")
+        if kind is not None and str(kind).strip().lower() not in _STEP_KINDS:
+            issues.append(f"步骤 {sid} 的 kind 非法: {kind}")
+        if "parallel_safe" in s and not isinstance(s.get("parallel_safe"), bool):
+            issues.append(f"步骤 {sid} 的 parallel_safe 不是布尔值")
+        writes = s.get("writes")
+        if writes is not None and (
+            not isinstance(writes, list)
+            or any(not isinstance(w, str) or not w.strip() for w in writes)
+        ):
+            issues.append(f"步骤 {sid} 的 writes 必须是字符串列表")
+        dc = s.get("done_check")
+        if dc is not None:
+            _mode = str(dc.get("mode") or "").strip().lower() if isinstance(dc, dict) else ""
+            if not isinstance(dc, dict) or _mode not in ("file", "gate", "llm", "none"):
+                issues.append(f"步骤 {sid} 的 done_check 非法")
+            elif _mode == "gate" and not str(dc.get("cmd") or "").strip():
+                issues.append(f"步骤 {sid} 的 done_check(gate) 缺少 cmd")
+            elif _mode == "file" and not str(dc.get("path") or "").strip():
+                issues.append(f"步骤 {sid} 的 done_check(file) 缺少 path")
     return issues
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 死磕 DAG 波次 W1-W2：契约 / 计划 v2 / 比较器 / 恢复 —— 纯函数（无 I/O、无 LLM）
+# ──────────────────────────────────────────────────────────────────────
+
+_STEP_KINDS = frozenset({"write", "research", "verify", "synthesize"})
+_CRITERIA_MAX = 12
+_CRITERION_TYPES = frozenset({"mechanical", "judgmental"})
+_CHECK_KINDS = frozenset({"file", "gate", "none"})
+
+
+def _normalize_check(raw: Any) -> Dict[str, Any]:
+    """Normalize a criteria mechanical check; anything unusable → kind=none."""
+    if not isinstance(raw, dict):
+        return {"kind": "none"}
+    kind = str(raw.get("kind") or "none").strip().lower()
+    if kind not in _CHECK_KINDS:
+        return {"kind": "none"}
+    if kind == "file":
+        path = str(raw.get("path") or "").strip()[:300]
+        if not path:
+            return {"kind": "none"}
+        try:
+            min_bytes = max(0, int(raw.get("min_bytes") or 0))
+        except (TypeError, ValueError):
+            min_bytes = 0
+        return {"kind": "file", "path": path, "min_bytes": min_bytes}
+    if kind == "gate":
+        cmd = str(raw.get("cmd") or "").strip()[:500]
+        if not cmd:
+            return {"kind": "none"}
+        return {"kind": "gate", "cmd": cmd}
+    return {"kind": "none"}
+
+
+def _normalize_criteria_item(raw: Any, idx: int, source_default: str = "system") -> Optional[Dict[str, Any]]:
+    if isinstance(raw, str):
+        raw = {"text": raw}
+    if not isinstance(raw, dict):
+        return None
+    text = str(raw.get("text") or "").strip()
+    if not text:
+        return None
+    ctype = str(raw.get("type") or "judgmental").strip().lower()
+    if ctype not in _CRITERION_TYPES:
+        ctype = "judgmental"
+    source = str(raw.get("source") or source_default).strip().lower()
+    if source not in ("system", "user"):
+        source = source_default
+    check = _normalize_check(raw.get("check")) if ctype == "mechanical" else {"kind": "none"}
+    if check.get("kind") == "none":
+        ctype = "judgmental"
+    return {
+        "id": str(raw.get("id") or f"c{idx}")[:40],
+        "text": text[:500],
+        "type": ctype,
+        "source": source,
+        "check": check,
+    }
+
+
+def _parse_criteria_response(raw: str) -> List[Dict[str, Any]]:
+    """Parse an LLM criteria reply (JSON object with ``criteria`` or a bare
+    list); tolerant to fenced code; returns [] on any unusable shape."""
+    if not raw or not raw.strip():
+        return []
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:]
+    data: Any = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = _re.search(r"\{.*\}", text, _re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = None
+    if isinstance(data, dict):
+        items = data.get("criteria")
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = None
+    if not isinstance(items, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in items[:_CRITERIA_MAX]:
+        norm = _normalize_criteria_item(item, len(out) + 1)
+        if norm:
+            out.append(norm)
+    return out
+
+
+def _contract_hash(goal: str, criteria: List[Dict[str, Any]]) -> str:
+    payload = json.dumps(
+        {
+            "goal": (goal or "").strip(),
+            "criteria": [
+                {"text": c.get("text"), "type": c.get("type"), "check": c.get("check")}
+                for c in (criteria or []) if isinstance(c, dict)
+            ],
+        },
+        ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _merge_criteria(
+    system_criteria: List[Dict[str, Any]],
+    user_subgoals: List[Any],
+) -> List[Dict[str, Any]]:
+    """Merge stored system criteria with user-appended subgoals (D3 compat):
+    dedupe by normalized text, user entries become judgmental criteria."""
+    merged: List[Dict[str, Any]] = []
+    seen: set = set()
+    for c in (system_criteria or []):
+        if not isinstance(c, dict):
+            continue
+        text = str(c.get("text") or "").strip()
+        key = _re.sub(r"\s+", "", text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(c))
+    for sg in (user_subgoals or []):
+        text = str(sg or "").strip()
+        key = _re.sub(r"\s+", "", text)
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        merged.append({
+            "id": f"u{len(merged) + 1}",
+            "text": text[:500],
+            "type": "judgmental",
+            "source": "user",
+            "check": {"kind": "none"},
+        })
+    # A4.9 Minor: enforce globally unique ids (system ids come from the LLM
+    # and may collide with the u<N> user ids or each other).
+    used: set = set()
+    for c in merged:
+        cid = str(c.get("id") or "")
+        if not cid or cid in used:
+            n = len(used) + 1
+            cid = f"c{n}"
+            while cid in used:
+                n += 1
+                cid = f"c{n}"
+        c["id"] = cid
+        used.add(cid)
+    return merged
+
+
+def _format_criteria_block(criteria: List[Dict[str, Any]]) -> str:
+    items = [
+        c for c in (criteria or [])
+        if isinstance(c, dict) and str(c.get("text") or "").strip()
+    ]
+    if not items:
+        return ""
+    lines = [
+        "<acceptance_criteria>",
+        "验收标准（必须全部满足才算完成；append-only，不得放松）：",
+    ]
+    for c in items:
+        tag = {"mechanical": "机械可检", "judgmental": "需判断"}.get(str(c.get("type")), "需判断")
+        src = "用户追加" if c.get("source") == "user" else "系统生成"
+        check = c.get("check") or {}
+        extra = ""
+        if check.get("kind") == "file":
+            extra = f"（检查：文件 {check.get('path')} ≥{check.get('min_bytes') or 0}B）"
+        elif check.get("kind") == "gate":
+            extra = f"（检查：命令 {str(check.get('cmd'))[:120]}）"
+        lines.append(f"- [{c.get('id')}][{tag}/{src}] {c.get('text')}{extra}")
+    lines.append("</acceptance_criteria>")
+    return "\n".join(lines)
+
+
+def _normalize_done_check(raw: Any, verification_method: str = "") -> Dict[str, Any]:
+    """Normalize a step done_check; legacy ``gate: <cmd>`` verification_method
+    maps to {mode: gate}; anything unusable → {mode: none}."""
+    check = raw if isinstance(raw, dict) else None
+    if check:
+        mode = str(check.get("mode") or "").strip().lower()
+        if mode == "file":
+            path = str(check.get("path") or "").strip()[:300]
+            if path:
+                try:
+                    min_bytes = max(0, int(check.get("min_bytes") or 0))
+                except (TypeError, ValueError):
+                    min_bytes = 0
+                return {"mode": "file", "path": path, "min_bytes": min_bytes}
+        elif mode == "gate":
+            cmd = str(check.get("cmd") or "").strip()[:500]
+            if cmd:
+                return {"mode": "gate", "cmd": cmd}
+        elif mode == "llm":
+            return {"mode": "llm"}
+    vm = str(verification_method or "").strip()
+    if vm.lower().startswith("gate:"):
+        cmd = vm[len("gate:"):].strip()
+        if cmd:
+            return {"mode": "gate", "cmd": cmd[:500]}
+    return {"mode": "none"}
+
+
+def _validate_step_graph(steps: List[Dict[str, Any]]) -> List[str]:
+    """Dependency integrity + cycle detection (a plan must be a DAG)."""
+    issues: List[str] = []
+    if not isinstance(steps, list):
+        return ["steps 不是列表"]
+    id_set = {
+        str(s.get("id") or "").strip()
+        for s in steps if isinstance(s, dict) and str(s.get("id") or "").strip()
+    }
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get("id") or "").strip() or "?"
+        deps = s.get("dependencies") or []
+        if not isinstance(deps, list):
+            issues.append(f"步骤 {sid} 的 dependencies 不是列表")
+            continue
+        for d in deps:
+            dsid = str(d)
+            if dsid == sid:
+                issues.append(f"步骤 {sid} 依赖自身")
+            elif dsid not in id_set:
+                issues.append(f"步骤 {sid} 依赖不存在的步骤: {d}")
+    graph = {
+        str(s.get("id") or "").strip(): [
+            str(d) for d in (s.get("dependencies") or []) if isinstance(d, (str, int))
+        ]
+        for s in steps
+        if isinstance(s, dict) and str(s.get("id") or "").strip()
+    }
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in graph}
+
+    def _dfs(n: str) -> bool:
+        color[n] = GRAY
+        for m in graph.get(n, []):
+            if m not in color:
+                continue
+            if color[m] == GRAY:
+                return True
+            if color[m] == WHITE and _dfs(m):
+                return True
+        color[n] = BLACK
+        return False
+
+    if any(color[n] == WHITE and _dfs(n) for n in list(graph)):
+        issues.append("步骤依赖存在环")
+    return issues
+
+
+def _canonical_statement(step: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonical statement fields for hashing — v1 raw steps and v2
+    normalized steps produce identical payloads (legacy-compatible)."""
+    _kind_raw = str(step.get("kind") or "").strip().lower()
+    if _kind_raw not in _STEP_KINDS:
+        _kind_raw = "research" if step.get("delegable") is True else "write"
+    _dc = step.get("done_check")
+    if _dc is not None and not isinstance(_dc, dict):
+        _dc = None
+    return {
+        "id": str(step.get("id") or ""),
+        "description": str(step.get("description") or ""),
+        "expected_output": str(step.get("expected_output") or ""),
+        "boundary": str(step.get("boundary") or ""),
+        "dependencies": sorted(
+            str(d) for d in (step.get("dependencies") or []) if isinstance(d, (str, int))
+        ),
+        "writes": sorted(
+            str(w) for w in (step.get("writes") or []) if isinstance(w, str)
+        ),
+        "kind": _kind_raw,
+        "verification_method": str(step.get("verification_method") or ""),
+        "tools": sorted(
+            str(t) for t in (step.get("tools") or []) if isinstance(t, str)
+        ),
+        "done_check": _normalize_done_check(
+            _dc, str(step.get("verification_method") or "")
+        ),
+        "parallel_safe": (
+            bool(step.get("parallel_safe"))
+            if isinstance(step.get("parallel_safe"), bool) else False
+        ),
+        "delegable": (
+            bool(step.get("delegable"))
+            if isinstance(step.get("delegable"), bool) else False
+        ),
+    }
+
+
+def step_statement_hash(step: Dict[str, Any]) -> str:
+    """Content hash of a step's frozen statement (W1c immutability).
+    Includes the v2 contract fields (kind/done_check/tools/...) so a replan
+    cannot rewrite them undetected (A4.9 Minor)."""
+    payload = json.dumps(_canonical_statement(step), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_done_steps_preserved(
+    old_steps: List[Dict[str, Any]],
+    new_steps: List[Dict[str, Any]],
+) -> List[str]:
+    """W1c: settled (done) steps are immutable across replan — id + statement
+    + done status must survive verbatim; anything else is a violation."""
+    issues: List[str] = []
+    new_by_id = {
+        str(s.get("id")): s for s in (new_steps or [])
+        if isinstance(s, dict) and s.get("id")
+    }
+    for s in (old_steps or []):
+        if not isinstance(s, dict) or s.get("status") != "done":
+            continue
+        sid = str(s.get("id") or "")
+        new = new_by_id.get(sid)
+        if new is None:
+            issues.append(f"已完成步骤 {sid} 在重规划后消失")
+            continue
+        if step_statement_hash(s) != step_statement_hash(new):
+            issues.append(f"已完成步骤 {sid} 的陈述被改写（违反不可变契约）")
+        if str(new.get("status") or "pending") != "done":
+            issues.append(f"已完成步骤 {sid} 的状态被回退")
+    return issues
+
+
+def _mechanical_checks(criteria: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for c in (criteria or []):
+        check = c.get("check") if isinstance(c, dict) else None
+        if isinstance(check, dict) and check.get("kind") in ("file", "gate"):
+            out.append(c)
+    return out
+
+
+def _recovery_action(attempts: int, max_retries: int) -> str:
+    """W2a per-node recovery ladder: local_retry → local_patch → replan."""
+    attempts = max(1, int(attempts or 1))
+    max_retries = max(0, int(max_retries or 0))
+    if attempts <= max_retries:
+        return "local_retry"
+    if attempts == max_retries + 1:
+        return "local_patch"
+    return "replan"
+
+
+def _direction_family(text: str) -> str:
+    norm = _re.sub(r"\s+", " ", str(text or "")).strip().lower()[:120]
+    return norm or "unknown"
+
+
+def _normalize_stale_active(conv: Any) -> bool:
+    """W2d: normalize a conversation left ``active`` by a process restart to
+    a resumable ``paused`` with a PAUSED packet. Returns True if changed."""
+    try:
+        if getattr(conv, "deathmatch_status", None) != "active":
+            return False
+        conv.deathmatch_status = "paused"
+        conv.deathmatch_reason = "服务重启：目标循环中断，已停泊（发送任意消息恢复）"
+        # A4.9 r2 N5: freeze the wall clock on crash-park — resume() would
+        # otherwise charge the whole downtime against the budget (parked time
+        # must never count).
+        try:
+            started = getattr(conv, "deathmatch_wall_time_started_at", None)
+            if started is not None:
+                used = int(getattr(conv, "deathmatch_wall_time_used_seconds", 0) or 0)
+                used += max(0, int((datetime.utcnow() - started).total_seconds()))
+                conv.deathmatch_wall_time_used_seconds = used
+                conv.deathmatch_wall_time_started_at = None
+        except Exception:
+            pass
+        try:
+            conv.deathmatch_pause_state = {
+                "gate": "crash-recovery",
+                "question": "目标循环在服务重启时中断，是否继续？",
+                "options": ["继续（发送任意消息）", "调整目标", "放弃"],
+                "default_if_continue": "按原目标与计划继续推进",
+                "state": {
+                    "turn": int(getattr(conv, "deathmatch_turns", 0) or 0),
+                    "plan_version": int(getattr(conv, "deathmatch_plan_version", 0) or 0),
+                },
+                "ts": _time.time(),
+            }
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def _load_stale_active(db: AsyncSession) -> List[Any]:
+    from app.db.database import Conversation
+    # A4.9 Important: multi-instance safety — if another live worker owns
+    # conversations on the shared DB (heartbeat fresh), do NOT park anything;
+    # recovery is only safe when this worker is alone (single-instance deploy)
+    # or the other workers' heartbeats are stale.
+    try:
+        from sqlalchemy import text as _text
+        from app.services.shared_state import WORKER_INSTANCE_ID as _me
+        # last_heartbeat is DOUBLE PRECISION (time.time()); the cutoff must be
+        # the same numeric domain (A4.9 r2 N2).
+        _cutoff = _time.time() - 90
+        _r = await db.execute(
+            _text(
+                "SELECT COUNT(*) FROM worker_instances "
+                "WHERE status = 'active' AND id != :me AND last_heartbeat > :cutoff"
+            ),
+            {"me": _me, "cutoff": _cutoff},
+        )
+        _others = int(_r.scalar_one_or_none() or 0)
+        if _others:
+            logger.warning(
+                "deathmatch stale-active recovery skipped: %d other live worker(s) present",
+                _others,
+            )
+            return []
+    except Exception:
+        # single-instance / fresh DB / tests: proceed (fail-open to recovery)
+        pass
+    stmt = select(Conversation).where(
+        Conversation.deathmatch_mode == True,  # noqa: E712
+        Conversation.deathmatch_status == "active",
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+# A4.9 (DAG wave r1 Critical + r2): the detached `task_conversation` is where
+# the goal loop mutates state; this is the single source of truth for the
+# fields mirrored back to the request-scoped row before commit. A missing
+# field silently evaporates across requests — every manager-mutated deathmatch
+# field must be listed here (pinned by test_fix_sync_fields_cover_manager_state).
+DEATHMATCH_SYNC_FIELDS = (
+    # status / verdict / counters
+    "deathmatch_status", "deathmatch_turns", "deathmatch_verdict",
+    "deathmatch_reason", "deathmatch_consecutive_failures",
+    "deathmatch_marker_miss_count", "deathmatch_grilling_completed",
+    "deathmatch_grilling_total", "deathmatch_grilling_round",
+    "deathmatch_verify_failures", "deathmatch_last_verification_result",
+    "deathmatch_human_gate",
+    # plan / settled / reflections
+    "deathmatch_plan", "deathmatch_plan_version",
+    "deathmatch_settled_ledger", "deathmatch_reflections",
+    # budget / wall clock
+    "deathmatch_max_turns", "deathmatch_max_wall_time_seconds",
+    "deathmatch_wall_time_started_at", "deathmatch_wall_time_used_seconds",
+    # context
+    "deathmatch_context_summary", "deathmatch_compressed_context",
+    # W1a/W2b/W2c contract / recovery layer
+    "deathmatch_acceptance_criteria", "deathmatch_failed_directions",
+    "deathmatch_pause_state", "deathmatch_events",
+    "deathmatch_no_progress_replans",
+)
+
+
+def sync_deathmatch_state(target: Any, source: Any) -> None:
+    """Copy the deathmatch state fields from the detached task conversation
+    to the request-scoped row (single-source wiring list; absent source
+    attributes are skipped, never nulled)."""
+    for field in DEATHMATCH_SYNC_FIELDS:
+        if hasattr(source, field):
+            setattr(target, field, getattr(source, field))
+
+
+# A4.9 closure residual: control fields whose external change (user action:
+# pause/stop/resume/adjust) must win over the stream's stale copy for the
+# REST OF THE STREAM. Data fields (plan/settled/events/...) follow the
+# optimistic rule instead: external change wins for that sync, then the loop
+# may write again once the DB matches the snapshot.
+DEATHMATCH_CONTROL_FIELDS = frozenset({
+    "deathmatch_status",
+    "deathmatch_human_gate",
+    "deathmatch_pause_state",
+    "deathmatch_reason",
+    "deathmatch_max_turns",
+    "deathmatch_max_wall_time_seconds",
+    "deathmatch_wall_time_started_at",
+    "deathmatch_wall_time_used_seconds",
+})
+
+
+def merge_sync_deathmatch_state(
+    target: Any,
+    source: Any,
+    last_synced: Optional[Dict[str, Any]] = None,
+    frozen: Any = frozenset(),
+) -> Tuple[Dict[str, Any], frozenset]:
+    """Optimistic per-field merge for the detached task conversation.
+
+    - Loop-dirty fields (source != last snapshot) are written only when the
+      DB row still holds the snapshot value (no external writer).
+    - An external change to a CONTROL field freezes that field for the rest
+      of the stream (user intent wins); data fields follow the DB once and
+      accept future loop writes.
+    - Fields the loop did not touch are never written (no clobber).
+    Returns (new_snapshot, frozen_fields).
+    """
+    snapshot: Dict[str, Any] = dict(last_synced or {})
+    frozen_set = set(frozen or ())
+    for field in DEATHMATCH_SYNC_FIELDS:
+        if field in frozen_set or not hasattr(source, field):
+            continue
+        src = getattr(source, field)
+        db_val = getattr(target, field, None)
+        if field in snapshot:
+            if src == snapshot[field]:
+                # Not loop-dirty. A concurrent external change of a CONTROL
+                # field must still freeze here (A4.9 r-residual F1: otherwise
+                # the stale source looks dirty next sync and clobbers it).
+                if db_val != snapshot[field] and field in DEATHMATCH_CONTROL_FIELDS:
+                    snapshot[field] = _copy.deepcopy(db_val)
+                    frozen_set.add(field)
+                    continue
+                snapshot[field] = _copy.deepcopy(db_val)
+                continue
+            if db_val != snapshot[field]:
+                # External writer changed this field since our snapshot.
+                if field in DEATHMATCH_CONTROL_FIELDS:
+                    snapshot[field] = _copy.deepcopy(db_val)
+                    frozen_set.add(field)
+                else:
+                    snapshot[field] = _copy.deepcopy(db_val)
+                continue
+        setattr(target, field, src)
+        # A4.9 r-residual F2: snapshot must hold a DEEP COPY — several
+        # mutators (events/reflections/plan) append in place, and aliasing
+        # would make the next comparison see src == snapshot (write skipped,
+        # terminal batch lost).
+        snapshot[field] = _copy.deepcopy(src)
+    return snapshot, frozenset(frozen_set)
+
+
+async def recover_stale_active_deathmatch(db: AsyncSession) -> int:
+    """W2d startup scan: active goal loops cannot survive a process restart
+    (the SSE driver dies with it) — park them with a resume packet instead of
+    leaving a ghost 'active' status the UI cannot explain."""
+    try:
+        convs = await _load_stale_active(db)
+    except Exception as exc:
+        logger.warning("stale deathmatch recovery scan failed: %s", exc)
+        return 0
+    n = 0
+    for c in convs:
+        if _normalize_stale_active(c):
+            n += 1
+    if n:
+        try:
+            await db.flush()
+        except Exception as exc:
+            logger.warning("stale deathmatch recovery flush failed: %s", exc)
+    return n
 
 
 class DeathmatchManager:
@@ -999,6 +1586,13 @@ class DeathmatchManager:
         self._conv.deathmatch_human_gate = None
         # P1-5: a new goal starts with a clean settled ledger.
         self._conv.deathmatch_settled_ledger = None
+        # W1a/W2b/W2c: a new goal = a new contract — criteria, failed
+        # directions, pause packet and the no-progress breaker all reset.
+        self._conv.deathmatch_acceptance_criteria = None
+        self._conv.deathmatch_failed_directions = None
+        self._conv.deathmatch_pause_state = None
+        self._conv.deathmatch_no_progress_replans = 0
+        self._conv.deathmatch_events = None
 
     def deactivate(self) -> None:
         """Park the deathmatch (D3, 2026-08-31 autonomy wave): mode off,
@@ -1041,6 +1635,13 @@ class DeathmatchManager:
             self._conv.deathmatch_max_wall_time_seconds = config.deathmatch_max_wall_time_seconds
             self._conv.deathmatch_max_turns = config.deathmatch_max_turns
             self._conv.deathmatch_human_gate = None
+            # W2c: the PAUSED packet is consumed by the resume — clear it so a
+            # later status read cannot surface a stale question.
+            self._conv.deathmatch_pause_state = None
+            # W2b: a user-initiated resume is fresh authorization — reset the
+            # global no-progress breaker (A4.9 Important: otherwise the first
+            # post-resume no-progress replan immediately re-gates).
+            self._conv.deathmatch_no_progress_replans = 0
             self._conv.deathmatch_verify_failures = 0
             _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)  # C2: progress resets repair budget
         else:
@@ -1060,6 +1661,11 @@ class DeathmatchManager:
         self._conv.deathmatch_max_wall_time_seconds = config.deathmatch_max_wall_time_seconds
         self._conv.deathmatch_max_turns = config.deathmatch_max_turns
         self._conv.deathmatch_human_gate = None
+        # A4.9 r2 N4: mirror resume()'s W2 hygiene — clear the consumed PAUSED
+        # packet and reset the global no-progress breaker (a user-initiated
+        # resume is fresh authorization; verify_failures intentionally stays).
+        self._conv.deathmatch_pause_state = None
+        self._conv.deathmatch_no_progress_replans = 0
 
     def _accumulate_wall_time(self) -> None:
         """Fold the current wall-clock segment into the cumulative used
@@ -1691,6 +2297,17 @@ class DeathmatchManager:
                 + "\n".join(f"- {str(s)[:300]}" for s in _recent)
                 + "\n</subgoals>"
             )
+        # W1a: first-class acceptance criteria (system-synthesized + user
+        # subgoals merged) — every round the executor must see the full
+        # contract, not just the prose goal.
+        _crit_block = _format_criteria_block(self._all_criteria())
+        if _crit_block:
+            prompt = prompt + "\n\n" + _crit_block
+        # W2b: failed/forbidden directions must be visible to the executor so
+        # a recorded dead end is never retried without a new insight.
+        _failed_block = self._failed_directions_block()
+        if _failed_block:
+            prompt = prompt + "\n\n" + _failed_block
         # B2: agent-maintained handoff file — the agent keeps PROGRESS.md in
         # the workspace root (current step / done / next / blockers) and
         # re-reads it at the start of each round, so it can self-heal across
@@ -1767,6 +2384,23 @@ class DeathmatchManager:
             + "\n\n附加验收标准（全部必须满足才算完成）：\n"
             + "\n".join(f"- {str(s)[:300]}" for s in subgoals)
         )
+
+    def _all_criteria(self) -> List[Dict[str, Any]]:
+        """W1a: merged contract criteria — stored system criteria + user
+        subgoals (D3 compat), deduped by normalized text."""
+        stored = getattr(self._conv, "deathmatch_acceptance_criteria", None) or []
+        subgoals = getattr(self._conv, "deathmatch_subgoals", None) or []
+        return _merge_criteria(
+            stored if isinstance(stored, list) else [],
+            subgoals if isinstance(subgoals, list) else [],
+        )
+
+    def _goal_with_criteria(self) -> str:
+        """W1a: goal + full acceptance criteria block — the judge sees the
+        whole contract (append-only) instead of the prose goal alone."""
+        base = self._goal_with_subgoals()
+        block = _format_criteria_block(self._all_criteria())
+        return (base + "\n\n" + block) if block else base
 
     def _build_telemetry_block(self) -> str:
         """C2: remaining wall time / step progress / stall & failure counters
@@ -2179,6 +2813,11 @@ class DeathmatchManager:
         goal = self._conv.deathmatch_goal or ""
         if goal:
             parts.append(f"目标:\n{_truncate(goal, 2000)}")
+        # W1a: the acceptance criteria are audit state — they must survive
+        # compression exactly like the goal (append-only contract).
+        _crit_block = _format_criteria_block(self._all_criteria())
+        if _crit_block:
+            parts.append(_crit_block)
         plan = self._conv.deathmatch_plan or {"steps": []}
         steps = plan.get("steps") or []
         if steps:
@@ -2441,6 +3080,10 @@ intent 只能是以下之一：
         goal = await self._synthesize_goal_from_answers(db)
         await self._draft_bible_from_grilling(db, goal)
         self.complete_grilling(goal)
+        try:
+            await self._synthesize_acceptance_criteria()
+        except Exception as exc:
+            logger.warning("criteria synthesis failed (zombie recovery): %s", exc)
         try:
             await self.generate_goal_plan(db)
         except Exception as exc:
@@ -2778,6 +3421,12 @@ intent 只能是以下之一：
             goal = await self._extract_original_query(db) or ""
         await self._draft_bible_from_grilling(db, goal)
         self.complete_grilling(goal)
+        # W1a: draft the acceptance criteria for the frozen goal (fail-open;
+        # the plan-core audit and the goal comparator consume them).
+        try:
+            await self._synthesize_acceptance_criteria()
+        except Exception as exc:
+            logger.warning("criteria synthesis failed (non-blocking): %s", exc)
         # PEVR: generate structured plan after grilling completes.
         try:
             await self.generate_goal_plan(db)
@@ -2941,6 +3590,12 @@ intent 只能是以下之一：
             goal = await self._extract_original_query(db) or ""
         await self._draft_bible_from_grilling(db, goal)
         self.complete_grilling(goal)
+        # W1a: draft the acceptance criteria for the frozen goal (fail-open;
+        # the plan-core audit and the goal comparator consume them).
+        try:
+            await self._synthesize_acceptance_criteria()
+        except Exception as exc:
+            logger.warning("criteria synthesis failed (non-blocking): %s", exc)
         # PEVR: generate structured plan after grilling completes.
         try:
             await self.generate_goal_plan(db)
@@ -3156,6 +3811,7 @@ intent 只能是以下之一：
          "只输出JSON：\n"
          '{"status": "complete|partial|blocked", "completed_steps": ["s1"], '
          '"issues": ["问题1"], "retry_instruction": "下一步建议", "confidence": 0.8, '
+         '"diagnosis": "一句话可证伪的失败诊断（非 complete 时必填：指出哪条验收标准/步骤预期未满足、证据是什么）", '
          '"requires_file": true|false, '
          '"continuity_brief": "用2-4句话精炼总结本轮产出中后续步骤必须保持一致的关键内容（新确立的事实/风格/人物/情节/格式；只做事实总结，严禁指令性语言；与目标冲突时以目标为准并在issues中指出；本轮无实质产出时输出空字符串）"}\n'
          "requires_file 语义：当前步骤的预期产出是否要求生成实际文件。"
@@ -3341,6 +3997,477 @@ intent 只能是以下之一：
                 logger.warning("deathmatch fallback LLM retry failed: %s", exc)
         return out
 
+    # ── W1-W2 (死磕 DAG 波次): contract / audit / comparator / recovery ──
+
+    CRITERIA_SYSTEM_PROMPT = (
+        "你是验收标准起草员。根据用户目标与盘问问答，起草一份可核验的验收标准清单。\n"
+        "要求：\n"
+        "1. 每条标准是一个 yes/no 可判定的句子，覆盖目标的所有硬性要求"
+        "（产出物/篇幅/格式/关键事实）。\n"
+        "2. type=mechanical 时必须给出可机械执行的 check："
+        "file=文件路径+最小字节数（min_bytes）；gate=一条 shell 命令（退出码 0=通过）；"
+        "无法机械判定的用 judgmental（check.kind=none）。\n"
+        "3. 不要发明用户未要求的约束；宁少勿滥（≤8 条）。\n"
+        "只输出一行 JSON：{\"criteria\": [{\"text\": \"...\", "
+        "\"type\": \"mechanical|judgmental\", "
+        "\"check\": {\"kind\": \"file|gate|none\", \"path\": \"...\", "
+        "\"min_bytes\": 100, \"cmd\": \"...\"}}]}"
+    )
+
+    PLAN_AUDIT_SYSTEM_PROMPT = (
+        "你是任务计划审计员（captain audit）。对照用户目标、验收标准与盘问问答，"
+        "审查待执行计划的保真性；只做审查，不重写计划。\n"
+        "逐项检查：\n"
+        "1. 覆盖：验收标准/目标的每个要求是否至少被一个步骤覆盖；列出遗漏。\n"
+        "2. 保真：每个步骤的 expected_output 是否忠实服务于目标，"
+        "是否存在「看似完成实际答非所问」的措辞。\n"
+        "3. 范围：是否存在超出目标范围的步骤（scope creep）、文件清理/删除/移动类步骤。\n"
+        "4. 依赖：dependencies 是否构成合理 DAG（无环、无悬空），执行顺序是否合理。\n"
+        "5. 可验证：done_check/verification_method 是否可真实执行"
+        "（不得要求本环境无法获得的实测数据）。\n"
+        "只输出一行 JSON：{\"issues\": [\"问题1\", ...]}；无问题输出 {\"issues\": []}。"
+    )
+
+    LOCAL_PATCH_SYSTEM_PROMPT = (
+        "你是单步骤修复器。只重写给定步骤（保持 id 与 dependencies 不变），"
+        "使其可执行、可验证；不得新增文件清理/移动/删除类操作。\n"
+        "输出 JSON：{\"steps\": [<仅该步骤的完整对象>]}（只输出 JSON）。"
+    )
+
+    _FAILED_DIRECTIONS_CAP = 20
+
+    def _record_event(self, event_type: str, **fields: Any) -> None:
+        """W2c: append-only capped decision/event log (never raises)."""
+        try:
+            events = getattr(self._conv, "deathmatch_events", None) or []
+            if not isinstance(events, list):
+                events = []
+            entry: Dict[str, Any] = {
+                "type": str(event_type)[:60],
+                "ts": _time.time(),
+                "turn": self._conv.deathmatch_turns or 0,
+            }
+            for k, v in fields.items():
+                key = str(k)[:30]
+                if isinstance(v, str):
+                    entry[key] = _truncate(v, 300)
+                elif isinstance(v, (int, float, bool)) or v is None:
+                    entry[key] = v
+                elif isinstance(v, list):
+                    entry[key] = [str(x)[:200] for x in v[:10]]
+                else:
+                    entry[key] = _truncate(str(v), 300)
+            events.append(entry)
+            cap = max(1, int(config.deathmatch_events_cap or 50))
+            self._conv.deathmatch_events = events[-cap:]
+        except Exception as exc:
+            logger.debug("event record failed: %s", exc)
+
+    def _write_pause_packet(
+        self,
+        *,
+        gate: str,
+        question: str,
+        options: Optional[List[Any]] = None,
+        default_if_continue: str = "",
+        state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """W2c: persist the PAUSED resume packet for every stop (vibeweaver
+        PAUSED protocol): gate / question / options / default / state."""
+        try:
+            self._conv.deathmatch_pause_state = {
+                "gate": str(gate)[:120],
+                "question": str(question)[:400],
+                "options": [str(o)[:200] for o in (options or [])][:3],
+                "default_if_continue": str(default_if_continue)[:200],
+                "state": state or {
+                    "status": self._conv.deathmatch_status,
+                    "turn": self._conv.deathmatch_turns or 0,
+                    "plan_version": self._conv.deathmatch_plan_version or 0,
+                },
+                "ts": _time.time(),
+            }
+            self._record_event(
+                "pause_packet", gate=gate, default=default_if_continue,
+            )
+        except Exception as exc:
+            logger.debug("pause packet write failed: %s", exc)
+
+    def _failed_directions(self) -> List[Dict[str, Any]]:
+        raw = getattr(self._conv, "deathmatch_failed_directions", None) or []
+        return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+    def _record_failed_direction(self, reason: str, family: str = "") -> Dict[str, Any]:
+        """W2b: record a failed direction (family-keyed); at/after the
+        configured threshold it becomes forbidden for this goal."""
+        fam = (family or _direction_family(reason))[:80]
+        entries = self._failed_directions()
+        hit: Optional[Dict[str, Any]] = None
+        for e in entries:
+            if str(e.get("family") or "") == fam:
+                hit = e
+                break
+        if hit is None:
+            hit = {
+                "family": fam, "reason": str(reason)[:300],
+                "count": 0, "forbidden": False,
+            }
+            entries.append(hit)
+        hit["count"] = int(hit.get("count") or 0) + 1
+        hit["reason"] = str(reason)[:300]
+        hit["ts"] = _time.time()
+        if hit["count"] >= max(1, int(config.deathmatch_failed_direction_forbidden_threshold or 3)):
+            hit["forbidden"] = True
+        self._conv.deathmatch_failed_directions = entries[-self._FAILED_DIRECTIONS_CAP:]
+        self._record_event(
+            "failed_direction", family=fam, count=hit["count"], forbidden=hit["forbidden"],
+        )
+        return hit
+
+    def _failed_directions_block(self) -> str:
+        items = [
+            e for e in self._failed_directions()
+            if int(e.get("count") or 0) > 0
+        ]
+        if not items:
+            return ""
+        lines = [
+            "<failed_directions>",
+            "已失败/被禁止的推进方向（禁止重复无新洞察的尝试；重试必须说明新洞察）：",
+        ]
+        for e in items[-8:]:
+            mark = "⛔ 禁止" if e.get("forbidden") else f"❌ 已失败×{e.get('count')}"
+            lines.append(f"- {mark} {str(e.get('reason') or e.get('family'))[:150]}")
+        lines.append("</failed_directions>")
+        return "\n".join(lines)
+
+    def _bump_no_progress_replan(self) -> bool:
+        """W2b: count a no-progress replan; True when the cap is reached."""
+        self._conv.deathmatch_no_progress_replans = (
+            int(getattr(self._conv, "deathmatch_no_progress_replans", 0) or 0) + 1
+        )
+        cap = int(config.deathmatch_no_progress_replan_cap or 0)
+        reached = bool(cap) and self._conv.deathmatch_no_progress_replans >= cap
+        self._record_event(
+            "no_progress_replan",
+            count=self._conv.deathmatch_no_progress_replans, cap=cap, reached=reached,
+        )
+        return reached
+
+    def _reset_no_progress_replan(self) -> None:
+        if int(getattr(self._conv, "deathmatch_no_progress_replans", 0) or 0):
+            self._conv.deathmatch_no_progress_replans = 0
+            self._record_event("no_progress_replan", count=0, reset=True)
+
+    async def _synthesize_acceptance_criteria(self) -> List[Dict[str, Any]]:
+        """W1a: draft the acceptance criteria right after goal synthesis.
+        Fail-open: LLM failure leaves the legacy prose-goal behavior intact
+        (and empties the stored criteria so no stale contract survives)."""
+        if not config.deathmatch_criteria_enabled:
+            return []
+        goal = self._conv.deathmatch_goal or ""
+        if not goal.strip():
+            return []
+        try:
+            qa = self._format_history_for_prompt()
+            llm = self._make_llm()
+            user_prompt = (
+                f"用户目标:\n{_truncate(goal, 1500)}\n\n"
+                f"盘问问答:\n{qa[:2000] if qa else '(无)'}\n\n"
+                "请起草验收标准并输出 JSON。"
+            )
+            raw = await self._llm_generate(
+                llm, self.CRITERIA_SYSTEM_PROMPT, user_prompt, temperature=0.2,
+            )
+            crit = _parse_criteria_response(raw)
+            self._conv.deathmatch_acceptance_criteria = crit or None
+            self._record_event(
+                "criteria_synthesized",
+                count=len(crit),
+                contract_hash=_contract_hash(goal, crit) if crit else "",
+            )
+            return crit
+        except Exception as exc:
+            logger.warning("acceptance criteria synthesis failed (fail-open): %s", exc)
+            self._conv.deathmatch_acceptance_criteria = None
+            self._record_event("criteria_synthesized", count=0, error=str(exc)[:120])
+            return []
+
+    async def _audit_plan_core(self, plan: Dict[str, Any]) -> List[str]:
+        """W1d: independent plan-core audit (Prove2Me captain analogue).
+        Fail-open: any LLM/parse failure returns [] (the loop proceeds)."""
+        if not config.deathmatch_plan_audit_enabled:
+            return []
+        if not isinstance(plan, dict) or not (plan.get("steps") or []):
+            return []
+        try:
+            llm = self._make_llm(model_override=config.deathmatch_plan_audit_model or "")
+            user_prompt = (
+                f"用户目标:\n{_truncate(self._conv.deathmatch_goal or '', 1200)}\n\n"
+                f"{_format_criteria_block(self._all_criteria())}\n\n"
+                f"盘问问答:\n{(self._format_history_for_prompt() or '(无)')[:1500]}\n\n"
+                f"待审计划:\n{json.dumps(plan.get('steps') or [], ensure_ascii=False)[:4000]}\n\n"
+                "请审查并输出 JSON。"
+            )
+            raw = await self._llm_generate(
+                llm, self.PLAN_AUDIT_SYSTEM_PROMPT, user_prompt,
+                temperature=0.0, timeout=90.0,
+            )
+            parsed = self._parse_json_object(raw) or {}
+            issues = parsed.get("issues")
+            if isinstance(issues, list):
+                return [str(i)[:300] for i in issues[:10] if str(i).strip()]
+            return []
+        except Exception as exc:
+            logger.warning("plan-core audit failed (fail-open): %s", exc)
+            return []
+
+    def _check_file_condition(self, path: Any, min_bytes: Any, workspace_path: str) -> List[str]:
+        p = str(path or "").strip()
+        if not p:
+            return ["done_check 缺少 path"]
+        if not workspace_path:
+            return [f"无法定位工作区，无法检查交付物: {p}"]
+        abs_path = p if _os.path.isabs(p) else _os.path.join(workspace_path, p)
+        if not _os.path.isfile(abs_path):
+            return [f"缺少交付物文件: {p}"]
+        try:
+            size = _os.path.getsize(abs_path)
+        except OSError:
+            return [f"无法读取交付物: {p}"]
+        try:
+            mb = max(0, int(min_bytes or 0))
+        except (TypeError, ValueError):
+            mb = 0
+        if mb and size < mb:
+            return [f"交付物 {p} 仅 {size}B（要求 ≥{mb}B）"]
+        return []
+
+    async def _run_gate_command(self, command: str, workspace_path: str) -> List[str]:
+        """Execute a gate command inside the code-execution sandbox.
+        Returns [] on pass; an issue list on failure. Internal errors are
+        fail-open ([]), matching the original verification-gate semantics."""
+        command = str(command or "").strip()
+        if not command or len(command) > 500:
+            return ["gate 命令为空或过长"]
+        try:
+            from app.services.code_execution_service import CodeExecutionService
+            svc = CodeExecutionService()
+            # N1: the command travels via an ENV VAR, not embedded in the
+            # Python source — the static safety scan sees only this fixed
+            # wrapper (quote-blind regexes would otherwise reject perfectly
+            # valid gate commands containing "os.system", "eval", "open('/')"
+            # etc. inside the command literal).
+            code = (
+                "import subprocess, os, sys\n"
+                "cmd = os.environ.get('DM_GATE_CMD', '')\n"
+                "if not cmd:\n"
+                "    raise SystemExit('no DM_GATE_CMD')\n"
+                "r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)\n"
+                "print(f'[gate] exit={r.returncode}')\n"
+                "print((r.stdout or '')[-2000:])\n"
+                "print((r.stderr or '')[-2000:], file=sys.stderr)\n"
+            )
+            result = await svc.execute_python(
+                code, cwd=workspace_path, timeout=90,
+                extra_env={"DM_GATE_CMD": command},
+                allow_patterns=["subprocess module is not allowed"],
+            )
+            output = f"{result.stdout or ''}{result.stderr or ''}"
+            if getattr(result, "error", None):
+                output = output + f"\n[execution error] {result.error}"
+            # A4.9 r2 N3: anchor PASS to the wrapper's OWN first stdout line —
+            # a command echoing "[gate] exit=0" after a real failure must not
+            # spoof a pass.
+            _first_line = ""
+            try:
+                _first_line = (result.stdout or "").splitlines()[0].strip()
+            except (IndexError, AttributeError):
+                _first_line = ""
+            if result.return_code == 0 and _first_line == "[gate] exit=0":
+                return []
+            # I6: sanitize the gate output before it becomes an issue
+            # (prompt-injection surface).
+            return [_sanitize_gate_output(
+                f"验证门禁未通过（exit≠0）：{output[-1500:] or '(无输出)'}"
+            )]
+        except Exception as exc:
+            logger.warning("gate command error (non-blocking): %s", exc)
+            return []
+
+    async def _run_goal_comparator(self, workspace_path: str) -> List[str]:
+        """W1e: deterministic goal comparator — execute every mechanical
+        acceptance criterion (file checks always; gate checks only when the
+        command gate is enabled). Returns issue strings ([] = pass).
+        Fail-closed: an empty workspace or an internal error blocks finalize
+        instead of silently disabling the mechanical gate (A4.9 Important)."""
+        if not config.deathmatch_goal_comparator_enabled:
+            return []
+        checks = _mechanical_checks(self._all_criteria())
+        if not checks:
+            return []
+        if not workspace_path:
+            self._record_event("comparator", error="workspace_path empty", phase="error")
+            return ["无法定位工作区（workspace_path 为空），机械验收不可执行"]
+        issues: List[str] = []
+        try:
+            for c in checks:
+                check = c.get("check") or {}
+                if check.get("kind") == "file":
+                    issues += [
+                        f"[{c.get('id')}] {i}"
+                        for i in self._check_file_condition(
+                            check.get("path"), check.get("min_bytes"), workspace_path
+                        )
+                    ]
+                elif check.get("kind") == "gate":
+                    if not config.deathmatch_verify_command_gate_enabled:
+                        continue
+                    issues += [
+                        f"[{c.get('id')}] {i}"
+                        for i in await self._run_gate_command(check.get("cmd"), workspace_path)
+                    ]
+        except Exception as exc:
+            logger.warning("goal comparator failed (fail-closed): %s", exc)
+            self._record_event("comparator", error=str(exc)[:200], phase="error")
+            return [f"comparator 执行异常（fail-closed）：{type(exc).__name__}"]
+        return issues
+
+    async def _run_step_done_checks(self, step: Dict[str, Any], workspace_path: str) -> List[str]:
+        """W1e: deterministic per-step finalize check for unfinished steps."""
+        check = step.get("done_check") or {}
+        mode = str(check.get("mode") or "none")
+        if mode == "file":
+            return self._check_file_condition(
+                check.get("path"), check.get("min_bytes"), workspace_path
+            )
+        if mode == "gate":
+            if not config.deathmatch_verify_command_gate_enabled:
+                return []
+            return await self._run_gate_command(str(check.get("cmd") or ""), workspace_path)
+        return []
+
+    async def _local_patch_step(self, step: Dict[str, Any], issues: List[str]) -> bool:
+        """W2a: rewrite a single failing step (id + dependencies preserved,
+        protocol-validated against the full candidate plan). Returns True on
+        a successful, applied patch."""
+        try:
+            plan = self._conv.deathmatch_plan
+            if not isinstance(plan, dict):
+                return False
+            old_steps = list(plan.get("steps") or [])
+            idx = next(
+                (i for i, s in enumerate(old_steps) if s.get("id") == step.get("id")),
+                None,
+            )
+            if idx is None:
+                return False
+            llm = self._make_llm()
+            user_prompt = (
+                f"目标:\n{_truncate(self._conv.deathmatch_goal or '', 800)}\n\n"
+                f"当前步骤:\n{json.dumps(step, ensure_ascii=False)[:1500]}\n\n"
+                f"验证器问题:\n"
+                + "\n".join(f"- {str(i)[:200]}" for i in (issues or [])[:6])
+                + "\n\n请重写该步骤。"
+            )
+            raw = await self._llm_generate(
+                llm, self.LOCAL_PATCH_SYSTEM_PROMPT, user_prompt, temperature=0.2,
+            )
+            patched = self._parse_plan(raw)
+            if not patched:
+                return False
+            new_steps = patched.get("steps") or []
+            if len(new_steps) != 1:
+                return False
+            new_step = new_steps[0]
+            if str(new_step.get("id")) != str(step.get("id")):
+                return False
+            if list(new_step.get("dependencies") or []) != list(step.get("dependencies") or []):
+                return False
+            candidate_steps = list(old_steps)
+            new_step["status"] = "pending"
+            # A4.9 Important: preserve the attempt counter/recovery state —
+            # _parse_plan resets them (the model cannot be trusted to echo
+            # them), and a reset would make local_patch re-armable forever
+            # instead of "once, then legacy stall".
+            new_step["attempts"] = int(step.get("attempts") or 0)
+            new_step["recovery"] = "local_patch_applied"
+            candidate_steps[idx] = new_step
+            if _validate_plan_protocol({"steps": candidate_steps}, None):
+                return False
+            self._conv.deathmatch_plan = {"steps": candidate_steps}
+            self._conv.deathmatch_plan_version = (self._conv.deathmatch_plan_version or 0) + 1
+            self._record_event(
+                "local_patch", step_id=str(step.get("id")),
+                issues=[str(i)[:200] for i in (issues or [])[:5]],
+            )
+            return True
+        except Exception as exc:
+            logger.warning("local patch failed: %s", exc)
+            return False
+
+    async def _maybe_node_recovery(
+        self,
+        verify_result: Optional[Dict[str, Any]],
+        last_response: str,
+    ) -> Optional[Dict[str, Any]]:
+        """W2a: per-node recovery FSM on a no-progress partial round.
+        local_retry (attempts <= max) → local_patch (once) → legacy stall.
+        Returns a continue-decision when a local_patch was applied (the
+        legacy stall is skipped this turn); None otherwise."""
+        if not verify_result or verify_result.get("status") != "partial":
+            return None
+        plan = self._conv.deathmatch_plan
+        if not isinstance(plan, dict):
+            return None
+        step_id = verify_result.get("current_step")
+        step = next(
+            (s for s in (plan.get("steps") or []) if s.get("id") == step_id),
+            None,
+        )
+        if step is None:
+            return None
+        step["attempts"] = int(step.get("attempts") or 0) + 1
+        action = _recovery_action(
+            step["attempts"], config.deathmatch_node_recovery_max_retries
+        )
+        step["recovery"] = action
+        diagnosis = str(verify_result.get("diagnosis") or "").strip()
+        if not diagnosis:
+            diagnosis = str(verify_result.get("retry_instruction") or "").strip()[:200]
+        self._record_event(
+            "node_recovery", step_id=str(step_id), attempts=step["attempts"],
+            action=action, diagnosis=diagnosis[:200],
+        )
+        issues = [str(i)[:200] for i in (verify_result.get("issues") or [])[:5]]
+        if action == "local_retry":
+            self._record_failed_direction(
+                f"[{step_id}] {issues[0] if issues else (diagnosis or '同一问题未解决')}",
+                family=f"node:{step_id}",
+            )
+            return None
+        if action == "local_patch":
+            _patch_issues = list(issues) + ([f"诊断: {diagnosis}"] if diagnosis else [])
+            ok = await self._local_patch_step(step, _patch_issues)
+            if ok:
+                return {
+                    "status": "active",
+                    "should_continue": True,
+                    "continuation_prompt": self.get_continuation_prompt(last_response),
+                    "verdict": "continue",
+                    "reason": f"local_patch: 步骤 {step_id} 已局部重写（第{step['attempts']}次尝试）",
+                    "message": (
+                        f"[死磕] 步骤 {step_id} 连续未过，已局部重写计划并继续 "
+                        f"(第{self._conv.deathmatch_turns}轮)"
+                    ),
+                    "verify_result": verify_result,
+                }
+            self._record_failed_direction(
+                f"[{step_id}] local_patch 失败: {diagnosis or '协议校验不通过'}",
+                family=f"node:{step_id}",
+            )
+        return None
+
     async def generate_goal_plan(self, db: AsyncSession) -> Optional[Dict[str, Any]]:
         """Generate a structured plan right after grilling completes.
 
@@ -3395,6 +4522,39 @@ intent 只能是以下之一：
             )
             return None
 
+        # W1d: independent plan-core audit (default ON, fail-open) — one
+        # bounded repair + re-audit; remaining issues are recorded but never
+        # block the loop.
+        try:
+            audit_issues = await self._audit_plan_core(plan)
+        except Exception as exc:
+            logger.warning("plan-core audit error (fail-open): %s", exc)
+            audit_issues = []
+        if audit_issues:
+            self._record_event("plan_audit", issues=audit_issues[:5], repaired=False)
+            try:
+                repair_prompt = (
+                    user_prompt
+                    + "\n\n【计划核心审计发现问题】\n- "
+                    + "\n- ".join(audit_issues[:8])
+                    + "\n请修复上述问题后重新输出完整 JSON 计划（只输出 JSON）。"
+                )
+                raw2 = await self._llm_generate(llm, system_prompt, repair_prompt)
+                plan2 = await self._parse_plan_with_repair(
+                    raw2, user_prompt, llm, system_prompt=system_prompt,
+                )
+                if plan2:
+                    remaining = await self._audit_plan_core(plan2)
+                    plan = plan2
+                    self._record_event(
+                        "plan_audit", issues=audit_issues[:5],
+                        remaining=remaining[:5], repaired=True,
+                    )
+            except Exception as exc:
+                logger.warning("plan-core audit repair failed (non-blocking): %s", exc)
+        else:
+            self._record_event("plan_audit", issues=[], repaired=False)
+
         self._conv.deathmatch_plan = plan
         self._conv.deathmatch_plan_version = (self._conv.deathmatch_plan_version or 0) + 1
         return plan
@@ -3437,6 +4597,18 @@ intent 只能是以下之一：
                 [str(t)[:60] for t in _tools if isinstance(t, str) and t.strip()][:12]
                 if isinstance(_tools, list) else []
             )
+            _kind_raw = str(s.get("kind") or "").strip().lower()
+            if _kind_raw not in _STEP_KINDS:
+                _kind_raw = "research" if s.get("delegable") is True else "write"
+            _writes_raw = s.get("writes")
+            _writes_norm = (
+                [str(w)[:200] for w in _writes_raw if isinstance(w, str) and w.strip()][:20]
+                if isinstance(_writes_raw, list) else []
+            )
+            try:
+                _attempts = max(0, int(s.get("attempts") or 0))
+            except (TypeError, ValueError):
+                _attempts = 0
             norm.append({
                 "id": str(s.get("id") or f"s{len(norm)+1}"),
                 "description": str(s.get("description", ""))[:600],
@@ -3457,6 +4629,18 @@ intent 只能是以下之一：
                 # Strict bool: anything else (incl. the string "false") = False.
                 "delegable": s.get("delegable") if isinstance(s.get("delegable"), bool) else False,
                 "status": str(s.get("status") or "pending"),
+                # ── v2（死磕 DAG 波次 W1b）────────────────────────────
+                "kind": _kind_raw,
+                "writes": _writes_norm,
+                "parallel_safe": (
+                    s.get("parallel_safe")
+                    if isinstance(s.get("parallel_safe"), bool) else False
+                ),
+                "done_check": _normalize_done_check(
+                    s.get("done_check"), str(s.get("verification_method", ""))
+                ),
+                "attempts": _attempts,
+                "recovery": str(s.get("recovery") or "idle")[:20],
             })
         return {"steps": norm} if norm else None
 
@@ -3773,67 +4957,41 @@ intent 只能是以下之一：
         return "\n".join(snippets) if snippets else "(无法读取前序文件内容)"
 
     async def _run_verification_gate(self, workspace_path: str, current_step: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """A1b: deterministic verification gate — a step's
-        verification_method may start with ``gate: <shell command>``; the
-        command runs inside the code-execution sandbox (cwd = workspace)
-        BEFORE the LLM verifier. Exit 0 → pass (returns None); non-zero →
-        the gate output becomes the issue (partial, short-circuits the LLM
-        call — deterministic evidence beats vibe). Opt-in via config."""
+        """A1b + W1b: deterministic verification gate — a step's
+        verification_method may start with ``gate: <shell command>`` (legacy)
+        or carry a done_check {mode: gate}. The command runs inside the
+        code-execution sandbox (cwd = workspace) BEFORE the LLM verifier.
+        Exit 0 → pass (returns None); non-zero → the gate output becomes
+        the issue (partial, short-circuits the LLM call). Opt-in via config."""
         if not config.deathmatch_verify_command_gate_enabled:
             return None
         method = str(current_step.get("verification_method") or "").strip()
-        if not method.startswith("gate:"):
-            return None
-        command = method[len("gate:"):].strip()
+        command = ""
+        if method.startswith("gate:"):
+            command = method[len("gate:"):].strip()
+        else:
+            check = current_step.get("done_check") or {}
+            if isinstance(check, dict) and str(check.get("mode")) == "gate":
+                command = str(check.get("cmd") or "")
         if not command or len(command) > 500:
             return None
-        try:
-            from app.services.code_execution_service import CodeExecutionService
-            svc = CodeExecutionService()
-            # N1: the command travels via an ENV VAR, not embedded in the
-            # Python source — the static safety scan sees only this fixed
-            # wrapper (quote-blind regexes would otherwise reject perfectly
-            # valid gate commands containing "os.system", "eval", "open('/')"
-            # etc. inside the command literal).
-            code = (
-                "import subprocess, os\n"
-                "cmd = os.environ.get('DM_GATE_CMD', '')\n"
-                "if not cmd:\n"
-                "    raise SystemExit('no DM_GATE_CMD')\n"
-                "r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)\n"
-                "print(f'[gate] exit={r.returncode}')\n"
-                "print((r.stdout or '')[-2000:])\n"
-                "print((r.stderr or '')[-2000:], file=sys.stderr)\n"
+        issues = await self._run_gate_command(command, workspace_path)
+        if not issues:
+            logger.info(
+                "deathmatch verification gate PASSED for step %s (conv %s)",
+                current_step.get("id"), self._conv.id,
             )
-            result = await svc.execute_python(
-                code, cwd=workspace_path, timeout=90,
-                extra_env={"DM_GATE_CMD": command},
-                allow_patterns=["subprocess module is not allowed"],
-            )
-            output = f"{result.stdout or ''}{result.stderr or ''}"
-            if getattr(result, "error", None):
-                output = output + f"\n[execution error] {result.error}"
-            if result.return_code == 0 and "[gate] exit=0" in output:
-                logger.info(
-                    "deathmatch verification gate PASSED for step %s (conv %s)",
-                    current_step.get("id"), self._conv.id,
-                )
-                return None
-            # I6: sanitize the gate output before it becomes an issue
-            # (prompt-injection surface — the verifier is short-circuited).
-            issue = _sanitize_gate_output(
-                f"验证门禁未通过（exit≠0）：{output[-1500:] or '(无输出)'}"
-            )
-            logger.info("deathmatch verification gate BLOCKED step %s: %s",
-                        current_step.get("id"), issue[:200])
-            return {
-                "status": "partial",
-                "issues": [issue],
-                "retry_instruction": f"修复后重跑验证命令：{command[:200]}",
-            }
-        except Exception as exc:
-            logger.warning("verification gate error (non-blocking): %s", exc)
             return None
+        issue = issues[0]
+        logger.info(
+            "deathmatch verification gate BLOCKED step %s: %s",
+            current_step.get("id"), issue[:200],
+        )
+        return {
+            "status": "partial",
+            "issues": [issue],
+            "retry_instruction": f"修复后重跑验证命令：{command[:200]}",
+        }
 
     async def verify_step_outputs(
         self,
@@ -4039,7 +5197,11 @@ intent 只能是以下之一：
                 )
                 user_prompt = (
                     f"目标:\n{_truncate(self._conv.deathmatch_goal or '', 800)}\n\n"
-                    f"当前正在执行的步骤:\n{json.dumps(current_step, ensure_ascii=False)[:1000]}\n\n"
+                    + (
+                        f"{_format_criteria_block(self._all_criteria())}\n\n"
+                        if _format_criteria_block(self._all_criteria()) else ""
+                    )
+                    + f"当前正在执行的步骤:\n{json.dumps(current_step, ensure_ascii=False)[:1000]}\n\n"
                     # A4.9 M2: the step JSON dump is capped at 1000 chars and
                     # boundary sits late in key order — surface it explicitly
                     # so check-item 9 can never be silently inert.
@@ -4137,6 +5299,9 @@ intent 只能是以下之一：
                     result["continuity_brief"] = str(
                         parsed.get("continuity_brief") or ""
                     ).strip()[:800]
+                    # W2a: the verifier's falsifiable diagnosis for this round
+                    # (feeds the node-recovery ladder / failed directions).
+                    result["diagnosis"] = str(parsed.get("diagnosis") or "").strip()[:300]
 
                     # Only mark the current step as done when the LLM verifier
                     # explicitly says "complete". Do NOT use heuristic shortcuts.
@@ -4185,6 +5350,9 @@ intent 只能是以下之一：
                                     f"步骤 {current_step.get('id')} 完成："
                                     f"{str(current_step.get('description') or '')[:80]}"
                                 ),
+                                # W1c: freeze the statement + hash of the
+                                # settled step (replan must preserve it).
+                                "step": dict(current_step),
                             })
                             # Bible evolution: extract canon facts from this
                             # completed step (creative goals) — background
@@ -4439,6 +5607,10 @@ intent 只能是以下之一：
                 "\n\n注意：当前计划的所有步骤均已完成，但用户目标尚未完全达成。"
                 "请根据目标补充新的步骤来完成剩余工作。"
             )
+        # W2b: the replanner must see (and not reintroduce) failed directions.
+        _failed_block = self._failed_directions_block()
+        if _failed_block:
+            user_prompt += "\n\n" + _failed_block
         # C2 harness repair (coarse_replan, one-shot): the last stall judged
         # the plan too fine-grained — ask for a coarser plan this time.
         if getattr(self, "_replan_coarse", False):
@@ -4459,6 +5631,23 @@ intent 只能是以下之一：
             raw, user_prompt, llm, system_prompt=replanner_prompt,
         )
         if new_plan:
+            # W1c: settled statements are immutable — a replan that rewrites,
+            # drops or un-dones a done step is rejected outright (the settled
+            # ledger keeps the evidence; the plan may only grow/new-version).
+            _violations = _validate_done_steps_preserved(
+                steps, new_plan.get("steps") or []
+            )
+            if _violations:
+                logger.warning(
+                    "PEVR replan rejected: settled-statement violations: %s",
+                    "; ".join(_violations[:3]),
+                )
+                self._record_event("statement_violation", violations=_violations[:5])
+                self._record_failed_direction(
+                    f"重规划试图改写已定案步骤: {_violations[0]}",
+                    family="statement-violation",
+                )
+                return None
             # Carry over per-step continuity state from the OLD plan so the
             # anti-drift fallback chain (step continuity_brief / output_files /
             # output_summary) survives replanning — otherwise a replan severs
@@ -4527,6 +5716,14 @@ intent 只能是以下之一：
             ],
         }
         self._conv.deathmatch_human_gate = json.dumps(gate_report, ensure_ascii=False)
+        # W2c: persist the structured PAUSED resume packet (gate/question/
+        # options/default-if-continue/state) — every stop has a resume packet.
+        self._write_pause_packet(
+            gate=str(reason)[:80] or "human_gate",
+            question=str(reason)[:400],
+            options=gate_report.get("suggested_actions") or [],
+            default_if_continue="发送任意消息 = 按默认建议继续推进",
+        )
 
     async def evaluate_after_turn(
         self,
@@ -4694,7 +5891,7 @@ intent 只能是以下之一：
         # are already recovered agentically by _safe_judge's continuation
         # directive + the verifier's progress detection, and judge/verifier
         # conflicts are resolved by an LLM reconciliation below.
-        _goal_with_subgoals = self._goal_with_subgoals()
+        _goal_with_subgoals = self._goal_with_criteria()
         # B1: build the environment evidence pack for the judge (AJ-Bench:
         # judge+evidence > stronger blind judge). Deterministic, no LLM.
         _judge_evidence = ""
@@ -4887,6 +6084,134 @@ intent 只能是以下之一：
 
         # If judge says done, verify against the plan before finalizing.
         if verdict == "done":
+            # W1e: deterministic goal comparator — mechanical acceptance
+            # criteria run BEFORE any finalize path (fail-closed: a failed
+            # mechanical check rejects the done verdict outright).
+            _cmp_issues: List[str] = []
+            try:
+                _cmp_issues = await self._run_goal_comparator(workspace_path)
+            except Exception as exc:
+                logger.warning("goal comparator failed (fail-open): %s", exc)
+            if _cmp_issues:
+                self._record_event("comparator", issues=_cmp_issues[:5], phase="block")
+                self._record_failed_direction(
+                    "机械验收未通过：" + _cmp_issues[0], family="comparator",
+                )
+                # A4.9 Important: a blocked done must also feed the global
+                # convergence breaker — an unsatisfiable mechanical criterion
+                # must not loop forever under unlimited autonomy.
+                if self._bump_no_progress_replan():
+                    self.trigger_human_gate(
+                        f"机械验收连续 {self._conv.deathmatch_no_progress_replans} 次未通过，"
+                        "已触发全局收敛断路器（可恢复）",
+                        report={"suggested_actions": ["继续（发送任意消息）", "调整目标", "放弃"]},
+                    )
+                    try:
+                        self._final_attachments = await self.collect_final_deliverables_from_messages()
+                    except Exception:
+                        self._final_attachments = []
+                    return {
+                        "status": "human_gate",
+                        "should_continue": False,
+                        "continuation_prompt": None,
+                        "verdict": "continue",
+                        "reason": (
+                            f"comparator_blocked_cap "
+                            f"({self._conv.deathmatch_no_progress_replans})"
+                        ),
+                        "message": (
+                            f"死磕模式已进入人工介入 — 机械验收连续 "
+                            f"{self._conv.deathmatch_no_progress_replans} 次未通过"
+                            f"（{_cmp_issues[0][:80]}）。"
+                            "\n继续方式（PAUSED）：发送任意消息 = 按默认建议继续推进（默认）；"
+                            "回复「调整目标」改变目标；回复「放弃」结束死磕。"
+                        ),
+                        "verify_result": verify_result,
+                    }
+                _cont = self.get_continuation_prompt(last_response) or ""
+                _cont_block = (
+                    "\n\n[系统] 机械验收（goal comparator）未通过，必须修复后才能结束：\n- "
+                    + "\n- ".join(_cmp_issues[:5])
+                )
+                return {
+                    "status": "active",
+                    "should_continue": True,
+                    "continuation_prompt": _cont + _cont_block,
+                    "verdict": "continue",
+                    "reason": "comparator: " + "; ".join(_cmp_issues[:3]),
+                    "message": (
+                        f"[死磕] 机械验收未通过（{_cmp_issues[0][:60]}），继续修复 "
+                        f"(第{self._conv.deathmatch_turns}轮)"
+                    ),
+                    "verify_result": verify_result,
+                }
+            self._record_event("comparator", issues=[], phase="pass")
+            if _has_plan:
+                _step_issues: List[str] = []
+                for s in _unfinished_steps:
+                    try:
+                        _step_issues += [
+                            f"[{s.get('id')}] {i}"
+                            for i in await self._run_step_done_checks(s, workspace_path)
+                        ]
+                    except Exception:
+                        continue
+                if _step_issues:
+                    self._record_event(
+                        "step_done_check", issues=_step_issues[:5], phase="block",
+                    )
+                    # A4.9 Important: same breaker accounting as the goal
+                    # comparator block (bounded, resumable).
+                    if self._bump_no_progress_replan():
+                        self.trigger_human_gate(
+                            f"步骤机械验收连续 {self._conv.deathmatch_no_progress_replans} 次未通过，"
+                            "已触发全局收敛断路器（可恢复）",
+                            report={"suggested_actions": ["继续（发送任意消息）", "调整目标", "放弃"]},
+                        )
+                        try:
+                            self._final_attachments = await self.collect_final_deliverables_from_messages()
+                        except Exception:
+                            self._final_attachments = []
+                        return {
+                            "status": "human_gate",
+                            "should_continue": False,
+                            "continuation_prompt": None,
+                            "verdict": "continue",
+                            "reason": (
+                                f"step_done_check_cap "
+                                f"({self._conv.deathmatch_no_progress_replans})"
+                            ),
+                            "message": (
+                                f"死磕模式已进入人工介入 — 步骤机械验收连续 "
+                                f"{self._conv.deathmatch_no_progress_replans} 次未通过"
+                                f"（{_step_issues[0][:80]}）。"
+                                "\n继续方式（PAUSED）：发送任意消息 = 按默认建议继续推进（默认）；"
+                                "回复「调整目标」改变目标；回复「放弃」结束死磕。"
+                            ),
+                            "verify_result": verify_result,
+                        }
+                    _cont = self.get_continuation_prompt(last_response) or ""
+                    _cont_block = (
+                        "\n\n[系统] 未完成步骤的机械验收未通过，必须修复后才能结束：\n- "
+                        + "\n- ".join(_step_issues[:5])
+                    )
+                    return {
+                        "status": "active",
+                        "should_continue": True,
+                        "continuation_prompt": _cont + _cont_block,
+                        "verdict": "continue",
+                        "reason": "step_done_check: " + "; ".join(_step_issues[:3]),
+                        "message": (
+                            f"[死磕] 步骤机械验收未通过（{_step_issues[0][:60]}），继续修复 "
+                            f"(第{self._conv.deathmatch_turns}轮)"
+                        ),
+                        "verify_result": verify_result,
+                    }
+            # Both mechanical gates passed (goal comparator + unfinished-step
+            # done_check) — genuine progress, clear the breaker (A4.9 r2 N1:
+            # the reset must come AFTER the step checks, or a step-level
+            # block can never reach the cap).
+            self._reset_no_progress_replan()
             # Agentic completion gate: the judge LLM is the completion
             # authority (agentic principle 2026-07-20 — 禁止正则/硬编码分类
             # 器). When the plan still has unfinished steps or the verifier
@@ -4923,6 +6248,7 @@ intent 只能是以下之一：
                         # Genuine progress → reset stall counter (matches the
                         # normal-progress reset in the partial branch below).
                         self._conv.deathmatch_verify_failures = 0
+                        self._reset_no_progress_replan()
                         _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)  # C2: progress resets repair budget
                     logger.info(
                         "deathmatch: judge=done but reconciliation=continue "
@@ -4967,6 +6293,7 @@ intent 只能是以下之一：
                 # decision == finalize → fall through to the done finalize.
             self._conv.deathmatch_status = "done"
             self._conv.deathmatch_verify_failures = 0
+            self._reset_no_progress_replan()
             _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)  # C2: progress resets repair budget
             # The judge's done verdict is accepted (possibly backed by the
             # reconciliation LLM) — mark remaining plan steps done so the UI
@@ -4975,6 +6302,19 @@ intent 只能是以下之一：
                 for s in (_plan.get("steps") or []):
                     if s.get("status") != "done":
                         s["status"] = "done"
+                if _unfinished_steps:
+                    # W1e + A4.9 Minor: only steps whose mechanical checks
+                    # PASSED (or declared none) reach this point — record the
+                    # close-out with an accurate reason.
+                    self._record_event(
+                        "finalized_without_step_evidence",
+                        steps=[s.get("id") for s in _unfinished_steps][:10],
+                        reason=(
+                            "reconcile-finalize：这些步骤未经 verifier 单独定案；"
+                            "机械 done_check 未发现失败（gate 类在未启用时跳过、执行异常不阻断；"
+                            "失败者已在收口前拦截）"
+                        ),
+                    )
             # Generate the final task summary table.
             final_table = self.generate_final_summary_table()
             # Collect deliverable files from agent tool output (not filesystem
@@ -5009,6 +6349,13 @@ intent 只能是以下之一：
             # C1 freeze: this paused path must not charge the parked period
             # on resume (A4.9 r4 Important 3 residual).
             self._freeze_wall_time()
+            # W2c: every stop carries a resume packet (A4.9 Minor).
+            self._write_pause_packet(
+                gate="judge-parse-failures",
+                question=self._conv.deathmatch_reason,
+                options=["发送任意消息重试", "调整目标", "放弃"],
+                default_if_continue="按默认建议重试评判并继续推进",
+            )
             try:
                 self._final_attachments = await self.collect_final_deliverables_from_messages()
             except Exception:
@@ -5109,6 +6456,7 @@ intent 只能是以下之一：
                 # recovered (a dead judge must still escalate, P1-7).
                 if not infra_failed:
                     self._conv.deathmatch_verify_failures = 0
+                    self._reset_no_progress_replan()
                     _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)  # C2: progress resets repair budget
             elif _progress_made_pc:
                 logger.info(
@@ -5120,6 +6468,7 @@ intent 只能是以下之一：
                 # (skipped on judge infra turns — P1-7).
                 if not infra_failed:
                     self._conv.deathmatch_verify_failures = 0
+                    self._reset_no_progress_replan()
                     _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)  # C2: progress resets repair budget
             else:
                 # The branch already attempted replan once this turn — do NOT
@@ -5159,6 +6508,45 @@ intent 只能是以下之一：
                         f"verifier partial, no progress (step {verify_result.get('current_step')}, "
                         "no new files or completed steps)"
                     )
+                # W2a: per-node recovery ladder (local_retry → local_patch)
+                # before the legacy stall machinery (attempts carried on the
+                # step; a successful local_patch returns a continue decision).
+                _node_decision = await self._maybe_node_recovery(
+                    verify_result, last_response
+                )
+                if _node_decision is not None:
+                    return _node_decision
+                # W2b: global no-progress replan breaker (approved plan §5):
+                # counts only rounds that would actually replan; a resumable
+                # human_gate bounds runaway replan churn even in autonomy.
+                _will_replan = self._conv.deathmatch_verify_failures >= 1
+                if _will_replan and self._bump_no_progress_replan():
+                    self.trigger_human_gate(
+                        f"连续 {self._conv.deathmatch_no_progress_replans} 次无进展重规划，"
+                        "已触发全局收敛断路器（可恢复）",
+                        report={"suggested_actions": ["继续（发送任意消息）", "调整目标", "放弃"]},
+                    )
+                    try:
+                        self._final_attachments = await self.collect_final_deliverables_from_messages()
+                    except Exception:
+                        self._final_attachments = []
+                    return {
+                        "status": "human_gate",
+                        "should_continue": False,
+                        "continuation_prompt": None,
+                        "verdict": "continue",
+                        "reason": (
+                            f"no_progress_replan_cap "
+                            f"({self._conv.deathmatch_no_progress_replans})"
+                        ),
+                        "message": (
+                            f"死磕模式已进入人工介入 — 连续 "
+                            f"{self._conv.deathmatch_no_progress_replans} 次无进展重规划。"
+                            "\n继续方式（PAUSED）：发送任意消息 = 按默认建议继续推进（默认）；"
+                            "回复「调整目标」改变目标；回复「放弃」结束死磕。"
+                        ),
+                        "verify_result": verify_result,
+                    }
                 _stall = await self._handle_stall(
                     _stall_reason,
                     verify_result, last_response,
@@ -5176,6 +6564,11 @@ intent 只能是以下之一：
                 if not infra_failed:
                     self._conv.deathmatch_verify_failures = 0
                     _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)  # C2: progress resets repair budget
+                    # W2b: real progress resets the global no-progress breaker.
+                    # A4.9 r2 N6: only on non-infra turns (same P1-7 rule as
+                    # the stall counter — a dead judge channel must not clear
+                    # the convergence breaker).
+                    self._reset_no_progress_replan()
 
         self._record_reflection(last_response, verdict, verify_result, reason=reason)
 
@@ -5199,6 +6592,13 @@ intent 只能是以下之一：
                     f"judge 连续 {_infra_n} 次超时/错误（infra），评估通道不可用"
                 )
                 self._freeze_wall_time()
+                # W2c: every stop carries a resume packet (A4.9 Minor).
+                self._write_pause_packet(
+                    gate="judge-infra",
+                    question=self._conv.deathmatch_reason,
+                    options=["发送任意消息重试", "调整目标", "放弃"],
+                    default_if_continue="检查模型服务后发送任意消息重试",
+                )
                 return {
                     "status": "paused",
                     "should_continue": False,
@@ -5353,11 +6753,21 @@ intent 只能是以下之一：
 
     def _record_settled(self, entry: Dict[str, Any]) -> None:
         """Append a settled verdict (step completion / reconcile overturn).
-        Bounded at _SETTLED_LEDGER_CAP; never raises."""
+        W1c: a step_complete entry freezes the step statement + its hash so a
+        later replan cannot silently reword settled work. Bounded, never raises."""
         try:
             ledger = self._settled_ledger()
             entry = dict(entry)
+            step = entry.pop("step", None)
+            if isinstance(step, dict):
+                entry["step_id"] = str(step.get("id") or "")
+                entry["statement_hash"] = step_statement_hash(step)
+                entry.setdefault("statement", {
+                    "description": str(step.get("description") or "")[:200],
+                    "expected_output": str(step.get("expected_output") or "")[:200],
+                })
             entry["turn"] = self._conv.deathmatch_turns or 0
+            entry["ts"] = _time.time()
             ledger.append(entry)
             self._conv.deathmatch_settled_ledger = ledger[-self._SETTLED_LEDGER_CAP:]
         except Exception as exc:

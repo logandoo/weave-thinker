@@ -232,6 +232,26 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> finishAffinity());
         }
 
+        /** Open an http(s) URL in the system browser instead of navigating the SPA WebView. */
+        @JavascriptInterface
+        public boolean openUrl(String url) {
+            if (url == null || url.isEmpty()) return false;
+            try {
+                Uri uri = Uri.parse(url);
+                String scheme = uri.getScheme();
+                if (scheme == null) return false;
+                scheme = scheme.toLowerCase();
+                if (!"http".equals(scheme) && !"https".equals(scheme)) return false;
+                Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(intent);
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "openUrl failed: " + url, e);
+                return false;
+            }
+        }
+
         private void showSaveResult(boolean success, String filename) {
             runOnUiThread(() -> {
                 if (success) {
@@ -469,7 +489,15 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public void onBackPressed() {
         webView.evaluateJavascript("window.handleAndroidBack && window.handleAndroidBack()", result -> {
-            if (!"true".equals(result)) {
+            if ("true".equals(result)) {
+                return;
+            }
+            // The current document may be an external page the SPA navigated to
+            // (e.g. a link inside a citation card). Prefer WebView history so the
+            // user returns to the SPA instead of exiting the app.
+            if (webView.canGoBack()) {
+                webView.goBack();
+            } else {
                 runOnUiThread(() -> MainActivity.super.onBackPressed());
             }
         });

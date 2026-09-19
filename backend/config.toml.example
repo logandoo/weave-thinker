@@ -49,6 +49,12 @@ Markdown格式要求（严格遵守，否则渲染会出错）：
 [agent.tools]
 mcp_progressive_enabled = true
 
+[agent.process]
+max_sessions_per_user = 4
+idle_timeout_seconds = 1800
+max_buffer_bytes = 262144
+max_read_chars = 20000
+
 [agent.tool_loop]
 max_iterations = 50
 max_consecutive_iterations = 999
@@ -86,6 +92,7 @@ enabled = false
 cache_ttl_minutes = 5
 
 [agent.audit]
+policy = "advisory"
 reject_budget = 2
 numeric_gate_enabled = true
 numeric_provenance_gate_mode = "enforce"
@@ -244,6 +251,9 @@ scheduled_task_retention_days = 30
 root_dir = "user_workspaces"
 use_project_venv = true
 create_readme = true
+snapshots_enabled = true
+snapshots_max_file_mb = 10
+snapshots_retention = 50
 
 [browser]
 enabled = true
@@ -364,8 +374,13 @@ stall_hard_threshold = 16
 verify_interval = 1
 self_eval_username = "<YOUR-DB-USER>"
 self_eval_password = "<YOUR-SECRET>"
-plan_exploration_enabled = true
-plan_exploration_max_steps = 5
+criteria_enabled = true
+plan_audit_enabled = true
+goal_comparator_enabled = true
+node_recovery_max_retries = 2
+failed_direction_forbidden_threshold = 3
+no_progress_replan_cap = 3
+events_cap = 50
 reflection_memory_max_items = 10
 continuity_anchor_enabled = true
 judge_evidence_enabled = true

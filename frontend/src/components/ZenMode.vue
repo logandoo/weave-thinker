@@ -114,8 +114,16 @@ function getHalfWidth() {
 const rightPanelWidth = ref(getHalfWidth())
 const isResizing = ref(false)
 
+// rAF 合帧 + 值守卫：连续 resize 每帧最多写一次，值未变不触发重渲染。
+let resizeRaf = 0
+
 function onWindowResize() {
-  rightPanelWidth.value = getHalfWidth()
+  if (resizeRaf) return
+  resizeRaf = requestAnimationFrame(() => {
+    resizeRaf = 0
+    const next = getHalfWidth()
+    if (next !== rightPanelWidth.value) rightPanelWidth.value = next
+  })
 }
 
 function startResize(e: MouseEvent) {

@@ -34,6 +34,10 @@ class PermissionContext:
 DEFAULT_AGENT_PERMISSIONS = {
     "terminal_execution": False,
     "code_execution": True,
+    # P0（2026-09-19）：工作区写/编辑默认允许（有快照回滚兜底）；恢复快照默认
+    # 拒绝（会覆盖工作区当前状态，需用户显式授权）。
+    "workspace_write": True,
+    "workspace_restore": False,
     "note_create": True,
     "note_edit": True,
     "note_delete": False,
@@ -76,6 +80,8 @@ def is_permission_allowed(user: Any, key: str) -> bool:
 def permission_description(key: str) -> str:
     descriptions = {
         "terminal_execution": "终端命令执行（高风险操作）",
+        "workspace_write": "工作区文件写入/编辑",
+        "workspace_restore": "恢复工作区快照（会覆盖当前文件内容）",
         "note_create": "新增笔记",
         "note_edit": "编辑笔记",
         "note_delete": "删除笔记",
@@ -90,6 +96,11 @@ def permission_key_for_tool_request(tool_name: str, details: Optional[Dict[str, 
     details = details or {}
     if tool_name == "terminal":
         return "terminal_execution"
+    if tool_name == "process":
+        action = (details.get("action") or "").lower()
+        if action in ("start", "write", "kill"):
+            return "terminal_execution"
+        return None
     if tool_name == "notes":
         action = (details.get("action") or "").lower()
         if action == "create_note":

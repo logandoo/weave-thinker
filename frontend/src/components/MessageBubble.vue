@@ -244,7 +244,7 @@
             <button class="note-preview-close" @click="searchPreviewIdx = null">×</button>
           </div>
           <div class="note-preview-body">
-            <a v-if="previewedResult.result.url" class="search-preview-url" :href="previewedResult.result.url" target="_blank" rel="noopener noreferrer">
+            <a v-if="previewedResult.result.url" class="search-preview-url" :href="previewedResult.result.url" target="_blank" rel="noopener noreferrer" @click="onPreviewUrlClick">
               {{ previewedResult.result.url }}
             </a>
             <p v-if="previewedResult.bibText" class="search-preview-bib">{{ previewedResult.bibText }}</p>
@@ -623,6 +623,62 @@ watch(mermaidZoomScale, () => {
   }
 })
 
+function onAndroidBack(e: Event) {
+  if (searchPreviewIdx.value !== null) {
+    e.preventDefault()
+    searchPreviewIdx.value = null
+    return
+  }
+  if (previewIdx.value !== null) {
+    e.preventDefault()
+    previewIdx.value = null
+    return
+  }
+  if (filePreviewIdx.value !== null) {
+    e.preventDefault()
+    filePreviewIdx.value = null
+    return
+  }
+  if (showMermaidCodeDialog.value) {
+    e.preventDefault()
+    closeMermaidCodeDialog()
+    return
+  }
+  if (showMermaidZoomDialog.value) {
+    e.preventDefault()
+    closeMermaidZoomDialog()
+    return
+  }
+  if (showMathViewDialog.value) {
+    e.preventDefault()
+    showMathViewDialog.value = false
+    return
+  }
+  if (lightboxMedia.value) {
+    e.preventDefault()
+    closeLightbox()
+  }
+}
+
+function openViaAndroidBridge(href: string): boolean {
+  const bridge = (window as any).WeaverNoteApp
+  if (bridge?.openUrl && href) {
+    try {
+      return bridge.openUrl(href) === true
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
+function onPreviewUrlClick(e: MouseEvent) {
+  const href = (e.currentTarget as HTMLAnchorElement).href
+  if (openViaAndroidBridge(href)) {
+    e.preventDefault()
+  }
+}
+
 async function onContentClick(e: MouseEvent) {
   const target = e.target as HTMLElement
   const img = target.tagName === 'IMG'
@@ -653,7 +709,9 @@ async function onContentClick(e: MouseEvent) {
       e.stopPropagation()
       const confirmed = await showLinkConfirm({ message: `确定要打开链接吗？\n${href}` })
       if (confirmed) {
-        window.open(href, '_blank', 'noopener,noreferrer')
+        if (!openViaAndroidBridge(href)) {
+          window.open(href, '_blank', 'noopener,noreferrer')
+        }
       }
     }
   }
@@ -693,6 +751,7 @@ onMounted(() => {
   document.addEventListener('mermaid-edit', onMermaidEdit as EventListener)
   document.addEventListener('mermaid-zoom', onMermaidZoom as EventListener)
   document.addEventListener('math-edit', onMathEdit as EventListener)
+  window.addEventListener('weaver:android-back', onAndroidBack)
 })
 
 onBeforeUnmount(() => {
@@ -700,6 +759,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('mermaid-edit', onMermaidEdit as EventListener)
   document.removeEventListener('mermaid-zoom', onMermaidZoom as EventListener)
   document.removeEventListener('math-edit', onMathEdit as EventListener)
+  window.removeEventListener('weaver:android-back', onAndroidBack)
 })
 
 function copyMessage() {

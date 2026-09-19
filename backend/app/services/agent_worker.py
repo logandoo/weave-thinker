@@ -28,7 +28,6 @@ from app.services.agent_loop import AgentLoop
 from app.services.llm_service import LLMService
 from app.services.agent_service import should_use_custom_model
 from app.services.title_generator import TitleGeneratorService
-from app.api.chat import _is_scratch_path
 from app.services.workspace_service import ensure_user_workspace
 from app.api.chat import _transform_tool_loop_results
 from app.services.markdown_sanitizer import sanitize_markdown
@@ -256,6 +255,7 @@ class AgentWorker:
             system_prompt = f"{system_prompt}\n\n{_BACKGROUND_TASK_HINT}"
 
             # E4（2026-09-14，默认关）：后台任务注入小预算用户记忆（fail-open）
+            _mem_block = ""
             try:
                 from app.services import memory_task_context as _mtc
                 if _mtc.background_task_memory_enabled():
@@ -322,6 +322,9 @@ class AgentWorker:
                 enable_compression=config.agent_compression_enabled,
                 permission_callback=_make_background_permission_callback(),
             )
+            # 记忆优先级最高（与 chat.py 同）：后台任务注入的记忆进入审计
+            # 证据域 [M]，不得被判「凭空编造」（2026-09-18 conv 3583d840）。
+            agent_loop.injected_memory_context = _mem_block or ""
 
             accumulated_response = ""
             accumulated_reasoning = ""
@@ -720,50 +723,34 @@ class AgentWorker:
             await asyncio.sleep(5)
 
     def _extract_attachments(self, tool_results_accumulated: list[dict]) -> list[dict]:
-        """Same policy as chat._transform_tool_loop_results:
+        """Explicit-only policy (user directive 2026-09-18, prod conv 8b382ad8).
 
-        - F3（2026-09-14）：产物收集改按工具注册元数据 `produces_files` 判定
-          （新工具声明即被收集）；未声明时回退旧名列表（向后兼容）。
-        - 声明产物的工具自动收集，排除 scratch/task_XXXX 临时文件。
-        - provide_file entries are the agent's explicit set: kept as-is (no
-          scratch filter) and win over auto-collection when present.
+        Download cards come solely from successful ``provide_file`` calls —
+        the agent's explicit delivery intent. Byproducts of execute_code /
+        terminal / other file-producing tools are never auto-attached: an
+        analysis background task must not offer the files it analyzed.
         """
-        try:
-            from app.tools.registry import registry as _tool_registry
-        except Exception:
-            _tool_registry = None
-        auto_attachments = []
         provided_attachments = []
         seen_paths: set[str] = set()
         for tr in tool_results_accumulated:
-            name = tr.get("name", "")
-            raw_result = tr.get("result", "")
-            produces = False
-            if _tool_registry is not None:
-                try:
-                    produces = _tool_registry.tool_produces_files(name)
-                except Exception:
-                    produces = False
-            if not produces and name not in ("execute_code", "code_execution", "provide_file"):
+            if tr.get("name") != "provide_file":
                 continue
-            if raw_result:
-                try:
-                    parsed = json.loads(raw_result)
-                    gen_files = parsed.get("generated_files", [])
-                    for f in gen_files:
-                        if not isinstance(f, dict):
-                            continue
-                        fpath = f.get("path", "")
-                        if not fpath or fpath in seen_paths:
-                            continue
-                        seen_paths.add(fpath)
-                        if name == "provide_file":
-                            provided_attachments.append(f)
-                        elif not _is_scratch_path(fpath):
-                            auto_attachments.append(f)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        return provided_attachments if provided_attachments else auto_attachments
+            raw_result = tr.get("result", "")
+            if not raw_result:
+                continue
+            try:
+                parsed = json.loads(raw_result)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for f in parsed.get("generated_files", []):
+                if not isinstance(f, dict):
+                    continue
+                fpath = f.get("path", "")
+                if not fpath or fpath in seen_paths:
+                    continue
+                seen_paths.add(fpath)
+                provided_attachments.append(f)
+        return provided_attachments
 
     def _get_start_time(self, started_at: datetime) -> float:
         return started_at.timestamp()

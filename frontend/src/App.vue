@@ -121,16 +121,14 @@ onUnmounted(() => {
   position: absolute;
   inset: 0;
   overflow: hidden;
-  will-change: transform, opacity, filter;
-  transition: opacity 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-              transform 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-              filter 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: opacity, transform;
+  transition: opacity 0.28s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .zen-mode-enter-from,
 .zen-mode-leave-to {
   opacity: 0;
-  transform: scale(0.97);
-  filter: blur(6px);
+  transform: scale(0.98);
 }
 </style>

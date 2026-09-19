@@ -23,6 +23,7 @@ from app.services.title_generator import TitleGeneratorService
 from app.services.workspace_service import ensure_user_workspace
 from app.services.agent_loop import AgentLoop, _strip_dsml_all, _strip_leading_orphan_punct
 from app.services.citation_ledger import CitationLedger, normalize_url
+from app.services.reasoning_sanitizer import scrub_reasoning_meta, scrub_reasoning_streaming
 from app.services.deathmatch_service import DeathmatchManager, MARKER_RE
 from app.tools.skill_tools import build_skills_system_prompt, resolve_skill, is_system_skill
 from app.tools.registry import registry
@@ -208,66 +209,37 @@ def _is_scratch_path(path: str | None) -> bool:
 def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[dict]:
     """Compute the download-card set from accumulated tool results.
 
+    Explicit-only contract (user directive 2026-09-18, prod conv 8b382ad8):
+    download cards come **solely** from successful ``provide_file`` calls —
+    the agent's explicit delivery intent, per the tool's own contract
+    ("用户明确要求把文件给我/下载/提供文件"). Byproducts of ``terminal`` /
+    ``execute_code`` / ``code_execution`` / ``pdf_export`` are never surfaced:
+    an analysis turn that clones or reads reference trees must not offer the
+    analyzed files as downloads (prod: 278 cards from ``_refs/*``).
+
     Single source of truth shared by the persist-time transform
-    (``_transform_tool_loop_results``) and the live SSE path. The LIVE card
-    set must always equal what the persisted message will show, otherwise the
-    streamed count is wrong (conv fbf5779b, 2026-08-06: the SSE path streamed
-    only the CURRENT tool call's ``generated_files`` while the frontend
-    REPLACED the whole set on each event — the live count jumped 1→1→1→1→4
-    and previously shown docx cards vanished mid-stream).
+    (``_transform_tool_loop_results``) and the live SSE path, so the live card
+    set always equals the persisted one (conv fbf5779b, 2026-08-06).
 
-    Rules (mirror the transform contract):
-    - scratch/task_XXXX intermediates never surface as cards;
-    - an explicit ``provide_file`` set wins over byproduct auto-collection;
-    - missing ``type`` is inferred from the file extension;
-    - same-name files deduplicate keeping the largest reported size.
+    Missing ``type`` is inferred from the file extension; same-name files
+    deduplicate keeping the largest reported size.
     """
-    auto_attachments: list[dict] = []       # byproduct collection (execute_code/terminal/pdf_export)
-    provided_attachments: list[dict] = []   # explicit provide_file set
+    provided_attachments: list[dict] = []
     for tr in tool_results_accumulated:
-        name = tr.get("name", "")
+        if tr.get("name") != "provide_file":
+            continue
         raw_result = tr.get("result", "")
-        if name in ("code_execution", "execute_code", "terminal"):
-            try:
-                parsed = json.loads(raw_result) if raw_result else {}
-                gen_files = parsed.get("generated_files", [])
-                if gen_files:
-                    for gf in gen_files:
-                        if not isinstance(gf, dict) or _is_scratch_path(gf.get("path")):
-                            continue
-                        auto_attachments.append(gf)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        elif name == "pdf_export":
-            try:
-                parsed = json.loads(raw_result) if raw_result else {}
-                if parsed.get("success") and parsed.get("file_path"):
-                    if not _is_scratch_path(parsed.get("file_path")):
-                        auto_attachments.append({
-                            "name": parsed.get("filename") or os.path.basename(parsed["file_path"]),
-                            "path": parsed["file_path"],
-                            "size": parsed.get("size") or 0,
-                            "type": "pdf",
-                        })
-            except (json.JSONDecodeError, TypeError):
-                pass
-        elif name == "provide_file":
-            try:
-                parsed = json.loads(raw_result) if raw_result else {}
-                gen_files = parsed.get("generated_files", [])
-                if gen_files:
-                    for gf in gen_files:
-                        if isinstance(gf, dict):
-                            provided_attachments.append(gf)
-            except (json.JSONDecodeError, TypeError):
-                pass
+        try:
+            parsed = json.loads(raw_result) if raw_result else {}
+            gen_files = parsed.get("generated_files", [])
+            if gen_files:
+                for gf in gen_files:
+                    if isinstance(gf, dict):
+                        provided_attachments.append(gf)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-    # Explicit provide_file attachments are the agent's chosen deliverable set
-    # and win over byproduct auto-collection (conv 2b36fb09: a scratch draft
-    # + debug stats leaked in next to the final docx). When the agent did not
-    # call provide_file, auto-collection remains the fallback.
-    all_attachments = provided_attachments if provided_attachments else auto_attachments
-    if not all_attachments:
+    if not provided_attachments:
         return []
 
     # Infer file type from extension when missing so download cards
@@ -286,7 +258,7 @@ def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[
         ".flac": "audio", ".aac": "audio",
         ".mp4": "video", ".webm": "video", ".mov": "video", ".m4v": "video", ".avi": "video",
     }
-    for att in all_attachments:
+    for att in provided_attachments:
         if not att.get("type") or att.get("type") == "file":
             fname = att.get("name") or att.get("filename") or ""
             ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
@@ -297,7 +269,7 @@ def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[
     # across multiple execute_code calls), keep the largest reported size
     # so the final, complete file is the one offered for download.
     seen_names: dict[str, dict] = {}
-    for att in all_attachments:
+    for att in provided_attachments:
         fname = att.get("name") or att.get("filename") or ""
         if not fname:
             continue
@@ -1855,6 +1827,22 @@ async def chat_stream(
                     async with _AsyncSessionLocal() as _sctx_db:
                         shared_context = await build_shared_agent_context(_sctx_db, current_user.id)
 
+            # 记忆优先级最高（2026-09-18 conv 3583d840，A4.9 I2 修复）：把本轮
+            # 注入写手上下文的**全部**记忆源（v2 检索摘要 / v1 dream / 条目层 /
+            # 身份记忆）带给审计证据域（[M] 权威来源），避免审计把记忆事实判成
+            # 「凭空编造」并指示写手拒答；v1 回落路径（[memory] 关闭）同样覆盖。
+            _mem_parts = [
+                str(getattr(shared_context, "memory_summary", "") or ""),
+                str(getattr(shared_context, "dream_summary", "") or ""),
+                "\n".join(
+                    str(getattr(_e, "content", "") or "")
+                    for _e in (getattr(shared_context, "memory_entries", None) or [])
+                ),
+                str(identity_context or ""),
+            ]
+            agent_loop.injected_memory_context = "\n\n".join(
+                _p for _p in _mem_parts if _p.strip())
+
             sys_prompt = await agent_service._build_system_prompt(
                 assistant=assistant,
                 shared_context=shared_context,
@@ -2027,6 +2015,11 @@ async def chat_stream(
                 # and per-chunk regex strip misses it (conv 6227fb26 leak).
                 _canary_tail = ""
                 _reasoning_canary_tail = ""
+                # 显示层元引用清洗（2026-09-18 思考卫生波）：与 canary 同级的
+                # 确定性护栏——提示词禁止仍会概率性复发，思考对用户可见，
+                # 命中“系统提示词/coordinator note/identity rules”等内部脚手架
+                # 的短语由该尾缓冲清洗，跨分片拆词也不会泄漏。
+                _reasoning_meta_tail = ""
                 content_segments: list[str] = []
                 display_sequence: list[dict] = []
                 tool_results_accumulated: list[dict] = []
@@ -2204,6 +2197,12 @@ async def chat_stream(
                     }})
 
                 task_db = AsyncSessionLocal()
+                # A4.9 closure residual: optimistic sync snapshot — captured at
+                # bind time so the very first verdict sync already detects
+                # concurrent user actions (pause/stop/resume) instead of
+                # clobbering them (last-writer-wins).
+                _dm_sync_snapshot: dict = {}
+                _dm_sync_frozen = frozenset()
                 try:
                     task_conversation = await task_db.get(Conversation, _cap_conversation_id)
                     task_user = await task_db.get(User, _cap_user_id)
@@ -2211,6 +2210,18 @@ async def chat_stream(
                     if _deathmatch_mgr is not None and task_conversation is not None:
                         _deathmatch_mgr._conv = task_conversation
                         agent_loop.deathmatch_manager = _deathmatch_mgr
+                        from app.services.deathmatch_service import (
+                            DEATHMATCH_SYNC_FIELDS as _DM_SYNC_FIELDS,
+                        )
+                        import copy as _copy
+                        # Deep-copied seed: several fields are mutated in place
+                        # (events/reflections/plan), so aliasing the live row's
+                        # objects would hide changes (A4.9 r-residual F2).
+                        _dm_sync_snapshot = {
+                            _f: _copy.deepcopy(getattr(task_conversation, _f))
+                            for _f in _DM_SYNC_FIELDS
+                            if hasattr(task_conversation, _f)
+                        }
                         # Emit initial deathmatch status for frontend
                         await _put({"deathmatch_verdict": {
                             "status": _deathmatch_mgr._conv.deathmatch_status,
@@ -2354,6 +2365,10 @@ async def chat_stream(
                                 _reasoning_chunk, _reasoning_canary_tail = strip_canary_streaming(
                                     event["reasoning_content"], _reasoning_canary_tail
                                 )
+                                # 元引用清洗（canary 之后，尾缓冲处理跨分片拆词）
+                                _reasoning_chunk, _reasoning_meta_tail = scrub_reasoning_streaming(
+                                    _reasoning_chunk, _reasoning_meta_tail
+                                )
                                 assistant_reasoning += _reasoning_chunk
                                 current_reasoning_segment += _reasoning_chunk
                                 await _put({"reasoning_content": _reasoning_chunk})
@@ -2416,6 +2431,7 @@ async def chat_stream(
                                 # marker is prepended to post-tool content.
                                 _canary_tail = ""
                                 _reasoning_canary_tail = ""
+                                _reasoning_meta_tail = ""
                                 _pre_tool_gate.on_tool_call()
                                 tc = event["tool_call"]
                                 tool_call_events_accumulated.append(tc)
@@ -2524,6 +2540,7 @@ async def chat_stream(
                                     # into post-tool content (A4.9 review).
                                     _canary_tail = ""
                                     _reasoning_canary_tail = ""
+                                    _reasoning_meta_tail = ""
                                 if _gate_flush.strip():
                                     logger.info(
                                         "Pre-tool gate released by iteration_done "
@@ -2564,6 +2581,7 @@ async def chat_stream(
                                 search_queries_by_call = {}
                                 _canary_tail = ""
                                 _reasoning_canary_tail = ""
+                                _reasoning_meta_tail = ""
                                 _pre_tool_gate.reset()
                                 # 压缩前后 token 对比（含工具 schema 口径）——
                                 # 前端在「上下文压缩」步骤块内展示 X → Y tokens 变化。
@@ -2648,6 +2666,7 @@ async def chat_stream(
                                 # agent_steps[] and the citation mapping.
                                 _canary_tail = ""
                                 _reasoning_canary_tail = ""
+                                _reasoning_meta_tail = ""
                                 _pre_tool_gate.reset()
                                 # conv 827a6f78 turn-B (2026-09-03): sync the
                                 # CLIENT on the silent QC reset — without this
@@ -2683,21 +2702,28 @@ async def chat_stream(
                                     async with AsyncSessionLocal() as _dm_db:
                                         _dm_conv = await _dm_db.get(Conversation, conversation_id)
                                         if _dm_conv:
-                                            _dm_conv.deathmatch_status = task_conversation.deathmatch_status
-                                            _dm_conv.deathmatch_turns = task_conversation.deathmatch_turns
-                                            _dm_conv.deathmatch_verdict = task_conversation.deathmatch_verdict
-                                            _dm_conv.deathmatch_reason = task_conversation.deathmatch_reason
-                                            _dm_conv.deathmatch_consecutive_failures = task_conversation.deathmatch_consecutive_failures
-                                            _dm_conv.deathmatch_marker_miss_count = task_conversation.deathmatch_marker_miss_count
-                                            _dm_conv.deathmatch_grilling_completed = task_conversation.deathmatch_grilling_completed
-                                            _dm_conv.deathmatch_grilling_total = task_conversation.deathmatch_grilling_total
-                                            _dm_conv.deathmatch_grilling_round = task_conversation.deathmatch_grilling_round
-                                            _dm_conv.deathmatch_plan = task_conversation.deathmatch_plan
-                                            _dm_conv.deathmatch_plan_version = task_conversation.deathmatch_plan_version
-                                            _dm_conv.deathmatch_verify_failures = task_conversation.deathmatch_verify_failures
-                                            _dm_conv.deathmatch_last_verification_result = task_conversation.deathmatch_last_verification_result
-                                            _dm_conv.deathmatch_human_gate = task_conversation.deathmatch_human_gate
+                                            # A4.9: optimistic per-field merge
+                                            # (external user actions win; see
+                                            # merge_sync_deathmatch_state) —
+                                            # replaces the old blind copy.
+                                            from app.services.deathmatch_service import (
+                                                merge_sync_deathmatch_state,
+                                            )
+                                            _new_snapshot, _new_frozen = (
+                                                merge_sync_deathmatch_state(
+                                                    _dm_conv,
+                                                    task_conversation,
+                                                    _dm_sync_snapshot,
+                                                    _dm_sync_frozen,
+                                                )
+                                            )
                                             await _dm_db.commit()
+                                            # Only advance the baseline AFTER a
+                                            # successful commit — otherwise a
+                                            # failed sync would look persisted
+                                            # and later syncs would skip it.
+                                            _dm_sync_snapshot = _new_snapshot
+                                            _dm_sync_frozen = _new_frozen
                                 except Exception:
                                     logger.exception("Failed to commit deathmatch state")
 
@@ -2886,6 +2912,7 @@ async def chat_stream(
                                 search_queries_by_call = {}
                                 _canary_tail = ""
                                 _reasoning_canary_tail = ""
+                                _reasoning_meta_tail = ""
                                 # Deathmatch per-turn persistence above writes
                                 # assistant_content (which INCLUDES gated text);
                                 # flush the gated text to the stream so the
@@ -2901,6 +2928,17 @@ async def chat_stream(
                                 _gate_flush = _pre_tool_gate.flush()
                                 if _gate_flush.strip():
                                     await _put({"content": _gate_flush})
+                                # A4.9 R1 NEW-2：流结束时冲刷元引用尾缓冲
+                                # （canary 尾是残缺标记、按设计丢弃；元引用尾
+                                # 是正常思考文本，必须清洗后补发，否则尾部
+                                # 最多 63 字符静默丢失）。
+                                if _reasoning_meta_tail:
+                                    _meta_flush = scrub_reasoning_meta(_reasoning_meta_tail)
+                                    if _meta_flush:
+                                        assistant_reasoning += _meta_flush
+                                        current_reasoning_segment += _meta_flush
+                                        await _put({"reasoning_content": _meta_flush})
+                                    _reasoning_meta_tail = ""
                                 break
 
                     # Strip a leading orphan colon HERE (not only at
@@ -3686,7 +3724,8 @@ async def chat_stream(
                         # PHASE 5: forward the phase marker ("final" for
                         # _final_thinking / grace-call output) so the
                         # frontend can route iteration vs final reasoning.
-                        _payload = {"reasoning_content": event["reasoning_content"]}
+                        _payload = {"reasoning_content": scrub_reasoning_meta(
+                            event["reasoning_content"])}
                         if event.get("phase"):
                             _payload["phase"] = event["phase"]
                         yield {"event": "reasoning_content", "data": json.dumps(_payload)}
@@ -3965,7 +4004,8 @@ async def resume_stream(
         elif delta["type"] == "content":
             return {"event": "content", "data": json.dumps({"content": delta["data"]})}
         elif delta["type"] == "reasoning":
-            return {"event": "reasoning_content", "data": json.dumps({"reasoning_content": delta["data"]})}
+            return {"event": "reasoning_content", "data": json.dumps(
+                {"reasoning_content": scrub_reasoning_meta(delta["data"])})}
         elif delta["type"] == "content_segment":
             return {"event": "content_segment", "data": json.dumps({"segment_content": delta["data"]})}
         elif delta["type"] == "tool_call":
@@ -4423,7 +4463,8 @@ async def resume_stream(
                     break
 
                 if "reasoning_content" in event:
-                    _payload = {"reasoning_content": event["reasoning_content"]}
+                    _payload = {"reasoning_content": scrub_reasoning_meta(
+                        event["reasoning_content"])}
                     if event.get("phase"):
                         _payload["phase"] = event["phase"]
                     yield {"event": "reasoning_content", "data": json.dumps(_payload)}

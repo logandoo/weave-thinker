@@ -15,7 +15,7 @@ category: office
 - 读取/编辑用户上传的 docx（`uploads/` 目录）
 
 ## 用法
-通过 `execute_code` 调用 `python-docx`（预装，版本 1.2.0）生成代码并执行，输出 `.docx` 文件保存到**工作区根目录**（用绝对路径，写在工作区根目录的文件才会成为下载卡片）。
+通过 `execute_code` 调用 `python-docx`（预装，版本 1.2.0）生成代码并执行，输出 `.docx` 文件保存到**工作区根目录**（用绝对路径；需要给用户下载时调用 `provide_file` 生成下载卡片，写文件本身不会自动出卡片）。
 
 ## 页面设置（默认是 Letter，中文文档必须显式设 A4）
 python-docx 默认模板是 Letter（8.5"×11"）而非 A4；中文正式文档一律显式设置：
@@ -242,7 +242,7 @@ for p in doc.paragraphs:
 检查：段落/表格数量符合预期、标题样式正确、内容非空。如需渲染成图核对版式，可用 `terminal` 调用 soffice 转 PDF（如 `/opt/homebrew/bin/soffice --headless --convert-to pdf report.docx`）。
 
 ## 规则
-1. 输出文件必须保存到工作区根目录（绝对路径），返回路径供前端展示下载卡片；草稿/中间数据写 scratch 临时目录。
+1. 输出文件必须保存到工作区根目录（绝对路径），并调用 `provide_file` 生成下载卡片；草稿/中间数据写 scratch 临时目录。
 2. 不要用代码生成 PDF——PDF 导出使用 `pdf_export` 工具。
 3. 表格使用 `style="Table Grid"` 以显示边框；固定列宽需同时设置 `table.autofit = False`、`columns[i].width` 与每格 `cell.width`。
 4. 长文档先规划结构（标题层级），再逐节填充；标题必须用内置 Heading 样式。

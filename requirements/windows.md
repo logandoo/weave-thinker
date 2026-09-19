@@ -36,6 +36,7 @@ winget install Python.Python.3.13              # 勾选 Add to PATH
 winget install OpenJS.NodeJS.LTS               # 18+（LTS 20/22 推荐）
 winget install Git.Git
 # 可选:  BtbN.FFmpeg (ffmpeg)
+# 可选:  TheDocumentFoundation.LibreOffice   # Office 服务端高保真预览（不装则浏览器端渲染兜底）
 # PDF 导出：原生 Windows 需 weasyprint 系统 DLL（pango/harfbuzz/gdk-pixbuf，
 # 见 weasyprint 官方文档；WSL2 直接按 ubuntu.md 的 apt 包安装）
 node -v; python --version; psql --version      # 三个版本号都验证一下

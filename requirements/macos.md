@@ -11,6 +11,8 @@
 # 数据库 + 运行时 + 证书工具
 brew install postgresql@16 python@3.13 node@22 openssl
 
+# 可选（Office 服务端高保真预览；不装则浏览器端渲染兜底）：
+#   brew install --cask libreoffice
 # 可选：
 #   ffmpeg（语音音轨处理/导出）        brew install ffmpeg
 #   PDF 导出（weasyprint 系统库）      brew install pango cairo gdk-pixbuf

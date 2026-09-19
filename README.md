@@ -30,7 +30,7 @@ cp docker/.env.example               .env                       # 改 POSTGRES_P
 ./scripts/docker_start.sh
 ```
 
-打开 `http://<host>:8158/app/frontend/` 注册账号即可使用。数据落在命名卷，`docker compose down` 不丢；浏览器工具在 `.env` 里设 `WITH_BROWSER=1` 后重建启用；HTTPS 由反向代理终结或挂载证书启用。受限网络下可在 `.env` 设 `NPM_REGISTRY` / `PIP_INDEX_URL` / `APT_MIRROR` 加速构建，SELinux 系统设 `WT_MOUNT_OPTS=ro,z`（详见[使用手册](docs/USER_MANUAL.md)「受限网络与 SELinux」）。备份、升级与故障排查见[使用手册](docs/USER_MANUAL.md)。
+打开 `http://<host>:8158/app/frontend/` 注册账号即可使用。数据落在命名卷，`docker compose down` 不丢；浏览器工具在 `.env` 里设 `WITH_BROWSER=1` 后重建启用；Office 文档的服务端预览由镜像内置 LibreOffice 提供（默认启用，`.env` 设 `WITH_LIBREOFFICE=0` 可精简镜像并回退浏览器端渲染）；HTTPS 由反向代理终结或挂载证书启用。受限网络下可在 `.env` 设 `NPM_REGISTRY` / `PIP_INDEX_URL` / `APT_MIRROR` 加速构建，SELinux 系统设 `WT_MOUNT_OPTS=ro,z`（详见[使用手册](docs/USER_MANUAL.md)「受限网络与 SELinux」）。备份、升级与故障排查见[使用手册](docs/USER_MANUAL.md)。
 
 ### 用 AI 助手代部署（部署 skill）
 
@@ -163,6 +163,8 @@ cd ..
 **原生渲染**：LaTeX 公式即时渲染；代码沙箱生成 Word 文档时，公式转为 OMML 原生对象（双击可编辑）；Mermaid 矢量图、ECharts 交互图表（数据须来自真实检索）；图片 lightbox、音视频行内播放。
 
 **文件解析**：图片走 VLM 视觉解读，音频经 ASR 转写，PDF 与 Office 文档按类型解析；解析结果可存为笔记继续追问。
+
+**文件与文档预览**：聊天里的附件与交付卡片点击即预览——图片看大图、音视频行内播放、PDF / 文本 / Markdown / 代码按类型渲染；Office 文档优先由服务端转为 PDF（Excel 按工作表整页导出，表格与图表完整），支持连续滚动、缩放与翻页，未安装 LibreOffice 时自动改用浏览器端渲染兜底；类型无法识别时显示工作区相对路径与下载入口。Agent 还可以把整个文件夹作为卡片交付：点开是文件夹管理器，可浏览子目录、预览与下载单文件、一键下载整个文件夹的 zip 包。
 
 **可信计算**：`calculate` 是 AST 白名单安全计算器（无 eval），复杂计算走代码沙箱；模型口算的数字不作依据。
 

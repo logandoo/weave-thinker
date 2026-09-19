@@ -25,6 +25,8 @@ node -v                                     # 验收 ≥ v18
 
 # 可选：
 #   ffmpeg（语音/导出）   sudo apt install -y ffmpeg
+#   LibreOffice（Office 服务端高保真预览；不装则浏览器端渲染兜底）
+#     sudo apt install -y --no-install-recommends libreoffice-core libreoffice-calc libreoffice-writer libreoffice-impress
 #   pgvector（24.04: postgresql-16-pgvector；22.04: 需 pgdg apt 源）
 #   PDF 导出（weasyprint 系统库，包名按发行版分列）：
 #     24.04:  sudo apt install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0

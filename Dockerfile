@@ -3,6 +3,7 @@
 # 构建（仓库根为上下文）：
 #   docker build -t weave-thinker:local .
 #   docker build --build-arg WITH_BROWSER=1 -t weave-thinker:browser .   # 含 Chromium（浏览器工具）
+#   docker build --build-arg WITH_LIBREOFFICE=0 -t weave-thinker:slim .   # 精简：不含 LibreOffice（Office 预览改用浏览器端渲染）
 # 受限网络加速（可选，留空=官方源）：
 #   docker build --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
 #                --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -24,6 +25,9 @@ RUN npm run build
 FROM python:3.13-slim-bookworm AS runtime
 
 ARG WITH_BROWSER=0
+# Office 文档服务端预览（LibreOffice，默认内置以开箱获得表格/图表完整渲染；
+# 设 0 可显著减小镜像，此时 Office 预览自动回退浏览器端渲染）
+ARG WITH_LIBREOFFICE=1
 # 构建期镜像加速（可选，留空=官方源）：
 #   APT_MIRROR=mirrors.tuna.tsinghua.edu.cn（替换 deb.debian.org 主机名）
 #   PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
@@ -53,6 +57,13 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         shared-mime-info \
         fonts-noto-cjk \
         ffmpeg \
+    && if [ "$WITH_LIBREOFFICE" = "1" ]; then \
+        apt-get install -y --no-install-recommends \
+            libreoffice-core libreoffice-calc libreoffice-writer libreoffice-impress \
+        && echo "LibreOffice: 已安装（Office 服务端预览）"; \
+    else \
+        echo "WITH_LIBREOFFICE=0 — 跳过 LibreOffice（Office 预览使用浏览器端渲染兜底）"; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -85,6 +85,7 @@ docker compose ps                # 查看容器健康状态
   `pgdata`、`workspace_data`、`memories_data`、`audio_data`、`output_data`、`skins_data` 中，
   `docker compose down` 不会丢数据。
 - **浏览器工具（可选）**：镜像默认不装 Chromium（体积小、构建快）。需要「浏览器 10 件套」时在 `.env` 加 `WITH_BROWSER=1` 后重新 `./scripts/docker_start.sh`（镜像会明显变大）。
+- **Office 服务端预览（默认内置）**：镜像内置 LibreOffice，Excel/Word/PPT 可服务端转换渲染（表格与图表完整）。不需要时可 `.env` 设 `WITH_LIBREOFFICE=0` 重建以精简镜像（此时 Office 预览自动改用浏览器端渲染）。
 - **HTTPS（可选）**：默认 HTTP，生产建议由 Nginx/网关终结 TLS 后反代到 8158；也可以把
   `key.pem`/`cert.pem` 放进 `backend/certs/` 目录并挂载，容器入口会自动检测并启用 HTTPS
   （详见 [15.4](#154-tls-与反向代理)）。
@@ -553,6 +554,9 @@ A：`docker compose logs app` 看首条错误；常见原因：`[database] host`
 
 **Q：浏览器工具报 Playwright/Chromium 缺失？**
 A：Docker 镜像默认不带 Chromium，`.env` 设 `WITH_BROWSER=1` 重建；手动部署执行 `.venv/bin/python -m playwright install chromium`。
+
+**Q：Office 文档预览显示「无法在线渲染」或图表不完整？**
+A：服务端高保真预览依赖 LibreOffice：Docker 镜像默认内置；手动部署请参考 `requirements/` 对应平台文档安装（可选，不装时自动使用浏览器端渲染兜底，复杂图表可能无法完整呈现）。
 
 **Q：语音没反应/识别不到？**
 A：确认已配置 `[endpoints.asr]`/`[endpoints.tts]`、浏览器麦克风权限、页面为 HTTPS 或 localhost（浏览器对非安全上下文禁用麦克风）。热词可在设置中补。

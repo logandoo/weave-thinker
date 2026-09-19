@@ -40,6 +40,7 @@ services:
       dockerfile: Dockerfile
       args:
         WITH_BROWSER: ${WITH_BROWSER:-0}
+        WITH_LIBREOFFICE: ${WITH_LIBREOFFICE:-1}
         # 受限网络构建加速（可选，留空=官方源；见 docs/USER_MANUAL.md「受限网络与 SELinux」）：
         NPM_REGISTRY: ${NPM_REGISTRY:-}
         APT_MIRROR: ${APT_MIRROR:-}

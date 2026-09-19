@@ -43,6 +43,19 @@ case "$REG" in 200|201) echo "[OK]   register -> $REG ($USER_NAME)";; *) echo "[
 TOKEN="$("${CURL[@]}" -m 15 -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASS\"}" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)"
 if [ -n "$TOKEN" ]; then echo "[OK]   login -> token"; else echo "[FAIL] login 未取得 token"; exit 1; fi
 
+CAPS="$("${CURL[@]}" -m 15 "$BASE/api/system/capabilities" -H "Authorization: Bearer $TOKEN" 2>/dev/null)"
+if printf '%s' "$CAPS" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+tools = d.get("tools") or d.get("capabilities") or []
+names = {t.get("name") if isinstance(t, dict) else t for t in tools}
+print("ok" if {"provide_file", "provide_folder"} <= names else "missing")
+' 2>/dev/null | grep -q '^ok$'; then
+    echo "[OK]   capabilities -> provide_file / provide_folder 在线"
+else
+    echo "[WARN] capabilities 未列出 provide_folder（旧版本或升级未生效；Office/文件夹交付不可用）"
+fi
+
 AID="$("${CURL[@]}" -m 15 "$BASE/api/assistants" -H "Authorization: Bearer $TOKEN" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])' 2>/dev/null)"
 if [ -n "$AID" ]; then echo "[OK]   assistants -> $AID"; else echo "[FAIL] assistants 列表为空"; exit 1; fi
 

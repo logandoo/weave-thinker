@@ -57,7 +57,7 @@ if docker info >/dev/null 2>&1; then
     if [ -n "${FREE_KB:-}" ]; then
         FREE_GB=$((FREE_KB / 1024 / 1024))
         if [ "$FREE_GB" -lt 5 ]; then
-            bad "data-root 所在文件系统剩余 ${FREE_GB}G（构建需 ≥5G；把 data-root 迁到大盘，见 troubleshooting）"
+            bad "data-root 所在文件系统剩余 ${FREE_GB}G（构建需 ≥5G，默认镜像含 LibreOffice 约 +0.4G；把 data-root 迁到大盘，见 troubleshooting）"
         else
             ok "data-root 剩余 ${FREE_GB}G"
         fi
@@ -118,6 +118,13 @@ for u in https://ghcr.io/v2/ https://registry-1.docker.io/v2/ https://docker.m.d
         *)   ok "registry 可达: $u (HTTP $code)" ;;
     esac
 done
+
+# 9. LibreOffice（手动部署的 Office 服务端预览依赖；Docker 镜像默认内置，无需本机安装）
+if command -v soffice >/dev/null 2>&1; then
+    ok "LibreOffice: $(soffice --version 2>/dev/null | head -1 | cut -c1-48)（Office 服务端预览可用）"
+else
+    warn "未检测到 LibreOffice —— 手动部署时 Office 预览回退浏览器端渲染（Docker 镜像默认内置，无需本机安装；需要服务端高保真预览见 troubleshooting 第 9 节）"
+fi
 
 echo "== 汇总: OK=$PASS WARN=$WARN FAIL=$FAIL =="
 if [ "$FAIL" -gt 0 ]; then

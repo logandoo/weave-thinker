@@ -1,6 +1,6 @@
 ---
 name: weave-thinker-deployment
-description: "部署、升级与排障 Weave Thinker 自托管实例。Deploy, upgrade, and troubleshoot a self-hosted Weave Thinker instance with Docker or bare metal. TRIGGER when：用户要求部署/安装/启动/升级 weave-thinker（Docker 或手动）；Docker 构建失败或极慢；容器起不来或重启循环；SELinux permission denied / 容器读不到挂载配置；国内网络 GitHub / registry / apt / pip / npm 不可达或极慢；数据库或模型端点配置问题；部署后的冒烟验证。Covers preflight environment checks, mirror-accelerated builds, SELinux mount handling, config bootstrap, smoke tests, and a troubleshooting index. NOT for：开发功能或修改代码（走仓库常规开发流程）、纯前端调试。"
+description: "部署、升级与排障 Weave Thinker 自托管实例。Deploy, upgrade, and troubleshoot a self-hosted Weave Thinker instance with Docker or bare metal. TRIGGER when：用户要求部署/安装/启动/升级 weave-thinker（Docker 或手动）；Docker 构建失败或极慢；容器起不来或重启循环；SELinux permission denied / 容器读不到挂载配置；国内网络 GitHub / registry / apt / pip / npm 不可达或极慢；数据库或模型端点配置问题；Office 预览不可用或图表不完整（LibreOffice 缺失/被关闭）；部署后的冒烟验证。Covers preflight environment checks, mirror-accelerated builds, SELinux mount handling, config bootstrap, smoke tests, and a troubleshooting index. NOT for：开发功能或修改代码（走仓库常规开发流程）、纯前端调试。"
 license: Apache-2.0
 compatibility: Requires Docker (or compatible runtime) and network access to container registries; Linux/macOS/WSL2. Helper scripts need bash, curl, and python3.
 ---
@@ -53,6 +53,8 @@ cp docker/.env.example               .env
 - `backend/config_model.toml`：至少一个 LLM 端点（`[endpoints.main]` 的 base_url/api_key/model_name）；自托管推理服务填其可被容器访问的地址（宿主机服务用宿主 LAN IP，不要用 127.0.0.1）。
 - `.env`：`POSTGRES_PASSWORD`（与 config.toml 一致）；端口冲突改 `APP_PORT`。
 
+Office 服务端预览：Docker 镜像默认内置 LibreOffice（Excel/Word/PPT 转 PDF 渲染，表格与图表完整）；不需要可在 `.env` 设 `WITH_LIBREOFFICE=0` 重建精简（此时 Office 预览自动回退浏览器端渲染，复杂图表可能不完整）。
+
 受限网络构建加速（可选，留空 = 官方源；改后重建）：
 
 ```bash
@@ -73,7 +75,7 @@ Docker（推荐）：
 ./scripts/docker_build.sh     # 只构建镜像（可透传 --build-arg）
 ```
 
-手动部署：分平台文档 `requirements/{macos,ubuntu,windows}.md`（发行树；主仓在 `tools/openextras/requirements/`）与 `docs/USER_MANUAL.md` §1.2；构建 `./scripts/project_build.sh`，启停 `./scripts/start.sh` / `stop.sh` / `restart.sh`。
+手动部署：分平台文档 `requirements/{macos,ubuntu,windows}.md`（发行树；主仓在 `tools/openextras/requirements/`）与 `docs/USER_MANUAL.md` §1.2；构建 `./scripts/project_build.sh`，启停 `./scripts/start.sh` / `stop.sh` / `restart.sh`。Office 服务端预览为可选依赖：按平台文档安装 LibreOffice（不装则自动回退浏览器端渲染）。
 
 ## 步骤 4 — 冒烟验证（必做）
 
@@ -86,7 +88,7 @@ bash scripts/smoke.sh http://127.0.0.1:8158 --chat    # 加注册→登录→真
 
 ## 步骤 5 — 排障
 
-按症状查 [references/troubleshooting.md](references/troubleshooting.md)：构建极慢或失败、容器重启循环、配置不可读（SELinux）、磁盘打满（data-root / containerd）、端口冲突、模型端点不通、记忆子系统降级（embedding 占位）。
+按症状查 [references/troubleshooting.md](references/troubleshooting.md)：构建极慢或失败、容器重启循环、配置不可读（SELinux）、磁盘打满（data-root / containerd）、端口冲突、模型端点不通、记忆子系统降级（embedding 占位）、Office 预览不可用或图表不完整（LibreOffice 缺失/被关闭）。
 
 ## 升级 / 备份 / 回滚
 

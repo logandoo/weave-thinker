@@ -93,6 +93,19 @@ containerd 镜像存储（若使用）还需 `/etc/containerd/config.toml` 的 `
 **根因**：未配置 `[endpoints.embedding]`（模板占位地址）。
 **处置**：不配置即降级运行（v2 记忆向量检索不可用）；需要时配置 embedding 端点后重启。
 
+## 9. Office 预览不可用 / 图表不完整
+
+**现象**：点击 Excel/Word/PPT 附件显示「该 Office 文件无法在线渲染，请下载后查看」，或 Excel 图表被裁切、表格样式丢失。
+
+**根因**：Office 服务端高保真预览依赖 LibreOffice——手动部署未安装，或 Docker 使用了 `WITH_LIBREOFFICE=0` 的精简镜像。
+
+**处置**：
+
+- Docker（默认已内置）：确认 `.env` 未设 `WITH_LIBREOFFICE=0`；改回后 `./scripts/docker_start.sh` 重建（镜像约 +0.4G）并跑冒烟确认 `capabilities -> provide_file / provide_folder 在线`。
+- 手动部署：按 `requirements/{ubuntu,macos,windows}.md` 安装 LibreOffice（core/calc/writer/impress）后重启服务。
+- 验证服务端转换：带登录 token 请求 `"$BASE/api/files/office-pdf?path=<工作区相对路径>"`——返回 `200`（PDF）即正常；`501 office_preview_unavailable` 表示未安装/被关闭，此时预览自动回退浏览器端渲染（docx/pptx 可用，复杂图表可能不完整）；`422 office_preview_failed` 为该文件转换失败（可下载后查看）。
+- 已安装但转换失败：查看 `chatllm.log` 中 office-preview 相关日志；确认磁盘未满、文件后缀在支持列表（doc/docx/xls/xlsx/ppt/pptx/odt/ods/odp/rtf）。
+
 ## 冒烟失败时的定位顺序
 
 1. `bash scripts/smoke.sh <BASE_URL>` 先确认 `/docs` 与登录页（200 才算服务在）。

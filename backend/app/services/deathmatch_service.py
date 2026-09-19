@@ -206,7 +206,7 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "3. 如果已经收集到足够信息，立即生成最终文件或清单：导出 PDF 必须使用 pdf_export 工具，其他文件类型（Excel/PPT/Word 等）使用 execute_code。\n"
     "4. 只有在真正交付了可验证的产出（文件、代码、清单、结果）后，才能说任务完成。\n"
     "5. 不要描述你打算做什么——直接行动。调用工具完成任务。\n"
-    "6. 当你需要将已生成的文件提供给用户时，调用 provide_file 工具生成下载卡片，不要只在文字中列出文件路径。\n"
+    "6. 当你需要将已生成的文件（或整个文件夹）提供给用户时，调用 provide_file / provide_folder 工具生成下载卡片或文件夹卡片，不要只在文字中列出路径。\n"
     "7. 如果任务目标中明确有字数/篇幅要求（如'每章不低于2000字'），在生成文件后必须调用 word_count 工具统计实际字数，确认满足要求后再标记完成。\n"
     "8. 严禁编造实测数据、测试截图或运行日志。无法在本环境真实执行的测试/操作，必须明确说明限制，"
     "改用公开资料并在产出中显著标注'估算/公开数据，非实测'。\n"
@@ -3762,7 +3762,7 @@ intent 只能是以下之一：
         "绝不要求产出无法真实获得的'实测数据/实测截图/实测日志'。\n"
         "11. 执行 Agent 已内置以下工具：web_search（联网搜索）、browser / browser_navigate / "
         "browser_snapshot 等（网页浏览与交互）、terminal（shell 命令）、execute_code（Python 代码执行）、"
-        "pdf_export（PDF 导出）、provide_file（文件下载卡片）、workspace_read（读取工作区文件）、"
+        "pdf_export（PDF 导出）、provide_file / provide_folder（文件/文件夹卡片）、workspace_read（读取工作区文件）、"
         "word_count（字数统计）、memory、notes。规划步骤时必须直接利用这些内置能力；"
         "需要浏览或操作网页时一律使用内置 browser 系列工具，严禁规划'安装/搭建第三方自动化工具链'的步骤"
         "（如安装 Playwright/Selenium 做浏览器自动化、自建爬虫框架）。\n"
@@ -6839,7 +6839,7 @@ intent 只能是以下之一：
         lines.append("4. 完成当前步骤后明确说明产出内容和文件名")
         lines.append("5. 在生成本步骤内容前，使用 workspace_read 读取前序步骤的文件，确保风格、设定一致")
         lines.append("6. 如果步骤有字数要求，完成后使用 word_count 统计，不满足则需补充")
-        lines.append("7. 全部完成后使用 provide_file 将最终文件作为下载卡片提供给用户")
+        lines.append("7. 全部完成后使用 provide_file（交付物是文件夹时用 provide_folder）将最终文件作为下载卡片提供给用户")
         lines.append("8. 严禁移动、删除、重命名、复制任何已有文件。严禁执行 mv、rm、cp 等文件操作命令")
         lines.append("9. 严禁操作、修改、删除与当前任务无关的文件。所有文件应直接生成到目标位置")
         lines.append("10. 严禁规划'清理工作区'、'整理文件'等与用户目标无关的文件管理操作")
@@ -6960,16 +6960,29 @@ intent 只能是以下之一：
 
     @staticmethod
     def _deduplicate_attachments(all_atts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Deduplicate attachments by name, keeping the largest size."""
+        """Deduplicate attachments by name, keeping the largest size.
+
+        Folder cards (``type == "folder"``, 2026-09-19) deduplicate by
+        ``rel_path`` so same-named folders in different directories survive.
+        """
         by_name: Dict[str, Dict[str, Any]] = {}
+        by_folder: Dict[str, Dict[str, Any]] = {}
         for att in all_atts:
+            if att.get("type") == "folder":
+                key = att.get("rel_path") or att.get("path") or att.get("name") or ""
+                if not key:
+                    continue
+                existing = by_folder.get(key)
+                if existing is None or (att.get("size") or 0) > (existing.get("size") or 0):
+                    by_folder[key] = att
+                continue
             name = att.get("name") or att.get("filename") or ""
             if not name:
                 continue
             existing = by_name.get(name)
             if existing is None or (att.get("size") or 0) > (existing.get("size") or 0):
                 by_name[name] = att
-        return list(by_name.values())
+        return list(by_name.values()) + list(by_folder.values())
 
     async def _collect_from_provide_file_only(self) -> List[Dict[str, Any]]:
         """Collect files that were explicitly provided via ``provide_file`` tool calls.
@@ -7008,7 +7021,7 @@ intent 只能是以下之一：
                     for step in agent_steps:
                         name = step.get("name", "")
                         title = step.get("title", "")
-                        if not (name == "provide_file" or title == "提供文件"):
+                        if name not in ("provide_file", "provide_folder") and title not in ("提供文件", "提供文件夹"):
                             continue
                         content = step.get("content", "")
                         if not content:
@@ -7017,9 +7030,13 @@ intent 只能是以下之一：
                             parsed = json.loads(content)
                         except (json.JSONDecodeError, TypeError):
                             continue
-                        gen_files = parsed.get("generated_files", [])
-                        for gf in gen_files:
-                            if isinstance(gf, dict) and gf.get("name") and gf.get("path"):
+                        for gf in parsed.get("generated_files") or []:
+                            if isinstance(gf, dict) and gf.get("name") and (gf.get("rel_path") or gf.get("path")):
+                                all_atts.append(gf)
+                        for gf in parsed.get("generated_folders") or []:
+                            if isinstance(gf, dict) and gf.get("name") and (gf.get("rel_path") or gf.get("path")):
+                                if gf.get("type") != "folder":
+                                    gf = {**gf, "type": "folder"}
                                 all_atts.append(gf)
         except Exception as exc:
             logger.warning("_collect_from_provide_file_only DB query failed: %s", exc)
@@ -7060,7 +7077,7 @@ intent 只能是以下之一：
                     atts = tr_obj.get("attachments") or []
                     if isinstance(atts, list):
                         for att in atts:
-                            if isinstance(att, dict) and att.get("name") and att.get("path"):
+                            if isinstance(att, dict) and att.get("name") and (att.get("rel_path") or att.get("path")):
                                 all_atts.append(att)
         except Exception as exc:
             logger.warning("_collect_all_attachments_legacy DB query failed: %s", exc)
@@ -7182,7 +7199,7 @@ intent 只能是以下之一：
                         if isinstance(att, dict):
                             _add_file(
                                 att.get("name") or att.get("filename"),
-                                att.get("path") or att.get("file_path"),
+                                att.get("path") or att.get("file_path") or att.get("rel_path"),
                                 att.get("size"),
                                 att.get("type"),
                             )
@@ -7208,7 +7225,7 @@ intent 只能是以下之一：
         from app.tools.provide_file import _guess_file_type
         try:
             name = att.get("name") or ""
-            path = att.get("path") or ""
+            path = att.get("path") or att.get("file_path") or att.get("rel_path") or ""
             m = _re.match(r"^(.+?)(\d+)(\.[A-Za-z0-9]+)$", name)
             if not m or not path:
                 return [att]
@@ -7216,7 +7233,9 @@ intent 只能是以下之一：
             num_len = len(num_str)
             base_num = int(num_str)
             directory = _os.path.dirname(path)
-            if not directory or not _os.path.isdir(directory):
+            # rel_path cards (2026-09-19) have no absolute directory to scan —
+            # the numbered-family expansion is an absolute-path-only legacy aid.
+            if not directory or not _os.path.isabs(directory) or not _os.path.isdir(directory):
                 return [att]
             found: Dict[int, Dict[str, Any]] = {base_num: att}
             try:

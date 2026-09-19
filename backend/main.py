@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import os
+import re
 import signal
 import sys
 import asyncio
@@ -281,6 +282,21 @@ async def reload_config(request: Request):
     return {"status": "ok"}
 
 
+# 2026-09-19: content-hashed bundles are safe to cache forever; index.html
+# must always revalidate, otherwise a long-open tab (or a heuristically cached
+# document) keeps running a stale build after a deploy — symptom seen as
+# "office previews render blank" while the server already served new PDFs.
+# Vite/Terser hashes are base64url and may contain "-" (even trailing);
+# scope to assets/ so hand-written files can never be pinned immutable.
+_HASHED_ASSET_RE = re.compile(r"^assets/[^/]+-[A-Za-z0-9_-]{4,}\.[a-z0-9]+$")
+
+
+def _static_cache_headers(full_path: str) -> dict:
+    if _HASHED_ASSET_RE.search(full_path):
+        return {"Cache-Control": "public, max-age=31536000, immutable"}
+    return {"Cache-Control": "no-cache, must-revalidate"}
+
+
 # SPA catch-all: serve index.html for client-side routes
 @app.get("/app/frontend/{full_path:path}")
 async def spa_fallback(full_path: str):
@@ -288,10 +304,14 @@ async def spa_fallback(full_path: str):
         # Resolve the real path and ensure it stays within static_dir
         file_path = os.path.realpath(os.path.join(static_dir, full_path))
         if file_path.startswith(os.path.realpath(static_dir) + os.sep) and os.path.isfile(file_path):
-            return FileResponse(file_path)
+            return FileResponse(file_path, headers=_static_cache_headers(full_path))
     # Serve index.html for client-side routing
     if os.path.isfile(index_path):
-        return FileResponse(index_path, media_type="text/html")
+        return FileResponse(
+            index_path,
+            media_type="text/html",
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
     return {"detail": "Not Found"}
 
 

@@ -133,10 +133,25 @@ export interface PartUpdatedEvent {
 
 export interface FileAttachment {
   name: string
-  path: string
+  /** Legacy absolute path (old persisted messages); prefer rel_path. */
+  path?: string
+  /** Workspace-relative path (2026-09-19) — the only path shown to users. */
+  rel_path?: string
   size: number
   type: string
 }
+
+export interface FolderAttachment {
+  name: string
+  /** Legacy absolute path; prefer rel_path. */
+  path?: string
+  rel_path?: string
+  size: number
+  file_count: number
+  type: 'folder'
+}
+
+export type Attachment = FileAttachment | FolderAttachment
 
 export interface SubAgentOutput {
   name: string
@@ -167,7 +182,7 @@ export interface ToolResultsData {
   unqualified_results?: SearchResult[]
   failure_summary?: string
   agent_steps?: AgentStep[]
-  attachments?: FileAttachment[]
+  attachments?: Attachment[]
   content_segments?: string[]
   display_sequence?: DisplaySequenceItem[]
   task_plan?: TaskProgress | null

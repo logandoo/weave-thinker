@@ -4,31 +4,96 @@
 <template>
   <Teleport to="body">
     <div class="file-preview-overlay" @click.self="close">
-      <div class="file-preview-dialog" role="dialog" aria-modal="true">
+      <div class="file-preview-dialog" :class="{ 'file-preview-dialog--fill': isFillKind }" role="dialog" aria-modal="true">
         <div class="file-preview-header">
-          <span class="file-preview-title" :title="filename">{{ filename }}</span>
-          <button class="file-preview-close" aria-label="关闭预览" title="关闭" @click="close">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/>
-              <line x1="6" y1="6" x2="18" y2="18"/>
-            </svg>
-          </button>
+          <div class="file-preview-heading">
+            <span class="file-preview-title" :title="relPath || filename">{{ filename }}</span>
+            <span v-if="kind === 'unknown' && relPath" class="file-preview-subpath">工作区路径: {{ relPath }}</span>
+          </div>
+          <div class="file-preview-actions">
+            <button
+              v-if="loadError || officeClientError"
+              class="file-preview-action"
+              title="重试"
+              @click="reload"
+            >重试</button>
+            <button class="file-preview-action" title="下载" @click="download">下载</button>
+            <button class="file-preview-close" aria-label="关闭预览" title="关闭" @click="close">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
         </div>
-        <div class="file-preview-body">
-          <iframe
-            v-if="kind === 'pdf' && pdfBlobUrl"
-            :src="pdfBlobUrl"
-            class="file-preview-iframe"
-            title="PDF 预览"
-          ></iframe>
-          <div v-else-if="loading" class="file-preview-status">加载中...</div>
-          <div v-else-if="loadError" class="file-preview-status file-preview-status--error">{{ loadError }}</div>
+        <div class="file-preview-body" :class="{ 'file-preview-body--fill': isFillKind }">
+          <div v-if="loading" class="file-preview-status">加载中...</div>
+
+          <div v-else-if="loadError" class="file-preview-status file-preview-status--error">
+            <p class="file-preview-error-text">{{ loadError }}</p>
+            <button class="file-preview-action file-preview-action--primary" @click="reload">重试</button>
+          </div>
+
+          <img
+            v-else-if="kind === 'image'"
+            :src="url"
+            class="file-preview-image"
+            alt="图片预览"
+            @error="loadError = '图片加载失败'"
+          />
+
+          <video
+            v-else-if="kind === 'video'"
+            :src="url"
+            class="file-preview-video"
+            controls
+            playsinline
+          ></video>
+
+          <audio
+            v-else-if="kind === 'audio'"
+            :src="url"
+            class="file-preview-audio"
+            controls
+          ></audio>
+
+          <PdfViewer
+            v-else-if="(kind === 'pdf' || officeMode === 'server') && pdfBytes"
+            :bytes="pdfBytes"
+            class="file-preview-pdf"
+          />
+
+          <div v-else-if="officeMode === 'client'" class="file-preview-office">
+            <component
+              :is="officeComponent"
+              v-if="officeComponent && officeBuffer"
+              :src="officeBuffer"
+              class="file-preview-office-host"
+              @rendered="onOfficeRendered"
+              @error="onOfficeError"
+            />
+            <div v-if="officeClientError" class="file-preview-status file-preview-status--error">
+              <p class="file-preview-error-text">{{ officeClientError }}</p>
+              <button class="file-preview-action file-preview-action--primary" @click="download">下载文件</button>
+            </div>
+          </div>
+
           <div
             v-else-if="kind === 'markdown'"
             class="file-preview-markdown markdown-body"
             v-html="renderedHtml"
           ></div>
-          <pre v-else class="file-preview-pre">{{ textContent }}</pre>
+
+          <pre v-else-if="kind === 'text' || kind === 'code'" class="file-preview-pre">{{ textContent }}</pre>
+
+          <div v-else class="file-preview-unknown">
+            <div class="file-preview-unknown-icon">📎</div>
+            <div class="file-preview-unknown-title">{{ fileTypeLabel(kind) }} 类型暂不支持在线预览</div>
+            <div v-if="kind === 'unknown' && relPath" class="file-preview-unknown-path">
+              工作区路径：<code>{{ relPath }}</code>
+            </div>
+            <button class="file-preview-action file-preview-action--primary" @click="download">下载文件</button>
+          </div>
         </div>
       </div>
     </div>
@@ -36,58 +101,123 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, markRaw, onMounted, onUnmounted, ref, shallowRef, type Component } from 'vue'
 import { renderMarkdownToHtml } from '@/composables/useMarkdown'
+import { classifyFile, fileTypeLabel, type FileKind } from '@/composables/filePreview'
+import { buildOfficePdfUrl } from '@/api/workspaceFiles'
+import { downloadUrl } from '@/composables/useDownload'
+import PdfViewer from './PdfViewer.vue'
 
 const props = defineProps<{
   filename: string
   url: string
+  relPath?: string | null
+  type?: string | null
+  /**
+   * Path used for the server office conversion (`/api/files/office-pdf`).
+   * New attachments carry a workspace-relative `rel_path`; legacy persisted
+   * attachments only have an absolute in-workspace `path` — both are valid
+   * for the endpoint (it enforces workspace containment), but only rel_path
+   * is ever shown to the user. The download link uses `url`, which callers
+   * build from the same fallback.
+   */
+  sourcePath?: string | null
 }>()
 
 const emit = defineEmits<{ close: [] }>()
 
-const MARKDOWN_EXTS = new Set(['md', 'markdown'])
-
-function extOf(name: string): string {
-  const base = (name || '').split(/[?#]/)[0]
-  const idx = base.lastIndexOf('.')
-  return idx === -1 ? '' : base.slice(idx + 1).toLowerCase()
-}
-
-const kind = computed<'pdf' | 'markdown' | 'text'>(() => {
-  const ext = extOf(props.filename)
-  if (ext === 'pdf') return 'pdf'
-  if (MARKDOWN_EXTS.has(ext)) return 'markdown'
-  return 'text'
-})
+const kind = computed<FileKind>(() => classifyFile(props.filename, props.type))
+const isOfficeKind = computed(() => kind.value === 'word' || kind.value === 'excel' || kind.value === 'ppt')
+// PDF / Office bodies own a fixed-height frame so the viewer gets real estate;
+// other kinds (text, image, audio) keep an auto-height dialog.
+const isFillKind = computed(
+  () => kind.value === 'pdf' || isOfficeKind.value,
+)
+const officeSource = computed(() => props.sourcePath || props.relPath || '')
 
 const loading = ref(false)
 const loadError = ref('')
 const textContent = ref('')
-const pdfBlobUrl = ref('')
-let objectUrl: string | null = null
+const pdfBytes = ref<ArrayBuffer | null>(null)
+const officeMode = ref<'none' | 'server' | 'client'>('none')
+const officeBuffer = ref<ArrayBuffer | null>(null)
+const officeComponent = shallowRef<Component | null>(null)
+const officeClientError = ref('')
 
 const renderedHtml = computed(() =>
   kind.value === 'markdown' ? renderMarkdownToHtml(textContent.value) : ''
 )
 
+async function loadText() {
+  const res = await fetch(props.url)
+  if (!res.ok) throw new Error(`加载失败（${res.status}）`)
+  textContent.value = await res.text()
+}
+
+async function loadPdf() {
+  const res = await fetch(props.url)
+  if (!res.ok) throw new Error(`加载失败（${res.status}）`)
+  pdfBytes.value = await res.arrayBuffer()
+}
+
+async function loadOfficeComponent(): Promise<Component> {
+  if (kind.value === 'word') {
+    const mod = await import('@vue-office/docx')
+    return markRaw((mod.default || mod) as Component)
+  }
+  if (kind.value === 'excel') {
+    await import('@vue-office/excel/lib/index.css')
+    const mod = await import('@vue-office/excel')
+    return markRaw((mod.default || mod) as Component)
+  }
+  const mod = await import('@vue-office/pptx')
+  return markRaw((mod.default || mod) as Component)
+}
+
+/**
+ * Office chain (D-81): server LibreOffice→PDF first (needs rel_path), then
+ * client-side OOXML renderer fallback when conversion is unavailable.
+ */
+async function loadOffice() {
+  const source = officeSource.value
+  if (source) {
+    try {
+      const res = await fetch(buildOfficePdfUrl(source))
+      if (res.ok) {
+        pdfBytes.value = await res.arrayBuffer()
+        officeMode.value = 'server'
+        return
+      }
+      // 501/422/404 → fall through to the client renderer
+    } catch {
+      // network error → client renderer
+    }
+  }
+  const res = await fetch(props.url)
+  if (!res.ok) throw new Error(`加载失败（${res.status}）`)
+  officeBuffer.value = await res.arrayBuffer()
+  officeComponent.value = await loadOfficeComponent()
+  officeMode.value = 'client'
+}
+
 async function loadContent() {
   loading.value = true
   loadError.value = ''
+  officeClientError.value = ''
+  officeMode.value = 'none'
+  officeBuffer.value = null
+  officeComponent.value = null
+  pdfBytes.value = null
+  textContent.value = ''
   try {
-    const res = await fetch(props.url)
-    if (!res.ok) throw new Error(`加载失败（${res.status}）`)
     if (kind.value === 'pdf') {
-      // 下载端点带 Content-Disposition: attachment，直接塞进 iframe 会触发下载；
-      // 先取回字节再以 blob URL 内联展示（同一文件 URL，无需改后端）。
-      const blob = await res.blob()
-      releaseObjectUrl()
-      // 强制 application/pdf：blob URL 的类型决定 iframe 是内联渲染还是下载
-      objectUrl = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }))
-      pdfBlobUrl.value = objectUrl
-    } else {
-      textContent.value = await res.text()
+      await loadPdf()
+    } else if (isOfficeKind.value) {
+      await loadOffice()
+    } else if (kind.value === 'markdown' || kind.value === 'text' || kind.value === 'code') {
+      await loadText()
     }
+    // image/video/audio/unknown/archive render directly from `url`
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : '加载失败'
   } finally {
@@ -95,11 +225,22 @@ async function loadContent() {
   }
 }
 
-function releaseObjectUrl() {
-  if (objectUrl) {
-    URL.revokeObjectURL(objectUrl)
-    objectUrl = null
-  }
+function onOfficeRendered() {
+  officeClientError.value = ''
+}
+
+function onOfficeError(e: unknown) {
+  // Keep the raw renderer error for debugging, show an actionable message.
+  console.error('office client renderer failed:', e)
+  officeClientError.value = '该 Office 文件无法在线渲染，请下载后查看'
+}
+
+function reload() {
+  loadContent()
+}
+
+async function download() {
+  await downloadUrl(props.url, props.filename)
 }
 
 function close() {
@@ -119,7 +260,6 @@ onMounted(() => {
 
 onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown)
-  releaseObjectUrl()
 })
 </script>
 
@@ -142,11 +282,18 @@ onUnmounted(() => {
   border: 1px solid var(--panel-border);
   box-shadow: var(--frame-shadow);
   border-radius: var(--radius-xl);
-  width: min(860px, 92vw);
-  max-height: 84vh;
+  width: min(960px, 94vw);
+  max-height: 88vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* PDF / Office viewers need a definite height: an auto-height flex column
+   collapses a flex:1 iframe to ~0 (user report 2026-09-19: "PDF 预览高度太
+   低，几乎无法浏览"). Fixed frame + fill body gives the viewer the space. */
+.file-preview-dialog--fill {
+  height: min(88vh, 980px);
 }
 
 .file-preview-header {
@@ -159,6 +306,13 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.file-preview-heading {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
 .file-preview-title {
   font-size: 14px;
   font-weight: 600;
@@ -166,6 +320,42 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-preview-subpath {
+  font-size: 11px;
+  color: var(--color-text-light);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.file-preview-action {
+  font-size: 12px;
+  color: var(--color-text-light);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.file-preview-action:hover {
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  color: var(--color-text);
+}
+
+.file-preview-action--primary {
+  color: var(--color-primary);
+  border-color: color-mix(in srgb, var(--color-primary) 40%, transparent);
 }
 
 .file-preview-close {
@@ -190,14 +380,62 @@ onUnmounted(() => {
   min-height: 0;
   overflow: auto;
   padding: 16px 20px 20px;
+  display: flex;
+  flex-direction: column;
 }
 
-.file-preview-iframe {
+/* Fill kinds: the viewer (iframe / office host) owns the whole body box. */
+.file-preview-body--fill {
+  overflow: hidden;
+  padding: 12px;
+}
+
+.file-preview-pdf {
+  flex: 1 1 auto;
   width: 100%;
-  height: 72vh;
-  border: 0;
+  min-height: 0;
+}
+
+.file-preview-image {
+  max-width: 100%;
+  max-height: 76vh;
+  object-fit: contain;
+  align-self: center;
   border-radius: var(--radius-sm);
-  background: var(--color-white);
+}
+
+.file-preview-video {
+  max-width: 100%;
+  max-height: 76vh;
+  background: #000;
+  border-radius: var(--radius-sm);
+  align-self: center;
+}
+
+.file-preview-audio {
+  width: 100%;
+  margin-top: 24px;
+}
+
+.file-preview-office {
+  min-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  /* the client-side OOXML renderer document scrolls here (user report
+     2026-09-19: weekly_report.docx could not scroll in the fallback path) */
+  overflow: auto;
+}
+
+.file-preview-body--fill .file-preview-office {
+  min-height: 0;
+}
+
+.file-preview-office-host {
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  height: auto;
 }
 
 .file-preview-status {
@@ -209,6 +447,15 @@ onUnmounted(() => {
 
 .file-preview-status--error {
   color: var(--color-error);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.file-preview-error-text {
+  margin: 0;
+  word-break: break-word;
 }
 
 .file-preview-pre {
@@ -224,6 +471,38 @@ onUnmounted(() => {
   white-space: pre-wrap;
   word-break: break-word;
   overflow-x: auto;
+}
+
+.file-preview-unknown {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 48px 16px;
+}
+
+.file-preview-unknown-icon {
+  font-size: 40px;
+}
+
+.file-preview-unknown-title {
+  font-size: 14px;
+  color: var(--color-text);
+}
+
+.file-preview-unknown-path {
+  font-size: 12px;
+  color: var(--color-text-light);
+  max-width: 100%;
+}
+
+.file-preview-unknown-path code {
+  font-family: var(--font-mono);
+  background: var(--surface-workbench);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  word-break: break-all;
 }
 
 .file-preview-markdown {
@@ -359,11 +638,11 @@ onUnmounted(() => {
 
   .file-preview-dialog {
     width: 100%;
-    max-height: 88vh;
+    max-height: 90vh;
   }
 
-  .file-preview-iframe {
-    height: 64vh;
+  .file-preview-dialog--fill {
+    height: 90vh;
   }
 }
 </style>

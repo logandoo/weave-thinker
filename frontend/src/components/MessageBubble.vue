@@ -38,7 +38,8 @@
           v-for="(ref, idx) in fileRefs"
           :key="`file-${idx}`"
           class="msg-note-tag msg-file-tag"
-          @click.stop="filePreviewIdx = filePreviewIdx === idx ? null : idx"
+          :title="ref.relPath ? `预览 ${ref.relPath}` : ref.filename"
+          @click.stop="onFileRefClick(ref)"
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
@@ -222,18 +223,16 @@
       </div>
     </Teleport>
 
-    <!-- File preview popup -->
-    <Teleport to="body">
-      <div v-if="filePreviewIdx !== null && fileRefs[filePreviewIdx]" class="note-preview-overlay" @click="filePreviewIdx = null">
-        <div class="note-preview-card" @click.stop>
-          <div class="note-preview-header">
-            <span class="note-preview-title">{{ fileRefs[filePreviewIdx].filename }}</span>
-            <button class="note-preview-close" @click="filePreviewIdx = null">×</button>
-          </div>
-          <div class="note-preview-body markdown-body" v-html="filePreviewHtml"></div>
-        </div>
-      </div>
-    </Teleport>
+    <!-- File preview dialog (user-uploaded [file-ref] chips) -->
+    <FilePreviewDialog
+      v-if="previewFileRef"
+      :filename="previewFileRef.filename"
+      :url="fileRefUrl(previewFileRef)"
+      :rel-path="previewFileRef.relPath || null"
+      :source-path="previewFileRef.relPath || previewFileRef.absolutePath || null"
+      :type="previewFileRef.fileType || null"
+      @close="filePreviewRef = null"
+    />
 
     <!-- Search result preview popup -->
     <Teleport to="body">
@@ -369,17 +368,21 @@
 import { computed, ref, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import type {
   Message, SearchResult, SearchRound, ToolResultsData, AgentStep,
-  FileAttachment, TaskProgress as TaskPlan, SubAgentOutput, SubAgentThinking,
+  FileAttachment, Attachment, TaskProgress as TaskPlan, SubAgentOutput, SubAgentThinking,
   DisplaySequenceItem,
 } from '@/types'
 import SearchResults from './SearchResults.vue'
 import FileAttachmentComp from './FileAttachment.vue'
+import FilePreviewDialog from './FilePreviewDialog.vue'
 import StreamMarkdown from './StreamMarkdown.vue'
 import TaskProgressComp from './TaskProgress.vue'
 import ToolPartCard from './ToolPartCard.vue'
 import MediaLightbox from './MediaLightbox.vue'
 import { useInlineImageZoom } from '@/composables/useInlineImageZoom'
 import { useChatStore } from '@/stores/chat'
+import { classifyFile } from '@/composables/filePreview'
+import { buildDownloadUrl } from '@/api/workspaceFiles'
+import { downloadUrl } from '@/composables/useDownload'
 import {
   renderMarkdownToHtml,
   addCitationSuperscripts,
@@ -1039,14 +1042,16 @@ const parsedAgentSteps = computed<AgentStep[]>(() => {
   return parsedToolResultsData.value?.agent_steps ?? []
 })
 
-const parsedAttachments = computed<FileAttachment[]>(() => {
+const parsedAttachments = computed<Attachment[]>(() => {
   const raw = parsedToolResultsData.value?.attachments ?? []
-  // Deduplicate by name so duplicate download cards never appear
+  // Deduplicate so duplicate cards never appear (files by name, folders by path)
   const seen = new Set<string>()
   return raw.filter((att) => {
-    const name = att.name || att.filename || ''
-    if (!name || seen.has(name)) return false
-    seen.add(name)
+    const key = att.type === 'folder'
+      ? `folder:${att.rel_path || att.path || att.name}`
+      : `file:${att.name || (att as FileAttachment).filename || ''}`
+    if (!key || seen.has(key)) return false
+    seen.add(key)
     return true
   })
 })
@@ -1219,12 +1224,22 @@ const noteRefs = computed<NoteRefInfo[]>(() => {
   return refs
 })
 
-// Parse file references from content
+// Parse file references from content (user uploads). The [file-ref] block
+// carries metadata lines; new messages use 工作区路径 (workspace-relative),
+// legacy messages use 文件路径 (absolute) — both are accepted.
 const FILE_REF_REGEX = /\[file-ref:([^\]]*)\]\n([\s\S]*?)\n\[\/file-ref\]\n*/g
 
 interface FileRefInfo {
   filename: string
-  content: string
+  relPath: string
+  absolutePath: string
+  fileType: string
+  sizeText: string
+}
+
+function _refMeta(content: string, label: string): string {
+  const m = content.match(new RegExp(`${label}[：:]\\s*(.+)`))
+  return m ? m[1].trim() : ''
 }
 
 const fileRefs = computed<FileRefInfo[]>(() => {
@@ -1232,18 +1247,37 @@ const fileRefs = computed<FileRefInfo[]>(() => {
   let match: RegExpExecArray | null
   const re = new RegExp(FILE_REF_REGEX.source, 'g')
   while ((match = re.exec(props.message.content)) !== null) {
-    refs.push({ filename: match[1], content: match[2] })
+    const content = match[2] || ''
+    refs.push({
+      filename: match[1],
+      relPath: _refMeta(content, '工作区路径'),
+      absolutePath: _refMeta(content, '文件路径'),
+      fileType: _refMeta(content, '文件类型'),
+      sizeText: _refMeta(content, '文件大小'),
+    })
   }
   return refs
 })
 
-const filePreviewIdx = ref<number | null>(null)
-const filePreviewHtml = computed(() => {
-  if (filePreviewIdx.value === null) return ''
-  const ref = fileRefs.value[filePreviewIdx.value]
-  if (!ref) return ''
-  return renderMarkdownToHtml(ref.content)
+const filePreviewRef = ref<number | null>(null)
+const previewFileRef = computed<FileRefInfo | null>(() => {
+  if (filePreviewRef.value === null) return null
+  return fileRefs.value[filePreviewRef.value] || null
 })
+
+function fileRefUrl(ref: FileRefInfo): string {
+  return buildDownloadUrl(ref.relPath || ref.absolutePath)
+}
+
+function onFileRefClick(ref: FileRefInfo) {
+  const kind = classifyFile(ref.filename, ref.fileType)
+  if (kind === 'archive') {
+    downloadUrl(fileRefUrl(ref), ref.filename)
+    return
+  }
+  const idx = fileRefs.value.indexOf(ref)
+  filePreviewRef.value = idx === -1 ? null : idx
+}
 
 const strippedContent = computed(() => {
   let content = stripDsmlTags(props.message.content)

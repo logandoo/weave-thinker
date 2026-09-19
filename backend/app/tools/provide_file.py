@@ -11,12 +11,16 @@ rendered.
 
 The tool is deliberately *explicit* — the agent chooses which files to
 attach.  There is no automatic filesystem scanning (which the user
-explicitly rejected).  The security model mirrors ``api/files.py``: only
-files inside the requesting user's workspace can be attached.
+explicitly rejected).  Security (2026-09-19): path resolution is delegated to
+``app.services.workspace_paths`` — only files inside the requesting user's
+workspace are ever returned; absolute paths outside, ``..`` traversal and
+escaping symlinks are rejected by the system, not by prompt discipline.
+
+Cards carry a workspace-relative ``rel_path`` (never the full system path).
 """
+import asyncio
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -47,54 +51,6 @@ def _guess_file_type(name: str) -> str:
     return _EXT_TYPE_MAP.get(ext, "file")
 
 
-def _resolve_within_workspace(target: str, workspace_root: str) -> str | None:
-    """Resolve *target* to an existing file inside *workspace_root*.
-
-    ``target`` may be:
-      * an absolute path (must be inside the workspace)
-      * a workspace-relative path
-      * a bare filename (searched recursively, first match wins)
-    Returns the resolved absolute path or ``None``.
-    """
-    ws = str(Path(workspace_root).resolve())
-
-    # Absolute path: must be inside the workspace.
-    if os.path.isabs(target):
-        resolved = str(Path(target).resolve())
-        if (resolved == ws or resolved.startswith(ws + os.sep)) and os.path.isfile(resolved):
-            return resolved
-        # Fall through to filename search below for a bare-name fallback.
-
-    # Workspace-relative path.
-    rel = Path(ws) / target
-    rel_resolved = str(rel.resolve())
-    if (rel_resolved == ws or rel_resolved.startswith(ws + os.sep)) and os.path.isfile(rel_resolved):
-        return rel_resolved
-
-    # Bare-filename recursive search (mirrors api/files.py download fallback).
-    base = os.path.basename(target)
-    if base and base != target:
-        candidate = _find_by_name(base, ws)
-        if candidate:
-            return candidate
-    elif base == target and base:
-        candidate = _find_by_name(base, ws)
-        if candidate:
-            return candidate
-
-    return None
-
-
-def _find_by_name(name: str, workspace_root: str) -> str | None:
-    for dirpath, _dirs, filenames in os.walk(workspace_root):
-        for fn in filenames:
-            if fn == name:
-                candidate = os.path.join(dirpath, fn)
-                if os.path.isfile(candidate):
-                    return candidate
-    return None
-
-
 async def provide_file(args: Dict[str, Any], **kwargs) -> str:
     """Attach one or more existing workspace files as download cards."""
     user = kwargs.get("user")
@@ -106,6 +62,12 @@ async def provide_file(args: Dict[str, Any], **kwargs) -> str:
         )
 
     from app.services.workspace_service import ensure_user_workspace
+    from app.services.workspace_paths import (
+        WorkspacePathError,
+        resolve_workspace_file,
+        to_rel_path,
+    )
+
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
     workspace_root = str(Path(workspace.root_path).resolve())
 
@@ -130,30 +92,41 @@ async def provide_file(args: Dict[str, Any], **kwargs) -> str:
         target = str(target).strip().strip("'\"")
         if not target:
             continue
-        resolved = _resolve_within_workspace(target, workspace_root)
-        if resolved is None:
-            not_found.append(target)
-            logger.info("provide_file: file not found in workspace: %s", target)
-            continue
-        name = os.path.basename(resolved)
         try:
-            size = os.path.getsize(resolved)
+            resolved = await asyncio.to_thread(
+                resolve_workspace_file, target, workspace_root
+            )
+        except WorkspacePathError as exc:
+            not_found.append(target)
+            logger.info("provide_file: rejected %r (%s)", target, exc.code)
+            continue
+        name = resolved.name
+        try:
+            rel_path = to_rel_path(resolved, workspace_root)
+        except WorkspacePathError as exc:  # pragma: no cover - resolver guarantees inside
+            not_found.append(target)
+            logger.warning("provide_file: rel path failed for %r (%s)", target, exc.code)
+            continue
+        try:
+            size = resolved.stat().st_size
         except OSError:
             size = 0
         generated.append({
             "name": name,
-            "path": resolved,
+            "rel_path": rel_path,
             "size": size,
             "type": _guess_file_type(name),
         })
-        logger.info("provide_file: attached %s (%d bytes) from %s", name, size, resolved)
+        logger.info("provide_file: attached %s (%d bytes) at %s", name, size, rel_path)
 
     summary_parts: List[str] = []
     if generated:
         names = ", ".join(g["name"] for g in generated)
         summary_parts.append(f"已提供 {len(generated)} 个文件作为下载卡片：{names}")
     if not_found:
-        summary_parts.append(f"未找到的文件：{', '.join(not_found)}")
+        summary_parts.append(
+            f"未找到的文件：{', '.join(not_found)}（只能提供当前用户工作区内的文件）"
+        )
     if not generated:
         summary_parts.append("没有可提供的文件。请确认文件路径正确且文件位于用户工作区内。")
 
@@ -181,6 +154,8 @@ registry.register(
             "或当你需要将之前生成的文件以下载卡片形式展示给用户时，调用此工具。"
             "支持绝对路径、工作区相对路径、或纯文件名（会自动在工作区内搜索）。"
             "可同时提供多个文件。这不是文件扫描——只附加你明确指定的文件。"
+            "安全边界：只能提供当前用户工作区内的文件；工作区外的系统文件或其他用户"
+            "目录即使被要求也会被系统拒绝，不要尝试提供。"
         ),
         "parameters": {
             "type": "object",

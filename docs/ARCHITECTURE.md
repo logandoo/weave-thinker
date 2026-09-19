@@ -23,7 +23,7 @@ Weave Thinker 是一个**具备长期记忆、工具调用、多模态语音交�
 核心能力一览：
 
 - **Agent 对话**：协调器语义路由 → ReAct 工具循环（≤50 轮）→ LLM 发送前审计 → 流式 SSE 渲染
-- **38 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务等
+- **43 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务等
 - **三层记忆**：v1 DB 摘要记忆、文件记忆工具（AGENT.md/USER.md/changelog.md）、v2 概念/潜意识/情节子系统
 - **死磕模式**：盘问 → 目标循环（PEVR + judge/verifier 双 LLM 门 + 三级停滞升级）的自主长线任务模式
 - **双工语音**：一条 WebSocket 实现全双工对话（流式 ASR + 语义 EoT + barge-in 打断 + 流式 TTS）
@@ -89,7 +89,7 @@ weave-thinker/
 │  ├─ app/
 │  │  ├─ api/                          # 20+ 路由模块（§3.2 全表）
 │  │  ├─ services/                     # ~78 服务模块：AgentLoop/三层记忆/死磕/语音/导出（§3.3）
-│  │  ├─ tools/                        # 38 个工具函数 + MCP 动态扩展（§3.4）
+│  │  ├─ tools/                        # 43 个工具函数 + MCP 动态扩展（§3.4）
 │  │  ├─ core/                         # config.py（双 TOML 合并）· deps.py（JWT）· provider_router.py
 │  │  ├─ db/                           # database.py（模型 + 启动幂等迁移，无 Alembic）
 │  │  ├─ schemas/                      # Pydantic 请求/响应模型
@@ -168,7 +168,7 @@ weave-thinker/
 - **code_execution_service.py**：代码沙箱（子代理生成→执行→自动修复循环）
 - **interactive_browser_service.py / browser_service.py**：交互式浏览器会话（navigate/click/type/scroll/screenshot/execute_js）与一次性抓取
 
-### 3.4 工具系统（`backend/app/tools/`，38 个工具函数 + MCP）
+### 3.4 工具系统（`backend/app/tools/`，43 个工具函数 + MCP）
 
 注册机制：`registry.py` 单例 `ToolRegistry`，`register(name, toolset, schema, handler, check_fn, …)`，`dispatch()` 支持权限门、可见工具集 fail-closed、异步超时；启动时 `_discover_tools()` 自动导入 + `load_mcp_servers_from_config()` 注册 MCP 工具。
 
@@ -181,7 +181,8 @@ weave-thinker/
 | memory | 文件记忆读写（AGENT.md/USER.md/changelog.md，read/add/replace/remove） |
 | notes | 笔记读写（list/get/create/update/delete） |
 | workspace_read / workspace_glob / grep / diff / word_count | workspace 文件操作族 |
-| provide_file | 把 workspace 文件显式挂成下载卡片 |
+| provide_file | 把 workspace 文件显式挂成下载卡片（按类型内联预览，Office 服务端转 PDF） |
+| provide_folder | 把 workspace 文件夹挂成文件夹卡片（弹层浏览/预览/单文件下载/整包 zip） |
 | pdf_export | 文本/笔记/对话渲染 PDF（WeasyPrint + CJK 字体 + 引用附录） |
 | delegate_task | 子代理委派（深度≤2、独立 LLM、信号量并发） |
 | background_task | 提交长时后台任务（agent_tasks 表，5h 超时） |

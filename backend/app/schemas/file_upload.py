@@ -11,6 +11,7 @@ class FileParseResult(BaseModel):
     file_type: str | None = None
     filename: str = ""
     file_path: str | None = None
+    rel_path: str | None = None
     size: int = 0
 
 

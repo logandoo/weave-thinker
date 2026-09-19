@@ -210,9 +210,9 @@ def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[
     """Compute the download-card set from accumulated tool results.
 
     Explicit-only contract (user directive 2026-09-18, prod conv 8b382ad8):
-    download cards come **solely** from successful ``provide_file`` calls —
-    the agent's explicit delivery intent, per the tool's own contract
-    ("用户明确要求把文件给我/下载/提供文件"). Byproducts of ``terminal`` /
+    download cards come **solely** from successful ``provide_file`` and
+    ``provide_folder`` calls (2026-09-19) — the agent's explicit delivery
+    intent, per the tools' own contracts. Byproducts of ``terminal`` /
     ``execute_code`` / ``code_execution`` / ``pdf_export`` are never surfaced:
     an analysis turn that clones or reads reference trees must not offer the
     analyzed files as downloads (prod: 278 cards from ``_refs/*``).
@@ -221,23 +221,27 @@ def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[
     (``_transform_tool_loop_results``) and the live SSE path, so the live card
     set always equals the persisted one (conv fbf5779b, 2026-08-06).
 
-    Missing ``type`` is inferred from the file extension; same-name files
-    deduplicate keeping the largest reported size.
+    Missing ``type`` is inferred from the file extension (files only — folder
+    entries are structurally tagged); same-name files deduplicate keeping the
+    largest reported size; folders deduplicate by ``rel_path``.
     """
     provided_attachments: list[dict] = []
     for tr in tool_results_accumulated:
-        if tr.get("name") != "provide_file":
+        if tr.get("name") not in ("provide_file", "provide_folder"):
             continue
         raw_result = tr.get("result", "")
         try:
             parsed = json.loads(raw_result) if raw_result else {}
-            gen_files = parsed.get("generated_files", [])
-            if gen_files:
-                for gf in gen_files:
-                    if isinstance(gf, dict):
-                        provided_attachments.append(gf)
         except (json.JSONDecodeError, TypeError):
-            pass
+            continue
+        for gf in parsed.get("generated_files") or []:
+            if isinstance(gf, dict):
+                provided_attachments.append(gf)
+        for gf in parsed.get("generated_folders") or []:
+            if isinstance(gf, dict):
+                if gf.get("type") != "folder":
+                    gf = {**gf, "type": "folder"}
+                provided_attachments.append(gf)
 
     if not provided_attachments:
         return []
@@ -259,24 +263,34 @@ def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[
         ".mp4": "video", ".webm": "video", ".mov": "video", ".m4v": "video", ".avi": "video",
     }
     for att in provided_attachments:
+        if att.get("type") == "folder":
+            continue
         if not att.get("type") or att.get("type") == "file":
             fname = att.get("name") or att.get("filename") or ""
             ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
             att["type"] = _ext_type_map.get(ext, "file")
 
-    # Deduplicate attachments by name to avoid duplicate download cards.
-    # For files that share the same name (e.g. a document being appended to
-    # across multiple execute_code calls), keep the largest reported size
-    # so the final, complete file is the one offered for download.
+    # Deduplicate attachments. Files: by name, keeping the largest reported
+    # size so the final, complete file is offered (a document appended to
+    # across multiple calls). Folders: by rel_path, same size rule.
     seen_names: dict[str, dict] = {}
+    seen_folders: dict[str, dict] = {}
     for att in provided_attachments:
+        if att.get("type") == "folder":
+            key = att.get("rel_path") or att.get("name") or ""
+            if not key:
+                continue
+            existing = seen_folders.get(key)
+            if existing is None or (att.get("size") or 0) > (existing.get("size") or 0):
+                seen_folders[key] = att
+            continue
         fname = att.get("name") or att.get("filename") or ""
         if not fname:
             continue
         existing = seen_names.get(fname)
         if existing is None or (att.get("size") or 0) > (existing.get("size") or 0):
             seen_names[fname] = att
-    return list(seen_names.values())
+    return list(seen_names.values()) + list(seen_folders.values())
 
 
 def _derive_title_from_url(url: str) -> str:

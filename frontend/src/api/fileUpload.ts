@@ -10,6 +10,7 @@ export interface FileParseResult {
   file_type?: string | null
   filename: string
   file_path?: string | null
+  rel_path?: string | null
   size?: number
 }
 

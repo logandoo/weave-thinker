@@ -1179,6 +1179,38 @@ class Config:
     def workspace_create_readme(self) -> bool:
         return bool(self.workspace.get("create_readme", True))
 
+    # 2026-09-19：Office 预览（/api/files/office-pdf，soffice 服务端转 PDF）。
+    # enabled=false 或探测不到 soffice → 端点 501，前端自动回退客户端渲染器；
+    # cache_dir 缺省用系统临时目录（不放入 git 树）。全部有代码默认值。
+    @property
+    def office_preview(self) -> dict:
+        return self._config.get("office_preview", {})
+
+    @property
+    def office_preview_enabled(self) -> bool:
+        return bool(self.office_preview.get("enabled", True))
+
+    @property
+    def office_preview_soffice_path(self) -> str:
+        return str(self.office_preview.get("soffice_path", "soffice") or "soffice")
+
+    @property
+    def office_preview_timeout_seconds(self) -> int:
+        return int(self.office_preview.get("timeout_seconds", 60))
+
+    @property
+    def office_preview_cache_max_mb(self) -> int:
+        return int(self.office_preview.get("cache_max_mb", 512))
+
+    @property
+    def office_preview_cache_dir(self) -> Path:
+        raw = str(self.office_preview.get("cache_dir", "") or "").strip()
+        if raw:
+            return self._resolve_project_path(raw, default="output_files/office_preview")
+        import tempfile
+
+        return Path(tempfile.gettempdir()) / "weave_thinker_office_preview"
+
     # P1a（2026-09-19）：工作区影子 git 快照。默认开启；`snapshots_max_file_mb`
     # 以上的文件不进入快照（列入 skipped_large_files）；retention 为保留快照数。
     @property

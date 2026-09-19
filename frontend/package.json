@@ -10,6 +10,9 @@
   },
   "dependencies": {
     "@tanstack/vue-virtual": "^3.13.31",
+    "@vue-office/docx": "^1.6.3",
+    "@vue-office/excel": "^1.7.14",
+    "@vue-office/pptx": "^1.0.1",
     "axios": "^1.6.5",
     "dompurify": "^3.2.5",
     "echarts": "^6.1.0",
@@ -17,9 +20,11 @@
     "katex": "^0.16.45",
     "marked": "^17.0.5",
     "mermaid": "^11.14.0",
+    "pdfjs-dist": "^6.3.289",
     "pinia": "^2.1.7",
     "simple-rnnoise-wasm": "^1.1.0",
     "vue": "^3.4.15",
+    "vue-demi": "^0.14.6",
     "vue-router": "^4.6.4",
     "vuedraggable": "^4.1.0"
   },

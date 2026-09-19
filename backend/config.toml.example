@@ -255,6 +255,12 @@ snapshots_enabled = true
 snapshots_max_file_mb = 10
 snapshots_retention = 50
 
+[office_preview]
+enabled = true
+soffice_path = "soffice"
+timeout_seconds = 60
+cache_max_mb = 512
+
 [browser]
 enabled = true
 max_content_length = 30000

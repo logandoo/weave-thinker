@@ -172,7 +172,7 @@ cd ..
 
 ## 内置工具与技能
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 38 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 10 项系统技能。
+后端 `app/tools/` 经 `registry.register()` 静态注册 43 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 10 项系统技能。
 
 <details>
 <summary>完整工具清单（38 个）</summary>
@@ -190,7 +190,7 @@ cd ..
 | 笔记 | `notes` | 笔记本与笔记的列表、读取、创建、修改、删除 |
 | 记忆 | `memory` | 跨会话长期记忆（agent/user 双目标 + system 只读系统文档） |
 | 任务编排 | `delegate_task` / `background_task` / `schedule` / `session_search` / `mixture_of_agents` | 子代理并行委派、后台长线任务、定时任务、跨会话搜索、混合专家 |
-| 文件工作区 | `workspace_read` / `workspace_glob` / `grep` / `diff` / `word_count` / `provide_file` | 读取、查找、对比、字数统计与文件交付 |
+| 文件工作区 | `workspace_read` / `workspace_glob` / `grep` / `diff` / `word_count` / `provide_file` / `provide_folder` | 读取、查找、对比、字数统计；文件与文件夹交付（预览/下载/整包 zip） |
 | 导出 | `pdf_export` | 笔记、对话记录、工作区文件导出 PDF |
 | 技能 | `skill_view` / `skill_manage` / `skill_run_script` | 加载 SKILL.md、创建用户技能、执行捆绑脚本 |
 | 语音 | `asr_transcribe` / `tts_synthesize` | 系统 ASR / TTS 端点开放给 agent |
@@ -215,7 +215,7 @@ frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI ·
 backend/    FastAPI + async SQLAlchemy 2.0
   ├─ app/api/        20+ 路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/…）
   ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出
-  ├─ app/tools/      工具体系（38 个工具函数 + MCP 动态扩展）
+  ├─ app/tools/      工具体系（43 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）
   └─ skills/         系统技能（SKILL.md 目录，Agent 可加载执行）
 webview-app/ Android WebView 壳（可选，JS 桥 window.WeaverNoteApp）

@@ -3,41 +3,52 @@
 
 <template>
   <div v-if="attachments && attachments.length" class="file-attachments">
-    <template v-for="file in attachments" :key="file.path">
-      <div v-if="inferType(file) === 'image'" class="image-card" title="点击查看大图" @click="openLightbox(file)">
-        <img :src="getImageUrl(file)" :alt="file.name" class="image-preview" loading="lazy" @error="handleImgError" />
+    <template v-for="file in attachments" :key="attachmentKey(file)">
+      <FolderAttachment v-if="file.type === 'folder'" :folder="file" />
+
+      <div v-else-if="kindOf(file) === 'image'" class="image-card" title="点击查看大图" @click="openLightbox(file)">
+        <img :src="targetUrl(file)" :alt="file.name" class="image-preview" loading="lazy" @error="handleImgError" />
         <div class="image-name">{{ file.name }}</div>
       </div>
-      <div v-else-if="inferType(file) === 'audio'" class="media-card">
+
+      <div v-else-if="kindOf(file) === 'audio'" class="media-card">
         <div class="media-head">
           <span class="media-icon">🎵</span>
           <span class="file-name">{{ file.name }}</span>
           <button class="media-download" title="下载" @click="downloadFile(file)">⬇</button>
         </div>
-        <audio :src="getMediaUrl(file)" controls preload="metadata" class="media-player"></audio>
+        <audio :src="targetUrl(file)" controls preload="metadata" class="media-player"></audio>
       </div>
-      <div v-else-if="inferType(file) === 'video'" class="media-card">
+
+      <div v-else-if="kindOf(file) === 'video'" class="media-card">
         <div class="media-head">
           <span class="media-icon">🎬</span>
           <span class="file-name">{{ file.name }}</span>
           <button class="media-download" title="放大播放" @click="openLightbox(file)">⛶</button>
           <button class="media-download" title="下载" @click="downloadFile(file)">⬇</button>
         </div>
-        <video :src="getMediaUrl(file)" controls playsinline preload="metadata" class="media-player media-video"></video>
+        <video :src="targetUrl(file)" controls playsinline preload="metadata" class="media-player media-video"></video>
       </div>
+
       <div v-else class="file-card" @click="onFileCardClick(file)">
-        <div class="file-icon">{{ fileIcon(inferType(file)) }}</div>
+        <div class="file-icon">{{ fileIcon(kindOf(file)) }}</div>
         <div class="file-info">
           <span class="file-name">{{ file.name }}</span>
           <span class="file-meta">
-            <span class="file-type-badge">{{ fileTypeLabel(inferType(file)) }}</span>
+            <span class="file-type-badge">{{ fileTypeLabel(kindOf(file)) }}</span>
             <span class="file-size">{{ formatSize(file.size) }}</span>
           </span>
+          <span
+            v-if="kindOf(file) === 'unknown' && displayPath(file)"
+            class="file-workspace-path"
+            :title="displayPath(file)"
+          >工作区路径: {{ displayPath(file) }}</span>
         </div>
         <button class="download-icon" title="下载" @click.stop="downloadFile(file)">⬇</button>
       </div>
     </template>
   </div>
+
   <MediaLightbox
     :media="lightboxFile"
     :kind="lightboxKind"
@@ -45,24 +56,31 @@
     @close="lightboxFile = null"
     @download="downloadFile"
   />
+
   <FilePreviewDialog
     v-if="previewFile"
     :filename="previewFile.name"
-    :url="getDownloadUrl(previewFile)"
+    :url="targetUrl(previewFile)"
+    :rel-path="relPathOf(previewFile)"
+    :source-path="previewFile.rel_path || previewFile.path || null"
+    :type="previewFile.type"
     @close="previewFile = null"
   />
 </template>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { FileAttachment } from '@/types'
+import type { Attachment, FileAttachment } from '@/types'
 import MediaLightbox from './MediaLightbox.vue'
 import FilePreviewDialog from './FilePreviewDialog.vue'
+import FolderAttachment from './FolderAttachment.vue'
+import { buildDownloadUrl } from '@/api/workspaceFiles'
+import { classifyFile, fileIcon, fileTypeLabel, formatSize, type FileKind } from '@/composables/filePreview'
 import { downloadUrl } from '@/composables/useDownload'
 import { useToast } from '@/composables/useToast'
 
-defineProps<{
-  attachments: FileAttachment[]
+const props = defineProps<{
+  attachments: Attachment[]
 }>()
 
 const lightboxFile = ref<FileAttachment | null>(null)
@@ -70,47 +88,46 @@ const previewFile = ref<FileAttachment | null>(null)
 const abortController = ref<AbortController | null>(null)
 const { show: showToast } = useToast()
 
-const PREVIEWABLE_EXT_RE = /\.(pdf|md|markdown|txt|py|ts|js|json|sh|yaml|yml|html|css|sql|go|rs|java)$/i
+function kindOf(file: FileAttachment): FileKind {
+  return classifyFile(file.name, file.type)
+}
 
-function isPreviewable(file: FileAttachment): boolean {
-  return PREVIEWABLE_EXT_RE.test(file.name || '') || PREVIEWABLE_EXT_RE.test(file.path || '')
+function relPathOf(file: FileAttachment): string {
+  return file.rel_path || ''
+}
+
+function attachmentKey(file: Attachment): string {
+  return file.rel_path || file.path || `${file.type}:${file.name}`
+}
+
+function displayPath(file: FileAttachment): string {
+  return file.rel_path || ''
+}
+
+function targetUrl(file: FileAttachment): string {
+  return buildDownloadUrl(file.rel_path || file.path || '')
 }
 
 function onFileCardClick(file: FileAttachment) {
-  if (isPreviewable(file)) {
-    previewFile.value = file
-  } else {
+  const kind = kindOf(file)
+  if (kind === 'archive') {
+    // Recognized but not previewable in-app: straight to download.
     downloadFile(file)
+  } else {
+    previewFile.value = file
   }
 }
 
 const lightboxKind = computed<'image' | 'video'>(() => {
   const f = lightboxFile.value
   if (!f) return 'image'
-  return inferType(f) === 'video' ? 'video' : 'image'
+  return kindOf(f) === 'video' ? 'video' : 'image'
 })
 
 const lightboxUrl = computed(() => {
   const f = lightboxFile.value
-  return f ? getImageUrl(f) : ''
+  return f ? targetUrl(f) : ''
 })
-
-function getTokenParam(): string {
-  const token = localStorage.getItem('chatllm_token')
-  return token ? `&token=${encodeURIComponent(token)}` : ''
-}
-
-function getImageUrl(file: FileAttachment): string {
-  return `/api/files/download?path=${encodeURIComponent(file.path)}${getTokenParam()}`
-}
-
-function getMediaUrl(file: FileAttachment): string {
-  return `/api/files/download?path=${encodeURIComponent(file.path)}${getTokenParam()}`
-}
-
-function getDownloadUrl(file: FileAttachment): string {
-  return `/api/files/download?path=${encodeURIComponent(file.path)}${getTokenParam()}`
-}
 
 function handleImgError(ev: Event) {
   (ev.target as HTMLImageElement).style.display = 'none'
@@ -120,59 +137,9 @@ function openLightbox(file: FileAttachment) {
   lightboxFile.value = file
 }
 
-function fileIcon(type: string): string {
-  const icons: Record<string, string> = {
-    pdf: '📄', word: '📝', excel: '📊', csv: '📊', text: '📃',
-    markdown: '📃', json: '📋', python: '🐍', javascript: '📜',
-    html: '🌐', css: '🎨', image: '🖼️', archive: '📦',
-    audio: '🎵', video: '🎬', ppt: '📊', file: '📎',
-  }
-  return icons[type] || '📎'
-}
-
-const TYPE_LABELS: Record<string, string> = {
-  pdf: 'PDF', word: 'Word', excel: 'Excel', csv: 'CSV', text: 'TXT',
-  markdown: 'MD', json: 'JSON', python: 'Python', javascript: 'JS',
-  html: 'HTML', css: 'CSS', image: 'Image', archive: 'Archive',
-  audio: 'Audio', video: 'Video', ppt: 'PPT', file: 'FILE',
-}
-
-const EXT_TYPE_MAP: Record<string, string> = {
-  pdf: 'pdf', docx: 'word', doc: 'word',
-  pptx: 'ppt', ppt: 'ppt',
-  xlsx: 'excel', xls: 'excel', csv: 'csv',
-  txt: 'text', md: 'markdown', json: 'json',
-  py: 'python', js: 'javascript', ts: 'javascript',
-  html: 'html', css: 'css',
-  png: 'image', jpg: 'image', jpeg: 'image',
-  gif: 'image', webp: 'image', bmp: 'image', svg: 'image',
-  zip: 'archive', gz: 'archive', tar: 'archive',
-  mp3: 'audio', wav: 'audio', m4a: 'audio', ogg: 'audio',
-  flac: 'audio', aac: 'audio',
-  mp4: 'video', webm: 'video', mov: 'video', m4v: 'video', avi: 'video',
-}
-
-function inferType(file: FileAttachment): string {
-  const t = file.type
-  if (t && t !== 'file') return t
-  const name = file.name || file.path || ''
-  const ext = name.includes('.') ? (name.split('.').pop() || '').toLowerCase() : ''
-  return EXT_TYPE_MAP[ext] || 'file'
-}
-
-function fileTypeLabel(type: string): string {
-  return TYPE_LABELS[type || ''] || (type || 'FILE').toUpperCase()
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1048576).toFixed(1)} MB`
-}
-
 async function downloadFile(file: FileAttachment) {
   try {
-    const url = getDownloadUrl(file)
+    const url = targetUrl(file)
 
     abortController.value?.abort()
     abortController.value = new AbortController()
@@ -187,7 +154,7 @@ async function downloadFile(file: FileAttachment) {
   } catch (e: any) {
     if (e?.name === 'AbortError') return
     if (e?.response?.status === 404) {
-      console.warn('Download 404 for:', file.path, '- file may have been cleaned up')
+      console.warn('Download 404 for:', displayPath(file), '- file may have been cleaned up')
     } else {
       console.error('Download failed:', e)
     }
@@ -213,7 +180,7 @@ async function downloadFile(file: FileAttachment) {
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all var(--transition-fast);
-  max-width: 280px;
+  max-width: 320px;
   min-width: 180px;
 }
 
@@ -292,8 +259,8 @@ async function downloadFile(file: FileAttachment) {
 }
 
 /* 小比例完整展示（不裁切）：contain 保持原比例。桌面端以高度为上限，
-  保证 9:16 竖图在不滚动窗口的情况下全貌可见；移动端以宽度为上限，
-  保证 16:9 横图全貌可见。点击卡片进入可缩放 lightbox 查看细节。 */
+   保证 9:16 竖图在不滚动窗口的情况下全貌可见；移动端以宽度为上限，
+   保证 16:9 横图全貌可见。点击卡片进入可缩放 lightbox 查看细节。 */
 .image-preview {
   width: auto;
   height: auto;
@@ -359,6 +326,15 @@ async function downloadFile(file: FileAttachment) {
 .file-size {
   font-size: 11px;
   color: var(--color-text-light);
+}
+
+.file-workspace-path {
+  font-size: 10px;
+  color: var(--color-text-light);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
 }
 
 .download-icon {

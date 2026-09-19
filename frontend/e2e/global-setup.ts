@@ -15,16 +15,21 @@ async function globalSetup() {
   const frontendDir = path.resolve(__dirname, '..');
   const projectRoot = path.resolve(frontendDir, '..');
   const python = path.join(projectRoot, '.venv', 'bin', 'python');
-  const seed = path.join(projectRoot, 'tests', 'memory_ui_seed.py');
-  if (!fs.existsSync(seed) || !fs.existsSync(python)) {
-    console.log('[global-setup] seed script / venv python absent, skip');
-    return;
-  }
-  try {
-    const { stdout } = await execFileAsync(python, [seed], { cwd: projectRoot });
-    console.log('[global-setup] memory seed:', stdout.trim());
-  } catch (err) {
-    console.warn('[global-setup] memory seed failed (memory_panel.spec may fail):', err);
+  const seeds = [
+    path.join(projectRoot, 'tests', 'memory_ui_seed.py'),
+    path.join(projectRoot, 'tests', 'seed_workspace_preview_fixtures.py'),
+  ];
+  for (const seed of seeds) {
+    if (!fs.existsSync(seed) || !fs.existsSync(python)) {
+      console.log(`[global-setup] seed script ${path.basename(seed)} / venv python absent, skip`);
+      continue;
+    }
+    try {
+      const { stdout } = await execFileAsync(python, [seed], { cwd: projectRoot });
+      console.log(`[global-setup] seed ${path.basename(seed)}:`, stdout.trim());
+    } catch (err) {
+      console.warn(`[global-setup] seed ${path.basename(seed)} failed:`, err);
+    }
   }
 }
 

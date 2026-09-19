@@ -279,10 +279,12 @@ async def upload_and_parse_files(
                     upload, filename, workspace_root
                 )
                 ext = os.path.splitext(filename)[1].lower()
+                rel_path = os.path.relpath(file_path, workspace_root).replace(os.sep, "/")
                 results.append(FileParseResult(
                     success=True,
                     filename=filename,
                     file_path=file_path,
+                    rel_path=rel_path,
                     size=size,
                     file_type=ext.lstrip(".") or "bin",
                 ))

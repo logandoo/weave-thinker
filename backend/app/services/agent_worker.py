@@ -725,15 +725,27 @@ class AgentWorker:
     def _extract_attachments(self, tool_results_accumulated: list[dict]) -> list[dict]:
         """Explicit-only policy (user directive 2026-09-18, prod conv 8b382ad8).
 
-        Download cards come solely from successful ``provide_file`` calls —
-        the agent's explicit delivery intent. Byproducts of execute_code /
-        terminal / other file-producing tools are never auto-attached: an
-        analysis background task must not offer the files it analyzed.
+        Download cards come solely from successful ``provide_file`` and
+        ``provide_folder`` calls (2026-09-19) — the agent's explicit delivery
+        intent. Byproducts of execute_code / terminal / other file-producing
+        tools are never auto-attached: an analysis background task must not
+        offer the files it analyzed. Dedup key: ``rel_path`` (or legacy
+        absolute ``path``), so both card generations work.
         """
         provided_attachments = []
         seen_paths: set[str] = set()
+
+        def _add(entry: dict, *, folder: bool) -> None:
+            if folder and entry.get("type") != "folder":
+                entry = {**entry, "type": "folder"}
+            fpath = entry.get("rel_path") or entry.get("path") or ""
+            if not fpath or fpath in seen_paths:
+                return
+            seen_paths.add(fpath)
+            provided_attachments.append(entry)
+
         for tr in tool_results_accumulated:
-            if tr.get("name") != "provide_file":
+            if tr.get("name") not in ("provide_file", "provide_folder"):
                 continue
             raw_result = tr.get("result", "")
             if not raw_result:
@@ -742,14 +754,12 @@ class AgentWorker:
                 parsed = json.loads(raw_result)
             except (json.JSONDecodeError, TypeError):
                 continue
-            for f in parsed.get("generated_files", []):
-                if not isinstance(f, dict):
-                    continue
-                fpath = f.get("path", "")
-                if not fpath or fpath in seen_paths:
-                    continue
-                seen_paths.add(fpath)
-                provided_attachments.append(f)
+            for f in parsed.get("generated_files") or []:
+                if isinstance(f, dict):
+                    _add(f, folder=False)
+            for f in parsed.get("generated_folders") or []:
+                if isinstance(f, dict):
+                    _add(f, folder=True)
         return provided_attachments
 
     def _get_start_time(self, started_at: datetime) -> float:

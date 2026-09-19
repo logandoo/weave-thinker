@@ -47,6 +47,9 @@
       v-if="previewingFile"
       :filename="previewingFile.filename"
       :url="getFilePreviewUrl(previewingFile)"
+      :rel-path="previewingFile.rel_path || null"
+      :source-path="previewingFile.rel_path || previewingFile.file_path || null"
+      :type="previewingFile.file_type || null"
       @close="previewingFile = null"
     />
 
@@ -433,6 +436,9 @@ import FilePreviewDialog from './FilePreviewDialog.vue'
 import { skillsApi } from '@/api/skills'
 import type { Skill } from '@/types'
 import { fileUploadApi, type FileParseResult } from '@/api/fileUpload'
+import { classifyFile } from '@/composables/filePreview'
+import { buildDownloadUrl } from '@/api/workspaceFiles'
+import { downloadUrl } from '@/composables/useDownload'
 
 const chatStore = useChatStore()
 const assistantStore = useAssistantStore()
@@ -532,7 +538,6 @@ const showFileUpload = ref(false)
 // ChatInput remounts (conversation switches, pane refreshes).
 const uploadedFiles = computed(() => uploadStore.files)
 const previewingFile = ref<FileParseResult | null>(null)
-const PREVIEWABLE_EXT_RE = /\.(pdf|md|markdown|txt|py|ts|js|json|sh|yaml|yml|html|css|sql|go|rs|java)$/i
 // Paste-image / drag-drop upload: drag depth guards the flicker between
 // child-element dragenter/dragleave pairs. Only file drags are intercepted —
 // text/link drags keep the contenteditable's native drop behavior.
@@ -1108,7 +1113,7 @@ async function handleSend() {
   }
   if (uploadedFiles.value.length > 0) {
     for (const f of uploadedFiles.value) {
-      if (f.file_path) {
+      if (f.file_path || f.rel_path) {
         const sizeStr = f.size
           ? f.size < 1024
             ? `${f.size} B`
@@ -1116,7 +1121,7 @@ async function handleSend() {
               ? `${(f.size / 1024).toFixed(1)} KB`
               : `${(f.size / 1048576).toFixed(1)} MB`
           : '未知'
-        fullContent += `[file-ref:${f.filename}]\n文件路径: ${f.file_path}\n文件类型: ${f.file_type || 'unknown'}\n文件大小: ${sizeStr}\n[/file-ref]\n\n`
+        fullContent += `[file-ref:${f.filename}]\n工作区路径: ${f.rel_path || f.file_path}\n文件类型: ${f.file_type || 'unknown'}\n文件大小: ${sizeStr}\n[/file-ref]\n\n`
       }
     }
   }
@@ -1260,18 +1265,22 @@ function removeUploadedFile(idx: number) {
 }
 
 function isPreviewableFilename(filename: string): boolean {
-  return PREVIEWABLE_EXT_RE.test(filename || '')
+  const kind = classifyFile(filename)
+  return kind !== 'archive' && kind !== 'unknown' && kind !== 'folder'
 }
 
 /** Same URL mechanism as FileAttachment.vue (token in query for iframe/fetch). */
 function getFilePreviewUrl(file: FileParseResult): string {
-  const token = localStorage.getItem('chatllm_token')
-  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : ''
-  return `/api/files/download?path=${encodeURIComponent(file.file_path || '')}${tokenParam}`
+  return buildDownloadUrl(file.rel_path || file.file_path || '')
 }
 
 function onChipClick(file: FileParseResult) {
-  if (!file.file_path || !isPreviewableFilename(file.filename)) return
+  if (!file.rel_path && !file.file_path) return
+  const kind = classifyFile(file.filename, file.file_type)
+  if (kind === 'archive') {
+    downloadUrl(getFilePreviewUrl(file), file.filename)
+    return
+  }
   previewingFile.value = file
 }
 

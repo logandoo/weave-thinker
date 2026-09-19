@@ -1,5 +1,5 @@
-# Copyright (c) 2026 Weave Thinker Contributors
-# SPDX-License-Identifier: Apache-2.0
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Weave Thinker产品功能介绍
 

@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2026 Weave Thinker Contributors -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Weave Thinker— Backend API 文档（详版）
+# Weave Thinker — Backend API 文档（详版）
 
 > **文档结构**：
 > - **一、接口明细**：全部 HTTP 接口，由 `tools/gen_api_md.py` 从**运行中后端的 `/openapi.json`** 自动生成

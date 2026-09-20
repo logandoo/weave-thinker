@@ -319,8 +319,13 @@ JUDGE_SYSTEM_PROMPT = (
      "且无法通过合理默认自主决定。此时输出 {\"verdict\": \"ask\", "
      "\"reason\": \"<需要用户提供的具体内容>\"}。\n"
      "- 能用合理默认继续的不得判 ASK，应判 CONTINUE。\n\n"
-     "判定原则：宁可保守判为 CONTINUE，也绝不在没有看到可验证产出时判为 DONE。\n\n"
-     "证据映射要求（A2b）：判定 DONE 时，reason 必须引用具体证据——文件路径、"
+    "判定原则：宁可保守判为 CONTINUE，也绝不在没有看到可验证产出时判为 DONE。\n\n"
+    "未执行占位规则：若环境证据的机械扫描列出交付物中的未执行占位标记"
+    "（如「待执行/待填报/不填报数值/占位」），而目标或验收标准要求该部分给出实际结果"
+    "（计算/统计/实证/数据/基准），则不得判 done——必须判 continue，并要求在实际可得范围内"
+    "完成执行或明确向用户说明降级；仅当验收标准或用户明确允许该留白（如已同意数据不可得）"
+    "并已在 reason 中引用该依据时，方可判 done。\n\n"
+    "证据映射要求（A2b）：判定 DONE 时，reason 必须引用具体证据——文件路径、"
      "测试/命令输出、或回复中实际展示的产出内容。"
      "'看起来完成了'、'已经全部完成'、'所有内容已交付'等空口声明不构成证据；"
      "无法引用任何具体证据时，必须判 CONTINUE。"
@@ -356,6 +361,23 @@ def _judge_evidence_section(evidence: str) -> str:
         f"{ev}\n"
         "</environment_evidence>\n\n"
     )
+
+
+# ── 未执行占位检测（2026-09-20, conv a104fbc5 placeholder gate）──────────
+# 事故：s5 实证章节结果表全部以「受限估计：待执行/不填报数值」占位交付，
+# verifier 只读文件头尾片段未命中拦截，judge 证据包只有文件名与自述摘要，
+# 105 轮后仍判 done。此处是确定性证据（非硬终判）：只把「交付物内容里存在
+# 未执行标记」这一环境事实喂给 verifier/judge，由它们结合验收标准判断该留白
+# 是否被允许（用户同意数据不可得时标注受限是合法行为，不得硬拦）。
+_PLACEHOLDER_MARKERS: tuple = (
+    "待执行", "待填报", "待补", "待完成", "待数据", "待闭环", "待核验",
+    "待验证", "不填报", "占位", "TBD", "TODO",
+)
+_PLACEHOLDER_SCAN_MAX_FILES = 12
+_PLACEHOLDER_SCAN_MAX_SAMPLES = 2
+_PLACEHOLDER_SCAN_SAMPLE_CHARS = 100
+_PLACEHOLDER_SCAN_MAX_BYTES = 512 * 1024
+_PLACEHOLDER_EVIDENCE_CHARS = 1200
 
 # Tools whose non-error output represents genuine information gain for the
 # verifier's progress detection (read/search/browse). Execution tools like
@@ -536,6 +558,26 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [截断]"
 
 
+def _head_tail_truncate(text: str, limit: int) -> str:
+    """Head+tail truncation with an explicit middle-omission marker.
+
+    2026-09-20 审计完整性：head-only 截断会丢掉尾部证据（文件清单、数字、
+    结论、工具轨迹——conv a104fbc5 的 judge 正是看不到尾部才判 done）。两端
+    可见 + 显式标注 + 省略字符数（供确定性核查定位缺口）。
+    """
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= 40:
+        # A4.9 r2 Minor: 极小预算下 half=0 会让 text[-0:]=全文（假截断），
+        # 退化为显式头部截断。
+        return text[: max(0, limit)] + "…[已截断]"
+    half = (limit - 32) // 2
+    omitted = len(text) - 2 * half
+    return text[:half] + f"\n…[中间省略 {omitted} 字符]…\n" + text[-half:]
+
+
 # E2/CAST（2026-09-14）：失败 taxonomy（推理侧 4 条之一）——可选字段，
 # 旧判词无该字段时解析行为逐字节不变。共享常量见 eval_metrics。
 from app.services.eval_metrics import TAXONOMY_VALUES as JUDGE_TAXONOMY_VALUES  # noqa: E402
@@ -662,7 +704,7 @@ async def _call_judge_llm(goal: str, last_response: str, *, timeout: float = DEF
 
     prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
         goal=_truncate(goal, 2000),
-        response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        response=_head_tail_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         evidence=_judge_evidence_section(evidence),
     )
 
@@ -1667,6 +1709,70 @@ class DeathmatchManager:
         self._conv.deathmatch_pause_state = None
         self._conv.deathmatch_no_progress_replans = 0
 
+    def begin_revision(self, user_query: str = "") -> bool:
+        """D3-revision (2026-09-20, conv a104fbc5): a completed round that
+        receives explicit user dissatisfaction or a rework instruction must
+        REOPEN execution instead of being reduced to chat. The plan, steps
+        and settled ledger are untouched (no statement mutation); the
+        critique is appended to the cross-round context so the next
+        continuation carries it, and stall/breaker counters reset (a
+        user-initiated direction change is fresh authorization).
+
+        Returns True when the loop was reopened; False when there is nothing
+        to reopen (already running / no goal)."""
+        status = self._conv.deathmatch_status
+        if status in ("active", "grilling"):
+            return False
+        if not str(self._conv.deathmatch_goal or "").strip():
+            return False
+        self._conv.deathmatch_mode = True
+        self._conv.deathmatch_status = "active"
+        self._conv.deathmatch_reason = "user-revision"
+        self._conv.deathmatch_human_gate = None
+        # A consumed PAUSED packet must not survive the reopen (mirrors
+        # resume()/resume_from_partial(), A4.9 Minor-1).
+        self._conv.deathmatch_pause_state = None
+        self._conv.deathmatch_consecutive_failures = 0
+        self._conv.deathmatch_verify_failures = 0
+        self._conv.deathmatch_no_progress_replans = 0
+        _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)
+        if status == "done":
+            # A full user-requested revision of a FINALIZED round is a fresh
+            # authorization window: the done finalize does not freeze the
+            # wall clock, so folding "now - started_at" would charge the whole
+            # idle period (3 parked days → instant human_gate on any finite
+            # budget; A4.9 Important-2). Reset both budgets and start the
+            # segment now — an exhausted max_turns must not gate the revision
+            # before its first turn.
+            self._conv.deathmatch_wall_time_used_seconds = 0
+            self._conv.deathmatch_wall_time_started_at = None
+            self._conv.deathmatch_turns = 0
+        # Fold nothing for the done window (started_at is None); paused/gated/
+        # partial reopen keeps resume() semantics: parked time is not
+        # chargeable (the segment is folded once) and the cumulative budget
+        # continues.
+        self._accumulate_wall_time()
+        self._conv.deathmatch_max_wall_time_seconds = config.deathmatch_max_wall_time_seconds
+        self._conv.deathmatch_max_turns = config.deathmatch_max_turns
+        critique = " ".join((user_query or "").split())
+        if critique:
+            block = "[用户修订要求 — 本轮必须据此修订已交付成果]\n" + critique[:1500]
+            summary = str(
+                getattr(self._conv, "deathmatch_context_summary", "") or ""
+            ).strip()
+            if block not in summary:
+                summary = (summary + "\n\n" + block).strip() if summary else block
+                try:
+                    self._conv.deathmatch_context_summary = summary[-12000:]
+                except Exception as exc:
+                    logger.debug("begin_revision: summary write failed: %s", exc)
+        self._record_event("revision_requested", query=critique[:200])
+        logger.info(
+            "Deathmatch revision requested: conversation %s reopened (query=%r)",
+            self._conv.id, critique[:80],
+        )
+        return True
+
     def _accumulate_wall_time(self) -> None:
         """Fold the current wall-clock segment into the cumulative used
         seconds and start a fresh segment. The cumulative total is what
@@ -2464,22 +2570,50 @@ class DeathmatchManager:
             parts.append(
                 "已完成步骤（已定案——除非出现新证据，不得据此推翻）:\n"
                 + "\n".join(
-                    f"- {s.get('id')}: {str(s.get('description') or '')[:80]}"
-                    f" → {str(s.get('output_summary') or '(无摘要)')[:120]}"
+                    # A4.9 r2 Minor: clamp the id — an LLM-authored 400-char id
+                    # would otherwise eat the evidence budget and push the
+                    # placeholder scan out of the pack.
+                    f"- {_truncate(str(s.get('id') or ''), 40)}: {_truncate(str(s.get('description') or ''), 80)}"
+                    f" → {_truncate(str(s.get('output_summary') or '(无摘要)'), 120)}"
                     for s in done_steps[:8]
                 )
             )
+            if len(done_steps) > 8:
+                parts.append(
+                    f"（已完成步骤共 {len(done_steps)} 个，按计划序仅列前 8 个；"
+                    f"其余未展示 ≠ 不存在）"
+                )
+        # 2026-09-20 placeholder gate (conv a104fbc5): the judge previously
+        # saw only filenames/summaries and could not tell an executed
+        # deliverable from a placeholder scaffold. Feed it the deterministic
+        # marker scan BEFORE the (potentially huge) workspace listing — the
+        # pack is tail-truncated at _JUDGE_EVIDENCE_CHARS, so a late scan
+        # would silently vanish on large workspaces (A4.9 Important-1).
+        if workspace_path:
+            try:
+                _outputs: List[str] = []
+                for s in (plan.get("steps") or []):
+                    for fp in (s.get("output_files") or s.get("writes") or []):
+                        p = str(fp or "").strip()
+                        if p and p not in _outputs:
+                            _outputs.append(p)
+                _scan = self._scan_unexecuted_placeholders(workspace_path, _outputs)
+                if _scan:
+                    parts.append(_scan)
+            except Exception as exc:
+                logger.debug("judge evidence: placeholder scan failed: %s", exc)
         if workspace_path:
             try:
                 files = self._workspace_file_snapshot(workspace_path)
-                parts.append("工作区文件快照:\n" + self._format_workspace_listing(files))
+                parts.append("工作区文件快照:\n" + self._format_workspace_listing(
+                    files, total=getattr(self, "_last_snapshot_total", len(files))))
             except Exception as exc:
                 logger.debug("judge evidence: workspace snapshot failed: %s", exc)
         prev = self._conv.deathmatch_last_verification_result or {}
         if prev:
             parts.append(
                 f"上轮验证: status={prev.get('status')}, "
-                f"issues={str(prev.get('issues') or [])[:200]}"
+                f"issues={_truncate(str(prev.get('issues') or []), 200)}"
             )
         # P1-5: settled verdicts (step completions + reconcile overturns) —
         # the judge must not flip them without new evidence.
@@ -2488,14 +2622,15 @@ class DeathmatchManager:
             parts.append(_settled)
         if tool_results:
             trace = "\n".join(
-                f"[{getattr(tr, 'name', '?')}] {str(getattr(tr, 'result', '') or '')[:200]}"
+                f"[{getattr(tr, 'name', '?')}] {_truncate(str(getattr(tr, 'result', '') or ''), 200)}"
                 for tr in tool_results[-6:]
             )
             if trace.strip():
                 parts.append("本轮工具调用:\n" + trace)
         ev = "\n\n".join(p for p in parts if p.strip())
         if len(ev) > _JUDGE_EVIDENCE_CHARS:
-            ev = ev[: _JUDGE_EVIDENCE_CHARS - 16] + "\n…(证据截断)"
+            # 2026-09-20：头+尾（旧头截断会丢工具轨迹/上轮验证等尾部证据）
+            ev = _head_tail_truncate(ev, _JUDGE_EVIDENCE_CHARS)
         return ev
 
     def get_repetition_prompt(self) -> Optional[str]:
@@ -2927,32 +3062,20 @@ class DeathmatchManager:
     ) -> str:
         """Classify user's follow-up intent after a completed deathmatch round.
 
-        Returns one of: NEW_ROUND, DISCUSS, CLARIFY.
-        """
-        # Fast-path heuristics for obviously discussion/feedback messages. These
-        # short phrases almost never represent a new deathmatch task.
-        discussion_hints = [
-            "怎么样", "如何", "评价", "点评", "评分", "打分",
-            "改写", "重写", "修改", "补充", "增加", "添加",
-            "删除", "去掉", "完善", "优化", "调整", "再写",
-            "继续", "接着", "展开", "详细", "精简", "总结",
-            "谢谢", "感谢", "不错", "挺好", "不好", "不行",
-            "为什么", "怎么回事", "什么意思", "能否", "可不可以",
-        ]
-        q = query.strip()
-        if len(q) <= 30 or any(hint in q for hint in discussion_hints):
-            # If the message looks like feedback but also contains a brand-new task
-            # directive, still let the LLM decide. Otherwise treat as DISCUSS.
-            if not any(
-                directive in q
-                for directive in [
-                    "新任务", "重新分析", "重新写", "写一篇", "写一份",
-                    "分析", "调研", "研究", "设计", "制定", "规划",
-                ]
-            ) or len(q) <= 12:
-                return "DISCUSS"
+        Returns one of: NEW_ROUND, REVISE, DISCUSS, CLARIFY.
 
-        from app.services.llm_service import LLMService
+        FULLY AGENTIC (project red line, user directive 2026-09-20): the LLM
+        judges from the synthesized goal + the user's message. There is NO
+        keyword/regex pre-classification — hint lists ("修改"/"重写"/…) both
+        miss paraphrases and hijack explicit new-task messages, and the
+        project forbids hardcoded semantic classifiers (feedback 2026-07-20,
+        `feedback_no_hardcoded_classifiers.md`). On any LLM/parse failure the
+        classifier fails open to DISCUSS (the conservative legacy default:
+        normal chat carries the context, nothing is silently reopened).
+        """
+        q = (query or "").strip()
+        if not q:
+            return "DISCUSS"
 
         # Use the synthesized goal as the task signal; the full compressed summary
         # is often too long and distracts the classifier.
@@ -2975,13 +3098,15 @@ class DeathmatchManager:
 
 intent 只能是以下之一：
 - NEW_ROUND：用户明确提出了一个全新的、独立的任务，需要启动新一轮死磕模式。示例："再帮我分析另一个行业", "请重新写一篇关于XX的文章", "新任务：调研YY"。
-- DISCUSS：用户基于上一轮结果进行讨论、追问、简单修正、评价或闲聊。示例："你觉得写得怎么样？", "请再补充一些数据", "写得太长了", "谢谢"。
+- REVISE：用户对上一轮已交付成果不满意，或提出修改/返工/补充要求。示例："这篇写得很糟糕，没有实际分析", "重写第三章", "数据太少，补充真实数据", "写得太长了"。
+- DISCUSS：用户基于上一轮结果进行讨论、追问、评价或闲聊，且没有要求修改成果。示例："你觉得写得怎么样？", "这个结论的依据是什么？", "如何优化这篇文章？", "谢谢"。
 - CLARIFY：用户仍在当前死磕任务的执行阶段，需要进一步澄清目标或补充信息。仅当新消息明显是对上一轮未完成任务（而非已完成结果）的延续时才选此项。
 
 判定原则：
-1. 如果用户只是评价、追问、小修改，或消息很短（少于15字），优先判为 DISCUSS。
-2. 只有当用户明确说"新任务"、"重新"、"换一个"或提出完全不同的目标时，才判为 NEW_ROUND。
-3. 不要判为 CLARIFY  unless 上一轮任务明显还没有交付最终产出。
+1. 负面评价、指出缺陷，或任何修改/重写/补充/删除/调整要求 → 一律判 REVISE（"太长了""数据不够"这类隐含否定也算）；只有纯讨论/追问/致谢 → DISCUSS。
+2. 消息很短且只是寒暄/追问时判 DISCUSS；短消息同样是明确返工要求时不得因短而降级。
+3. 明确说"新任务/换一个/做完这个再做一个全新主题"或提出完全不同的目标 → NEW_ROUND，即使消息里带"重写/修改"字样。
+4. 不要判为 CLARIFY  unless 上一轮任务明显还没有交付最终产出。
 """
         llm = self._make_llm()
         raw = ""
@@ -3017,7 +3142,7 @@ intent 只能是以下之一：
                     data = None
         if isinstance(data, dict):
             intent = str(data.get("intent", "DISCUSS")).upper()
-            if intent in {"NEW_ROUND", "DISCUSS", "CLARIFY"}:
+            if intent in {"NEW_ROUND", "REVISE", "DISCUSS", "CLARIFY"}:
                 logger.info("Deathmatch intent classification: query=%r intent=%s", q, intent)
                 return intent
         logger.info("Deathmatch intent classification fallback: query=%r", q)
@@ -3806,6 +3931,10 @@ intent 只能是以下之一：
         "   e) kill list：是否出现 style.md 中的禁用表达/句式；\n"
         "   f) 伏笔：应回收的伏笔是否遗漏。\n"
         "   任一违反 → 标记 partial，issues 具体指出违反的设定条目（引用设定原文）。\n"
+        "7. 未执行占位检查：若用户提示中给出『未执行占位标记（机械扫描）』，且当前步骤预期产出"
+        "要求实际结果（数据/计算/统计/实证结果表），而文件内容以『待执行/待填报/不填报数值/占位』"
+        "代替结果、只给出设计与方案，则不得判 complete——判 partial，并在 issues/diagnosis 中"
+        "列出未执行的交付项。\n"
         "合理推测或基于公开资料的整理是可以接受的，但必须被明确标注为估算/公开数据，不得伪装成实测。\n"
         "workspace 文件快照按目录分组列出，包含全部已知文件；不要仅因某文件不在列表开头就断定其缺失。\n"
          "只输出JSON：\n"
@@ -4008,6 +4137,10 @@ intent 只能是以下之一：
         "file=文件路径+最小字节数（min_bytes）；gate=一条 shell 命令（退出码 0=通过）；"
         "无法机械判定的用 judgmental（check.kind=none）。\n"
         "3. 不要发明用户未要求的约束；宁少勿滥（≤8 条）。\n"
+        "4. 若目标要求实际执行/计算/用真实数据支撑的产出（实证分析、基准测试、数据核验、统计等），"
+        "必须为该部分起草一条可判定标准，明确要求给出实际执行结果（计算值/统计量/结论），"
+        "禁止只覆盖文件名、章节存在性或篇幅；不得以『待执行/待填报』占位充当满足。"
+        "目标允许数据受限降级时，标准应要求降级后的实际计算仍被执行并标注边界。\n"
         "只输出一行 JSON：{\"criteria\": [{\"text\": \"...\", "
         "\"type\": \"mechanical|judgmental\", "
         "\"check\": {\"kind\": \"file|gate|none\", \"path\": \"...\", "
@@ -4839,26 +4972,37 @@ intent 只能是以下之一：
         # the verifier prompt uses the grouped listing below so that older
         # deliverables are never invisible.
         snap.sort(key=lambda x: x.get("mtime", 0), reverse=True)
+        self._last_snapshot_total = len(snap)
         return snap[:400]
 
     @staticmethod
-    def _format_workspace_listing(files: List[Dict[str, Any]]) -> str:
+    def _format_workspace_listing(files: List[Dict[str, Any]], total: Optional[int] = None) -> str:
         """Format the workspace snapshot as a directory-grouped listing.
 
         Unlike a flat "N most recent" list, this guarantees every directory
         and every file type is represented, so the verifier never concludes
         that existing deliverables are missing merely because newer files
         pushed them out of a truncated window.
+
+        2026-09-20 审计完整性：快照硬上限 400 必须显式披露总数（旧实现静默，
+        verifier/judge 可能据"列表里没有"判定交付物缺失）。
         """
         if not files:
             return "(无文件)"
         from collections import defaultdict
+        total_n = int(total if total is not None else len(files))
         by_dir: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for f in files:
             path = f.get("path", "")
             d, _, name = path.rpartition("/")
             by_dir[d or "(根目录)"].append(f)
-        lines: List[str] = [f"共 {len(files)} 个文件（按目录分组）:"]
+        lines: List[str] = [f"共 {total_n} 个文件（按目录分组）:"]
+        if total_n > len(files):
+            lines.append(
+                f"（快照上限：仅列出最近修改的 {len(files)} 个；"
+                f"其余 {total_n - len(files)} 个未列出——未列出 ≠ 不存在，"
+                f"不得据此判定交付物缺失）"
+            )
         for d in sorted(by_dir):
             entries = by_dir[d]
             lines.append(f"[{d}] ({len(entries)} 个文件)")
@@ -4883,6 +5027,87 @@ intent 只能是以下之一：
     def _is_text_file(path: str) -> bool:
         ext = _os.path.splitext(str(path))[1].lower()
         return ext not in DeathmatchManager._BINARY_FILE_EXTENSIONS
+
+    @staticmethod
+    def _scan_unexecuted_placeholders(
+        workspace_path: str,
+        files: Any,
+        *,
+        max_files: int = _PLACEHOLDER_SCAN_MAX_FILES,
+    ) -> str:
+        """Deterministic evidence: unexecuted placeholder markers inside
+        deliverable files (2026-09-20, conv a104fbc5).
+
+        Returns a bounded evidence block listing each file with its hit
+        count and sample lines, or "" when nothing was found. Never raises;
+        missing/binary/oversized entries are skipped. This is EVIDENCE for
+        the verifier/judge prompts, not a completion verdict — a legitimate
+        "数据不可得" annotation agreed by the user's acceptance criteria must
+        still be judge-able as complete.
+        """
+        if not workspace_path:
+            return ""
+        try:
+            wanted: List[str] = []
+            for fp in (files or []):
+                p = str(fp or "").strip()
+                if not p or p in wanted:
+                    continue
+                if not DeathmatchManager._is_text_file(p):
+                    continue
+                wanted.append(p)
+                if len(wanted) >= max(1, int(max_files)):
+                    break
+            if not wanted:
+                return ""
+            # A4.9 r3：文件上限必须披露（未扫描 ≠ 无占位）
+            _valid_count = 0
+            for fp in (files or []):
+                p = str(fp or "").strip()
+                if not p or not DeathmatchManager._is_text_file(p):
+                    continue
+                _valid_count += 1
+            lines: List[str] = []
+            for rel in wanted:
+                abs_path = rel if _os.path.isabs(rel) else _os.path.join(workspace_path, rel)
+                if not _os.path.isfile(abs_path):
+                    continue
+                try:
+                    with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                        content = fh.read(_PLACEHOLDER_SCAN_MAX_BYTES)
+                except OSError:
+                    continue
+                hits = 0
+                samples: List[str] = []
+                for line in content.splitlines():
+                    if not any(m in line for m in _PLACEHOLDER_MARKERS):
+                        continue
+                    hits += 1
+                    if len(samples) < _PLACEHOLDER_SCAN_MAX_SAMPLES:
+                        samples.append(" ".join(line.split())[:_PLACEHOLDER_SCAN_SAMPLE_CHARS])
+                if hits:
+                    detail = f"- {rel}: 命中 {hits} 处"
+                    if samples:
+                        detail += " | 示例: " + "；".join(f"「{s}」" for s in samples)
+                    lines.append(detail)
+            if _valid_count > len(wanted):
+                lines.append(
+                    f"（扫描上限 {max_files} 个文件：另有 {_valid_count - len(wanted)} 个未扫描"
+                    f"——未扫描 ≠ 无占位）"
+                )
+            if not lines:
+                return ""
+            text = (
+                "未执行占位标记（机械扫描：交付物内容含"
+                "『待执行/待填报/不填报数值/占位』等未执行标记）:\n"
+                + "\n".join(lines)
+            )
+            if len(text) > _PLACEHOLDER_EVIDENCE_CHARS:
+                text = text[: _PLACEHOLDER_EVIDENCE_CHARS - 12] + "\n…(扫描截断)"
+            return text
+        except Exception as exc:
+            logger.debug("placeholder scan failed: %s", exc)
+            return ""
 
     def _read_prior_file_snippets(
         self,
@@ -4945,8 +5170,19 @@ intent 只能是以下之一：
                     snippets.append(
                         f"--- 文件: {fp} (步骤 {s.get('id')}) ---\n{pair}\n"
                     )
+            if len(output_files) > max_files:
+                # A4.9 r3：未展示 ≠ 不存在
+                snippets.append(
+                    f"（步骤 {s.get('id')} 共 {len(output_files)} 个产出文件，"
+                    f"仅展示前 {max_files} 个；其余未展示 ≠ 不存在，不得据此判缺失）"
+                )
         if new_files:
             parts = ["## 本轮新产出/变更的文件（当前步骤实际写入的内容，开头+结尾）"]
+            if len(new_files) > 3:
+                parts.append(
+                    f"（本轮新产出/变更共 {len(new_files)} 个文件，仅展示前 3 个；"
+                    f"其余未展示 ≠ 不存在）"
+                )
             for f in new_files[:3]:
                 fp = str(f.get("path") or "")
                 pair = _read_pair(fp)
@@ -5187,24 +5423,61 @@ intent 只能是以下之一：
                 llm = self._make_llm(
                     model_override=config.deathmatch_verify_model or ""
                 )
-                files_desc = self._format_workspace_listing(files)
+                files_desc = self._format_workspace_listing(
+                    files, total=getattr(self, "_last_snapshot_total", len(files)))
                 prior_outputs = ""
                 for s in steps:
                     if s.get("status") == "done" and s.get("id") != current_step.get("id"):
-                        prior_outputs += f"步骤 {s.get('id')}: {s.get('output_summary', '')[:200]}\n"
+                        prior_outputs += (
+                            f"步骤 {s.get('id')}: "
+                            f"{_truncate(str(s.get('output_summary') or ''), 200)}\n"
+                        )
                 prior_file_snippets = self._read_prior_file_snippets(
                     steps, workspace_path, new_files=new_files
                 )
+                # 2026-09-20 placeholder gate: deterministic marker scan of THIS
+                # step's expected outputs so the verifier can flag design-only
+                # scaffolds ("受限估计：待执行") instead of accepting them.
+                # A4.9 r2 Important-1: `output_files` is only written back at
+                # step COMPLETION, so on a step's first verification pass the
+                # declared outputs may be empty — always include this turn's
+                # new/changed files (new_files), or the scan would be inert
+                # exactly when it matters.
+                _cur_outputs = [
+                    str(x) for x in (
+                        current_step.get("output_files")
+                        or current_step.get("writes")
+                        or []
+                    )
+                ]
+                for _f in (new_files or []):
+                    _p = str(_f.get("path") or "").strip()
+                    if _p and _p not in _cur_outputs:
+                        _cur_outputs.append(_p)
+                _placeholder_ev = self._scan_unexecuted_placeholders(
+                    workspace_path, _cur_outputs
+                )
+                _step_json = json.dumps(current_step, ensure_ascii=False)
+                if len(_step_json) > 1000:
+                    # 2026-09-20 审计完整性：静默 [:1000] 会砍掉步骤契约后段
+                    # （expected_output/output_files 位于 JSON key 顺序后部）。
+                    _step_json = _step_json[:1000] + "\n…[步骤 JSON 截断]…"
                 user_prompt = (
                     f"目标:\n{_truncate(self._conv.deathmatch_goal or '', 800)}\n\n"
                     + (
                         f"{_format_criteria_block(self._all_criteria())}\n\n"
                         if _format_criteria_block(self._all_criteria()) else ""
                     )
-                    + f"当前正在执行的步骤:\n{json.dumps(current_step, ensure_ascii=False)[:1000]}\n\n"
-                    # A4.9 M2: the step JSON dump is capped at 1000 chars and
-                    # boundary sits late in key order — surface it explicitly
-                    # so check-item 9 can never be silently inert.
+                    + f"当前正在执行的步骤:\n{_step_json}\n\n"
+                    # 步骤契约必须显式在场（不依赖 JSON dump 的 key 顺序/长度）：
+                    # expected_output 是 verifier 判 complete 的第一依据。
+                    + (
+                        f"当前步骤预期产出（expected_output）:\n"
+                        f"{_truncate(str(current_step.get('expected_output') or ''), 400)}\n\n"
+                        if current_step.get("expected_output") else ""
+                    )
+                    # A4.9 M2: boundary 位于 JSON key 顺序后部，显式呈现，
+                    # 保证检查项 9 永不静默失效。
                     + (
                         f"当前步骤边界约束（boundary）:\n"
                         f"{_truncate(str(current_step.get('boundary') or ''), 300)}\n\n"
@@ -5212,7 +5485,8 @@ intent 只能是以下之一：
                     )
                     + f"此前已完成步骤的产出:\n{prior_outputs or '(无)'}\n\n"
                     f"文件内容片段（前序步骤产物 + 本轮新产出/变更文件，均为开头+结尾）:\n{prior_file_snippets}\n\n"
-                    f"Agent最近回复:\n{_truncate(last_response, 2000)}\n\n"
+                    + (f"{_placeholder_ev}\n\n" if _placeholder_ev else "")
+                    + f"Agent最近回复:\n{_head_tail_truncate(last_response, 2000)}\n\n"
                     f"workspace文件快照:\n{files_desc}\n\n"
                     + (
                         f"<bible>\n{self._build_bible_context_block()}\n</bible>\n\n"
@@ -5244,6 +5518,9 @@ intent 只能是以下之一：
                     f"9) 边界完整性：若当前步骤声明了 boundary 边界约束，检查本轮产出/变更是否违反"
                     f"（越界修改、覆盖或引用被禁止的对象）。违反→标记 partial，"
                     f"并在 issues 中引用被违反的边界原文。\n"
+                    f"10) 未执行占位检查：若上方机械扫描列出本步骤产出中的未执行占位标记"
+                    f"（待执行/待填报/不填报数值/占位），而步骤预期要求实际结果，"
+                    f"不得判 complete——判 partial 并在 issues/diagnosis 中列出未执行交付项。\n"
                     f"只有当步骤产出确实满足预期时才标记为 complete。"
                 )
                 # A5: MoA aggregation path (optional) — multiple reference
@@ -5296,12 +5573,12 @@ intent 只能是以下之一：
                     # step must keep consistent. Persisted with the result and
                     # injected into the next continuation prompt (survives
                     # context compression because it is re-read from the DB).
-                    result["continuity_brief"] = str(
+                    result["continuity_brief"] = _truncate(str(
                         parsed.get("continuity_brief") or ""
-                    ).strip()[:800]
+                    ).strip(), 800)
                     # W2a: the verifier's falsifiable diagnosis for this round
                     # (feeds the node-recovery ladder / failed directions).
-                    result["diagnosis"] = str(parsed.get("diagnosis") or "").strip()[:300]
+                    result["diagnosis"] = _truncate(str(parsed.get("diagnosis") or "").strip(), 300)
 
                     # Only mark the current step as done when the LLM verifier
                     # explicitly says "complete". Do NOT use heuristic shortcuts.
@@ -5373,10 +5650,10 @@ intent 只能是以下之一：
                             # turns the response is narration, not content.
                             _brief = result.get("continuity_brief") or ""
                             current_step["output_summary"] = (
-                                _brief[:300] if _brief else _truncate(last_response, 300)
+                                _truncate(_brief, 300) if _brief else _truncate(last_response, 300)
                             )
                             if _brief:
-                                current_step["continuity_brief"] = _brief[:400]
+                                current_step["continuity_brief"] = _truncate(_brief, 400)
                             # Collect output files from workspace snapshot.
                             if _evidence_files:
                                 current_step["output_files"] = [

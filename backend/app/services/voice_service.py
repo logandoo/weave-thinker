@@ -5080,7 +5080,8 @@ class VoiceDuplexSession:
         try:
             # No filler for proactive notices: the user asked nothing, so a
             # "让我想想" opener would be a non-sequitur (pre-TTFT behavior).
-            await self._generate_and_speak(prompt_text, allow_tools=True, allow_filler=False)
+            # user_turn=False: 合成系统通知不参与澄清检测（A4.9 r1 Important-2）。
+            await self._generate_and_speak(prompt_text, allow_tools=True, allow_filler=False, user_turn=False)
         finally:
             self._turn_active = False
             self._tools_running = False
@@ -5088,10 +5089,10 @@ class VoiceDuplexSession:
                 await self._set_state("listen")
 
     async def _generate_and_speak(self, text: str, allow_tools: bool = False, prefetched: Optional[str] = None,
-                                  allow_filler: bool = True) -> None:
+                                  allow_filler: bool = True, user_turn: bool = True) -> None:
         try:
             await self._generate_and_speak_impl(text, allow_tools=allow_tools, prefetched=prefetched,
-                                                allow_filler=allow_filler)
+                                                allow_filler=allow_filler, user_turn=user_turn)
         finally:
             # vmem：本轮生成结束信号（正常/取消/异常全部到达；记忆插话仲裁
             # 以 "epoch > 钩子时点" 判本轮，超时封顶，等待永远不挂死）。
@@ -5107,8 +5108,16 @@ class VoiceDuplexSession:
 
     async def _clarification_shadow(self, text: str) -> None:
         """B11（2026-09-14）：语音纠正候选 shadow 记录（applied=False，不应用；
-        独立会话，失败静默）。"""
+        独立会话，失败静默）。
+
+        2026-09-20 A4.9 r1 Important-3：必须遵守记忆运行时总开关
+        （`memory_runtime_enabled`，与 chat 及本文件其他记忆路径一致）——
+        运行时被禁用时不得再调用澄清 LLM。"""
         try:
+            from app.core.config import get_config
+            from app.services.memory_runtime_state import memory_runtime_enabled
+            if not memory_runtime_enabled(get_config()):
+                return
             from app.db.database import AsyncSessionLocal
             from app.services.memory_clarification_service import process_clarification
             uid = getattr(self.user, "id", None)
@@ -5120,14 +5129,15 @@ class VoiceDuplexSession:
             logger.debug("voice clarification shadow failed", exc_info=True)
 
     async def _generate_and_speak_impl(self, text: str, allow_tools: bool = False, prefetched: Optional[str] = None,
-                                       allow_filler: bool = True) -> None:
+                                       allow_filler: bool = True, user_turn: bool = True) -> None:
         self._history.append({"role": "user", "content": text})
-        # B11（2026-09-14）：语音纠正 shadow——语音里的"不对/忘掉"过去完全
-        # 不进 clarification（detect_signal 只在 chat.py）。先 shadow 记录
-        # 候选（applied=False）不应用，供准确率观察后再决定是否启用。
+        # B11（2026-09-14）语音纠正 shadow；2026-09-20（用户指令）全 agentic：
+        # 删除关键词预分类闸门（detect_signal 已移除），真实用户轮无条件
+        # shadow 记录候选（applied=False，LLM 判定 is_correction），不应用。
+        # A4.9 r1 Important-2：后台任务系统通知的合成 prompt 不是用户语音
+        # （user_turn=False），不得送澄清检测。
         try:
-            from app.services.memory_clarification_service import detect_signal
-            if text and self.user is not None and detect_signal(text):
+            if user_turn and text and self.user is not None:
                 task = asyncio.create_task(self._clarification_shadow(text))
                 _voice_clarification_tasks.add(task)
                 task.add_done_callback(_voice_clarification_tasks.discard)

@@ -1010,6 +1010,7 @@ async def chat_stream(
 
         return EventSourceResponse(_busy_events())
 
+    user_message = None  # 仅「新用户消息」轮（普通/编辑）绑定；regenerate 不产生新消息
     if request.regenerate_from_message_id:
         conversation_messages = await _trim_messages_for_regeneration(
             db,
@@ -1053,36 +1054,40 @@ async def chat_stream(
         request.messages[-1].content if request.messages else "",
     )
 
-    # §5.4 澄清检测：Stage 1 关键词命中（请求路径零 LLM）→ fire-and-forget
-    # 异步 LLM 验证+应用修正（独立会话；本轮回答可能仍基于旧记忆，下轮即修正）
+    # §5.4 澄清检测：全 agentic —— 每条新用户消息无条件 fire-and-forget 异步 LLM
+    # 判定（2026-09-20 用户指令：删除关键词预分类闸门 `detect_signal`；漏检=纠正
+    # 永不处理，成本暂不考虑。LLM 自行判定 is_correction，非纠正则零业务写入）。
+    # regenerate 是对旧轮的重新生成，不重复检测（也不存在新 user_message）。
     try:
         from app.core.config import get_config as _gc_clar
         from app.services.memory_runtime_state import memory_runtime_enabled as _mem_rt_clar
         _cfg_clar = _gc_clar()
-        if _mem_rt_clar(_cfg_clar):
-            from app.services.memory_clarification_service import detect_signal
-            if detect_signal(latest_user_query or ""):
-                _clar_uid = current_user.id
-                _clar_conv = conversation_id
-                _clar_msg_id = getattr(user_message, "id", None)
-                _clar_text = latest_user_query
+        if (
+            _mem_rt_clar(_cfg_clar)
+            and not request.regenerate_from_message_id
+            and (latest_user_query or "").strip()
+        ):
+            from app.services.memory_clarification_service import process_clarification
+            _clar_uid = current_user.id
+            _clar_conv = conversation_id
+            _clar_msg_id = getattr(user_message, "id", None)
+            _clar_text = latest_user_query
 
-                async def _clarification_bg():
-                    try:
-                        from app.db.database import AsyncSessionLocal as _ASL
-                        from app.services.memory_clarification_service import process_clarification
-                        async with _ASL() as _cdb:
-                            await process_clarification(
-                                _cdb, _clar_uid, _clar_text,
-                                conversation_id=_clar_conv, message_id=_clar_msg_id)
-                    except Exception:
-                        logger.debug("background clarification failed", exc_info=True)
+            async def _clarification_bg():
+                try:
+                    from app.db.database import AsyncSessionLocal as _ASL
+                    async with _ASL() as _cdb:
+                        await process_clarification(
+                            _cdb, _clar_uid, _clar_text,
+                            conversation_id=_clar_conv, message_id=_clar_msg_id)
+                except Exception:
+                    logger.debug("background clarification failed", exc_info=True)
 
-                _ct = asyncio.create_task(_clarification_bg())
-                _clarification_tasks.add(_ct)
-                _ct.add_done_callback(_clarification_tasks.discard)
+            _ct = asyncio.create_task(_clarification_bg())
+            _clarification_tasks.add(_ct)
+            _ct.add_done_callback(_clarification_tasks.discard)
     except Exception:
-        logger.debug("clarification detect_signal failed", exc_info=True)
+        logger.debug("clarification scheduling failed", exc_info=True)
 
     # DEATHMATCH lifecycle handling
     if request.deathmatch_action:
@@ -1126,6 +1131,8 @@ async def chat_stream(
                     if intent == "NEW_ROUND":
                         await dm_mgr.compress_conversation_context(db)
                         dm_mgr.activate_grilling()
+                    elif intent == "REVISE":
+                        dm_mgr.begin_revision(latest_user_query)
                     elif intent == "CLARIFY":
                         dm_mgr.activate_grilling()
                     # DISCUSS: keep deathmatch off; normal mode will carry the summary.
@@ -1184,6 +1191,13 @@ async def chat_stream(
                         "Deathmatch paused for discussion message in conversation %s",
                         conversation_id,
                     )
+                elif intent == "REVISE":
+                    # User dissatisfaction/rework while the loop is active:
+                    # keep running — the message itself is corrective input.
+                    logger.info(
+                        "Deathmatch kept active for revision message in conversation %s",
+                        conversation_id,
+                    )
         elif conversation.deathmatch_status not in ("grilling", "active"):
             dm_mgr = DeathmatchManager(conversation)
             if conversation.deathmatch_status in ("paused", "human_gate"):
@@ -1214,6 +1228,11 @@ async def chat_stream(
                 if intent == "NEW_ROUND":
                     await dm_mgr.compress_conversation_context(db)
                     dm_mgr.activate_grilling()
+                elif intent == "REVISE":
+                    # 2026-09-20 (conv a104fbc5): a critique/rework instruction
+                    # on a completed round reopens execution instead of
+                    # degenerating into a fact-check chat with no revision.
+                    dm_mgr.begin_revision(latest_user_query)
                 elif intent == "CLARIFY":
                     dm_mgr.activate_grilling()
                 else:

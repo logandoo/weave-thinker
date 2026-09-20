@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import signal
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +63,58 @@ _NPM_FORCE_PATTERN = re.compile(r'\bnpm\s+install\s+.*(--force|-f)\b', re.IGNORE
 _SOURCE_PATTERN = re.compile(r'(?:\bsource\s+|\.\s+)/?(tmp|var|dev|shm)', re.IGNORECASE)
 
 _MAX_OUTPUT_BYTES = 5 * 1024 * 1024
+
+# A4.9 r1 Important-2（2026-09-20）：取消 10k 静默截断后，10k–100k 区间的输出
+# 会原样进入消息历史——预算层只在 >100k 时存档，128k 上下文下有溢出风险。
+# 单流超过该阈值即全文存档（tool_results/，无损可回读）+ 预览指针；
+# 这是「保存而非丢弃」，与用户完整性原则一致（不是省 token 的截断）。
+_STREAM_PERSIST_CHARS = 30_000
+
+
+def _decode_output_capped(raw: bytes) -> str:
+    """Decode captured process output WITHOUT silent character amputation.
+
+    用户原则（2026-08-14 / 2026-09-20 审计要求）：信息完整性永远高于节省 token。
+    旧实现按 `terminal_max_output`（默认 1 万字符）静默 `[:n]` 截断——terminal 是
+    审计 grounding 工具，截断后的结果没有任何存档指针，审计回读也无从恢复，直接
+    制造"看不到证据=编造"的误杀面。现在：
+    - 正常情况下返回**全量**输出；体积治理交给 tool_result_digest / budget 层
+      （>8k 摘要、>100k 全文存档 + 回读指针）。
+    - 仅保留 5MB 字节硬顶作为 OOM 保护；触顶时显式标注截断并提供恢复路径提示。
+    """
+    if len(raw) <= _MAX_OUTPUT_BYTES:
+        return raw.decode("utf-8", errors="replace")
+    text = raw[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+    return text + (
+        f"\n…[输出超过单次捕获上限 {_MAX_OUTPUT_BYTES} 字节，已截断；"
+        "完整输出请分页读取或重定向到文件]…\n"
+    )
+
+
+async def _persist_stream_if_large(text: str, workspace_path: str, tag: str) -> str:
+    """单流 >30k：全文存档 + 预览指针（无损，模型/审计可回读）。
+
+    与 `_decode_output_capped` 配合：正常路径不留静默字符截断；体积治理用
+    「存档 + 指针」而非丢弃。存档写入 tool_results/（allow-list 根），
+    审计 grounding 回读可恢复全文。
+    """
+    if len(text) <= _STREAM_PERSIST_CHARS:
+        return text
+    try:
+        from app.services.tool_result_budget import BudgetConfig, maybe_persist_tool_result
+        cfg = BudgetConfig(max_result_size_chars=0, preview_chars=1500)
+        return await maybe_persist_tool_result(
+            text,
+            tool_name="terminal",
+            tool_use_id=tag,
+            config=cfg,
+            workspace_path=workspace_path,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("terminal stream persist failed: %s", exc)
+        return text + (
+            f"\n…[输出超长（{len(text)} 字符）且存档失败，已保留全文]…\n"
+        )
 
 
 def check_terminal_requirements() -> bool:
@@ -263,8 +316,8 @@ async def terminal(args: dict, **kwargs) -> str:
         timeout = float(default_timeout)
     timeout = max(5.0, min(timeout, float(max_timeout)))
 
-    max_output = getattr(config, "terminal_max_output", 10000)
-
+    # 2026-09-20：不再读取 terminal_max_output 做静默字符截断（见
+    # _decode_output_capped 的完整性说明）。体积治理由 digest/budget 层负责。
     venv_bin = str(config.project_root / ".venv" / "bin")
     workspace_path = kwargs.get("workspace_path", "")
     _workspace_venv_bin = ""
@@ -335,14 +388,14 @@ async def terminal(args: dict, **kwargs) -> str:
         except (asyncio.TimeoutError, Exception):
             stderr_task.cancel()
 
+        _ws_archive = kwargs.get("workspace_path", "")
+        _tag = str(kwargs.get("tool_call_id") or uuid.uuid4().hex[:12])
         if _timed_out:
-            if len(stdout_bytes) > _MAX_OUTPUT_BYTES:
-                stdout_bytes = stdout_bytes[:_MAX_OUTPUT_BYTES]
-            if len(stderr_bytes) > _MAX_OUTPUT_BYTES:
-                stderr_bytes = stderr_bytes[:_MAX_OUTPUT_BYTES]
             return json.dumps({
-                "stdout": stdout_bytes.decode("utf-8", errors="replace")[:max_output],
-                "stderr": stderr_bytes.decode("utf-8", errors="replace")[:max_output],
+                "stdout": await _persist_stream_if_large(
+                    _decode_output_capped(stdout_bytes), _ws_archive, f"{_tag}-timeout-stdout"),
+                "stderr": await _persist_stream_if_large(
+                    _decode_output_capped(stderr_bytes), _ws_archive, f"{_tag}-timeout-stderr"),
                 "return_code": -1,
                 "error": f"Command timed out after {timeout}s",
                 "timed_out": True,
@@ -355,17 +408,15 @@ async def terminal(args: dict, **kwargs) -> str:
                     "(4) 检查是否存在死循环或阻塞等待。"
                     "对于确实需要长时间运行的任务，使用 background_task 工具提交到后台执行。"
                     "不要用相同命令重复调用——会再次超时。"
+                    "（若输出尾部标注了捕获上限截断，请分页/重定向到文件后读取完整输出。）"
                 ),
                 "working_dir": cwd,
             }, ensure_ascii=False)
 
-        if len(stdout_bytes) > _MAX_OUTPUT_BYTES:
-            stdout_bytes = stdout_bytes[:_MAX_OUTPUT_BYTES]
-        if len(stderr_bytes) > _MAX_OUTPUT_BYTES:
-            stderr_bytes = stderr_bytes[:_MAX_OUTPUT_BYTES]
-
-        stdout = stdout_bytes.decode("utf-8", errors="replace")[:max_output]
-        stderr = stderr_bytes.decode("utf-8", errors="replace")[:max_output]
+        stdout = await _persist_stream_if_large(
+            _decode_output_capped(stdout_bytes), _ws_archive, f"{_tag}-stdout")
+        stderr = await _persist_stream_if_large(
+            _decode_output_capped(stderr_bytes), _ws_archive, f"{_tag}-stderr")
 
         # Post-execution workspace snapshot: detect new/modified files.
         generated_files = await asyncio.to_thread(

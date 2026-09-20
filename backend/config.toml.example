@@ -116,6 +116,11 @@ segmented_verify_timeout_seconds = 120
 segmented_verify_max_claims = 40
 segmented_verify_retry_window_chars = 1500
 low_confidence_note_enabled = true
+chunked_claim_audit_enabled = true
+chunked_claim_target_tokens = 3000
+chunked_claim_max_chunks = 16
+chunked_claim_max_concurrency = 3
+chunked_claim_timeout_seconds = 90
 citation_map_gate_enabled = true
 draft_selection_enabled = true
 selection_timeout_seconds = 480
@@ -282,7 +287,6 @@ max_concurrent_sessions = 5
 enabled = true
 timeout_seconds = 30
 max_timeout_seconds = 120
-max_output_chars = 10000
 
 [code_execution]
 enabled = true

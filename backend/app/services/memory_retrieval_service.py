@@ -23,6 +23,18 @@ from app.services.memory_embedding_service import embed_text, embed_text_cached,
 config = get_config()
 logger = logging.getLogger(__name__)
 
+def _clip_marked(text: str, limit: int) -> str:
+    """字符截断必须显式标注省略（信息完整性原则，2026-09-20 审计要求）。
+
+    注入/检索路径的 `[:n]` 一律改用本函数：DB 保留全文，展示端给出省略号——
+    模型与审计员必须能区分「没有这条信息」与「这条信息被截断了」。
+    """
+    s = str(text or "")
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…"
+
+
 # BM25 词法来源标记（stage1 name/epi/sub + stage2 desc）——_cand_gate_score
 # 区分"BM25-only 未确认"与"hybrid 确认"候选（盲区 D，2026-08-16 校准实证）
 _BM25_SOURCES = ("stage1_name", "stage1_epi", "stage1_sub", "stage2_desc")
@@ -259,9 +271,9 @@ async def _fallback_context(db: AsyncSession, user_id: str) -> str:
         memory_summary, dream_summary = (row[0], row[1]) if row else (None, None)
         sections = []
         if memory_summary:
-            sections.append("共享长期记忆:\n" + memory_summary.strip()[:2000])
+            sections.append("共享长期记忆:\n" + _clip_marked(memory_summary.strip(), 2000))
         if dream_summary:
-            sections.append("近期 dream:\n" + dream_summary.strip()[:2000])
+            sections.append("近期 dream:\n" + _clip_marked(dream_summary.strip(), 2000))
         if not sections:
             _schedule_summary_generation(user_id)
         return "\n\n".join(sections)
@@ -745,7 +757,7 @@ async def _temporal_list_shortcut(
         lines = ["[相关事件 Episodic]"]
         for r in episodes:
             ids.append(r[0])
-            lines.append(f"- [{r[2]}] {(r[1] or '')[:200]}")
+            lines.append(f"- [{r[2]}] {_clip_marked(r[1], 200)}")
         sections.append("\n".join(lines))
 
     if len(episodes) < 5:
@@ -762,7 +774,7 @@ async def _temporal_list_shortcut(
             for r in concepts:
                 ids.append(r[0])
                 tag = " （推断，未经用户确认）" if r[5] == "agent_inferred" else ""
-                lines.append(f"- {r[1]}: {(r[2] or '')[:80]}{tag} [权重: {(r[4] or 0):.2f}]")
+                lines.append(f"- {r[1]}: {_clip_marked(r[2], 80)}{tag} [权重: {(r[4] or 0):.2f}]")
             sections.append("\n".join(lines))
         concept_count = len(concepts)
     else:
@@ -780,7 +792,7 @@ async def _temporal_list_shortcut(
             lines = ["[近期原文片段 Subconscious]"]
             for r in subs:
                 ids.append(r[0])
-                lines.append(f"- [{r[2]}] {(r[1] or '')[:200]} (未经整理)")
+                lines.append(f"- [{r[2]}] {_clip_marked(r[1], 200)} (未经整理)")
             sections.append("\n".join(lines))
 
     return "\n\n".join(sections), ids, 1.0 if ids else 0.0
@@ -1577,9 +1589,9 @@ async def _stage4_cross_encoder(
     docs = []
     for c in pool:
         if c.tier == "concept":
-            docs.append(f"{c.metadata.get('canonical_name', '')} {c.content[:200]}".strip())
+            docs.append(f"{c.metadata.get('canonical_name', '')} {_clip_marked(c.content, 200)}".strip())
         else:
-            docs.append(c.content[:256])
+            docs.append(_clip_marked(c.content, 256))
     if not docs:
         return ordered
     headers = {"Content-Type": "application/json"}
@@ -2031,7 +2043,8 @@ async def _build_injection_context_ex(
         lines = ["[相关事件 Episodic]"]
         for c in epi_slice:
             vf = c.metadata.get("valid_from", "")
-            lines.append(f"- [{vf}] {c.content[:200]}")
+            lines.append(f"- [{vf}] "
+                         f"{_clip_marked(c.metadata.get('narrative') or c.content, 200)}")
         sections.append((_section_score("episodic"), "\n".join(lines)))
 
     if concept_slice:
@@ -2054,7 +2067,7 @@ async def _build_injection_context_ex(
 
     dream_text = await _get_latest_dream(db, user_id)
     if dream_text:
-        sections.append((0.25, f"[近期 Dream]\n{dream_text[:500]}"))
+        sections.append((0.25, f"[近期 Dream]\n{_clip_marked(dream_text, 500)}"))
 
     # 用户画像基底（A4.6 根因 4；2026-08-09 写路径版）：profile 概念由
     # 调度器每日 LLM 提炼入库（memory_profile_service.sync_profile_concepts），
@@ -2083,7 +2096,8 @@ async def _build_injection_context_ex(
         lines = ["[近期原文片段 Subconscious]"]
         for c in sub_slice:
             ca = c.metadata.get("created_at", "")
-            lines.append(f"- [{ca}] {c.content[:200]} (未经整理)")
+            lines.append(f"- [{ca}] "
+                         f"{_clip_marked(c.metadata.get('raw_text') or c.content, 200)} (未经整理)")
         sections.append((_section_score("subconscious"), "\n".join(lines)))
 
     try:
@@ -2095,7 +2109,7 @@ async def _build_injection_context_ex(
     if clarifications:
         lines = ["[澄清提示]"]
         for cl in clarifications[:int(ret_cfg.get("injection_max_clarification", 3))]:
-            lines.append(f"- 用户澄清\"{cl['original_text'][:50]}\" → 已修正")
+            lines.append(f"- 用户澄清\"{_clip_marked(cl['original_text'], 50)}\" → 已修正")
         sections.append((0.1, "\n".join(lines)))
 
     if ret_cfg.get("assembly_grouping_enabled", False):

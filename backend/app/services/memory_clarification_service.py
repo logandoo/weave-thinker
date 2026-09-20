@@ -16,19 +16,10 @@ from app.db.database import MemoryClarification, MemoryConcept
 config = get_config()
 logger = logging.getLogger(__name__)
 
-_SIGNAL_WORDS = [
-    "不是", "不对", "错了", "我说的是", "其实是", "我的意思是",
-    "不是这个意思", "你理解错了", "纠正一下", "相反", "忘掉", "别记住",
-]
-
-
-def detect_signal(user_message: str) -> bool:
-    for word in _SIGNAL_WORDS:
-        if word in user_message:
-            if word == "不是" and "是不是" in user_message:
-                continue
-            return True
-    return False
+# 2026-09-20（用户指令）：原 `_SIGNAL_WORDS` 关键词表 + `detect_signal()` 请求路径
+# 预分类闸门已删除——纠正检测必须 agentic（项目红线：路由/意图判断禁止关键词枚举，
+# 见 memory/feedback_no_hardcoded_classifiers.md）。旧闸门漏检=纠正永不处理；
+# 现在每条消息无条件由下方 LLM 判定 `is_correction`（成本用户已确认不考虑）。
 
 
 async def process_clarification(
@@ -50,6 +41,14 @@ async def process_clarification(
         f"- {c['name']} (id={c['id']}): {c['short'] or ''}" for c in concepts
     ) or "无"
 
+    # 2026-09-20（A4.9 r1 Minor）：LLM 往返前先结束当前事务、归还连接池槽位——
+    # 全 agentic 后每条消息都会走到这里，若把池化连接压在 LLM 往返上，突发流量
+    # 可能耗尽连接池。此处无业务写入（仅读概念），commit 安全。
+    try:
+        await db.commit()
+    except Exception:
+        logger.debug("clarify pre-LLM connection release failed", exc_info=True)
+
     prompt = {
         "role": "system",
         "content": (
@@ -70,32 +69,50 @@ async def process_clarification(
 
         )
         response = (response or "").strip()
-        # A4a（2026-09-14）：写路径 LLM 调用入账（计费类；DC1 隔离读路径遥测）
-        # A4.9 I4 修复：shadow 观察不应推高计费口径（否则语音每次含信号词都
-        # 可能把用户推向降级梯子）→ shadow 记 read
-        try:
-            from app.services.memory_cost_governance_service import record_llm_call
-            async with db.begin_nested():
-                await record_llm_call(db, user_id, "clarify",
-                                      billing_class="read" if shadow else "write")
-        except Exception:
-            logger.debug("record clarify llm call failed", exc_info=True)
-        if response.startswith("```"):
-            lines = response.split("\n")
-            lines = [l for l in lines if not l.startswith("```")]
-            response = "\n".join(lines)
-        parsed = json.loads(response)
     except Exception as e:
         logger.warning("Clarification LLM call failed: %s", e)
         return None
 
-    if not parsed.get("is_correction"):
-        return None
+    parsed = None
+    try:
+        cleaned = response
+        if cleaned.startswith("```"):
+            lines = [l for l in cleaned.split("\n") if not l.startswith("```")]
+            cleaned = "\n".join(lines)
+        parsed = json.loads(cleaned)
+    except Exception as e:
+        logger.warning("Clarification response parse failed: %s", e)
 
-    confidence = float(parsed.get("confidence", 0))
+    _is_correction = bool(parsed and parsed.get("is_correction"))
+    confidence = float((parsed or {}).get("confidence", 0) or 0)
     auto_threshold = float(config.memory.get("clarification_auto_apply_threshold", 0.8))
     # B11 shadow：记录 applied=False 候选（不应用、不写 applied_at）
-    will_apply = (not shadow) and confidence >= auto_threshold
+    will_apply = bool(_is_correction and (not shadow) and confidence >= auto_threshold)
+
+    # A4a（2026-09-14）：记忆 LLM 调用入账（计费类；DC1 隔离读路径遥测）。
+    # 2026-09-20 全 agentic 化（每条消息都检测）后的两项修正：
+    # ① 计费口径：只有真正进入写路径（will_apply）的调用算 'write'；未命中纠正、
+    #    置信度不足未应用、解析失败一律遥测 ('read')——否则每条消息都会推高成本
+    #    治理降级梯子（DC1 本意，同 shadow 的既有理由）。
+    # ② 落账持久化：非纠正路径原先提前 return 未 commit，flush 的行随会话回滚，
+    #    全部账目丢失（agentic 后是绝大多数调用）。
+    try:
+        from app.services.memory_cost_governance_service import record_llm_call
+        async with db.begin_nested():
+            await record_llm_call(
+                db, user_id, "clarify",
+                billing_class="write" if will_apply else "read",
+            )
+    except Exception:
+        logger.debug("record clarify llm call failed", exc_info=True)
+
+    if not _is_correction:
+        # 非纠正（含解析失败）零业务写入，但账目必须落库。
+        try:
+            await db.commit()
+        except Exception:
+            logger.debug("clarify telemetry commit failed", exc_info=True)
+        return None
 
     clar_id = str(uuid.uuid4())
     clarification = MemoryClarification(

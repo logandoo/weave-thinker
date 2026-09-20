@@ -641,6 +641,24 @@ export const useChatStore = defineStore('chat', () => {
         }
         deathmatchMode.value = conversation.deathmatch_status !== 'done'
         _streamVersion.value++
+        // 死磕盘问：SSE 事件不重放——刷新/重开会话时必须从权威 GET 恢复
+        // 待答问题，否则 grillingQuestions 恒空 → ChatArea `isGrilling` 恒
+        // false，用户只看到「请回答上方的问题」而上方零气泡（conv 7579bdc7,
+        // 2026-09-19）。仅当前会话 + 未过期快照（A4.9 r1 Important-1：陈旧
+        // refresh 不得覆盖新轮次/新会话刚拉取的问题）；后台会话的 refresh
+        // 不得污染当前视图。
+        if (
+          conversationId === currentConversationId.value
+          && (messagesEpoch[conversationId] || 0) === epochAtStart
+          && (refreshSeqs[conversationId] || 0) === seqAtStart
+        ) {
+          if (conversation.deathmatch_status === 'grilling') {
+            await fetchGrillingQuestions(conversationId)
+          } else if (grillingQuestions.value.length > 0) {
+            grillingQuestions.value = []
+            grillingAnswers.value = {}
+          }
+        }
       }
       return true
     } catch (e) {
@@ -1145,6 +1163,11 @@ export const useChatStore = defineStore('chat', () => {
     if (currentConversationId.value === id) return
 
     currentConversationId.value = id
+    // 盘问问题/答案是会话级 UI 状态：切换会话立即清空，防止上一会话的
+    // 问题泄漏到新会话（A4.9 r1 Important-3）；grilling 状态由
+    // refreshConversation 重新从权威 GET 拉取。
+    grillingQuestions.value = []
+    grillingAnswers.value = {}
     try {
       const conversation = await chatApi.getConversation(id)
       // Cache the fetched conversation metadata independently of the sidebar
@@ -1233,6 +1256,45 @@ export const useChatStore = defineStore('chat', () => {
       // Restore deathmatchMode from conversation state
       deathmatchMode.value = !!(conversation.deathmatch_mode && conversation.deathmatch_status !== 'inactive' && conversation.deathmatch_status !== 'done' && conversation.deathmatch_status !== 'cleared')
       deathmatchAction.value = null
+      // 首次从侧栏打开死磕会话（无 deep link、本会话无历史流）：种入
+      // verdict——状态栏与 isGrilling 均读 getCurrentStream().deathmatchVerdict；
+      // 缺它则问题虽拉到也不渲染（A4.9 r2 residual）。仅在无既有 verdict
+      // 且非流式中种入，绝不覆盖实时 SSE 状态；形状与 refreshConversation
+      // 的权威快照一致。
+      const _selStream = getStream(id)
+      if (
+        !_selStream.streaming
+        && !_selStream.deathmatchVerdict
+        && conversation.deathmatch_mode
+        && conversation.deathmatch_status
+        && conversation.deathmatch_status !== 'inactive'
+      ) {
+        _selStream.deathmatchVerdict = {
+          status: conversation.deathmatch_status,
+          verdict: null,
+          reason: null,
+          turns: conversation.deathmatch_turns || 0,
+          max_turns: conversation.deathmatch_max_turns ?? 0,
+          grilling_completed: conversation.deathmatch_grilling_completed || 0,
+          grilling_total: conversation.deathmatch_grilling_total || 0,
+          grilling_round: conversation.deathmatch_grilling_round || 0,
+          grilling_round_total: conversation.deathmatch_grilling_round_total || 3,
+          message: conversation.deathmatch_status === 'done' ? '目标已完成' : '',
+          plan_version: conversation.deathmatch_plan_version || 0,
+          plan_steps: (conversation.deathmatch_plan?.steps || []).map((step: any) => ({
+            id: step.id || '',
+            description: step.description || '',
+            status: step.status || 'pending',
+          })),
+        }
+        _streamVersion.value++
+      }
+      // 应用内切换（Sidebar/Zen 只调 selectConversation，不走 refreshConversation）：
+      // 顶部已清空本会话的问题，这里必须从权威 GET 重拉，否则切走再切回
+      // grilling 会话时问题消失、isGrilling 恒 false（A4.9 r2 新回归）。
+      if (conversation.deathmatch_status === 'grilling') {
+        await fetchGrillingQuestions(id)
+      }
     } catch (e) {
       console.error('Failed to load messages:', e)
       if (!messages.value[id]) {
@@ -1743,15 +1805,31 @@ export const useChatStore = defineStore('chat', () => {
     return guarded
   }
 
+  // 每会话请求序号：并发的 GET 只允许最新一次写入（A4.9 r1 Important-1：
+  // 旧响应不得覆盖新轮次/新会话刚拉取的问题）。
+  const _grillingFetchSeq: Record<string, number> = {}
+
   async function fetchGrillingQuestions(convId: string) {
+    const seq = (_grillingFetchSeq[convId] || 0) + 1
+    _grillingFetchSeq[convId] = seq
     try {
       const resp = await fetch(`/api/agent-tasks/grilling/${convId}`, {
         headers: { 'Authorization': `Bearer ${localStorage.getItem('chatllm_token')}` }
       })
       if (resp.ok) {
         const data = await resp.json()
-        if (data.questions && data.questions.length > 0) {
-          grillingQuestions.value = data.questions.map((q: any) => ({
+        // 请求期间用户已切走会话或有更新的请求发出：丢弃本次迟到响应。
+        if (convId !== currentConversationId.value) return
+        if (_grillingFetchSeq[convId] !== seq) return
+        const incoming: any[] = Array.isArray(data.questions) ? data.questions : []
+        const incomingRound = incoming.reduce((m: number, q: any) => Math.max(m, q.round || 1), 0)
+        const currentMaxRound = grillingQuestions.value.length > 0
+          ? Math.max(...grillingQuestions.value.map(q => q.round || 1))
+          : 0
+        if (incoming.length > 0 && incomingRound >= currentMaxRound) {
+          // 轮次单调不回退（与 onDeathmatchVerdict 同规则）：等轮次可刷新
+          // 已答状态，旧轮次响应不得覆盖新轮次。
+          grillingQuestions.value = incoming.map((q: any) => ({
             task_id: q.task_id,
             question_id: q.question_id,
             question: q.question,
@@ -1761,11 +1839,16 @@ export const useChatStore = defineStore('chat', () => {
             status: q.status,
             answer: q.answer,
           }))
-          for (const q of data.questions) {
+          for (const q of incoming) {
             if (q.answer) {
               grillingAnswers.value[q.task_id] = q.answer
             }
           }
+        } else if (incoming.length === 0 && data.deathmatch_status === 'grilling') {
+          // 服务端在当前轮确认无待答问题：清空本地残留，避免旧会话问题
+          // 在新会话/新轮次下渲染（A4.9 r1 Important-3）。
+          grillingQuestions.value = []
+          grillingAnswers.value = {}
         }
       }
     } catch (e) {
@@ -2742,6 +2825,18 @@ export const useChatStore = defineStore('chat', () => {
         message: '',
       }
       _streamVersion.value++
+
+      // 死磕盘问兜底：轮询发现 grilling 且本地产问题为空或落后于服务端轮次
+      // （跨标签页回答/后端侧状态变化等非本页 SSE 路径）时补拉权威问题列表
+      // ——仅判断为空会让「另一标签页答完本轮」的页面卡在空轮次 spinner
+      // （A4.9 r1 Important-2）。
+      const grillingRoundNow = conversation.deathmatch_grilling_round || 1
+      const localMaxGrillingRound = grillingQuestions.value.length > 0
+        ? Math.max(...grillingQuestions.value.map(q => q.round || 1))
+        : 0
+      if (conversation.deathmatch_status === 'grilling' && localMaxGrillingRound < grillingRoundNow) {
+        void fetchGrillingQuestions(convId)
+      }
 
       if (conversation.deathmatch_status === 'done') {
         deathmatchMode.value = false

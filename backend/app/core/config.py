@@ -1297,9 +1297,10 @@ class Config:
     def terminal_max_timeout(self) -> float:
         return float(self.terminal.get("max_timeout_seconds", 120))
 
-    @property
-    def terminal_max_output(self) -> int:
-        return int(self.terminal.get("max_output_chars", 10000))
+    # terminal_max_output 已删除（2026-09-20 审计完整性）：旧实现用它做静默
+    # 字符截断且无存档指针，审计回读无法恢复。输出现为全量返回 + 单流超
+    # 阈值存档（tool_results/，无损可回读）+ 5MB OOM 硬顶显式标注。
+    # 兼容：旧配置里的 [terminal] max_output_chars 被忽略，不影响启动。
 
     # ---- Code execution skill ----
 
@@ -2161,6 +2162,35 @@ class Config:
         生产默认 0。
         """
         return int(self.agent_audit.get("full_evidence_max_tokens", 0))
+
+    # ---- chunked draft-claim audit (2026-09-20 SOTA wave) ----
+    # 审计窗口不再加宽：长稿按段落语义分块，逐块提取原子声称+局部风险标记，
+    # 汇总为有界「全稿声称清单」（带确定性证据在场标注与覆盖率），交给全局
+    # 审计员/闸门；未覆盖段显式降级为低置信，绝不静默合格。
+    @property
+    def agent_audit_chunked_claim_audit_enabled(self) -> bool:
+        """[agent.audit] 分块声称清单（SOTA wave，2026-09-20）参数。"""
+        return bool(self.agent_audit.get("chunked_claim_audit_enabled", True))
+
+    @property
+    def agent_audit_chunked_claim_target_tokens(self) -> int:
+        """[agent.audit] 分块声称清单（SOTA wave，2026-09-20）参数。"""
+        return int(self.agent_audit.get("chunked_claim_target_tokens", 3000))
+
+    @property
+    def agent_audit_chunked_claim_max_chunks(self) -> int:
+        """[agent.audit] 分块声称清单（SOTA wave，2026-09-20）参数。"""
+        return int(self.agent_audit.get("chunked_claim_max_chunks", 16))
+
+    @property
+    def agent_audit_chunked_claim_max_concurrency(self) -> int:
+        """[agent.audit] 分块声称清单（SOTA wave，2026-09-20）参数。"""
+        return int(self.agent_audit.get("chunked_claim_max_concurrency", 3))
+
+    @property
+    def agent_audit_chunked_claim_timeout_seconds(self) -> float:
+        """[agent.audit] 分块声称清单（SOTA wave，2026-09-20）参数。"""
+        return float(self.agent_audit.get("chunked_claim_timeout_seconds", 90))
 
     # ---- PTC (Programmatic Tool Calling) ----
 

@@ -87,6 +87,14 @@ total_timeout_seconds = 18000
 progress_update_interval_seconds = 2
 stale_recovery_minutes = 10
 
+[agent.durable_jobs]
+enabled = true
+max_concurrent_jobs = 4
+lease_seconds = 120
+poll_interval_seconds = 3
+total_timeout_seconds = 0
+jobs_root = "output_files/jobs"
+
 [agent.cache]
 enabled = false
 cache_ttl_minutes = 5

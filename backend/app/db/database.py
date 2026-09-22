@@ -647,12 +647,94 @@ class AgentTask(Base):
     # F1（2026-09-14）：运行中补充消息（JSON 数组 [{id, content, created_at}]，
     # worker 每 5s 轮询推入 interjection_queue 并在投递后清空；可空）
     pending_messages = Column(Text, nullable=True)
+    # D-轻（2026-09-22 durable execution 波）：断点续跑快照（JSON
+    # {version,cursor,messages,budget_used,elapsed,updated_at}）。有值时
+    # 启动恢复置 resumable 并从 cursor 续跑；无值维持旧行为（标 failed）。
+    checkpoint = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     parent = relationship("AgentTask", remote_side="AgentTask.id", backref="subtasks")
+
+
+class DurableJob(Base):
+    """D-重（2026-09-22）：durable job runner 的持久作业句柄。
+
+    execute_code/process/terminal 的 5h+ 重作业提交为 detached 子进程作业：
+    状态机 queued→leased→running→{succeeded,failed,cancelled,unknown}（迁移
+    白名单见 app.services.durable_types.can_transition）；退出回执=作业根目录
+    exit_code 文件；重复 idempotency_key 返回既有作业（不新建）。
+    """
+    __tablename__ = "durable_jobs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    source = Column(String(20), nullable=False, default="tool")  # execute_code|terminal|process|tool
+    spec = Column(Text, nullable=False)  # JSON {kind, command|code, workdir, timeout_seconds, env}
+    idempotency_key = Column(String(128), nullable=True, unique=True)
+    state = Column(String(20), nullable=False, default="queued")
+    attempts = Column(Integer, default=0)
+    lease_owner = Column(String(64), nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    pid = Column(Integer, nullable=True)
+    log_path = Column(String(512), nullable=True)
+    exit_code = Column(Integer, nullable=True)
+    result_digest = Column(Text, nullable=True)
+    cancel_requested_at = Column(DateTime, nullable=True)
+    cancel_state = Column(String(20), nullable=True)  # requested|acknowledged|too_late|failed
+    error = Column(Text, nullable=True)
+    timeout_seconds = Column(Float, default=0.0)  # 0=不限（5h+ 重作业的真实需求）
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DurableJobEvent(Base):
+    """append-only 事件 WAL（seq per job）——恢复凭据而非仅远端状态。"""
+    __tablename__ = "durable_job_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(36), ForeignKey("durable_jobs.id", ondelete="CASCADE"), nullable=False)
+    seq = Column(Integer, nullable=False)
+    event_type = Column(String(40), nullable=False)
+    payload = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("job_id", "seq", name="uq_durable_job_event_seq"),)
+
+
+class DurableJobArtifact(Base):
+    """作业产物登记（path+sha256+bytes）——「产出了什么」的证据面。"""
+    __tablename__ = "durable_job_artifacts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(36), ForeignKey("durable_jobs.id", ondelete="CASCADE"), nullable=False)
+    path = Column(String(1024), nullable=False)
+    sha256 = Column(String(64), nullable=False)
+    bytes = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SideEffectLedger(Base):
+    """副作用台账（D-轻）：幂等键 v2 含 call_id，重放同 call 命中即跳过（failed 允许重试）。
+
+    键格式见 app.services.durable_types.make_key（keyed on cursor+call_id 不是 seq）。
+    """
+    __tablename__ = "side_effect_ledger"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    principal_type = Column(String(20), nullable=False)   # agent_task|deathmatch
+    principal_id = Column(String(36), nullable=False)
+    cursor = Column(Integer, nullable=False)
+    tool_name = Column(String(64), nullable=False)
+    idempotency_key = Column(String(160), nullable=False, unique=True)
+    status = Column(String(20), nullable=False, default="pending")  # pending|done|failed|unknown
+    result_ref = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ScheduledTask(Base):

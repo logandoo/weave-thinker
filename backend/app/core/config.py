@@ -1421,7 +1421,41 @@ class Config:
 
     @property
     def agent_background_tasks_max_concurrent(self) -> int:
-        return int(self.agent_background_tasks.get("max_concurrent_tasks", 3))
+        # P2（2026-09-22 durable execution 波）：并发钳制 [1,8]（0/负数→1、99→8）
+        from app.services.durable_types import clamp_concurrency
+        return clamp_concurrency(self.agent_background_tasks.get("max_concurrent_tasks", 3))
+
+    # ---- Durable jobs（D-重, 2026-09-22）：5h+ 重作业持久执行 ----
+
+    @property
+    def agent_durable_jobs(self) -> dict:
+        return self.agent.get("durable_jobs", {})
+
+    @property
+    def agent_durable_jobs_enabled(self) -> bool:
+        return bool(self.agent_durable_jobs.get("enabled", True))
+
+    @property
+    def agent_durable_jobs_max_concurrent(self) -> int:
+        from app.services.durable_types import clamp_concurrency
+        return clamp_concurrency(self.agent_durable_jobs.get("max_concurrent_jobs", 4))
+
+    @property
+    def agent_durable_jobs_lease_seconds(self) -> float:
+        return float(self.agent_durable_jobs.get("lease_seconds", 120))
+
+    @property
+    def agent_durable_jobs_poll_interval(self) -> float:
+        return float(self.agent_durable_jobs.get("poll_interval_seconds", 3))
+
+    @property
+    def agent_durable_jobs_total_timeout(self) -> float:
+        """作业总时长上限（秒）；0=不限——5h+ 重作业的真实需求即靠 0 值脱出 5h 截断。"""
+        return float(self.agent_durable_jobs.get("total_timeout_seconds", 0))
+
+    @property
+    def agent_durable_jobs_root(self) -> str:
+        return str(self.agent_durable_jobs.get("jobs_root", "output_files/jobs"))
 
     @property
     def agent_background_tasks_poll_interval(self) -> int:

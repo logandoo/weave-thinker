@@ -121,6 +121,16 @@ async def _capture_snapshot(user: Any, workspace_root: str, reason: str) -> Dict
 
 
 async def workspace_write(args: Dict[str, Any], **kwargs) -> str:
+    """P1（2026-09-22）：per-path 写锁包装——跨任务同文件互斥（同轮分波由
+    agent_loop partition_write_waves 负责；stale-edit guard/写前快照在其内层）。"""
+    from app.services.workspace_lock_service import path_lock, canonical_key_path
+    _raw_path = canonical_key_path(kwargs.get("workspace_path"),
+                                   str((args or {}).get("path") or (args or {}).get("file_path") or ""))
+    async with path_lock(getattr(kwargs.get("user"), "id", "") or "", _raw_path):
+        return await _workspace_write_locked(args, **kwargs)
+
+
+async def _workspace_write_locked(args: Dict[str, Any], **kwargs) -> str:
     user = kwargs.get("user")
     path_arg = args.get("path") or args.get("file_path") or ""
     content = args.get("content")
@@ -180,6 +190,15 @@ async def workspace_write(args: Dict[str, Any], **kwargs) -> str:
 
 
 async def workspace_edit(args: Dict[str, Any], **kwargs) -> str:
+    """P1（2026-09-22）：per-path 写锁包装（同 workspace_write）。"""
+    from app.services.workspace_lock_service import path_lock, canonical_key_path
+    _raw_path = canonical_key_path(kwargs.get("workspace_path"),
+                                   str((args or {}).get("path") or (args or {}).get("file_path") or ""))
+    async with path_lock(getattr(kwargs.get("user"), "id", "") or "", _raw_path):
+        return await _workspace_edit_locked(args, **kwargs)
+
+
+async def _workspace_edit_locked(args: Dict[str, Any], **kwargs) -> str:
     user = kwargs.get("user")
     path_arg = args.get("path") or args.get("file_path") or ""
     old_string = args.get("old_string")

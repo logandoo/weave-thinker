@@ -158,6 +158,8 @@ cd ..
 
 **死磕模式**：先盘问再动手（最多 3 轮递进追问），随后进入 PEVR 目标循环；验证器要求工作区里有真实文件产出，幻影完成会被拦下；「待执行 / 待填写」的占位交付物无法通过完成判定，用说明、设计或计划代替真实结果同样会被拦下；你对结果的批评与返工要求会重新开启执行；停滞按重规划、部分交付、人工介入三级升级；状态全部落库，断网或隔夜可以续跑。
 
+**长任务持久执行**：长任务可提交为「持久作业」——脱离服务进程在后台独立运行，服务进程重启不中断（整机/容器重建除外：对账为「结果未知」，日志与回执保留），单作业不限时长，适合数小时级的批量计算、构建与数据处理；带退出回执、增量日志、产物登记与取消回执。后台任务逐轮自动落检查点，重启或优雅停机后从断点续跑而非从头再来；同轮多文件写入并行执行（同文件编辑仍严格按序），跨任务写同一文件有路径互斥与写前快照兜底。
+
 **全双工语音**：单条 WebSocket 上做流式识别与流式合成，播报中持续拾音，插话即时暂停并从断点续播；语义判端、近场声学门控、情绪应声、热词纠音；输出停滞自动回到聆听、语音识别掉线自动重连；语音里可以调用搜索、代码、笔记、记忆等工具，随口提的事自动转笔记，长内容的分块写入不再因单轮预算不足而失败。当前针对 DashScope FunASR 识别 + MiMo 合成组合调优，其他 ASR/TTS 供应商未经完整测试。
 
 **原生渲染**：LaTeX 公式即时渲染；代码沙箱生成 Word 文档时，公式转为 OMML 原生对象（双击可编辑）；Mermaid 矢量图、ECharts 交互图表（数据须来自真实检索）；图片 lightbox、音视频行内播放。
@@ -174,10 +176,10 @@ cd ..
 
 ## 内置工具与技能
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 43 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 10 项系统技能。
+后端 `app/tools/` 经 `registry.register()` 静态注册 49 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 10 项系统技能。
 
 <details>
-<summary>完整工具清单（43 个）</summary>
+<summary>完整工具清单（49 个）</summary>
 
 | 类别 | 工具函数 | 说明 |
 | --- | --- | --- |
@@ -193,6 +195,7 @@ cd ..
 | 笔记 | `notes` | 笔记本与笔记的列表、读取、创建、修改、追加、删除 |
 | 记忆 | `memory` | 跨会话长期记忆（agent/user 双目标 + system 只读系统文档） |
 | 任务编排 | `delegate_task` / `background_task` / `schedule` / `session_search` / `mixture_of_agents` | 子代理并行委派、后台长线任务、定时任务、跨会话搜索、混合专家 |
+| 持久作业 | `job_submit` / `job_status` / `job_logs` / `job_cancel` / `job_list` / `job_artifacts` | 持久长作业（5h+）：脱离进程后台执行、重启不中断、退出回执、增量日志、产物登记、取消回执 |
 | 文件工作区 | `workspace_read` / `workspace_glob` / `grep` / `diff` / `word_count` / `provide_file` / `provide_folder` | 读取、查找、对比、字数统计；文件与文件夹交付（预览/下载/整包 zip） |
 | 工作区写入 | `workspace_write` / `workspace_edit` / `workspace_snapshot` | 写入与精确编辑（先读后写 + 差异回执）、影子快照与一键回滚 |
 | 导出 | `pdf_export` | 笔记、对话记录、工作区文件导出 PDF |
@@ -219,7 +222,7 @@ frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI ·
 backend/    FastAPI + async SQLAlchemy 2.0
   ├─ app/api/        20+ 路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/…）
   ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出
-  ├─ app/tools/      工具体系（43 个工具函数 + MCP 动态扩展）
+  ├─ app/tools/      工具体系（49 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）
   └─ skills/         系统技能（SKILL.md 目录，Agent 可加载执行）
 webview-app/ Android WebView 壳（可选，JS 桥 window.WeaverNoteApp）

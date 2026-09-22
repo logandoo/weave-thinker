@@ -20,7 +20,7 @@ import time as _time
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update, text
+from sqlalchemy import select, update, text, or_
 
 from app.core.config import get_config
 from app.db.database import AsyncSessionLocal, AgentTask, Conversation, Message, User, Assistant, Notebook, Note
@@ -69,11 +69,14 @@ class AgentWorker:
         self._poll_task: asyncio.Task | None = None
         self._running_task_ids: set[str] = set()
         self._worker_tasks: set[asyncio.Task] = set()
+        # D-轻（A4.9 R1 C5）：优雅停机标记——drain 中断的任务落 resumable 非 cancelled
+        self._draining = False
 
     async def start(self) -> None:
         if not config.agent_background_tasks_enabled:
             logger.info("Background tasks disabled in config")
             return
+        self._draining = False  # R3 Minor-1：进程内 stop→start 不留陈旧 drain 标记
         # On startup, immediately recover ALL running/claimed tasks —
         # we know no worker is active, so there's no point waiting the
         # stale_recovery_minutes grace period. (For a 5-hour background
@@ -99,27 +102,58 @@ class AgentWorker:
         recovered = 0
         try:
             async with AsyncSessionLocal() as db:
+                # A4.9 R1 I9：多实例下不踩踏对端活任务——心跳 120s 内的 active
+                # worker 视为存活，其名下任务不由本实例恢复（单机模式 alive 为空=旧行为）
+                alive_others: list = []
+                if shared_state.is_db_enabled:
+                    try:
+                        _hb_cutoff = _time.time() - 120
+                        _r = await db.execute(
+                            text("SELECT id FROM worker_instances WHERE status='active' "
+                                 "AND last_heartbeat > :cutoff AND id != :me"),
+                            {"cutoff": _hb_cutoff, "me": shared_state.worker_id})
+                        alive_others = [row[0] for row in _r.fetchall()]
+                    except Exception:
+                        alive_others = []
                 for stuck_status in ("claimed", "running"):
                     conditions = [AgentTask.status == stuck_status]
+                    if alive_others:
+                        conditions.append(or_(AgentTask.worker_id.is_(None),
+                                              AgentTask.worker_id.notin_(alive_others)))
                     if not force:
                         # Normal poll: only recover tasks stale for > N min
                         cutoff = datetime.utcnow() - timedelta(minutes=stale_minutes)
                         conditions.append(AgentTask.updated_at < cutoff)
+                    err_msg = (
+                        f"Task recovered: backend restarted (was in '{stuck_status}')"
+                        if force else
+                        f"Task recovered: was stuck in '{stuck_status}' for over {stale_minutes} minutes (worker likely crashed)"
+                    )
                     stmt = (
                         update(AgentTask)
-                        .where(*conditions)
+                        .where(*conditions, AgentTask.checkpoint.is_(None))
                         .values(
                             status="failed",
-                            error=(
-                                f"Task recovered: backend restarted (was in '{stuck_status}')"
-                                if force else
-                                f"Task recovered: was stuck in '{stuck_status}' for over {stale_minutes} minutes (worker likely crashed)"
-                            ),
+                            error=err_msg,
                             completed_at=datetime.utcnow(),
                             updated_at=datetime.utcnow(),
                         )
                     )
                     result = await db.execute(stmt)
+                    recovered += result.rowcount
+                    # D-轻（2026-09-22）：有 checkpoint → resumable（sweeper 领取续跑），
+                    # 无 → failed（旧行为）；completed_at 置空（任务未终结）。
+                    stmt_res = (
+                        update(AgentTask)
+                        .where(*conditions, AgentTask.checkpoint.isnot(None))
+                        .values(
+                            status="resumable",
+                            error=f"Task interrupted: checkpoint preserved (was in '{stuck_status}')",
+                            completed_at=None,
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    result = await db.execute(stmt_res)
                     recovered += result.rowcount
                 if recovered > 0:
                     await db.commit()
@@ -132,6 +166,9 @@ class AgentWorker:
             logger.exception("Failed to recover orphaned agent tasks")
 
     async def stop(self) -> None:
+        # A4.9 R2 C5：先置 drain 标记——CancelledError 分支据此落 resumable
+        # （此前 _draining 从未置 True，_mark_drained 为死代码）
+        self._draining = True
         if self._poll_task is not None:
             self._poll_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -142,13 +179,25 @@ class AgentWorker:
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
             self._worker_tasks.clear()
+        # D-轻 drain（2026-09-22）：停机打断的任务落 resumable（有快照）而非 failed
+        try:
+            await self._recover_orphaned_tasks(force=True)
+        except Exception:
+            logger.exception("drain recovery failed")
         logger.info("AgentWorker stopped")
 
     async def _run_poll(self) -> None:
         await asyncio.sleep(5)
+        _recovery_tick = 0
         while True:
             try:
                 await self._poll_pending_tasks()
+                # A4.9 R2 N1：周期陈旧恢复——硬杀对端 worker 的心跳窗口（120s）
+                # 过期后，其 running/claimed 任务被 force=False 扫回（stale>N 分钟），
+                # 否则仅启动一次的对账会让这些任务永久搁浅。
+                _recovery_tick += 1
+                if _recovery_tick % 20 == 0:
+                    await self._recover_orphaned_tasks(force=False)
             except Exception:
                 logger.exception("Error in agent worker poll")
             interval = config.agent_background_tasks_poll_interval
@@ -164,7 +213,8 @@ class AgentWorker:
             stmt = (
                 select(AgentTask)
                 .where(
-                    AgentTask.status == "pending",
+                    # D-轻：resumable（有 checkpoint 的被中断任务）与 pending 同等可领
+                    AgentTask.status.in_(("pending", "resumable")),
                     AgentTask.task_type != "grilling",
                 )
                 .order_by(AgentTask.created_at.asc())
@@ -190,6 +240,92 @@ class AgentWorker:
                 worker = asyncio.create_task(self._execute_task(task_id), name=f"agent-worker-{task_id[:8]}")
                 self._worker_tasks.add(worker)
                 worker.add_done_callback(self._on_worker_done)
+
+    async def _preflight_pending_tool_calls(self, messages, *, task_id, cursor, user,
+                                            conversation, assistant, workspace_path):
+        """A4.9 R2 N3：恢复时重派 checkpoint 中未回填的 tool_calls。
+
+        语义：done/pending/unknown → 合成已记录结果或跳过（宁可 不双写）；
+        无记录 → 执行并回填台账；failed → 允许重试（N4）。随后补齐 tool 结果
+        消息，主循环从该边界继续（at-least-once）。
+        """
+        import json as _json
+        answered = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+        pending_tc = None
+        pending_msg = None
+        for m in reversed(messages):
+            if m.get("role") == "tool":
+                continue
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                pending_msg = m
+                pending_tc = [tc for tc in m["tool_calls"] if tc.get("id") not in answered]
+            break
+        if not pending_tc:
+            return messages
+        from app.services import side_effect_ledger as sel
+        from app.services.retry_utils import decide_tool_dispatch, plan_tool_calls_for_round
+        from app.tools.registry import registry as _registry
+        _perm_cb = _make_background_permission_callback()
+        _conv_id = str(getattr(conversation, "id", "") or "")
+        store = sel.get_ledger_store()
+        out = list(messages)
+        # R4 NEW-5/NEW-6（R5 修正）：与活路径同一套解析/修复（plan 先于归一化）——
+        # 可修复参数照常派发，仅 plan 判定的截断才合成反馈；并只对**待续的那条**
+        # assistant 消息整体出网合法化（含其已回答的旧调用，避免污染更早轮次）。
+        _plan, _safe_calls = plan_tool_calls_for_round(pending_tc)
+        if pending_msg is not None:
+            _, _msg_safe = plan_tool_calls_for_round(list(pending_msg.get("tool_calls") or []))
+            if isinstance(_msg_safe, list) and _msg_safe:
+                pending_msg["tool_calls"] = _msg_safe
+        for tc in pending_tc:
+            fn = tc.get("function") or {}
+            name = fn.get("name") or "unknown"
+            call_id = str(tc.get("id") or "")
+            if not call_id:
+                continue
+            _args, _args_error = decide_tool_dispatch(_plan, tc)
+            if _args_error is not None:
+                # R3 NEW-1：截断调用——合成反馈，绝不派发、不记台账（后续可重试）
+                out.append({"role": "tool", "tool_call_id": call_id, "name": name,
+                            "content": _args_error})
+                continue
+            _args = _args if isinstance(_args, dict) else {}
+            # R3 NEW-2：与后台任务同级的权限门（denied ops 不因恢复而绕过）
+            try:
+                if not _perm_cb(_conv_id, name, "", dict(_args)):
+                    result_text = _json.dumps(
+                        {"error": f"Background task: denied {name} operation (recovery gate)"},
+                        ensure_ascii=False)
+                    out.append({"role": "tool", "tool_call_id": call_id, "name": name,
+                                "content": result_text})
+                    continue
+            except Exception:
+                pass
+            if await sel.should_skip(store, "agent_task", task_id, cursor, name, call_id):
+                recorded = await sel.get_result(store, "agent_task", task_id, cursor, name, call_id)
+                result_text = recorded or _json.dumps(
+                    {"replayed": True, "skipped": "side effect already recorded (crash recovery)"},
+                    ensure_ascii=False)
+            else:
+                key = await sel.begin(store, "agent_task", task_id, cursor, name, call_id)
+                if key is None:
+                    result_text = _json.dumps({"replayed": True, "skipped": "ledger key present"},
+                                              ensure_ascii=False)
+                else:
+                    try:
+                        result_text = str(await _registry.dispatch(
+                            name, _args, user=user, conversation=conversation,
+                            assistant=assistant, workspace_path=workspace_path))
+                    except Exception as exc:
+                        result_text = _json.dumps({"error": f"recovery dispatch failed: {exc}"},
+                                                  ensure_ascii=False)
+                        await sel.finish(store, key, "failed", result_text)
+                    else:
+                        await sel.finish(store, key, "done", result_text)
+            out.append({"role": "tool", "tool_call_id": call_id, "name": name, "content": result_text})
+        logger.info("Background task %s preflight: re-dispatched %d in-flight tool call(s)",
+                    task_id, len(pending_tc))
+        return out
 
     def _on_worker_done(self, worker_task: asyncio.Task) -> None:
         self._worker_tasks.discard(worker_task)
@@ -219,7 +355,7 @@ class AgentWorker:
 
         async with AsyncSessionLocal() as db:
             task = await db.get(AgentTask, task_id)
-            if task is None or task.status not in ("pending", "claimed"):
+            if task is None or task.status not in ("pending", "claimed", "resumable"):
                 return
             task.status = "running"
             task.started_at = now
@@ -310,6 +446,45 @@ class AgentWorker:
 
             messages.append({"role": "user", "content": task.goal or ""})
 
+            # D-轻（2026-09-22）：有 checkpoint → 全量回放快照 messages + 消费计数
+            # 续算（State-Aware 恢复：重建下一次上下文视图，不做有损摘要）。
+            resume_preused = 0
+            if getattr(task, "checkpoint", None):
+                try:
+                    from app.services.task_checkpoint import parse_checkpoint, plan_resume
+                    _cp = parse_checkpoint(task.checkpoint)
+                    messages, resume_preused = plan_resume(_cp)
+                    # A4.9 R2 N3：重派在飞机 tool_calls（台账去重）后再续跑；
+                    # cursor=checkpoint.budget_used（即该迭代 consume 后的计数）。
+                    messages = await self._preflight_pending_tool_calls(
+                        messages, task_id=task_id, cursor=int(resume_preused),
+                        user=user, conversation=conversation, assistant=assistant,
+                        workspace_path=str(workspace.root_path))
+                    logger.info("Background task %s resuming from checkpoint (budget_used=%d)",
+                                task_id, resume_preused)
+                except ValueError:
+                    logger.exception("checkpoint unusable (loud error honored) — starting fresh")
+
+            # D-轻：checkpoint 回调（1s 节流；fail-open）
+            _cp_last = 0.0
+
+            async def _checkpoint_cb(cp, _task_id=task_id):
+                nonlocal _cp_last
+                import json as _json
+                import time as _t
+                _now = _t.monotonic()
+                if _now - _cp_last < 1.0:
+                    return
+                _cp_last = _now
+                try:
+                    async with AsyncSessionLocal() as cp_db:
+                        row = await cp_db.get(AgentTask, _task_id)
+                        if row is not None:
+                            row.checkpoint = _json.dumps(cp, ensure_ascii=False)
+                            await cp_db.commit()
+                except Exception:
+                    logger.exception("checkpoint persist failed (fail-open)")
+
             max_iterations = task.iterations_max or config.agent_tool_loop_max_iterations
 
             from app.model_gateway.factory import wire_provider_type as _wire_pt
@@ -353,6 +528,9 @@ class AgentWorker:
                 conversation=conversation,
                 assistant=assistant,
                 interjection_queue=interjection_queue,
+                checkpoint_cb=_checkpoint_cb,
+                budget_preused=resume_preused,
+                principal=("agent_task", task_id),
             ):
                 if deadline and asyncio.get_event_loop().time() > deadline:
                     logger.warning("Background task %s timed out after %ds", task_id, timeout)
@@ -673,7 +851,12 @@ class AgentWorker:
                 _pending_poller.cancel()
                 with suppress(asyncio.CancelledError):
                     await _pending_poller
-            await self._mark_cancelled(task_id)
+            # D-轻 drain（A4.9 R1 C5）：优雅停机打断 → resumable（保留快照）而非
+            # cancelled；用户显式取消（_cancelled 正常返回路径）仍 cancelled。
+            if self._draining:
+                await self._mark_drained(task_id)
+            else:
+                await self._mark_cancelled(task_id)
             raise
         except Exception as exc:
             if _pending_poller:
@@ -823,6 +1006,39 @@ class AgentWorker:
                 await db.commit()
         except Exception:
             logger.exception("Failed to mark task %s as cancelled", task_id)
+
+    async def _mark_drained(self, task_id: str) -> None:
+        """D-轻（A4.9 R2 C5 / R3 NEW-3）：优雅停机中断 → resumable（有快照）/failed（无）。
+
+        状态守卫：仅 running/claimed 可被 drain 改写——绝不把已 completed /
+        cancelled / 等终态复活为 resumable（违反「显式取消仍 cancelled」）。
+        """
+        try:
+            from app.services.task_checkpoint import drain_status_values
+            async with AsyncSessionLocal() as db:
+                task = await db.get(AgentTask, task_id)
+                if task is None:
+                    return
+                has_cp = bool(getattr(task, "checkpoint", None))
+                vals = drain_status_values(has_cp)
+                stmt = (
+                    update(AgentTask)
+                    .where(AgentTask.id == task_id,
+                           AgentTask.status.in_(("running", "claimed")))
+                    .values(
+                        status=vals["status"],
+                        error=("Task interrupted by graceful shutdown; checkpoint preserved (resumable)"
+                               if has_cp else "Task interrupted by graceful shutdown (no checkpoint)"),
+                        completed_at=vals["completed_at"],
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+                result = await db.execute(stmt)
+                await db.commit()
+                if result.rowcount == 0:
+                    logger.info("drain skip: task %s already in terminal state", task_id)
+        except Exception:
+            logger.exception("Failed to mark task %s as drained", task_id)
 
 
 agent_worker = AgentWorker()

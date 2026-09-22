@@ -242,15 +242,33 @@ async def restore_snapshot(
     if code != 0 or not tree:
         return {"ok": False, "error": f"快照不存在或不可用: {snapshot_id}"}
 
-    # 恢复前 capture 当前状态（恢复可再撤销）；失败不阻断恢复本身。
-    await create_snapshot(user_id, work_tree, reason=f"before restore {snapshot_id}", snapshot_root=snapshot_root)
+    # R6：恢复是工作区级写——对被恢复文件取 per-path 锁（与 workspace_write/edit
+    # 同键），避免恢复与并行写互相踩；锁按排序获取、finally 必释放。
+    from app.services.workspace_lock_service import canonical_key_path, path_lock
+    code, tree_out, _err = await _run_git(git_dir, work_tree, ["ls-tree", "-r", "--name-only", tree])
+    _restore_files = [ln.strip() for ln in tree_out.splitlines() if ln.strip()] if code == 0 else []
+    _locks = []
+    try:
+        for _rel in sorted(_restore_files):
+            _lk = path_lock(user_id, canonical_key_path(work_tree, _rel))
+            await _lk.acquire()
+            _locks.append(_lk)
 
-    code, _out, err = await _run_git(git_dir, work_tree, ["read-tree", tree])
-    if code != 0:
-        return {"ok": False, "error": f"git read-tree failed: {err.strip() or code}"}
-    code, _out, err = await _run_git(git_dir, work_tree, ["checkout-index", "-a", "-f"])
-    if code != 0:
-        return {"ok": False, "error": f"git checkout-index failed: {err.strip() or code}"}
+        # 恢复前 capture 当前状态（恢复可再撤销）；失败不阻断恢复本身。
+        await create_snapshot(user_id, work_tree, reason=f"before restore {snapshot_id}", snapshot_root=snapshot_root)
+
+        code, _out, err = await _run_git(git_dir, work_tree, ["read-tree", tree])
+        if code != 0:
+            return {"ok": False, "error": f"git read-tree failed: {err.strip() or code}"}
+        code, _out, err = await _run_git(git_dir, work_tree, ["checkout-index", "-a", "-f"])
+        if code != 0:
+            return {"ok": False, "error": f"git checkout-index failed: {err.strip() or code}"}
+    finally:
+        for _lk in reversed(_locks):
+            try:
+                _lk.release()
+            except RuntimeError:
+                pass
 
     code, out, _err = await _run_git(git_dir, work_tree, ["ls-tree", "-r", "--name-only", tree])
     restored_paths = [line for line in out.splitlines() if line.strip()] if code == 0 else []

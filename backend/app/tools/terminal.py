@@ -295,6 +295,26 @@ async def terminal(args: dict, **kwargs) -> str:
             "_permission_description": f"命令请求访问工作区外路径: {outside_path}",
         }, ensure_ascii=False)
 
+    # D-重（2026-09-22）：durable=true → 提交持久作业立即返回句柄（脱出 120s 内联顶）。
+    if args.get("durable"):
+        _uid = str(getattr(kwargs.get("user"), "id", "") or "")
+        if not _uid:
+            return json.dumps({"error": "durable terminal job requires an authenticated user"},
+                              ensure_ascii=False)
+        from app.services.job_runner_service import get_job_runner
+        job = await get_job_runner().submit(
+            user_id=_uid,
+            source="terminal",
+            spec={"kind": "shell", "command": command, "workdir": str(cwd)},
+            idempotency_key=args.get("idempotency_key") or None,
+        )
+        return json.dumps({
+            "durable": True,
+            "job_id": job["id"],
+            "state": job["state"],
+            "handle": "命令已提交持久作业（detached，后端重启不中断）。job_status 轮询、job_logs(offset) 读日志、job_artifacts 取产物、job_cancel 取消。",
+        }, ensure_ascii=False)
+
     Path(cwd).mkdir(parents=True, exist_ok=True)
 
     # Pre-execution workspace snapshot for generated-file detection.
@@ -469,6 +489,15 @@ registry.register(
                 "timeout": {
                     "type": "number",
                     "description": "Timeout in seconds (default: 30, max: 120)",
+                },
+                "durable": {
+                    "type": "boolean",
+                    "description": "If true, submit to the durable job runner and return a handle immediately (bypasses the 120s inline cap; detached, survives backend restarts; track with job_status/job_logs/job_artifacts). Use for long builds/training/ETL.",
+                    "default": False,
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Durable-job idempotency key (only used when durable=true); same key returns the existing job.",
                 },
                 "working_dir": {
                     "type": "string",

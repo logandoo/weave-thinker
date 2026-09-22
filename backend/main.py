@@ -110,6 +110,8 @@ async def _memory_reprobe_after_reload() -> None:
         _enable_memory()
 
 
+_durable_job_worker = None  # D-重：durable job worker 句柄（lifespan 启停）
+
 @app.on_event("startup")
 async def startup_event():
     if not config.security_jwt_secret_key:
@@ -192,6 +194,12 @@ async def startup_event():
     await agent_scheduler.start()
     await agent_worker.start()
     await export_worker.start()
+    # D-重（2026-09-22）：durable job runner——启动对账（exit_code 落盘 finalize/
+    # pid 活接管/否则 unknown）后进入轮询；5h+ 重作业靠 detached 子进程跨重启存活。
+    from app.services.job_runner_service import JobRunnerWorker
+    global _durable_job_worker
+    _durable_job_worker = JobRunnerWorker()
+    await _durable_job_worker.start()
     # §9.5：pgvector 缺失时 memory v2 表不存在——kill-switch 禁用 memory 子系统
     # （跨 Config 实例一致，服务以旧方案继续运行）
     from app.db import migrations as _db_migrations
@@ -252,6 +260,12 @@ async def shutdown_event():
     await agent_scheduler.stop()
     await agent_worker.stop()
     await export_worker.stop()
+    # D-重：durable job worker 停轮询（detached 子进程不连带杀死——作业跨重启存活）
+    try:
+        if _durable_job_worker is not None:
+            await _durable_job_worker.stop()
+    except Exception:
+        pass
     from app.services.memory_scheduler import memory_scheduler
     await memory_scheduler.stop()
     try:

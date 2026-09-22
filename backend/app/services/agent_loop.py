@@ -63,6 +63,10 @@ _PARALLEL_SAFE_TOOLS: Set[str] = {
     "grep",
     "diff",
     "vision_interpret",
+    # P1（2026-09-22 durable execution 波）：写工具进并行面——同轮按目标路径
+    # 分波执行（partition_write_waves）：异文件并行、同文件严格按模型顺序串行。
+    "workspace_write",
+    "workspace_edit",
 }
 
 _TOOL_CALL_RE = _re.compile(r'<tool_calls>.*?</tool_calls>', _re.DOTALL)
@@ -323,10 +327,15 @@ class _SessionContext:
 
 
 class IterationBudget:
-    def __init__(self, max_total: int):
+    def __init__(self, max_total: int, preused: int = 0):
         self.max_total = max_total
-        self._used = 0
+        # D-轻（2026-09-22）：断点续跑从既有消费计数继续（preused=checkpoint.budget_used）
+        self._used = max(0, int(preused))
         self._lock = asyncio.Lock()
+
+    @property
+    def used(self) -> int:
+        return self._used
 
     async def consume(self) -> bool:
         async with self._lock:
@@ -7044,16 +7053,23 @@ class AgentLoop:
         assistant: Any = None,
         precomputed_coord: Any = _UNSET,
         interjection_queue: Optional[asyncio.Queue] = None,
+        checkpoint_cb: Any = None,
+        budget_preused: int = 0,
+        principal: Any = None,
     ) -> AsyncIterator[dict]:
         state = AgentLoopState(messages=list(messages))
         state.injected_memory_context = self.injected_memory_context or ""
         state.interjection_queue = interjection_queue
+        # D-轻（2026-09-22）：断点续跑三件——checkpoint 回调 / 消费计数续算 /
+        # 副作用台账 principal（("agent_task", id) 等；None=交互会话不记台账）
+        state.checkpoint_cb = checkpoint_cb
+        state.principal = principal
         # MCP 渐进发现：把历史里已用过的 MCP 工具 schema 预载回来（跨轮粘性）。
         self._preload_discovered_from_history(state.messages)
         # Introspection hook for tests/diagnostics (stash, counters, flags).
         self._last_state = state
         state.max_web_searches = config.web_search_max_rounds * 3
-        state.budget = IterationBudget(self.max_iterations)
+        state.budget = IterationBudget(self.max_iterations, preused=budget_preused)
         # The auditor's system prompt names the assistant being audited
         # (2026-08-12: was hardcoded "Weave Thinker").
         self._audit_assistant_name = (getattr(assistant, "name", None) or "AI助手")
@@ -7303,6 +7319,10 @@ class AgentLoop:
         # routes into the exhaustion handler below, which evaluates the goal and
         # resets the budget for the next turn instead of terminating the run.
         while (await state.budget.get_remaining()) > 0 or state.budget_grace_call or self._skip_guardrails():
+            # D-轻（A4.9 R1 C4 修正）：checkpoint 位于 consume 之前——budget.used
+            # 仅代表「已完成」的迭代数，重放中断迭代时 consume 后回到同一 cursor，
+            # 台账键跨重放稳定（write-before-invoke）。
+            await self._maybe_checkpoint(state)
             if state.budget_grace_call:
                 state.budget_grace_call = False
                 async for event in self._grace_call(state):
@@ -8231,6 +8251,13 @@ class AgentLoop:
                         # 参数必须是合法 JSON（修复或 {}），否则 vLLM 400。
                         _dispatch_plan, _safe_tool_calls = plan_tool_calls_for_round(valid_tool_calls)
                         assistant_msg["tool_calls"] = _safe_tool_calls
+                        # D-轻（A4.9 R2 N3 / R3 NEW-1）：派发前落盘在飞迭代，存
+                        # **原始** tool_calls（含截断参数原样）——恢复时 preflight 对
+                        # 不可解析参数合成截断反馈、绝不以 {} 派发（同 R1 C1 红线）。
+                        _cp_assistant = dict(assistant_msg)
+                        _cp_assistant["tool_calls"] = valid_tool_calls
+                        await self._maybe_checkpoint(
+                            state, extra_messages=list(state.messages) + [_cp_assistant])
 
                         can_parallel = (
                             config.agent_tool_loop_parallel_tool_calls
@@ -8302,48 +8329,64 @@ class AgentLoop:
                                         timeout=_hard,
                                     )))
 
-                                par_task = asyncio.gather(*(c[2] for c in coros), return_exceptions=True)
-                                try:
-                                    while not par_task.done():
-                                        done, _ = await asyncio.wait({par_task}, timeout=8.0)
-                                        if not done:
-                                            yield {"ping": True}
-                                    raw_results = par_task.result()
-                                    results = []
-                                    for (tc, tool_args, _), r in zip(coros, raw_results):
-                                        if isinstance(r, asyncio.TimeoutError):
-                                            results.append(ToolCallResult(
-                                                call_id=tc["id"],
-                                                name=tc["function"]["name"],
-                                                arguments=tool_args,
-                                                result=json.dumps({"error": f"Tool '{tc['function']['name']}' timed out"}),
-                                                error=True,
-                                            ))
-                                        elif isinstance(r, ToolStalledError):
-                                            results.append(ToolCallResult(
-                                                call_id=tc["id"],
-                                                name=tc["function"]["name"],
-                                                arguments=tool_args,
-                                                result=json.dumps({"error": str(r)}),
-                                                error=True,
-                                            ))
-                                        elif isinstance(r, Exception):
-                                            results.append(ToolCallResult(
-                                                call_id=tc["id"],
-                                                name=tc["function"]["name"],
-                                                arguments=tool_args,
-                                                result=json.dumps({"error": f"Tool '{tc['function']['name']}' failed: {str(r)}"}),
-                                                error=True,
-                                            ))
-                                        else:
-                                            results.append(r)
-                                except asyncio.CancelledError:
-                                    par_task.cancel()
+                                # P1（2026-09-22）：同路径分波——波内并行、波间
+                                # 串行；结果按模型顺序回填（下游 zip(coros,…) 不变）。
+                                from app.services.workspace_lock_service import (
+                                    partition_write_waves as _partition_write_waves,
+                                )
+                                _waves = _partition_write_waves(
+                                    valid_tool_calls, getattr(self, "workspace_path", None))
+                                _results_by_id: Dict[str, ToolCallResult] = {}
+                                for _wave in _waves:
+                                    _wave_ids = {t["id"] for t in _wave}
+                                    wave_coros = [c for c in coros if c[0]["id"] in _wave_ids]
+                                    if not wave_coros:
+                                        continue
+                                    par_task = asyncio.gather(*(c[2] for c in wave_coros), return_exceptions=True)
                                     try:
-                                        await par_task
+                                        while not par_task.done():
+                                            done, _ = await asyncio.wait({par_task}, timeout=8.0)
+                                            if not done:
+                                                yield {"ping": True}
+                                        raw_results = par_task.result()
+                                        results = []
+                                        for (tc, tool_args, _), r in zip(wave_coros, raw_results):
+                                            if isinstance(r, asyncio.TimeoutError):
+                                                results.append(ToolCallResult(
+                                                    call_id=tc["id"],
+                                                    name=tc["function"]["name"],
+                                                    arguments=tool_args,
+                                                    result=json.dumps({"error": f"Tool '{tc['function']['name']}' timed out"}),
+                                                    error=True,
+                                                ))
+                                            elif isinstance(r, ToolStalledError):
+                                                results.append(ToolCallResult(
+                                                    call_id=tc["id"],
+                                                    name=tc["function"]["name"],
+                                                    arguments=tool_args,
+                                                    result=json.dumps({"error": str(r)}),
+                                                    error=True,
+                                                ))
+                                            elif isinstance(r, Exception):
+                                                results.append(ToolCallResult(
+                                                    call_id=tc["id"],
+                                                    name=tc["function"]["name"],
+                                                    arguments=tool_args,
+                                                    result=json.dumps({"error": f"Tool '{tc['function']['name']}' failed: {str(r)}"}),
+                                                    error=True,
+                                                ))
+                                            else:
+                                                results.append(r)
+                                        for _c, _res in zip(wave_coros, results):
+                                            _results_by_id[_c[0]["id"]] = _res
                                     except asyncio.CancelledError:
-                                        pass
-                                    raise
+                                        par_task.cancel()
+                                        try:
+                                            await par_task
+                                        except asyncio.CancelledError:
+                                            pass
+                                        raise
+                                results = [_results_by_id[tc["id"]] for tc, _, _ in coros]
 
                                 # Citation ledger: renumber web_search results
                                 # with turn-global ids BEFORE the digest layer
@@ -10441,7 +10484,105 @@ class AgentLoop:
             return tool_args
         return {k: v for k, v in tool_args.items() if not str(k).startswith("_")}
 
+    async def _maybe_checkpoint(self, state, extra_messages=None) -> None:
+        """D-轻：迭代起点/派发前回调 checkpoint（fail-open，绝不打断主循环）。
+
+        extra_messages（A4.9 R2 N3）：派发前把含 tool_calls 原 id 的 assistant
+        消息一并落盘——恢复时 preflight 重派这些调用并由台账按 call_id 去重。
+        """
+        cb = getattr(state, "checkpoint_cb", None)
+        if cb is None:
+            return
+        try:
+            from app.services.task_checkpoint import build_checkpoint
+            _msgs = list(extra_messages) if extra_messages is not None else state.messages
+            cp = build_checkpoint(
+                cursor=int(state.budget.used),
+                messages=_msgs,
+                budget_used=int(state.budget.used),
+            )
+            await cb(cp)
+        except Exception:
+            logger.exception("checkpoint_cb failed (fail-open)")
+
+    _SIDE_EFFECT_TOOLS = frozenset({
+        "workspace_write", "workspace_edit", "notes", "terminal",
+        "process", "execute_code", "job_submit",
+        # R6 补全：其余有外部/持久副作用的工具一并进台账（恢复重放去重覆盖）；
+        # R6 复审 N3：memory 的 read 动作无副作用——不记账（避免把热读缓存成截断结果）
+        "memory", "background_task", "schedule", "delegate_task",
+        "skill_run_script", "skill_manage", "pdf_export",
+        "tts_synthesize", "workspace_snapshot", "job_cancel",
+        "browser_navigate", "browser_click", "browser_type",
+        "browser_press", "browser_execute_js",
+    })
+
     async def _execute_single_tool(
+        self,
+        call_id: str,
+        tool_name: str,
+        tool_args: dict,
+        session_factory: Any,
+        user: Any,
+        conversation: Any,
+        assistant: Any,
+        state: AgentLoopState,
+        current_turn_content: str = "",
+        current_turn_tool_results: str = "",
+    ) -> ToolCallResult:
+        """D-轻：副作用工具走台账（write-before-invoke / 重放跳过）后转内层。"""
+        principal = getattr(state, "principal", None)
+        if not principal or tool_name not in self._SIDE_EFFECT_TOOLS:
+            return await self._execute_single_tool_inner(
+                call_id, tool_name, tool_args, session_factory, user, conversation,
+                assistant, state,
+                current_turn_content=current_turn_content,
+                current_turn_tool_results=current_turn_tool_results,
+            )
+        # R6 复审 N3：memory 只读动作不记账（省略 action 默认即 read；读无副作用）
+        if tool_name == "memory" and str((tool_args or {}).get("action") or "read").lower() == "read":
+            return await self._execute_single_tool_inner(
+                call_id, tool_name, tool_args, session_factory, user, conversation,
+                assistant, state,
+                current_turn_content=current_turn_content,
+                current_turn_tool_results=current_turn_tool_results,
+            )
+        from app.services import side_effect_ledger as sel
+        ptype, pid = principal
+        cursor = int(state.budget.used)
+        store = sel.get_ledger_store()
+        if await sel.should_skip(store, ptype, str(pid), cursor, tool_name, call_id):
+            recorded = await sel.get_result(store, ptype, str(pid), cursor, tool_name, call_id)
+            return ToolCallResult(
+                call_id=call_id,
+                name=tool_name,
+                arguments=tool_args,
+                result=recorded or json.dumps(
+                    {"replayed": True, "skipped": "side effect already recorded in ledger"},
+                    ensure_ascii=False),
+                error=False,
+            )
+        key = await sel.begin(store, ptype, str(pid), cursor, tool_name, call_id)
+        if key is None:
+            # 并发下同键先到：视为已记录，跳过（宁可不双写）
+            return ToolCallResult(
+                call_id=call_id,
+                name=tool_name,
+                arguments=tool_args,
+                result=json.dumps({"replayed": True, "skipped": "ledger key already present"},
+                                  ensure_ascii=False),
+                error=False,
+            )
+        result = await self._execute_single_tool_inner(
+            call_id, tool_name, tool_args, session_factory, user, conversation,
+            assistant, state,
+            current_turn_content=current_turn_content,
+            current_turn_tool_results=current_turn_tool_results,
+        )
+        await sel.finish(store, key, "failed" if result.error else "done", result.result)
+        return result
+
+    async def _execute_single_tool_inner(
         self,
         call_id: str,
         tool_name: str,

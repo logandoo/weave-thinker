@@ -385,6 +385,36 @@ async def generate_and_execute_code(args: dict, **kwargs) -> str:
     if safety_error:
         return json.dumps({"error": f"Generated code failed safety check: {safety_error}"}, ensure_ascii=False)
 
+    # D-重（2026-09-22）：durable=true → 提交持久作业立即返回句柄
+    # （detached 子进程，跳过内联 240s 总顶；5h+ 重作业的真实需求出口）。
+    if args.get("durable"):
+        _uid = str(getattr(kwargs.get("user"), "id", "") or "")
+        if not _uid:
+            return json.dumps({"error": "durable execute_code job requires an authenticated user"},
+                              ensure_ascii=False)
+        if args.get("use_tools"):
+            return json.dumps(
+                {"error": "durable=true 不支持 use_tools（PTC 为进程内桥，持久作业不可用）"},
+                ensure_ascii=False)
+        from app.services.job_runner_service import get_job_runner
+        # R6：持久作业落在稳定工作区（scratch 是本次调用的临时目录，重启后即失）
+        _durable_workdir = str(kwargs.get("workspace_path") or "").strip() or str(exec_cwd)
+        _spec = {"kind": "python", "code": code, "workdir": _durable_workdir}
+        if args.get("timeout_seconds") is not None:
+            _spec["timeout_seconds"] = float(args["timeout_seconds"])
+        job = await get_job_runner().submit(
+            user_id=_uid,
+            source="execute_code",
+            spec=_spec,
+            idempotency_key=args.get("idempotency_key") or None,
+        )
+        return json.dumps({
+            "durable": True,
+            "job_id": job["id"],
+            "state": job["state"],
+            "handle": "代码已提交持久作业（detached，后端重启不中断）。job_status 轮询、job_logs(offset) 读日志、job_artifacts 取产物、job_cancel 取消。",
+        }, ensure_ascii=False)
+
     import time as _time
     from app.services.workspace_scan import snapshot_files, detect_generated_files
     # Snapshot both scratch dir and workspace root
@@ -489,6 +519,19 @@ registry.register(
                     "type": "boolean",
                     "description": "If true, the generated code can call tools (web_search, browser, memory) via a tools proxy. Use this when the task requires fetching live data from the web or reading agent memory.",
                     "default": False,
+                },
+                "durable": {
+                    "type": "boolean",
+                    "description": "If true, submit to the durable job runner and return a handle immediately (detached, survives backend restarts; track with job_status/job_logs/job_artifacts). Use for long computations expected to exceed ~4 minutes. Note: durable=true is incompatible with use_tools=true (PTC is an in-process bridge) and runs in the user's workspace directory, not a scratch dir.",
+                    "default": False,
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "description": "Durable-job timeout in seconds; 0=unlimited (only used when durable=true).",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Durable-job idempotency key (only used when durable=true); same key returns the existing job.",
                 },
             },
             "required": ["task"],

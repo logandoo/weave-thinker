@@ -389,6 +389,61 @@ $$"""),
     ("user_model_providers_provider_not_null", """UPDATE user_model_providers SET provider = '' WHERE provider IS NULL"""),
     ("user_model_providers_provider_default", "ALTER TABLE user_model_providers ALTER COLUMN provider SET DEFAULT ''"),
     ("user_model_providers_provider_not_null_enforce", "ALTER TABLE user_model_providers ALTER COLUMN provider SET NOT NULL"),
+    # ── durable execution 波（2026-09-22）：D-轻 checkpoint/resume + D-重 job runner。
+    # 与 memory v2 无关，必须置于 pgvector_extension 之前（同上方约定）。
+    ("agent_tasks_checkpoint", "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS checkpoint TEXT"),
+    ("durable_jobs", """CREATE TABLE IF NOT EXISTS durable_jobs (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
+        source VARCHAR(20) NOT NULL DEFAULT 'tool',
+        spec TEXT NOT NULL,
+        idempotency_key VARCHAR(128) UNIQUE,
+        state VARCHAR(20) NOT NULL DEFAULT 'queued',
+        attempts INTEGER DEFAULT 0,
+        lease_owner VARCHAR(64),
+        lease_until TIMESTAMP,
+        pid INTEGER,
+        log_path VARCHAR(512),
+        exit_code INTEGER,
+        result_digest TEXT,
+        cancel_requested_at TIMESTAMP,
+        cancel_state VARCHAR(20),
+        error TEXT,
+        timeout_seconds DOUBLE PRECISION DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )"""),
+    ("durable_job_events", """CREATE TABLE IF NOT EXISTS durable_job_events (
+        id SERIAL PRIMARY KEY,
+        job_id VARCHAR(36) REFERENCES durable_jobs(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        event_type VARCHAR(40) NOT NULL,
+        payload TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(job_id, seq)
+    )"""),
+    ("durable_job_artifacts", """CREATE TABLE IF NOT EXISTS durable_job_artifacts (
+        id SERIAL PRIMARY KEY,
+        job_id VARCHAR(36) REFERENCES durable_jobs(id) ON DELETE CASCADE,
+        path VARCHAR(1024) NOT NULL,
+        sha256 VARCHAR(64) NOT NULL,
+        bytes INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )"""),
+    ("side_effect_ledger", """CREATE TABLE IF NOT EXISTS side_effect_ledger (
+        id SERIAL PRIMARY KEY,
+        principal_type VARCHAR(20) NOT NULL,
+        principal_id VARCHAR(36) NOT NULL,
+        cursor INTEGER NOT NULL,
+        tool_name VARCHAR(64) NOT NULL,
+        idempotency_key VARCHAR(160) UNIQUE NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        result_ref TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )"""),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (

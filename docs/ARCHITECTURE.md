@@ -23,7 +23,7 @@ Weave Thinker 是一个**具备长期记忆、工具调用、多模态语音交�
 核心能力一览：
 
 - **Agent 对话**：协调器语义路由 → ReAct 工具循环（≤50 轮）→ LLM 发送前审计 → 流式 SSE 渲染
-- **43 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务等
+- **49 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务、持久作业等
 - **三层记忆**：v1 DB 摘要记忆、文件记忆工具（AGENT.md/USER.md/changelog.md）、v2 概念/潜意识/情节子系统
 - **死磕模式**：盘问 → 目标循环（PEVR + judge/verifier 双 LLM 门 + 三级停滞升级）的自主长线任务模式
 - **双工语音**：一条 WebSocket 实现全双工对话（流式 ASR + 语义 EoT + barge-in 打断 + 流式 TTS）
@@ -89,7 +89,7 @@ weave-thinker/
 │  ├─ app/
 │  │  ├─ api/                          # 20+ 路由模块（§3.2 全表）
 │  │  ├─ services/                     # ~78 服务模块：AgentLoop/三层记忆/死磕/语音/导出（§3.3）
-│  │  ├─ tools/                        # 43 个工具函数 + MCP 动态扩展（§3.4）
+│  │  ├─ tools/                        # 49 个工具函数 + MCP 动态扩展（§3.4）
 │  │  ├─ core/                         # config.py（双 TOML 合并）· deps.py（JWT）· provider_router.py
 │  │  ├─ db/                           # database.py（模型 + 启动幂等迁移，无 Alembic）
 │  │  ├─ schemas/                      # Pydantic 请求/响应模型
@@ -168,7 +168,7 @@ weave-thinker/
 - **code_execution_service.py**：代码沙箱（子代理生成→执行→自动修复循环）
 - **interactive_browser_service.py / browser_service.py**：交互式浏览器会话（navigate/click/type/scroll/screenshot/execute_js）与一次性抓取
 
-### 3.4 工具系统（`backend/app/tools/`，43 个工具函数 + MCP）
+### 3.4 工具系统（`backend/app/tools/`，49 个工具函数 + MCP）
 
 注册机制：`registry.py` 单例 `ToolRegistry`，`register(name, toolset, schema, handler, check_fn, …)`，`dispatch()` 支持权限门、可见工具集 fail-closed、异步超时；启动时 `_discover_tools()` 自动导入 + `load_mcp_servers_from_config()` 注册 MCP 工具。
 
@@ -186,6 +186,7 @@ weave-thinker/
 | pdf_export | 文本/笔记/对话渲染 PDF（WeasyPrint + CJK 字体 + 引用附录） |
 | delegate_task | 子代理委派（深度≤2、独立 LLM、信号量并发） |
 | background_task | 提交长时后台任务（agent_tasks 表，5h 超时） |
+| job_submit / job_status / job_logs / job_cancel / job_list / job_artifacts | 持久作业（durable jobs）：脱离进程后台执行、退出回执、增量日志、产物登记、取消回执、重启对账 |
 | schedule | 定时任务管理（NL 表达式 → 确定性 cron） |
 | session_search | 历史会话全文搜索 |
 | context7_resolve_library_id / context7_query_docs | context7 文档查询 |

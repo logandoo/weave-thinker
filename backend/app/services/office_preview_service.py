@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Office → PDF conversion service (2026-09-19).
+"""Office → PDF / HTML conversion service (2026-09-19, HTML 2026-09-21).
 
 Server-side rendering path for Office previews (reference: deepseek-harness
 ``dsh-office-to-pdf`` — LibreOffice + client PDF rendering). The Node kit is
@@ -15,6 +15,13 @@ not portable to this Python stack, so the equivalent is a headless
   over the user profile lock;
 * bounded cache (LRU by mtime) and hard timeout with process-group kill.
 
+Spreadsheets can additionally be rendered to a self-contained HTML document
+(``convert_to_html``): the Calc HTML export keeps each sheet as one
+natural-width table (no print pagination), preserves styles/merges, and embeds
+charts as images which are inlined as data URIs and sanitized through a strict
+whitelist before the browser ever sees them. This is the preview path for
+``.xlsx``/``.xls``/``.ods``; word/ppt keep the PDF path.
+
 When no soffice binary is available the caller maps
 :class:`OfficePreviewUnavailable`/``None`` to HTTP 501 and the frontend falls
 back to its client-side renderers — office preview never becomes unavailable
@@ -22,17 +29,22 @@ just because the host lacks LibreOffice.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import html as html_lib
 import logging
 import os
 import re
 import shutil
-import zipfile
-import xml.etree.ElementTree as ET
 import signal
 import subprocess
 import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import Callable
+from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +52,13 @@ SUPPORTED_OFFICE_EXT = frozenset({
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".odt", ".ods", ".odp", ".rtf",
 })
+
+# Spreadsheet formats that get the HTML preview path (2026-09-21): LibreOffice
+# print-to-PDF pagination splits wide tables across pages and cuts long cell
+# text at page boundaries; the Calc HTML export keeps every sheet as one
+# natural-width table (horizontal scroll + CSS wrapping in the frontend) and
+# embeds charts as images.
+SPREADSHEET_EXT = frozenset({".xls", ".xlsx", ".ods"})
 
 # Spreadsheet formats whose sheets may carry charts. LibreOffice's default
 # paginated PDF export clips charts at page boundaries (user report
@@ -61,8 +80,68 @@ _XLSX_FIT_MAX_ROWS = 200
 # Bump whenever the conversion pipeline changes so stale cached PDFs are
 # not served under an unchanged source (v4 = xlsx print-setup patch;
 # v5 = patch hardening: paired pageSetUpPr, sheetProtection prefix,
-# well-formedness validation).
-_CACHE_VERSION = "5"
+# well-formedness validation; v6 = spreadsheet HTML preview path;
+# v7 = workbook column-width injection + multi-colgroup stripping;
+# v8 = sanitizer marker + CSS escape guard + early size budgets).
+_CACHE_VERSION = "8"
+
+# --- Spreadsheet HTML preview (2026-09-21) ---------------------------------
+# Sanitizer/output guards: the converted document is served to a sandboxed
+# iframe, and the sanitizer strips anything active or off-disk before it.
+_HTML_MAX_BYTES = 16 * 1024 * 1024
+_HTML_ASSET_MAX_BYTES = 8 * 1024 * 1024
+_HTML_ASSET_EXT = frozenset({".png", ".gif", ".jpg", ".jpeg", ".bmp", ".webp"})
+_HTML_ASSET_MIME = {
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+}
+# Element/attribute whitelist mirrors what LibreOffice's Calc HTML export
+# emits; everything else (scripts, frames, forms, on* handlers, data-* payload
+# blobs, external URLs) is dropped.
+_HTML_ALLOWED_TAGS = frozenset({
+    "html", "head", "style", "body",
+    "hr", "p", "center", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "colgroup", "col", "thead", "tbody", "tfoot", "tr", "td", "th",
+    "font", "b", "i", "u", "em", "strong", "s", "strike", "sub", "sup",
+    "small", "big", "span", "div", "br", "a", "img",
+})
+_HTML_VOID_TAGS = frozenset({"br", "hr", "col", "img"})
+# Bare structural tags are rebuilt by the sanitizer (own doctype/head/body).
+_HTML_SKELETON_TAGS = frozenset({"html", "head", "body"})
+# Text content of these never reaches the preview.
+_HTML_SUPPRESS_TAGS = frozenset({"script", "noscript", "textarea", "template", "title"})
+_HTML_ALLOWED_ATTRS = frozenset({
+    "align", "valign", "width", "height", "colspan", "rowspan", "border",
+    "cellspacing", "cellpadding", "bgcolor", "color", "face", "size",
+    "title", "alt", "nowrap", "name", "span",
+})
+# CSS is not tokenized here, so any backslash is rejected outright: CSS escape
+# sequences (`u\72l(...)`, `@\69 mport`) would otherwise bypass the substring
+# checks below (A4.9 2026-09-21). LibreOffice's own stylesheet contains none.
+_HTML_CSS_FORBIDDEN = ("url(", "@import", "expression(", "javascript:", "behavior:", "\\")
+# Marker proving the artifact passed the sanitizer (cache trust check).
+_HTML_PREVIEW_MARKER = 'data-wt-preview="1"'
+# Memory bounds: raw export is size-checked BEFORE parsing, inlined assets get
+# a running byte budget, and the assembled document must fit _HTML_MAX_BYTES.
+_HTML_MAX_RAW_CHARS = 48 * 1024 * 1024
+_HTML_ASSET_TOTAL_MAX_BYTES = 24 * 1024 * 1024
+# openpyxl width extraction decompresses the whole archive; refuse oversized
+# expansion (a 30MB deflated workbook can inflate into millions of cells).
+_HTML_WIDTHS_MAX_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
+# Readability layer injected after the LibreOffice stylesheet: text wraps
+# inside cells (no clipping) and wide tables scroll horizontally instead of
+# being split across pages.
+_HTML_PREVIEW_CSS = (
+    "html,body{margin:0;padding:0;background:#fff;}"
+    "body{padding:10px 12px 28px;}"
+    "table{border-collapse:collapse;}"
+    "td,th{overflow-wrap:anywhere;}"
+    "img{max-width:100%;height:auto;}"
+)
 
 # Single-page mode flattens a whole sheet onto one page. Beyond this page
 # height (PDF points; A4 is ~842pt) the page is unreadably large and can even
@@ -104,6 +183,363 @@ def _conversion_semaphore() -> "asyncio.Semaphore":  # noqa: F821 - lazy import
 
 def is_supported(name: str) -> bool:
     return Path(name).suffix.lower() in SUPPORTED_OFFICE_EXT
+
+
+def is_spreadsheet(name: str) -> bool:
+    return Path(name).suffix.lower() in SPREADSHEET_EXT
+
+
+def _is_valid_html(path: Path) -> bool:
+    """HTML cache entries are trusted only after a marker check.
+
+    The marker is emitted by :func:`sanitize_office_html`; a planted/poisoned
+    file in the shared cache dir can therefore never be served as a preview
+    (same threat model as the ``%PDF-`` magic check).
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(1024).lstrip().lower()
+        return head.startswith(b"<!doctype html") and _HTML_PREVIEW_MARKER.encode() in head
+    except OSError:
+        return False
+
+
+# Reading column widths needs a non-read-only openpyxl load; keep it bounded so
+# a huge uploaded workbook cannot stall the worker.
+_HTML_WIDTHS_MAX_SRC_BYTES = 32 * 1024 * 1024
+_HTML_DEFAULT_COL_WIDTH_PX = round(8.43 * 7 + 5)
+
+
+def _sheet_column_widths(src: Path) -> list[tuple[str, list[int]]] | None:
+    """Per-sheet column widths in px, in workbook order (all sheet states).
+
+    LibreOffice's Calc HTML export only keeps the first column's width, so the
+    browser auto-fits (and squeezes) every table. The preview re-injects the
+    workbook's intended widths; ``None`` when openpyxl cannot read the file
+    (the HTML then keeps the browser's auto layout).
+    """
+    try:
+        if src.stat().st_size > _HTML_WIDTHS_MAX_SRC_BYTES:
+            return None
+        with zipfile.ZipFile(src) as archive:
+            uncompressed = sum(info.file_size for info in archive.infolist())
+        if uncompressed > _HTML_WIDTHS_MAX_UNCOMPRESSED_BYTES:
+            return None
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+    except (OSError, ImportError, zipfile.BadZipFile):
+        return None
+    try:
+        wb = load_workbook(src, read_only=False, data_only=True)
+    except Exception:  # noqa: BLE001 - width metadata is best-effort
+        return None
+    try:
+        plan: list[tuple[str, list[int]]] = []
+        for ws in wb.worksheets:
+            widths: list[int] = []
+            for col in range(1, min(int(ws.max_column or 0), 512) + 1):
+                dim = ws.column_dimensions.get(get_column_letter(col))
+                width = dim.width if dim is not None and dim.width else None
+                widths.append(
+                    round(width * 7 + 5) if width else _HTML_DEFAULT_COL_WIDTH_PX
+                )
+            plan.append((ws.title, widths))
+        return plan
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            wb.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_HTML_TABLE_RE = re.compile(r"<table\b[^>]*>(.*?)</table>", re.S | re.I)
+_HTML_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.S | re.I)
+_HTML_CELL_RE = re.compile(r"<t[dh]\b([^>]*)>", re.I)
+_HTML_COLSPAN_RE = re.compile(r"colspan\s*=\s*[\"']?(\d+)", re.I)
+_HTML_SHEET_HEADING_RE = re.compile(
+    r"<h1>\s*Sheet\s+\d+\s*:\s*<em>(.*?)</em>\s*</h1>", re.S | re.I
+)
+
+
+def _html_table_column_counts(html: str) -> list[int]:
+    """Column count per ``<table>`` (colspan-aware metadata scan)."""
+    counts: list[int] = []
+    for table in _HTML_TABLE_RE.finditer(html):
+        max_cols = 0
+        for row in _HTML_ROW_RE.finditer(table.group(1)):
+            n = 0
+            for cell in _HTML_CELL_RE.finditer(row.group(1)):
+                span = _HTML_COLSPAN_RE.search(cell.group(1))
+                n += int(span.group(1)) if span else 1
+            max_cols = max(max_cols, n)
+        counts.append(max_cols)
+    return counts
+
+
+def _html_table_width_plan(
+    html: str, sheets: list[tuple[str, list[int]]]
+) -> list[list[int]]:
+    """Per-table column widths, aligned by the export's sheet headings.
+
+    The Calc HTML export has one ``<h1>Sheet N: <em>NAME</em></h1>`` heading
+    per exported sheet; a table is only width-injected when its sheet can be
+    resolved and the source has at least as many columns as the table uses.
+    """
+    counts = _html_table_column_counts(html)
+    headings = [
+        html_lib.unescape(m.group(1)).strip() for m in _HTML_SHEET_HEADING_RE.finditer(html)
+    ]
+    by_name = {name: widths for name, widths in sheets}
+    plan: list[list[int]] = []
+    for i, ncols in enumerate(counts):
+        widths: list[int] | None = None
+        if i < len(headings):
+            widths = by_name.get(headings[i])
+        if widths is None and not headings and i < len(sheets):
+            widths = sheets[i][1]  # heading format changed → positional fallback
+        if widths and 0 < ncols <= len(widths):
+            plan.append(widths[:ncols])
+        else:
+            plan.append([])
+    return plan
+
+
+class _OfficeHtmlSanitizer(HTMLParser):
+    """Whitelist sanitizer for LibreOffice-generated spreadsheet HTML.
+
+    Cell text is HTML-escaped by LibreOffice, but formula cells can emit live
+    anchors (``=HYPERLINK("http://…")``) and a hostile workbook could carry
+    other active markup, so the preview document is rebuilt from scratch:
+    only whitelisted elements/attributes survive, external URLs and ``on*``
+    handlers are dropped, local chart images are inlined as data URIs, and
+    the LibreOffice stylesheet is kept only when it contains no off-disk
+    ``url()``/``@import`` references.
+    """
+
+    def __init__(self, assets_dir: Path, table_widths: list[list[int]] | None = None):
+        super().__init__(convert_charrefs=True)
+        self._assets_dir = assets_dir
+        self._table_widths = table_widths or []
+        self._table_index = 0
+        # LibreOffice emits one <colgroup> per width run; after injecting the
+        # workbook widths every original colgroup/col is dropped until the
+        # first data row (or the end of the table).
+        self._skip_colgroups = False
+        self._open_colgroup = 0
+        self._body: list[str] = []
+        self._styles: list[str] = []
+        self._in_head = False
+        self._in_style = False
+        self._style_buf: list[str] = []
+        self._suppress: list[str] = []
+        self._data_uri_cache: dict[str, str | None] = {}
+        self._inlined_asset_bytes = 0
+
+    # -- helpers ----------------------------------------------------------
+    def _local_asset_data_uri(self, src: str) -> str | None:
+        # LibreOffice percent-encodes non-ASCII chart image names on Linux
+        # (LO 7.3 prod), so decode before resolving the flat export file.
+        raw = unquote(src.strip())
+        name = os.path.basename(raw)
+        if not name:
+            return None
+        if name in self._data_uri_cache:
+            return self._data_uri_cache[name]
+        result: str | None = None
+        path = self._assets_dir / name
+        if path.suffix.lower() in _HTML_ASSET_EXT and path.is_file():
+            try:
+                size = path.stat().st_size
+                if size <= _HTML_ASSET_MAX_BYTES:
+                    if self._inlined_asset_bytes + size > _HTML_ASSET_TOTAL_MAX_BYTES:
+                        raise OfficePreviewFailed("HTML preview assets exceed size budget")
+                    mime = _HTML_ASSET_MIME.get(path.suffix.lower(), "application/octet-stream")
+                    result = f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+                    self._inlined_asset_bytes += size
+            except OSError:
+                result = None
+        self._data_uri_cache[name] = result
+        return result
+
+    def _render_attrs(self, tag: str, attrs: list[tuple[str, str | None]]) -> str:
+        parts: list[str] = []
+        for raw_name, raw_value in attrs:
+            name = (raw_name or "").lower()
+            value = "" if raw_value is None else raw_value
+            if not name or name.startswith("on") or name.startswith("data-"):
+                continue
+            if name == "style":
+                if any(token in value.lower() for token in _HTML_CSS_FORBIDDEN):
+                    continue
+            elif name == "href":
+                if not value.strip().startswith("#"):
+                    continue
+            elif name == "src":
+                if not value.strip().lower().startswith("data:image/"):
+                    continue
+            elif name not in _HTML_ALLOWED_ATTRS:
+                continue
+            parts.append(f'{name}="{html_lib.escape(value, quote=True)}"')
+        return (" " + " ".join(parts)) if parts else ""
+
+    # -- HTMLParser hooks -------------------------------------------------
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in _HTML_SUPPRESS_TAGS:
+            self._suppress.append(tag)
+            return
+        if self._suppress:
+            return
+        if tag == "head":
+            self._in_head = True
+            return
+        if tag == "style":
+            self._in_style = True
+            self._style_buf = []
+            return
+        if tag == "table":
+            widths = (
+                self._table_widths[self._table_index]
+                if self._table_index < len(self._table_widths)
+                else []
+            )
+            self._table_index += 1
+            if widths:
+                total = sum(widths)
+                cols = "".join(f'<col style="width:{w}px">' for w in widths)
+                self._body.append(f'<table style="table-layout:fixed;width:{total}px">')
+                self._body.append(f"<colgroup>{cols}</colgroup>")
+                self._skip_colgroups = True  # drop stale LibreOffice colgroups
+            else:
+                self._body.append(f"<table{self._render_attrs(tag, attrs)}>")
+            return
+        if tag == "tr":
+            self._skip_colgroups = False  # colgroups always precede the rows
+        if tag in ("colgroup", "col") and self._skip_colgroups:
+            return
+        if tag in _HTML_SKELETON_TAGS or tag not in _HTML_ALLOWED_TAGS:
+            return
+        if tag == "img":
+            rendered = self._render_attrs(tag, attrs)
+            src_attr = None
+            for raw_name, raw_value in attrs:
+                if (raw_name or "").lower() == "src":
+                    src_attr = "" if raw_value is None else raw_value.strip()
+                    break
+            if src_attr is None:
+                return
+            if not src_attr.lower().startswith("data:image/"):
+                inlined = self._local_asset_data_uri(src_attr)
+                if not inlined:
+                    return  # unresolvable/external image → drop the element
+                rendered = re.sub(
+                    r'src="[^"]*"', f'src="{inlined}"', rendered, count=1
+                ) if 'src="' in rendered else f' src="{inlined}"'
+            self._body.append(f"<img{rendered}>")
+            return
+        if tag == "colgroup":
+            self._open_colgroup += 1  # auto-layout table keeps its colgroup
+        self._body.append(f"<{tag}{self._render_attrs(tag, attrs)}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in _HTML_SUPPRESS_TAGS:
+            return
+        if tag in ("colgroup", "col") and self._skip_colgroups:
+            return
+        if tag == "img":
+            self.handle_starttag(tag, attrs)
+            return
+        if tag in _HTML_ALLOWED_TAGS and tag not in _HTML_SKELETON_TAGS:
+            self._body.append(f"<{tag}{self._render_attrs(tag, attrs)}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._suppress:
+            if tag == self._suppress[-1]:
+                self._suppress.pop()
+            return
+        if tag == "head":
+            self._in_head = False
+            return
+        if tag == "style":
+            self._in_style = False
+            css = "".join(self._style_buf)
+            if css and not any(token in css.lower() for token in _HTML_CSS_FORBIDDEN):
+                self._styles.append(css)
+            self._style_buf = []
+            return
+        if tag == "colgroup":
+            if self._open_colgroup > 0:
+                self._open_colgroup -= 1
+                self._body.append("</colgroup>")
+            return
+        if tag == "table":
+            self._skip_colgroups = False
+        if (
+            tag in _HTML_ALLOWED_TAGS
+            and tag not in _HTML_VOID_TAGS
+            and tag not in _HTML_SKELETON_TAGS
+        ):
+            self._body.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if self._suppress:
+            return
+        if self._in_style:
+            self._style_buf.append(data)
+            return
+        if self._in_head:
+            return
+        self._body.append(html_lib.escape(data, quote=False))
+
+    def handle_comment(self, _data: str) -> None:
+        return
+
+    def handle_decl(self, _decl: str) -> None:
+        return
+
+    def render(self) -> str:
+        styles = "".join(self._styles)
+        doc = (
+            f"<!DOCTYPE html><html {_HTML_PREVIEW_MARKER}><head><meta charset=\"utf-8\">"
+            f"<style>{styles}</style>"
+            f"<style>{_HTML_PREVIEW_CSS}</style>"
+            "</head><body>" + "".join(self._body) + "</body></html>"
+        )
+        if len(doc.encode("utf-8")) > _HTML_MAX_BYTES:
+            raise OfficePreviewFailed(
+                f"HTML preview exceeds {_HTML_MAX_BYTES // (1024 * 1024)}MB limit"
+            )
+        return doc
+
+
+def sanitize_office_html(
+    html: str,
+    assets_dir: str | Path,
+    table_widths: list[list[int]] | None = None,
+) -> str:
+    """Sanitize one LibreOffice HTML export and inline its local images.
+
+    ``table_widths`` (optional) re-injects the source workbook's column widths
+    per HTML table so wide tables keep their natural width and scroll
+    horizontally; unresolvable tables keep the browser's auto layout.
+    """
+    if len(html) > _HTML_MAX_RAW_CHARS:
+        raise OfficePreviewFailed("HTML preview source exceeds size limit")
+    if table_widths:
+        counts = _html_table_column_counts(html)
+        aligned: list[list[int]] = []
+        for i, widths in enumerate(table_widths):
+            ncols = counts[i] if i < len(counts) else 0
+            aligned.append(widths[:ncols] if 0 < ncols <= len(widths) else [])
+        table_widths = aligned
+    parser = _OfficeHtmlSanitizer(Path(assets_dir), table_widths)
+    parser.feed(html)
+    parser.close()
+    return parser.render()
 
 
 def _find_soffice(preferred: str) -> str | None:
@@ -327,7 +763,11 @@ def _prune_cache(cache_dir: Path, max_cache_mb: int) -> None:
     if max_bytes <= 0:
         return
     try:
-        files = [p for p in cache_dir.glob("*.pdf") if p.is_file()]
+        files = [
+            p
+            for p in cache_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".pdf", ".html")
+        ]
     except OSError:
         return
     total = sum(p.stat().st_size for p in files if p.exists())
@@ -344,75 +784,106 @@ def _prune_cache(cache_dir: Path, max_cache_mb: int) -> None:
             continue
 
 
-def _run_soffice(soffice: str, src: Path, dest: Path, timeout: int) -> None:
-    """Blocking conversion; runs in a worker thread."""
+def _convert_once(
+    soffice: str,
+    src: Path,
+    profile: Path,
+    target: str,
+    timeout: int,
+    out_ext: str = "pdf",
+) -> Path:
+    """One soffice run into a private outdir; returns the produced file."""
+    outdir = profile.parent / "out"
+    outdir.mkdir(exist_ok=True)
+    for leftover in outdir.iterdir():
+        if leftover.is_file():
+            leftover.unlink()
+    cmd = [
+        soffice,
+        f"-env:UserInstallation=file://{profile}",
+        "--headless",
+        "--norestore",
+        "--convert-to",
+        target,
+        "--outdir",
+        str(outdir),
+        str(src),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        _out, err = proc.communicate(timeout=max(5, int(timeout)))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise OfficePreviewFailed(f"conversion timed out after {timeout}s")
+    if proc.returncode != 0:
+        detail = (err or b"").decode("utf-8", errors="replace")[:300]
+        raise OfficePreviewFailed(f"soffice exited {proc.returncode}: {detail}")
+    produced = [
+        p for p in sorted(outdir.iterdir()) if p.is_file() and p.suffix.lower() == f".{out_ext}"
+    ]
+    if not produced:
+        detail = (err or b"").decode("utf-8", errors="replace")[:300]
+        raise OfficePreviewFailed(f"no {out_ext.upper()} produced: {detail}")
+    return produced[0]
+
+
+def _run_soffice(
+    soffice: str,
+    src: Path,
+    dest: Path,
+    timeout: int,
+    target: str | None = None,
+    transform: "Callable[[Path], Path] | None" = None,
+) -> None:
+    """Blocking conversion; runs in a worker thread.
+
+    ``target`` overrides the LibreOffice ``--convert-to`` argument (used by
+    the HTML preview path); when it is ``None`` the PDF pipeline below runs
+    unchanged. ``transform`` post-processes the produced artifact inside the
+    conversion tempdir (chart images etc. are still on disk there).
+    """
     if not (os.path.isfile(soffice) and os.access(soffice, os.X_OK)):
         resolved = shutil.which(soffice)
         if not resolved:
             raise OfficePreviewUnavailable(f"soffice not found: {soffice}")
         soffice = resolved
 
-    def _convert(profile: Path, target: str, source: Path | None = None) -> Path:
-        """One soffice run into a private outdir; returns the produced PDF."""
-        outdir = profile.parent / "out"
-        outdir.mkdir(exist_ok=True)
-        for leftover in outdir.glob("*.pdf"):
-            leftover.unlink()
-        cmd = [
-            soffice,
-            f"-env:UserInstallation=file://{profile}",
-            "--headless",
-            "--norestore",
-            "--convert-to",
-            target,
-            "--outdir",
-            str(outdir),
-            str(source if source is not None else src),
-        ]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            _out, err = proc.communicate(timeout=max(5, int(timeout)))
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except OSError:
-                proc.kill()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
-            raise OfficePreviewFailed(f"conversion timed out after {timeout}s")
-        if proc.returncode != 0:
-            detail = (err or b"").decode("utf-8", errors="replace")[:300]
-            raise OfficePreviewFailed(f"soffice exited {proc.returncode}: {detail}")
-        pdfs = sorted(outdir.glob("*.pdf"))
-        if not pdfs:
-            detail = (err or b"").decode("utf-8", errors="replace")[:300]
-            raise OfficePreviewFailed(f"no PDF produced: {detail}")
-        return pdfs[0]
-
     with tempfile.TemporaryDirectory(prefix="wt_office_preview_") as tmp:
         profile = Path(tmp) / "profile"
         convert_src = src
-        target = convert_target(src.suffix)
-        if src.suffix.lower() == _XLSX_EXT and not _xlsx_needs_pagination(src):
+        chosen = target if target is not None else convert_target(src.suffix)
+        if (
+            target is None
+            and src.suffix.lower() == _XLSX_EXT
+            and not _xlsx_needs_pagination(src)
+        ):
             # Version-independent single-sheet pages: patch print setup, then
             # plain PDF export (works on LibreOffice 7.3 too — prod box).
             convert_src = _patch_xlsx_print_setup(src, Path(tmp))
             if convert_src != src:
-                target = "pdf"
-        produced = _convert(profile, target, convert_src)
+                chosen = "pdf"
+        out_ext = chosen.split(":")[0]
+        produced = _convert_once(soffice, convert_src, profile, chosen, timeout, out_ext)
 
         # Single-page export can flatten a huge sheet into one unrenderably
         # tall page (browser canvas limits → silent blank preview). Fall back
         # to the paginated export for those (A4.9 I-2).
-        if target != "pdf" and _needs_paginated_fallback(produced):
-            produced = _convert(Path(tmp) / "profile2", "pdf", src)
+        if out_ext == "pdf" and chosen != "pdf" and _needs_paginated_fallback(produced):
+            produced = _convert_once(soffice, src, Path(tmp) / "profile2", "pdf", timeout)
+        if transform is not None:
+            produced = transform(produced)
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         staging = dest.with_name(dest.name + ".tmp")
@@ -472,5 +943,78 @@ async def convert_to_pdf(
         if _is_valid_pdf(dest):
             return dest
         await asyncio.to_thread(_run_soffice, soffice, src_path, dest, timeout)
+        await asyncio.to_thread(_prune_cache, cache_path, max_cache_mb)
+        return dest
+
+
+async def convert_to_html(
+    src: str | Path,
+    *,
+    soffice: str,
+    cache_dir: str | Path,
+    timeout: int = 60,
+    max_cache_mb: int = 512,
+    cache_identity: str | None = None,
+    cache_stat: tuple[int, int] | None = None,
+) -> Path:
+    """Convert a spreadsheet to a cached, sanitized, self-contained HTML file.
+
+    LibreOffice's Calc HTML export renders every sheet as one natural-width
+    table (charts become images); :func:`sanitize_office_html` inlines those
+    images as data URIs, strips active/external markup and injects the
+    wrapping/scroll stylesheet. The artifact is served to a sandboxed iframe,
+    so no LibreOffice- or workbook-controlled script ever runs.
+
+    Cache semantics and error classes mirror :func:`convert_to_pdf`.
+    """
+    import asyncio
+
+    src_path = Path(src)
+    if not is_spreadsheet(src_path.name):
+        raise OfficePreviewFailed(f"not a spreadsheet: {src_path.suffix}")
+    try:
+        stat_result = src_path.stat()
+    except OSError as exc:
+        raise OfficePreviewFailed(f"cannot stat source: {exc}") from exc
+    if not src_path.is_file():
+        raise OfficePreviewFailed("source is not a regular file")
+
+    cache_path = Path(cache_dir)
+    try:
+        cache_path.mkdir(parents=True, exist_ok=True)
+        os.chmod(cache_path, 0o700)
+    except OSError:
+        pass
+    identity = cache_identity or str(src_path.resolve())
+    mtime_ns, size = cache_stat if cache_stat else (stat_result.st_mtime_ns, stat_result.st_size)
+    dest = cache_path / f"{_cache_key(identity, mtime_ns, size, src_path.suffix)}.html"
+    _prune_stale_spools(cache_path)
+    if _is_valid_html(dest):
+        return dest
+    if dest.exists():
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+
+    def _transform(produced: Path) -> Path:
+        if produced.stat().st_size > _HTML_MAX_RAW_CHARS:
+            raise OfficePreviewFailed("HTML preview source exceeds size limit")
+        raw = produced.read_text(encoding="utf-8", errors="replace")
+        widths: list[list[int]] | None = None
+        sheets = _sheet_column_widths(src_path)
+        if sheets:
+            widths = _html_table_width_plan(raw, sheets)
+        sanitized = sanitize_office_html(raw, produced.parent, widths)
+        clean = produced.with_name(produced.stem + ".wt_preview.html")
+        clean.write_text(sanitized, encoding="utf-8")
+        return clean
+
+    async with _conversion_semaphore():
+        if _is_valid_html(dest):
+            return dest
+        await asyncio.to_thread(
+            _run_soffice, soffice, src_path, dest, timeout, "html", _transform
+        )
         await asyncio.to_thread(_prune_cache, cache_path, max_cache_mb)
         return dest

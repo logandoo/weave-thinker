@@ -384,7 +384,20 @@ class Config:
 
     @property
     def voice_max_tokens(self) -> Optional[int]:
-        return _parse_int(self.voice.get("max_tokens", 1024))
+        # 4096 since conv fcb2e60a（2026-09-21）：1024 装不下「整段讨论写入
+        # 一条笔记」这类原子工具调用，模型输出在 arguments JSON 中途被截断。
+        return _parse_int(self.voice.get("max_tokens", 4096))
+
+    @property
+    def voice_max_tokens_ceiling(self) -> Optional[int]:
+        """截断恢复时输出预算的最高上限（有界重试，防长尾延迟失控）。"""
+        return _parse_int(self.voice.get("max_tokens_ceiling", 8192))
+
+    @property
+    def voice_truncation_retry_limit(self) -> int:
+        """每轮允许的截断恢复次数（预算翻倍重试）。"""
+        value = _parse_int(self.voice.get("truncation_retry_limit", 2))
+        return value if value and value > 0 else 2
 
     @property
     def voice_duplex_model(self) -> str:
@@ -619,6 +632,27 @@ class Config:
             return 3.0
 
     @property
+    def voice_eot_activity_bridge(self) -> bool:
+        """Whether the EoT watchdog may hold a would-be flush while the local
+        mic still carries near-field speech (ASR result-gap bridge,
+        2026-09-20). FunASR's realtime result stream can stall for seconds at
+        long-sentence boundaries while the user keeps speaking; without this
+        bridge the watchdog sees stale text + silence and flushes a
+        mid-utterance turn."""
+        return bool(self.voice.get("eot_activity_bridge", True))
+
+    @property
+    def voice_eot_activity_extension_seconds(self) -> float:
+        """Hard cap (s) on how long the activity bridge may postpone a flush.
+        Bounds the extra wait when local audio (e.g. room noise leaking past
+        the near-field gate) keeps the bridge armed; the flush lands as soon
+        as the local speech stops or the cap elapses."""
+        try:
+            return max(0.0, float(self.voice.get("eot_activity_extension_seconds", 8.0)))
+        except (TypeError, ValueError):
+            return 8.0
+
+    @property
     def voice_fragment_merge_seconds(self) -> float:
         """Probe window (s) for coalescing chopped ASR turns in the responder.
         Queued backlog fragments always merge immediately; while the merged
@@ -719,6 +753,34 @@ class Config:
             return max(0, min(4, int(self.voice.get("llm_retry_attempts", 2))))
         except (TypeError, ValueError):
             return 2
+
+    @property
+    def voice_llm_ttft_timeout_seconds(self) -> float:
+        """Wall-clock bound (s) on time-to-first-content-token for the voice
+        main LLM stream. The provider can hang without producing any chunk
+        (conv efaf8f9c class: stalled upstream, agent mode got consumer-side
+        guards, voice never did) — without this bound the turn waits forever,
+        the responder stays blocked and every later user turn is swallowed.
+        The consumer sees `_heartbeat_wrapped` sentinels while the upstream is
+        silent, so it can enforce this. 45s covers the worst observed provider
+        prefill (33s, DeepSeek congestion) with margin; 0 disables the guard."""
+        try:
+            return max(0.0, float(self.voice.get("llm_ttft_timeout_seconds", 45.0)))
+        except (TypeError, ValueError):
+            return 45.0
+
+    @property
+    def voice_llm_inactivity_timeout_seconds(self) -> float:
+        """Wall-clock bound (s) between real stream chunks after the first
+        content token arrived. A provider that stalls mid-generation would
+        otherwise hold the voice turn open indefinitely (the user hears
+        nothing and cannot get a word in). Heartbeat sentinels are not real
+        chunks; 30s is far above the normal inter-chunk cadence while still
+        bounding the dead air. 0 disables the guard."""
+        try:
+            return max(0.0, float(self.voice.get("llm_inactivity_timeout_seconds", 30.0)))
+        except (TypeError, ValueError):
+            return 30.0
 
     # ---- Interjection (插话) mechanism ----
 
@@ -1191,6 +1253,13 @@ class Config:
         return bool(self.office_preview.get("enabled", True))
 
     @property
+    def office_preview_html_enabled(self) -> bool:
+        # 2026-09-21：表格类 office 文件优先服务端转 HTML（长文本换行 / 宽表
+        # 横向滚动，替代打印分页）。false 时 /office-html 返回 501，前端回退
+        # PDF→客户端链路；转换失败同样自动回退。
+        return bool(self.office_preview.get("html_enabled", True))
+
+    @property
     def office_preview_soffice_path(self) -> str:
         return str(self.office_preview.get("soffice_path", "soffice") or "soffice")
 
@@ -1653,6 +1722,14 @@ class Config:
         short-circuits to partial with the gate output as the issue.
         OFF by default (shell execution in the sandbox is opt-in)."""
         return bool(self.deathmatch.get("verify_command_gate_enabled", False))
+
+    @property
+    def deathmatch_obligation_criteria_enabled(self) -> bool:
+        """W1a (2026-09-21, conv a104fbc5 fix): deterministic obligation
+        baseline — empirical/quantified deliverables automatically get a
+        blocking no-unexecuted-markers criterion (+ file-existence checks for
+        numeric-result steps). Pure Python, no shell. Default ON; kill switch."""
+        return bool(self.deathmatch.get("obligation_criteria_enabled", True))
 
     @property
     def deathmatch_criteria_enabled(self) -> bool:

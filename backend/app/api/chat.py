@@ -833,9 +833,26 @@ def _compose_terminal_content(
 
 
 async def _load_conversation_messages(db: AsyncSession, conversation_id: str, limit: int = None):
-    stmt = select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+    """Load a conversation's messages in chronological (ASC) order.
+
+    ``limit`` selects the NEWEST ``limit`` messages, still returned ASC —
+    conv a104fbc5 (2026-09-20): ordering ASC + LIMIT returned the OLDEST 200
+    of a 219-message conversation, so the newest user message never reached
+    the model (it continued stale deathmatch context for an hour and then
+    persisted an empty-answer failure). The downstream ``[-context_limit:]``
+    slice cannot recover messages the query already dropped — the newest
+    window must be taken here, at the SQL boundary.
+    """
     if limit is not None:
-        stmt = stmt.limit(limit)
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        return list(reversed(result.scalars().all()))
+    stmt = select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
     result = await db.execute(stmt)
     return result.scalars().all()
 

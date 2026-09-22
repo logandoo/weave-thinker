@@ -35,6 +35,7 @@ from app.services.provider_router import build_thinking_extra_body, get_provider
 from app.services.title_generator import TitleGeneratorService
 from app.services.tts_service import get_tts_service
 from app.services.agent_service import _load_identity_memory_context
+from app.services.retry_utils import parse_tool_arguments, truncated_tool_args_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,29 @@ def _norm_barge_compare(text: str) -> str:
 # Punctuation that marks a *complete* utterance (sentence-final). Used by the
 # adaptive endpointing watchdog to decide how long a silence means "done".
 _TERMINAL_PUNCT = "。！？!?…～~"
+# Hard cap (s) on how long one voice turn waits for the concurrent identity /
+# shared-memory load before generating with the fallback prompt. The load can
+# block for tens of seconds on a slow memory provider; the first answer must
+# not (2026-09-20 first-query TTFT fix). Loaded content applies from the next
+# turn on.
+_IDENTITY_WAIT_SECONDS = 2.5
+# Local mic-energy activity tracking (ASR result-gap bridge, 2026-09-20):
+# FunASR's realtime result stream can stall for seconds at long sentence
+# boundaries while the user keeps speaking (measured 6.7s gap on a real 77.5s
+# recording, conv 213f5a55 class). The EoT watchdog then sees "silence" and
+# flushes a mid-utterance turn. The uploaded mic PCM is the only activity
+# signal in that window; these constants mirror the frontend near-field
+# classifier (adaptive noise floor + ratio gate) over 16-bit PCM RMS.
+_MIC_ENERGY_FLOOR_INIT = 0.01 * 32768
+_MIC_ENERGY_FLOOR_MIN = 0.0005 * 32768
+_MIC_ENERGY_FLOOR_MAX = 0.06 * 32768
+_MIC_ENERGY_NEAR_RATIO = 4.0
+_MIC_ENERGY_NEAR_MIN = 0.003 * 32768
+# Freshness of a local-speech sample for the flush hold. Must cover the flush
+# decision latency (grace ~1.2s + processing) so speech that resumed just
+# before the would-be flush still holds it; a truly silent turn releases the
+# hold at the same moment the normal grace expires (no added wait).
+_MIC_ENERGY_ACTIVITY_FRESH_SECONDS = 1.2
 # Tags to strip from the text shown to the user (kept for TTS only).
 _TAG_RE = re.compile(r"[(（\[][^)）\]]{0,24}[)）\]]")
 # Emoji / pictographic symbols (stripped from both TTS and display text).
@@ -310,6 +334,67 @@ def _build_tool_notice_names(tool_calls: list[dict], lang: str) -> str:
         for tc in tool_calls
     ]
     return "、".join(names) if lang == "zh" else ", ".join(names)
+
+
+def _plan_voice_tool_calls(tool_calls: list[dict]) -> list[dict]:
+    """Classify accumulated voice tool calls for dispatch (order preserved).
+
+    Production incident conv fcb2e60a (2026-09-21): the voice LLM's output
+    budget (max_tokens=1024) truncated a `notes.create_note` arguments JSON
+    mid-string; the old code silently degraded the unparseable args to `{}`,
+    dispatched the call anyway and the tool answered "Unknown action", so the
+    model retried the same overlong call 7 times and gave up.
+
+    A call whose `function.arguments` is non-empty but does not parse is
+    therefore NOT dispatchable — the parameters are gone and executing `{}`
+    invents a different call. Parsing/repair semantics are shared with the
+    agent path (`retry_utils.parse_tool_arguments`). Each entry carries:
+      * `call`      — the original tool-call dict (persisted verbatim for
+                      forensics; never mutated)
+      * `args`      — parsed dict, or None when not dispatchable
+      * `truncated` — True for truncated/unparseable arguments
+      * `safe_call` — provider-safe copy (arguments normalized to `{}` when
+                      truncated) for re-sending in assistant messages
+    """
+    plan: list[dict] = []
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        args = parse_tool_arguments(fn.get("arguments"))
+        truncated = args is None
+        if truncated:
+            safe_call = {
+                **tc,
+                "function": {**fn, "arguments": "{}"},
+            }
+        else:
+            safe_call = tc
+        plan.append({
+            "call": tc,
+            "args": args,
+            "truncated": truncated,
+            "safe_call": safe_call,
+        })
+    return plan
+
+
+def _voice_truncation_feedback(name: str) -> str:
+    """Actionable tool result for a call whose args were cut off by the
+    model's output budget (shared wording with the agent path)."""
+    return truncated_tool_args_feedback(name)
+
+
+def _escalated_voice_max_tokens(current: Optional[int], ceiling: Optional[int]) -> int:
+    """Raise the voice output budget after a truncation (bounded by ceiling).
+
+    Doubling gives a truncated tool call room to land on retry; the ceiling
+    (config `[voice] max_tokens_ceiling`) keeps worst-case latency finite and
+    the per-turn retry limit bounds the number of escalations.
+    """
+    if ceiling is None or ceiling <= 0:
+        return current if current else 0
+    if not current or current <= 0:
+        return ceiling
+    return min(current * 2, ceiling)
 # Explicit user phrases that mean "cancel the current task". Only clear,
 # unambiguous stop commands match — the task continues for anything else.
 # Two tiers: (1) unambiguous long phrases matched as substrings anywhere in
@@ -1112,31 +1197,41 @@ class _VoiceASR:
     async def _funasr_supervisor(self) -> None:
         failures = 0
         first = True
+        warned = False
         while not self._closed:
             self._task_id = uuid.uuid4().hex[:32]
             try:
                 await self._funasr_connect()
             except Exception as exc:
+                was_first = first
                 if first:
-                    # First-connect failure — the session is already live
-                    # (`ready` was sent before ASR start), so tell the client
-                    # why recognition is unavailable instead of dying silently.
+                    # First connect failed — the session is already live
+                    # (`ready` was sent before ASR start). Report it, then keep
+                    # retrying like any later outage: a transient upstream
+                    # failure at session start must not leave the session
+                    # permanently deaf (A4.9 review Important-2).
                     self._start_error = exc
                     if self._start_done is not None:
                         self._start_done.set()
-                    await self._emit({"type": "error", "error": f"语音识别服务不可用: {exc}"})
-                    return
+                    first = False
                 failures += 1
-                logger.warning("voice ASR reconnect failed (%d): %s", failures, exc)
-                if failures >= 5:
-                    await self._emit({"type": "error", "error": f"语音识别服务不可用: {exc}"})
-                    return
+                logger.warning("voice ASR connect failed (%d): %s", failures, exc)
+                if not warned and (was_first or failures >= 5):
+                    # Surface an outage ONCE: immediately for the session's
+                    # first connect (recognition never worked — the user must
+                    # know), otherwise only after 5 consecutive failures, so a
+                    # transient mid-session blip doesn't flash the error UI
+                    # (A4.9 r2 Minor-1). Retrying never stops; recovery via
+                    # `task-started` → ready restores listen automatically.
+                    warned = True
+                    await self._emit({"type": "error", "error": f"语音识别服务暂时不可用，正在重连: {exc}"})
                 await asyncio.sleep(min(0.5 * failures, 3.0))
                 continue
-            if first and self._start_done is not None:
+            if self._start_done is not None:
                 self._start_done.set()
             first = False
             failures = 0
+            warned = False
             self._send_task = asyncio.create_task(self._funasr_send())
             self._recv_task = asyncio.create_task(self._funasr_recv())
             done, pending = await asyncio.wait(
@@ -1708,6 +1803,19 @@ class VoiceDuplexSession:
         self._eot_semantic_checking = False
         self._eot_semantic_complete = False
         self._eot_semantic_checked_text = ""
+        # Local mic-energy bridge state (ASR result-gap guard, 2026-09-20):
+        # adaptive noise floor + last local activity timestamp + the anchor of
+        # an in-progress held flush.
+        self._mic_energy_floor = _MIC_ENERGY_FLOOR_INIT
+        self._last_mic_activity = 0.0
+        self._flush_hold_since = 0.0
+        self._flush_hold_turn_started = 0.0
+        self._flush_hold_log_at = 0.0
+        # The first turn waits (bounded) for the concurrent identity load;
+        # later turns never block on it again (A4.9 review Minor-8).
+        self._identity_wait_done = False
+        # Test-only stall injection counter (see _test_llm_stall client event).
+        self._test_llm_stall = 0
 
         # Playback-progress tracking. In 语音助理 mode every answer reaches the user
         # ONLY as audio, so we must tie playback progress to the answer text:
@@ -1775,6 +1883,7 @@ class VoiceDuplexSession:
         # persona, name, and long-term memory as Agent mode).
         self._identity_prompt = ""
         self._identity_loaded = False
+        self._identity_task: Optional[asyncio.Task] = None
         # ---- 每轮异步记忆召回 + 记忆插话（vmem）----
         self._vmem_block_ctx = ""                       # 最新召回上下文（""=尚无成功召回）
         self._vmem_recall_inflight: set = set()         # 进行中的召回任务（强引用防 GC）
@@ -1876,6 +1985,20 @@ class VoiceDuplexSession:
         return self.config.voice_system_prompt or "你是一个全双工语音对话助手，用自然口语化的中文简洁回答。"
 
     async def _load_identity(self) -> None:
+        """Load identity/shared memory on a DEDICATED DB session.
+
+        SQLAlchemy AsyncSession is not safe for concurrent tasks, and this
+        coroutine runs in the background while `_load_history()` and per-turn
+        persistence use the session-owned `self.db` (A4.9 review 2026-09-20:
+        an interleaved execute/commit raises and is silently swallowed,
+        losing messages). The dedicated session serializes all identity DB
+        work away from the request session."""
+        from app.db.database import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as idb:
+            await self._load_identity_with_db(idb)
+
+    async def _load_identity_with_db(self, db) -> None:
         """Load the user's Agent-mode assistant identity + shared agent memory.
 
         This makes 语音助理 (voice) mode inherit the same persona, custom name,
@@ -1887,7 +2010,7 @@ class VoiceDuplexSession:
         try:
             from app.services.assistant_service import create_default_assistant_if_needed
 
-            assistant = await create_default_assistant_if_needed(self.db, self.user.id)
+            assistant = await create_default_assistant_if_needed(db, self.user.id)
             if assistant and assistant.system_prompt:
                 assistant_prompt = assistant.system_prompt.strip()
         except Exception as exc:
@@ -1896,7 +2019,7 @@ class VoiceDuplexSession:
         try:
             from app.services.assistant_service import ensure_voice_assistant
 
-            self._voice_assistant = await ensure_voice_assistant(self.db, self.user.id)
+            self._voice_assistant = await ensure_voice_assistant(db, self.user.id)
         except Exception as exc:
             logger.debug("voice identity: voice assistant load failed: %s", exc)
 
@@ -1938,7 +2061,7 @@ class VoiceDuplexSession:
                 from sqlalchemy import desc, select
                 recent_msgs = []
                 try:
-                    r = await self.db.execute(
+                    r = await db.execute(
                         select(Message)
                         .join(Conversation, Message.conversation_id == Conversation.id)
                         .where(Conversation.user_id == self.user.id, Message.role == "user")
@@ -1958,7 +2081,7 @@ class VoiceDuplexSession:
                     # fall back to the plain shared-memory context.
                     memory_context = await asyncio.wait_for(
                         memory_retrieval_service.retrieve_and_build_context(
-                            self.db, self.user.id, recent_msgs),
+                            db, self.user.id, recent_msgs),
                         timeout=10.0,
                     )
                 except asyncio.TimeoutError:
@@ -1975,7 +2098,7 @@ class VoiceDuplexSession:
                     logger.debug("voice memory retrieval empty — v1 fallback retired (v2 runtime)")
             else:
                 from app.services.memory_service import build_shared_agent_context
-                shared = await build_shared_agent_context(self.db, self.user.id)
+                shared = await build_shared_agent_context(db, self.user.id)
                 vmem_parts = []
                 if shared.memory_summary:
                     vmem_parts.append("共享长期记忆:\n" + shared.memory_summary.strip()[:2000])
@@ -2171,10 +2294,16 @@ class VoiceDuplexSession:
             }
             call_ids = [tc.get("id", "") for tc in tool_calls]
             if call_ids and all(cid in steps_by_id for cid in call_ids):
+                # A4.9 r1 Important：落档的截断 arguments（未闭合 JSON）不得原样
+                # 回放给供应商——严格实现会在重连后的首个回合 400。与派发侧同一
+                # 分类器：不可解析参数归一化为 {}（原始载荷仍在 messages 表留档）。
+                replay_calls = [
+                    entry["safe_call"] for entry in _plan_voice_tool_calls(tool_calls)
+                ]
                 self._history.append({
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": tool_calls,
+                    "tool_calls": replay_calls,
                 })
                 for cid in call_ids:
                     self._history.append({
@@ -2592,6 +2721,94 @@ class VoiceDuplexSession:
             return self._prox_utterance
         return self._prox_is_near()
 
+    def _track_mic_energy(self, pcm16: bytes) -> None:
+        """Track local mic activity from the incoming PCM (ASR gap bridge).
+
+        FunASR's result stream can stall for seconds at long-sentence
+        boundaries while the user keeps talking; the raw mic audio is the only
+        activity signal then. Adaptive noise floor (falls fast, rises slowly)
+        plus a near-field ratio gate, mirroring the browser-side classifier.
+        """
+        try:
+            import numpy as np
+
+            samples = np.frombuffer(pcm16, dtype=np.int16)
+            if samples.size == 0:
+                return
+            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+        except Exception:
+            return
+        if rms < self._mic_energy_floor:
+            self._mic_energy_floor = max(
+                _MIC_ENERGY_FLOOR_MIN, rms * 0.9 + self._mic_energy_floor * 0.1
+            )
+        else:
+            self._mic_energy_floor = min(
+                _MIC_ENERGY_FLOOR_MAX,
+                self._mic_energy_floor + self._mic_energy_floor * 0.002 + 1e-5,
+            )
+        near_thr = max(
+            self._mic_energy_floor * _MIC_ENERGY_NEAR_RATIO, _MIC_ENERGY_NEAR_MIN
+        )
+        if rms >= near_thr:
+            self._last_mic_activity = _now()
+
+    def _hold_flush_for_mic_activity(self) -> bool:
+        """True when a would-be EoT flush must be postponed because the local
+        mic still carries near-field speech while ASR results are stalled.
+
+        Bounded by ``voice_eot_activity_extension_seconds`` from the moment
+        the flush first became due; released as soon as local speech stops or
+        the cap elapses. Applies in every playback state — an onset pause or
+        an aux (backchannel/filler) must not fragment a live user monologue;
+        the mic-energy + proximity gates below are the only switches. Pure
+        state machine — unit-tested."""
+        if not self.config.voice_eot_activity_bridge:
+            self._flush_hold_since = 0.0
+            return False
+        now = _now()
+        # A hold anchor belongs to ONE continuous flush-due window: any new
+        # recognizer result/text supersedes the earlier would-be flush, so a
+        # fresh bounded window starts (without this, a hold from a previous
+        # gap kept its old anchor and the extension cap released the next hold
+        # immediately — observed 2026-09-20 E2E).
+        if (
+            self._flush_hold_since > 0
+            and max(self._last_text_change, self._last_asr_activity)
+            > self._flush_hold_since
+        ):
+            # A new recognizer result superseded the pending would-be flush —
+            # a fresh bounded hold window starts, including its per-decision
+            # budget (otherwise an old anchor makes the cap fire instantly on
+            # the next decision; observed live 2026-09-20 E2E).
+            self._flush_hold_since = 0.0
+            self._flush_hold_turn_started = 0.0
+        # Per-pending-turn total cap (A4.9 review Minor-5): window resets must
+        # not let repeated ASR stall/resume cycles postpone the flush across
+        # many windows — the turn as a whole is bounded.
+        if self._flush_hold_turn_started <= 0:
+            self._flush_hold_turn_started = now
+        if now - self._flush_hold_turn_started >= self.config.voice_eot_activity_extension_seconds:
+            self._flush_hold_since = 0.0
+            self._flush_hold_turn_started = 0.0
+            return False
+        if not self._prox_is_near():
+            self._flush_hold_since = 0.0
+            return False
+        if now - self._last_mic_activity > _MIC_ENERGY_ACTIVITY_FRESH_SECONDS:
+            self._flush_hold_since = 0.0
+            return False
+        if self._flush_hold_since <= 0:
+            self._flush_hold_since = now
+        if now - self._flush_hold_log_at >= 1.0:
+            self._flush_hold_log_at = now
+            logger.info(
+                "voice EoT flush held (local mic activity, ASR gap bridge, %.1fs total)",
+                now - self._flush_hold_turn_started,
+            )
+        return True
+
+
     async def _classify_barge_in(self, text: str, history: Optional[list[dict]] = None) -> str:
         """Return interrupt | defer | backchannel.
 
@@ -2722,12 +2939,18 @@ class VoiceDuplexSession:
                 verdict = "defer"
         if verdict:
             return verdict
-        # LLM returned nothing usable. Default to "backchannel" (don't
-        # interrupt) so ASR noise never cuts off TTS playback. A real user
-        # can always press the stop button to interrupt explicitly.
+        # LLM returned nothing usable (subagent timeout / malformed output).
+        # Fail-safe = defer, NOT backchannel: the deterministic noise/echo
+        # prefilters already ran before this classifier, so a real user turn
+        # that reaches here must never be silently dropped — defer QUEUES it
+        # (answered after the current playback) and the client shows the
+        # deferred notice. Short acknowledgements still resolve to
+        # backchannel (they are filler, not turns). A real user can always
+        # press the stop button to interrupt explicitly.
         if len(text) <= 4 and re.fullmatch(r"[嗯对哦好是的啊呃]+", text):
             return "backchannel"
-        return "backchannel"
+        logger.warning("voice barge-in classify unavailable — deferring turn: %r", text)
+        return "defer"
 
     async def _classify_intent(self, text: str, history: Optional[list[dict]] = None) -> dict:
         """Return {should_respond, needs_tools, reason}.
@@ -4170,12 +4393,17 @@ class VoiceDuplexSession:
                     fut.set_result(False)
 
     # ---- turn handling ----
-    def _enqueue_turn(self, text: str) -> None:
+    def _enqueue_turn(self, text: str, semantic_complete: bool = False) -> None:
         """Queue a turn for the responder. Duplicate turns (same normalized
         text already pending — ASR re-emits finalized sentences, the EoT
         watchdog can re-flush the same text after a defer) are dropped so a
         sentence never gets answered twice or leaves a ghost message (conv
-        689f06ec 13:59: "嗯，没啥，我再跟你聊聊。" enqueued twice)."""
+        689f06ec 13:59: "嗯，没啥，我再跟你聊聊。" enqueued twice).
+
+        ``semantic_complete`` carries the semantic-EoT verdict for this flush:
+        the responder skips the fragment-merge wait for it (the judge already
+        ruled the text complete — no need to wait for a possible continuation
+        fragment; 2026-09-20 latency fix)."""
         self._turn_enqueued_at = _now()
         norm = _norm_barge_compare(text)
         if norm:
@@ -4187,7 +4415,7 @@ class VoiceDuplexSession:
                 ):
                     logger.info("voice enqueue skipped (duplicate queued turn): %r", text)
                     return
-        self._turn_queue.put_nowait({"text": text})
+        self._turn_queue.put_nowait({"text": text, "semantic_complete": bool(semantic_complete)})
 
     def _record_backchannel(self, text: str) -> None:
         """Remember a recent backchannel verdict for *text* so the responder
@@ -4789,7 +5017,9 @@ class VoiceDuplexSession:
                 continue
             text = item.get("text", "")
             try:
-                text = await self._coalesce_fragments(text)
+                text = await self._coalesce_fragments(
+                    text, skip_wait=bool(item.get("semantic_complete"))
+                )
                 if not text.strip():
                     self._clear_pending_filler()
                     continue
@@ -4812,7 +5042,7 @@ class VoiceDuplexSession:
                 await self._send_json({"event": "error", "error": f"处理出错: {exc}"})
                 await self._set_state("listen")
 
-    async def _coalesce_fragments(self, text: str) -> str:
+    async def _coalesce_fragments(self, text: str, skip_wait: bool = False) -> str:
         """Reassemble one continuous utterance that the EoT chopped into
         several queued fragments. When upstream ASR results stall (noise
         threshold, reconnect, echo mix), the watchdog can flush mid-speech;
@@ -4841,7 +5071,7 @@ class VoiceDuplexSession:
                 except asyncio.QueueEmpty:
                     pass
             if not got:
-                if _utterance_complete(merged) or _now() >= deadline:
+                if skip_wait or _utterance_complete(merged) or _now() >= deadline:
                     break
                 wait = min(self.config.voice_fragment_merge_seconds, deadline - _now())
                 try:
@@ -4945,6 +5175,24 @@ class VoiceDuplexSession:
         _perf("turn_start", (_now() - self._turn_enqueued_at) * 1000 if self._turn_enqueued_at else 0,
               text_len=len(text), queued=(self._turn_enqueued_at is not None))
         self._turn_started = _now()
+
+        # Bound the wait for the concurrent identity/shared-memory load. A
+        # slow provider must never stall the answer; the fallback prompt
+        # applies for this turn and the loaded identity lands from the next
+        # turn (2026-09-20 first-query TTFT fix).
+        identity_task = self._identity_task
+        if (
+            identity_task is not None
+            and not identity_task.done()
+            and not self._identity_wait_done
+        ):
+            self._identity_wait_done = True
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(identity_task), timeout=_IDENTITY_WAIT_SECONDS
+                )
+            except Exception:
+                pass
 
         # Staggered parallel subagent + main-agent pattern: the main LLM starts
         # generating IMMEDIATELY while the intent subagent runs in parallel with
@@ -5201,6 +5449,19 @@ class VoiceDuplexSession:
         else:
             self._clear_pending_filler()
         svc, _ = self._build_llm()
+        if self._test_llm_stall > 0:
+            # Test-only hook (mirrors the `_test_inject_asr` convention): the
+            # next main LLM stream yields only heartbeat sentinels, so the
+            # stall guard can be exercised over a real WebSocket without a
+            # real provider outage.
+            self._test_llm_stall -= 1
+
+            async def _stalled_stream(*_a, **_k):
+                while True:
+                    await asyncio.sleep(1.0)
+                    yield {"type": "heartbeat", "data": None}
+
+            svc.stream_chat_structured = _stalled_stream
         tools = None
         if allow_tools:
             try:
@@ -5216,6 +5477,11 @@ class VoiceDuplexSession:
         tool_rounds = 0
         max_tool_rounds = 8
         notice_done = False
+        # 截断恢复（conv fcb2e60a 事故）：长工具调用被输出预算截断时，不执行
+        # 残缺参数，而是回可行动的截断错误并把本轮预算翻倍（有上限/有界次数）。
+        turn_max_tokens = self.config.voice_max_tokens
+        truncation_retries = 0
+        truncation_retry_limit = self.config.voice_truncation_retry_limit
         # Accumulate tool interaction for persistence (fix: save tool calls
         # to session record so the transcript shows what tools were used).
         _all_tool_calls: list[dict] = []
@@ -5260,11 +5526,20 @@ class VoiceDuplexSession:
             async with self._llm_gate:
                 while True:
                     try:
+                        # Stall guard clock (2026-09-20): the upstream can hang
+                        # without producing any chunk; `_heartbeat_wrapped`
+                        # then only yields heartbeat sentinels, and without a
+                        # consumer-side bound this loop never exits — the turn
+                        # stays "active" forever and every later user turn is
+                        # swallowed (prod conv 213f5a55: 5+ min no reply).
+                        # Resets per attempt (a 429 retry re-opens the stream).
+                        _stream_open_ts = _now()
+                        _last_real_event_ts = _stream_open_ts
                         async for ev in svc.stream_chat_structured(
                             messages,
                             tools=tools,
                             temperature=self.config.voice_temperature,
-                            max_tokens=self.config.voice_max_tokens,
+                            max_tokens=turn_max_tokens,
                             extra_body=self._extra_body(svc),
                         ):
                             if self._closed or self._task_cancelled:
@@ -5278,6 +5553,35 @@ class VoiceDuplexSession:
                                 logger.info("voice stream aborted early (barge-in)")
                                 break
                             etype = ev["type"]
+                            if etype == "heartbeat":
+                                # No real chunk for the heartbeat interval —
+                                # enforce the two configured bounds.
+                                now_hb = _now()
+                                ttft_limit = self.config.voice_llm_ttft_timeout_seconds
+                                if (
+                                    not _first_content
+                                    and ttft_limit > 0
+                                    and now_hb - _stream_open_ts >= ttft_limit
+                                ):
+                                    raise TimeoutError(
+                                        f"语音模型首字超时（{ttft_limit:.0f}s 未响应）"
+                                    )
+                                inact_limit = self.config.voice_llm_inactivity_timeout_seconds
+                                if (
+                                    _first_content
+                                    and inact_limit > 0
+                                    and now_hb - _last_real_event_ts >= inact_limit
+                                ):
+                                    raise TimeoutError(
+                                        f"语音模型生成停滞（{inact_limit:.0f}s 无新内容）"
+                                    )
+                                logger.warning(
+                                    "voice main LLM heartbeat without content (ttft=%.1fs, idle=%.1fs)",
+                                    now_hb - _stream_open_ts,
+                                    now_hb - _last_real_event_ts,
+                                )
+                                continue
+                            _last_real_event_ts = _now()
                             if etype == "content":
                                 data = ev["data"]
                                 if not _first_content:
@@ -5369,11 +5673,15 @@ class VoiceDuplexSession:
                     await self._send_json({"event": "assistant_text", "text": "（任务已取消）", "done": True})
                     self._history.append({"role": "assistant", "content": "（任务已取消）"})
                     return
+                # 截断调用绝不执行：参数残缺时 safe_call 归一化为 {}（供上游
+                # 合法回放），原始 tool_calls 保持原样落档取证。
+                tool_plan = _plan_voice_tool_calls(tool_calls)
+                safe_tool_calls = [entry["safe_call"] for entry in tool_plan]
                 # append assistant tool-call message then execute tools
                 messages.append({
                     "role": "assistant",
                     "content": reply_text or None,
-                    "tool_calls": tool_calls,
+                    "tool_calls": safe_tool_calls,
                 })
                 # Mirror into _history so LATER turns can see the real tool
                 # outputs (notebook names, search results...). Without this the
@@ -5382,7 +5690,7 @@ class VoiceDuplexSession:
                 self._history.append({
                     "role": "assistant",
                     "content": reply_text or None,
-                    "tool_calls": tool_calls,
+                    "tool_calls": safe_tool_calls,
                 })
                 _all_tool_calls.extend(tool_calls)
                 self._tools_running = True
@@ -5400,15 +5708,43 @@ class VoiceDuplexSession:
                         logger.debug("voice workspace init failed: %s", exc)
                         self._workspace_path = ""
 
-                for tc in tool_calls:
+                for entry in tool_plan:
                     if self._task_cancelled:
                         break
+                    tc = entry["call"]
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
-                    try:
-                        args = json.loads(fn.get("arguments") or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
+                    if entry["truncated"]:
+                        # conv fcb2e60a：旧行为把截断参数静默降级为 {} 并派发，
+                        # 工具回 "Unknown action"，模型同构重试 7 次后放弃。
+                        logger.warning(
+                            "voice tool call truncated — not dispatched: name=%s args_len=%d",
+                            name, len(fn.get("arguments") or ""),
+                        )
+                        result = _voice_truncation_feedback(name)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": result,
+                        })
+                        self._history.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": result,
+                        })
+                        _all_tool_results.append({
+                            "tool_call_id": tc.get("id", ""),
+                            "name": name,
+                            "content": result,
+                        })
+                        await self._send_json({"event": "tool_result", "name": name})
+                        await self._persist_turn_progress(
+                            full_reply + reply_text,
+                            json.dumps(_all_tool_calls, ensure_ascii=False),
+                            _build_voice_tool_results(_all_tool_results),
+                        )
+                        continue
+                    args = entry["args"] or {}
                     # Voice mode: the user explicitly asked via voice, so
                     # auto-grant write permissions (e.g. notes create_note).
                     # There is no interactive permission dialog in voice UI.
@@ -5452,6 +5788,20 @@ class VoiceDuplexSession:
                         json.dumps(_all_tool_calls, ensure_ascii=False),
                         _build_voice_tool_results(_all_tool_results),
                     )
+                if (
+                    any(e["truncated"] for e in tool_plan)
+                    and truncation_retries < truncation_retry_limit
+                ):
+                    new_budget = _escalated_voice_max_tokens(
+                        turn_max_tokens, self.config.voice_max_tokens_ceiling
+                    )
+                    if new_budget > (turn_max_tokens or 0):
+                        truncation_retries += 1
+                        turn_max_tokens = new_budget
+                        logger.warning(
+                            "voice truncated tool args — output budget raised to %d (retry %d/%d)",
+                            turn_max_tokens, truncation_retries, truncation_retry_limit,
+                        )
                 full_reply += reply_text
                 # Keep tools available for multi-step tasks (e.g. list_notebooks
                 # then create_note). The max_tool_rounds bound prevents runaway
@@ -5793,6 +6143,10 @@ class VoiceDuplexSession:
             # shattering one utterance into a cascade of fragment turns.
             # Barge-in responsiveness comes from the downstream classifier,
             # not from aggressive endpointing.
+            # Whether this flush was approved by the semantic-EoT judge as a
+            # complete turn — carried into the turn queue so the responder can
+            # skip the fragment-merge wait for it (2026-09-20 latency fix).
+            semantic_complete_flush = False
             if _utterance_complete(text):
                 # Flush when the recognizer has been idle for the grace period
                 # — OR when the text has sat complete for the hard cap even
@@ -5849,9 +6203,20 @@ class VoiceDuplexSession:
                     # flush mid-speech; wait for the hard threshold (I4).
                     continue
                 if semantic_ok:
+                    semantic_complete_flush = True
                     _perf("eot_semantic_flush",
                           (_now() - max(self._last_text_change, self._last_asr_activity)) * 1000,
                           text_len=len(text))
+            # ASR result-gap bridge (2026-09-20): FunASR can stall for seconds
+            # at long-sentence boundaries while the user keeps talking. The
+            # local mic energy is the only activity signal in that window —
+            # hold the flush (bounded) while near-field speech is locally
+            # present so the pending text keeps accumulating instead of
+            # flushing a mid-utterance turn.
+            if self._hold_flush_for_mic_activity():
+                continue
+            self._flush_hold_since = 0.0
+            self._flush_hold_turn_started = 0.0
             text = text.strip()
             self._pending_turn_text = ""
             self._complete_since = 0.0
@@ -5896,7 +6261,7 @@ class VoiceDuplexSession:
                     # generation+TTS window. `_handle_user_turn`'s fallback
                     # stays cooldown-suppressed behind this (2026-08-25).
                     await self._convert_filler_prefetch(text)
-                    self._enqueue_turn(text)
+                    self._enqueue_turn(text, semantic_complete=semantic_complete_flush)
 
     # ---- lifecycle ----
     async def run(self) -> None:
@@ -5915,15 +6280,17 @@ class VoiceDuplexSession:
 
         await self._send_json({"event": "ready", "tts": self.tts.is_configured()})
 
-        # Load Agent-mode assistant identity + shared memory so 语音助理 mode
-        # inherits the same persona, name, and long-term memory. Runs AFTER
-        # `ready` so a slow/unreachable memory provider never blocks the
-        # session start; the first answer still waits for it (or its bounded
-        # fallback).
-        try:
-            await self._load_identity()
-        except Exception as exc:
-            logger.debug("voice identity load failed (non-fatal): %s", exc)
+        # Identity/memory loading runs CONCURRENTLY with ASR startup. It can
+        # block for tens of seconds (shared-memory retrieval awaits a
+        # query-expansion LLM call on the user's provider — slow/unreachable
+        # observed), while the user's first utterance must be transcribed and
+        # answered immediately (2026-09-20 first-query TTFT fix). The first
+        # answer waits at most `_IDENTITY_WAIT_SECONDS` for it (see
+        # _handle_user_turn); loaded content applies from the next turn.
+        self._identity_task = asyncio.create_task(self._load_identity())
+        self._identity_task.add_done_callback(
+            lambda t: t.exception() if not t.cancelled() else None
+        )
 
         try:
             await self._load_history()
@@ -5999,6 +6366,7 @@ class VoiceDuplexSession:
                 if self._asr:
                     pcm16 = await asyncio.to_thread(ASRService._float32_to_pcm16, data)
                     if pcm16:
+                        self._track_mic_energy(pcm16)
                         await self._asr.send_audio(pcm16)
             elif text is not None:
                 try:
@@ -6067,6 +6435,14 @@ class VoiceDuplexSession:
                 self._prox_updated = _now()
         elif event == "interrupt":
             await self._request_interrupt()
+        elif event == "_test_llm_stall":
+            # Test-only: force the next main LLM stream to stall (heartbeats
+            # only) so the stall guard is verifiable over a real WS. Clamped
+            # and OverflowError-safe (A4.9 r2 Minor-2).
+            try:
+                self._test_llm_stall = max(1, min(10, int(msg.get("count", 1) or 1)))
+            except (TypeError, ValueError, OverflowError):
+                self._test_llm_stall = 1
         elif event == "_test_inject_asr":
             # Test-only: inject ASR text to test interjection without real
             # audio. Simulates FunASR emitting partial/segment events.
@@ -6100,6 +6476,12 @@ class VoiceDuplexSession:
             pass
         if self._prefetch.get("task") and not self._prefetch["task"].done():
             self._prefetch["task"].cancel()
+        if self._identity_task and not self._identity_task.done():
+            self._identity_task.cancel()
+            try:
+                await self._identity_task
+            except (asyncio.CancelledError, Exception):
+                pass
         for t in self._vmem_recall_inflight:
             if not t.done():
                 t.cancel()

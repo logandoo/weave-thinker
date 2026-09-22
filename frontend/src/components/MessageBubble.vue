@@ -395,6 +395,7 @@ import {
   katexModule,
   stripDsmlTags,
 } from '@/composables/useMarkdown'
+import { convertTabTablesToMarkdown } from '@/composables/tabTableConvert'
 import { useToast } from '@/composables/useToast'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 
@@ -1299,7 +1300,14 @@ const previewHtml = computed(() => {
 })
 
 const formattedContent = computed(() => {
-  let html = renderMarkdownToHtml(strippedContent.value)
+  // User pastes (browser/Excel clipboard) carry tab-separated rows; convert
+  // them to GFM tables before markdown rendering (conv a104fbc5: pasted
+  // tables collapsed into an unreadable run-on blob). Assistant output is
+  // authored Markdown — never rewritten.
+  const source = props.message.role === 'user'
+    ? convertTabTablesToMarkdown(strippedContent.value)
+    : strippedContent.value
+  let html = renderMarkdownToHtml(source)
   if (parsedToolResults.value.length > 0) {
     html = addCitationSuperscripts(html, true, referencedCitationIndices.value)
     if (citationNumberMap.value.size > 0) {

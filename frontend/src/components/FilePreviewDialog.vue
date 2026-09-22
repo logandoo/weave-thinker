@@ -63,6 +63,15 @@
             class="file-preview-pdf"
           />
 
+          <iframe
+            v-else-if="officeMode === 'html' && officeHtmlUrl"
+            :src="officeHtmlUrl"
+            class="file-preview-html"
+            sandbox=""
+            referrerpolicy="no-referrer"
+            title="表格预览"
+          ></iframe>
+
           <div v-else-if="officeMode === 'client'" class="file-preview-office">
             <component
               :is="officeComponent"
@@ -104,7 +113,7 @@
 import { computed, markRaw, onMounted, onUnmounted, ref, shallowRef, type Component } from 'vue'
 import { renderMarkdownToHtml } from '@/composables/useMarkdown'
 import { classifyFile, fileTypeLabel, type FileKind } from '@/composables/filePreview'
-import { buildOfficePdfUrl } from '@/api/workspaceFiles'
+import { buildOfficeHtmlUrl, buildOfficePdfUrl } from '@/api/workspaceFiles'
 import { downloadUrl } from '@/composables/useDownload'
 import PdfViewer from './PdfViewer.vue'
 
@@ -139,10 +148,24 @@ const loading = ref(false)
 const loadError = ref('')
 const textContent = ref('')
 const pdfBytes = ref<ArrayBuffer | null>(null)
-const officeMode = ref<'none' | 'server' | 'client'>('none')
+const officeMode = ref<'none' | 'server' | 'client' | 'html'>('none')
+const officeHtmlUrl = ref('')
 const officeBuffer = ref<ArrayBuffer | null>(null)
 const officeComponent = shallowRef<Component | null>(null)
 const officeClientError = ref('')
+
+function releaseOfficeHtml() {
+  if (officeHtmlUrl.value) {
+    URL.revokeObjectURL(officeHtmlUrl.value)
+    officeHtmlUrl.value = ''
+  }
+}
+
+// Guards the async HTML fetch: incremented on every content (re)load and on
+// unmount so a late-resolving response can never store a blob URL on a dead
+// or superseded component (each unrevoked URL pins the whole document).
+let officeHtmlLoadId = 0
+let unmounted = false
 
 const renderedHtml = computed(() =>
   kind.value === 'markdown' ? renderMarkdownToHtml(textContent.value) : ''
@@ -175,12 +198,33 @@ async function loadOfficeComponent(): Promise<Component> {
 }
 
 /**
- * Office chain (D-81): server LibreOffice→PDF first (needs rel_path), then
- * client-side OOXML renderer fallback when conversion is unavailable.
+ * Office chain (D-81, HTML path 2026-09-21): spreadsheets first try the
+ * server HTML preview (natural-width tables + wrapped long text), then the
+ * server LibreOffice→PDF path, then the client-side OOXML renderer.
  */
 async function loadOffice() {
   const source = officeSource.value
   if (source) {
+    if (kind.value === 'excel') {
+      const loadId = ++officeHtmlLoadId
+      try {
+        const res = await fetch(buildOfficeHtmlUrl(source))
+        if (res.ok) {
+          const html = await res.text()
+          if (unmounted || loadId !== officeHtmlLoadId) return
+          releaseOfficeHtml()
+          officeHtmlUrl.value = URL.createObjectURL(
+            new Blob([html], { type: 'text/html' }),
+          )
+          officeMode.value = 'html'
+          return
+        }
+        // 400/501/422 → fall through to the PDF path
+      } catch {
+        // network error → fall through
+      }
+      if (unmounted || loadId !== officeHtmlLoadId) return
+    }
     try {
       const res = await fetch(buildOfficePdfUrl(source))
       if (res.ok) {
@@ -205,6 +249,8 @@ async function loadContent() {
   loadError.value = ''
   officeClientError.value = ''
   officeMode.value = 'none'
+  officeHtmlLoadId += 1
+  releaseOfficeHtml()
   officeBuffer.value = null
   officeComponent.value = null
   pdfBytes.value = null
@@ -259,7 +305,10 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  unmounted = true
+  officeHtmlLoadId += 1
   document.removeEventListener('keydown', onKeydown)
+  releaseOfficeHtml()
 })
 </script>
 
@@ -393,6 +442,22 @@ onUnmounted(() => {
 .file-preview-pdf {
   flex: 1 1 auto;
   width: 100%;
+  min-height: 0;
+}
+
+/* Server-rendered spreadsheet HTML (sanitized, sandboxed): tables keep their
+   natural column widths and scroll horizontally; long text wraps inside
+   cells. Served from a blob URL with `sandbox` (no scripts). */
+.file-preview-html {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+
+.file-preview-body--fill .file-preview-html {
   min-height: 0;
 }
 

@@ -320,8 +320,9 @@ JUDGE_SYSTEM_PROMPT = (
      "\"reason\": \"<需要用户提供的具体内容>\"}。\n"
      "- 能用合理默认继续的不得判 ASK，应判 CONTINUE。\n\n"
     "判定原则：宁可保守判为 CONTINUE，也绝不在没有看到可验证产出时判为 DONE。\n\n"
-    "未执行占位规则：若环境证据的机械扫描列出交付物中的未执行占位标记"
-    "（如「待执行/待填报/不填报数值/占位」），而目标或验收标准要求该部分给出实际结果"
+    "未执行占位规则（agentic 判定）：若环境证据的『交付物内容摘录』或『未执行占位』判定"
+    "表明交付物以「待执行/受限估计/待填报/不填报数值」等留白代替实际结果，"
+    "而目标或验收标准要求该部分给出实际结果"
     "（计算/统计/实证/数据/基准），则不得判 done——必须判 continue，并要求在实际可得范围内"
     "完成执行或明确向用户说明降级；仅当验收标准或用户明确允许该留白（如已同意数据不可得）"
     "并已在 reason 中引用该依据时，方可判 done。\n\n"
@@ -369,15 +370,117 @@ def _judge_evidence_section(evidence: str) -> str:
 # 105 轮后仍判 done。此处是确定性证据（非硬终判）：只把「交付物内容里存在
 # 未执行标记」这一环境事实喂给 verifier/judge，由它们结合验收标准判断该留白
 # 是否被允许（用户同意数据不可得时标注受限是合法行为，不得硬拦）。
-_PLACEHOLDER_MARKERS: tuple = (
-    "待执行", "待填报", "待补", "待完成", "待数据", "待闭环", "待核验",
-    "待验证", "不填报", "占位", "TBD", "TODO",
+_PLACEHOLDER_JUDGE_CACHE: Dict[str, Any] = {}
+_PLACEHOLDER_JUDGE_MAX_CACHE = 128
+
+# A4.9 r1 F1（2026-09-21）：研究语域重包装不得成为规避执行义务的通道——
+# 「可执行而未执行」改写成「未估计/未报告/数据缺口/识别边界」同样属未执行占位。
+# 模块级常量：可被 tests/test_register_guard.py 直接断言（judge prompt 契约）。
+_PLACEHOLDER_JUDGE_PROMPT = (
+    "你是交付物质量核验器。判断给定交付物是否以『未执行占位』代替实际结果："
+    "承诺要执行/计算/取数的部分，实际写成待执行、受限估计、待填报、待验证等"
+    "留白，而不是真实结果。把本应执行/计算却未执行的工作改写成『未估计/未报告/"
+    "数据缺口/识别边界』等研究语域措辞，同样属于未执行占位——换词不改变未执行事实。"
+    "对照随附的【任务要求上下文】（它只是判断基准，不是被检文本）：按目标/验收义务/"
+    "步骤承诺本应实际执行/计算/取数，而交付物【以说明、设计、计划、状态标签或空白表格"
+    "代替结果本身】→ has_unexecuted_placeholders=true；交付物已给出具体的真实结果"
+    "（数值/表格/结果文件与执行记录，即使简短）→ false；交付物仅覆盖部分承诺条目、"
+    "承诺结果在本稿中缺失（非客观不可得，见下）→ true（保守阻断）；任务要求本身允许因数据/识别"
+    "客观不可得且已尝试获取而不执行（交付物已如实说明）→ false。"
+    "正常的方法论表述（数据/识别客观不可得且已尝试获取）、已完成的真实结果、"
+    "纯创作/纯方案文本不算。\n"
+    '输出JSON：{"has_unexecuted_placeholders": true|false, '
+    '"evidence": ["引用原文，最多3条"]}'
 )
-_PLACEHOLDER_SCAN_MAX_FILES = 12
-_PLACEHOLDER_SCAN_MAX_SAMPLES = 2
-_PLACEHOLDER_SCAN_SAMPLE_CHARS = 100
-_PLACEHOLDER_SCAN_MAX_BYTES = 512 * 1024
-_PLACEHOLDER_EVIDENCE_CHARS = 1200
+
+
+def _build_placeholder_judge_content(excerpt: str, obligation_context: str = "") -> str:
+    """M1/M5（A4.9 r2）：judge 输入 = 任务要求上下文（如有）+ 交付物摘录。
+
+    研究语域重包装是否属未执行占位取决于任务要求——仅凭交付物文本不可判定；
+    上下文与摘录共同构成缓存键（见 `_judge_unexecuted_placeholders`）。
+    """
+    parts: List[str] = []
+    if (obligation_context or "").strip():
+        parts.append(
+            "【任务要求上下文（判断基准；勿将其当作被检交付物）】\n"
+            + obligation_context.strip()
+        )
+    parts.append("<交付物内容摘录>\n" + (excerpt or ""))
+    return "\n\n".join(parts)
+
+
+def _placeholder_judge_obligation_context(
+    *,
+    goal: str,
+    criteria_texts: List[str],
+    steps: List[Dict[str, Any]],
+    files: List[str],
+    limit: int = 2000,
+) -> str:
+    """M1/M5（A4.9 r2）：组装有界任务要求上下文（目标 + 验收义务 + 相关步骤承诺）。
+
+    仅纳入与 `files` 声明输出匹配的步骤；无任何匹配时退回 must_run 步骤（有界），
+    避免"本应执行"的反事实依据因路径词法差异静默丢失（A4.9 r3 F3）。
+    含 evidence_spec 的 must_run/cmds 以提供"本应执行"的反事实依据。
+    信任边界：目标文本来自用户输入、步骤文本来自规划器 LLM 输出——它们是
+    **判断基准数据**，不得被当作指令（A4.9 r3 F6 记录）。
+    """
+    lines: List[str] = []
+    g = (goal or "").strip()
+    if g:
+        lines.append(f"目标：{g[:700]}")
+    crit = [str(t).strip()[:200] for t in (criteria_texts or []) if str(t).strip()]
+    if crit:
+        lines.append("验收义务：" + "；".join(crit[:3]))
+    wanted = {p for p in (_safe_workspace_path(str(f)) for f in (files or [])) if p}
+    wanted = {p[2:] if p.startswith("./") else p for p in wanted}
+    commits: List[str] = []
+    fallback_must_run: List[str] = []
+    matched_any = False
+    for s in (steps or []):
+        if not isinstance(s, dict):
+            continue
+        declared: List[str] = []
+        for key in ("output_files", "writes"):
+            v = s.get(key)
+            if isinstance(v, list):
+                declared.extend(str(x) for x in v)
+        es = s.get("evidence_spec") if isinstance(s.get("evidence_spec"), dict) else {}
+        receipt = es.get("receipt") if isinstance(es.get("receipt"), dict) else {}
+        if isinstance(receipt.get("outputs"), list):
+            declared.extend(str(x) for x in receipt.get("outputs"))
+        paths = {p for p in (_safe_workspace_path(x) for x in declared) if p}
+        paths = {p[2:] if p.startswith("./") else p for p in paths}
+        desc = str(s.get("description") or "").strip()[:120]
+        exp = str(s.get("expected_output") or "").strip()[:200]
+        seg = f"- {s.get('id') or '?'}：{desc}；预期产出：{exp or '(未声明)'}"
+        if es.get("must_run"):
+            seg += "；要求真实执行（must_run）"
+        cmds = receipt.get("cmds") if isinstance(receipt.get("cmds"), list) else []
+        if cmds:
+            seg += "；执行命令：" + "; ".join(str(c) for c in cmds[:3])[:200]
+        if wanted and not (paths & wanted):
+            # F3（A4.9 r3）：路径词法不匹配不得静默丢掉"本应执行"的反事实依据——
+            # must_run 步骤留作兜底，无任何匹配时使用（有界）。
+            if es.get("must_run"):
+                fallback_must_run.append(seg)
+            continue
+        matched_any = True
+        commits.append(seg)
+        if len(commits) >= 6:
+            break
+    if not matched_any and fallback_must_run:
+        # F3 兜底：无匹配（./ 前缀、绝对/反斜杠等形态差异）时退回 must_run 步骤。
+        commits = fallback_must_run[:3]
+    if commits:
+        lines.append("相关步骤承诺：\n" + "\n".join(commits))
+    text = "\n".join(lines)
+    bound = max(200, int(limit))
+    if len(text) > bound:
+        # F7（A4.9 r3）：上下文截断必须显式披露（与证据截断纪律一致）。
+        text = text[: bound - 24].rstrip() + "\n…（上下文超限截断）"
+    return text
 
 # Tools whose non-error output represents genuine information gain for the
 # verifier's progress detection (read/search/browse). Execution tools like
@@ -476,6 +579,72 @@ async def _ensure_creative_judged(goal: str) -> bool:
         logger.warning("creative-goal LLM judgment failed: %s", exc)
     _CREATIVE_GOAL_CACHE[key] = result
     return result
+
+
+async def _ensure_execution_judged(goal: str) -> Optional[bool]:
+    """r6/r8（用户红线：语义判断必须 agentic）：判断目标是否要求**真实执行/
+    计算/数据结果**（实证、统计、基准、回归等），替代关键词枚举触发。一次判定
+    按目标缓存；**失败/超时返回 None 且不缓存**（A4.9 r8 Critical：judge_json
+    失败返回 None 不抛异常，若不显式处理会导致瞬时故障永久解武装）；调用方负责
+    记录失败事件。"""
+    key = _normalize_goal_key(goal)
+    if not key:
+        return False
+    cached = _EXECUTION_NEED_CACHE.get(key)
+    if cached is not None and cached is not _EXECUTION_NEED_PENDING:
+        return cached is True
+    if cached is _EXECUTION_NEED_PENDING:
+        return None
+    if len(_EXECUTION_NEED_CACHE) > 256:
+        _EXECUTION_NEED_CACHE.clear()
+    _EXECUTION_NEED_CACHE[key] = _EXECUTION_NEED_PENDING
+    parsed: Any = None
+    try:
+        from app.services.agentic_judge import judge_json
+        parsed = await judge_json(
+            "你是任务分类器。判断给定的用户目标是否**要求真实执行/计算/数据结果**"
+            "（例如实证分析、统计/回归、基准测试、以真实数据支撑的结论）；"
+            "纯文学创作、纯方案/设计描述、纯文字整理不需要执行。\n"
+            '输出JSON：{"needs_execution": true|false}',
+            f"用户目标：\n{key[:800]}\n\n只输出JSON。",
+            task="execution_need",
+            default=None,
+            timeout=120.0,
+        )
+    except Exception as exc:
+        logger.warning("execution-need LLM judgment failed: %s", exc)
+        parsed = None
+    if not isinstance(parsed, dict):
+        _EXECUTION_NEED_CACHE.pop(key, None)
+        return None
+    result = bool(parsed.get("needs_execution"))
+    _EXECUTION_NEED_CACHE[key] = result
+    return result
+
+
+def _execution_need_cached(goal: str) -> bool:
+    """Sync view of the execution-need judgment (False until judged)."""
+    return _EXECUTION_NEED_CACHE.get(_normalize_goal_key(goal)) is True
+
+
+def _evidence_step_ids_bucket(goal: str, steps: Any) -> str:
+    """r8: cache key for the agentic 'which steps promise numeric results'
+    judgment (goal + step id/expected_output hash)."""
+    payload = json.dumps({
+        "goal": _normalize_goal_key(goal),
+        "steps": [
+            {"id": str(s.get("id") or ""),
+             "expected_output": str(s.get("expected_output") or "")[:400]}
+            for s in (steps or []) if isinstance(s, dict)
+        ],
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _evidence_step_ids_cached(goal: str, steps: Any) -> set:
+    """Sync view of the evidence-spec step judgment (empty until judged)."""
+    v = _EVIDENCE_STEP_IDS_CACHE.get(_evidence_step_ids_bucket(goal, steps))
+    return set(v) if isinstance(v, (set, list, tuple)) else set()
 
 
 def _bible_fingerprint(goal: str) -> str:
@@ -844,7 +1013,11 @@ async def _call_judge_llm(goal: str, last_response: str, *, timeout: float = DEF
 _PLAN_MAX_STEPS = 30
 
 
-def _validate_plan_protocol(plan: Any, valid_tool_names: Optional[set] = None) -> List[str]:
+def _validate_plan_protocol(
+    plan: Any,
+    valid_tool_names: Optional[set] = None,
+    require_evidence_spec_ids: Optional[set] = None,
+) -> List[str]:
     """Validate a parsed plan against the plan protocol. Returns a list of
     issue strings (empty = pass). Pure function — no I/O, no LLM.
 
@@ -915,6 +1088,31 @@ def _validate_plan_protocol(plan: Any, valid_tool_names: Optional[set] = None) -
                 issues.append(f"步骤 {sid} 的 done_check(gate) 缺少 cmd")
             elif _mode == "file" and not str(dc.get("path") or "").strip():
                 issues.append(f"步骤 {sid} 的 done_check(file) 缺少 path")
+        # W1a（2026-09-21 a104）：evidence_spec 协议校验（收据溯源在 W1b 消费）
+        es = s.get("evidence_spec")
+        if es is not None:
+            if not isinstance(es, dict):
+                issues.append(f"步骤 {sid} 的 evidence_spec 不是对象")
+            elif es:
+                _es_kind = str(es.get("kind") or "").strip().lower()
+                if _es_kind not in _EVIDENCE_SPEC_KINDS:
+                    issues.append(f"步骤 {sid} 的 evidence_spec.kind 非法: {es.get('kind')}")
+                _es_norm = _normalize_evidence_spec(es)
+                if not _es_norm["receipt"]["cmds"]:
+                    issues.append(f"步骤 {sid} 的 evidence_spec.receipt.cmds 为空")
+                if not _es_norm["receipt"]["outputs"]:
+                    issues.append(f"步骤 {sid} 的 evidence_spec.receipt.outputs 为空")
+        # M3（r5/r6/r8）：数值结果步骤必须携带 evidence_spec（fail-closed）；
+        # 需要哪些步骤由 **agentic 步骤判定**给出（`require_evidence_spec_ids`），
+        # 本函数只做结构校验——不含任何关键词分类。
+        if (
+            not es
+            and require_evidence_spec_ids is not None
+            and sid in require_evidence_spec_ids
+        ):
+            issues.append(
+                f"步骤 {sid} 的 expected_output 要求数值结果，但缺少 evidence_spec"
+            )
     return issues
 
 
@@ -925,7 +1123,208 @@ def _validate_plan_protocol(plan: Any, valid_tool_names: Optional[set] = None) -
 _STEP_KINDS = frozenset({"write", "research", "verify", "synthesize"})
 _CRITERIA_MAX = 12
 _CRITERION_TYPES = frozenset({"mechanical", "judgmental"})
-_CHECK_KINDS = frozenset({"file", "gate", "none"})
+_CHECK_KINDS = frozenset({"file", "gate", "none", "execution_content"})
+
+# ── W1a（2026-09-21 a104 修复波）：证据规格 + 确定性义务基线 ──────────────
+# 设计稿 §5.3/§12：实证类交付物的完成必须有证据义务；本波先落「无未执行占位」
+# 机械判据（纯 Python、无 shell，避开 I5 安全面），收据溯源在 W1b。
+_EVIDENCE_SPEC_KINDS = frozenset({"compute", "retrieval"})
+_EVIDENCE_ON_FAILURE = frozenset({"blocked", "ask", "degrade"})
+# r6（原则）：是否「要求真实执行/数据结果」由 agentic 判定缓存决定
+# （`_ensure_execution_judged`），不再用目标关键词枚举做意图分类。
+_EXECUTION_NEED_CACHE: Dict[str, Any] = {}
+_EXECUTION_NEED_PENDING = object()
+# r8：哪些步骤承诺「数值/执行结果」→ agentic 步骤判定缓存（替代 _NUMERIC_OUTPUT_RE）
+_EVIDENCE_STEP_IDS_CACHE: Dict[str, Any] = {}
+_EVIDENCE_STEP_IDS_MAX_CACHE = 128
+_OBLIGATION_MAX_FILE_CHECKS = 8
+# r7（用户红线：占位判定必须 agentic）：关键词表已删除；改为「交付物全文
+# 有界摘录 + fresh-context LLM 结构化判定」。
+_DELIVERABLE_EXCERPT_MAX_FILES = 8
+_DELIVERABLE_EXCERPT_PER_FILE_BYTES = 60000
+_DELIVERABLE_EXCERPT_MAX_CHARS = 120000
+
+
+def _safe_workspace_path(raw: Any) -> str:
+    """W1a: accept only relative, in-workspace-looking paths (no absolute,
+    no `..`) before they are joined by the marker scan or embedded in
+    agent-visible criteria text."""
+    s = str(raw or "").strip()
+    if not s or _os.path.isabs(s):
+        return ""
+    norm = s.replace("\\", "/")
+    if ".." in norm.split("/"):
+        return ""
+    return s[:300]
+
+
+def _read_deliverable_excerpt(
+    workspace_path: str,
+    files: Any,
+    *,
+    max_files: int = _DELIVERABLE_EXCERPT_MAX_FILES,
+    per_file: int = _DELIVERABLE_EXCERPT_PER_FILE_BYTES,
+    max_chars: int = _DELIVERABLE_EXCERPT_MAX_CHARS,
+) -> str:
+    """r7: deterministic bounded full-text excerpt of declared deliverables —
+    the input to the agentic placeholder judgment and to judge/verifier
+    prompts. Reads text files only; never raises; discloses file/char
+    truncation (silently truncating evidence is a project red line)."""
+    if not workspace_path:
+        return ""
+    wanted: List[str] = []
+    for fp in (files or []):
+        p = str(fp or "").strip()
+        if not p or p in wanted:
+            continue
+        wanted.append(p)
+    if not wanted:
+        return ""
+    parts: List[str] = []
+    total = 0
+    read = 0
+    skipped = 0
+    for rel in wanted:
+        if read >= max(1, int(max_files)):
+            skipped = len(wanted) - read
+            break
+        rel_safe = _safe_workspace_path(rel)
+        if not rel_safe:
+            continue
+        abs_path = _os.path.join(workspace_path, rel_safe)
+        if not _os.path.isfile(abs_path):
+            continue
+        if not DeathmatchManager._is_text_file(rel_safe):
+            continue
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                # r8：多读 1 字节以可靠检测逐文件截断（旧实现 read(per_file)
+                # 后比较长度恒为 False，截断从不披露）
+                text = fh.read(max(1, int(per_file)) + 1)
+        except OSError:
+            continue
+        if not text.strip():
+            continue
+        truncated_file = len(text) > per_file
+        text = text[:per_file]
+        remain = max_chars - total
+        if remain <= 0:
+            skipped = max(skipped, len(wanted) - read)
+            break
+        chunk = text[:remain]
+        if truncated_file or len(text) > len(chunk):
+            chunk += "\n…[文件截断]…"
+        parts.append(f"--- {rel_safe} ---\n{chunk}")
+        total += len(chunk)
+        read += 1
+    if not parts:
+        return ""
+    header = "交付物内容摘录（有界全文，供未执行占位/执行状态判定）:"
+    if skipped > 0:
+        header += (
+            f"\n（文件上限 {max_files}：另有 {skipped} 个声明文件未含在本摘录中"
+            "——未含 ≠ 无占位）"
+        )
+    return header + "\n" + "\n\n".join(parts)
+
+
+def _normalize_evidence_spec(raw: Any) -> Dict[str, Any]:
+    """W1a: step-level execution evidence contract (design §5.3). Returns {}
+    when absent/empty/malformed; W1b receipts consume the normalized shape,
+    and the step statement hash freezes it (I8)."""
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    kind = str(raw.get("kind") or "").strip().lower()
+    receipt_raw = raw.get("receipt") if isinstance(raw.get("receipt"), dict) else {}
+    cmds = receipt_raw.get("cmds")
+    cmds_norm = (
+        [str(c)[:400] for c in cmds if isinstance(c, str) and c.strip()][:8]
+        if isinstance(cmds, list) else []
+    )
+    outputs = receipt_raw.get("outputs")
+    outputs_norm = (
+        [str(o)[:200] for o in outputs if isinstance(o, str) and o.strip()][:12]
+        if isinstance(outputs, list) else []
+    )
+    try:
+        min_exit = max(0, int(receipt_raw.get("min_exit_code") or 0))
+    except (TypeError, ValueError):
+        min_exit = 0
+    try:
+        min_rows = max(0, int(receipt_raw.get("min_rows") or 0))
+    except (TypeError, ValueError):
+        min_rows = 0
+    on_failure = str(raw.get("on_failure") or "blocked").strip().lower()
+    if on_failure not in _EVIDENCE_ON_FAILURE:
+        on_failure = "blocked"
+    return {
+        "kind": kind if kind in _EVIDENCE_SPEC_KINDS else "compute",
+        "must_run": bool(raw.get("must_run", True)),
+        "receipt": {
+            "cmds": cmds_norm,
+            "min_exit_code": min_exit,
+            "outputs": outputs_norm,
+            "min_rows": min_rows,
+        },
+        "on_failure": on_failure,
+    }
+
+
+def _build_obligation_criteria(
+    steps: List[Dict[str, Any]],
+    evidence_step_ids: Any = None,
+) -> List[Dict[str, Any]]:
+    """W1a deterministic obligation *mechanism* (r6): given an agentically
+    judged execution goal, emit (a) a blocking no-unexecuted-markers criterion
+    with live path resolution at check time (plan outputs are backfilled at
+    step completion — r6 #1) and (b) file-existence checks for steps whose
+    expected_output contract promises numeric results.
+
+    Pure function; the *trigger* is agentic (`_execution_need_cached`), never
+    keyword enumeration. Degradation `allow` is always False here — authorized
+    blank sections require the structured contract field (W1b)."""
+    out: List[Dict[str, Any]] = [{
+        "id": "ob1",
+        "obligation": True,
+        "text": (
+            "交付物不得以未执行占位（待执行/受限估计/待填报/不填报数值等）"
+            "代替实际结果——需要实际结果的部分必须真实执行；无法执行的必须走"
+            "降级协议（结构化授权 + 显著标注），不得以占位充当完成"
+        ),
+        "type": "mechanical",
+        "source": "system",
+        "check": {"kind": "execution_content", "paths": [], "allow": False},
+    }]
+    n = 1
+    _evidence_ids = set(evidence_step_ids) if evidence_step_ids else set()
+    for s in reversed([x for x in (steps or []) if isinstance(x, dict)]):
+        if str(s.get("id") or "") not in _evidence_ids:
+            continue
+        files: List[Any] = []
+        for key in ("output_files", "writes"):
+            v = s.get(key)
+            if isinstance(v, list):
+                files.extend(v)
+        _es = s.get("evidence_spec") if isinstance(s.get("evidence_spec"), dict) else {}
+        _es_receipt = _es.get("receipt") if isinstance(_es.get("receipt"), dict) else {}
+        if isinstance(_es_receipt.get("outputs"), list):
+            files.extend(_es_receipt.get("outputs"))
+        for f in files:
+            p = _safe_workspace_path(f)
+            if not p:
+                continue
+            if n >= _OBLIGATION_MAX_FILE_CHECKS:
+                break
+            n += 1
+            out.append({
+                "id": f"ob{n}",
+                "obligation": True,
+                "text": f"步骤产出文件存在：{p[:120]}",
+                "type": "mechanical",
+                "source": "system",
+                "check": {"kind": "file", "path": p, "min_bytes": 1},
+            })
+    return out
 
 
 def _normalize_check(raw: Any) -> Dict[str, Any]:
@@ -949,6 +1348,13 @@ def _normalize_check(raw: Any) -> Dict[str, Any]:
         if not cmd:
             return {"kind": "none"}
         return {"kind": "gate", "cmd": cmd}
+    if kind == "execution_content":
+        paths_raw = raw.get("paths")
+        paths = (
+            [str(p).strip()[:300] for p in paths_raw if isinstance(p, str) and str(p).strip()][:12]
+            if isinstance(paths_raw, list) else []
+        )
+        return {"kind": "execution_content", "paths": paths, "allow": bool(raw.get("allow"))}
     return {"kind": "none"}
 
 
@@ -1095,6 +1501,8 @@ def _format_criteria_block(criteria: List[Dict[str, Any]]) -> str:
             extra = f"（检查：文件 {check.get('path')} ≥{check.get('min_bytes') or 0}B）"
         elif check.get("kind") == "gate":
             extra = f"（检查：命令 {str(check.get('cmd'))[:120]}）"
+        elif check.get("kind") == "execution_content":
+            extra = "（检查：agentic 判定交付物是否含未执行占位）"
         lines.append(f"- [{c.get('id')}][{tag}/{src}] {c.get('text')}{extra}")
     lines.append("</acceptance_criteria>")
     return "\n".join(lines)
@@ -1206,6 +1614,7 @@ def _canonical_statement(step: Dict[str, Any]) -> Dict[str, Any]:
         "done_check": _normalize_done_check(
             _dc, str(step.get("verification_method") or "")
         ),
+        "evidence_spec": _normalize_evidence_spec(step.get("evidence_spec")),
         "parallel_safe": (
             bool(step.get("parallel_safe"))
             if isinstance(step.get("parallel_safe"), bool) else False
@@ -1255,7 +1664,7 @@ def _mechanical_checks(criteria: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for c in (criteria or []):
         check = c.get("check") if isinstance(c, dict) else None
-        if isinstance(check, dict) and check.get("kind") in ("file", "gate"):
+        if isinstance(check, dict) and check.get("kind") in ("file", "gate", "execution_content", "markers"):
             out.append(c)
     return out
 
@@ -2493,13 +2902,26 @@ class DeathmatchManager:
 
     def _all_criteria(self) -> List[Dict[str, Any]]:
         """W1a: merged contract criteria — stored system criteria + user
-        subgoals (D3 compat), deduped by normalized text."""
+        subgoals (D3 compat). r5：义务在计划定稿时**持久化**进 stored
+        （append-only）。r6（#2）：kill switch 关闭时过滤掉义务判据（热关）。"""
         stored = getattr(self._conv, "deathmatch_acceptance_criteria", None) or []
         subgoals = getattr(self._conv, "deathmatch_subgoals", None) or []
-        return _merge_criteria(
+        merged = _merge_criteria(
             stored if isinstance(stored, list) else [],
             subgoals if isinstance(subgoals, list) else [],
         )
+        if not self._obligation_criteria_enabled():
+            merged = [
+                c for c in merged
+                if not (
+                    isinstance(c, dict)
+                    and (
+                        c.get("obligation")
+                        or (c.get("check") or {}).get("kind") == "markers"
+                    )
+                )
+            ]
+        return merged
 
     def _goal_with_criteria(self) -> str:
         """W1a: goal + full acceptance criteria block — the judge sees the
@@ -2583,12 +3005,12 @@ class DeathmatchManager:
                     f"（已完成步骤共 {len(done_steps)} 个，按计划序仅列前 8 个；"
                     f"其余未展示 ≠ 不存在）"
                 )
-        # 2026-09-20 placeholder gate (conv a104fbc5): the judge previously
-        # saw only filenames/summaries and could not tell an executed
-        # deliverable from a placeholder scaffold. Feed it the deterministic
-        # marker scan BEFORE the (potentially huge) workspace listing — the
-        # pack is tail-truncated at _JUDGE_EVIDENCE_CHARS, so a late scan
-        # would silently vanish on large workspaces (A4.9 Important-1).
+        # 2026-09-20 placeholder gate (conv a104fbc5), r7: the judge must see
+        # the actual deliverable content (not just filenames/summaries) to
+        # rule on unexecuted placeholders; feed it the bounded full-text
+        # excerpt BEFORE the (potentially huge) workspace listing — the pack
+        # is tail-truncated at _JUDGE_EVIDENCE_CHARS, so a late excerpt would
+        # silently vanish on large workspaces.
         if workspace_path:
             try:
                 _outputs: List[str] = []
@@ -2597,11 +3019,16 @@ class DeathmatchManager:
                         p = str(fp or "").strip()
                         if p and p not in _outputs:
                             _outputs.append(p)
-                _scan = self._scan_unexecuted_placeholders(workspace_path, _outputs)
-                if _scan:
-                    parts.append(_scan)
+                _excerpt = _read_deliverable_excerpt(
+                    workspace_path, _outputs, max_chars=2400
+                )
+                if _excerpt:
+                    parts.append(
+                        _excerpt
+                        + "\n（评审侧为有界摘录；完整判定由完成闸门的 agentic 占位检查执行）"
+                    )
             except Exception as exc:
-                logger.debug("judge evidence: placeholder scan failed: %s", exc)
+                logger.debug("judge evidence: deliverable excerpt failed: %s", exc)
         if workspace_path:
             try:
                 files = self._workspace_file_snapshot(workspace_path)
@@ -3899,13 +4326,26 @@ intent 只能是以下之一：
         "评测与死磕共用同一后端实例，产出中的耗时数据需标注这一环境因素。\n"
         "13. 若前序步骤的产出禁止被本步骤修改/覆盖、或本步骤有明确的范围禁区"
         "（如'只读分析、不得写入'、'不得改动某配置'），必须在该步骤的 boundary 字段中显式声明。\n"
+        "14. 若步骤需要实际执行/计算（实证、回归、统计、基准、数据处理），必须给出 evidence_spec："
+        '{"kind": "compute", "must_run": true, "receipt": {"cmds": ["python analysis/run.py"], '
+        '"min_exit_code": 0, "outputs": ["analysis/results.json"], "min_rows": 1}, '
+        '"on_failure": "blocked"}——outputs 必须是真实执行会产出的文件；'
+        "严禁以设计、说明或占位代替执行结果。\n"
+        "15. 计划文本的语域必须匹配目标领域：研究/学术类目标（论文、研究报告、实证分析）的"
+        "步骤描述、expected_output 与 verification_method 使用研究语域（数据、识别、估计、检验、"
+        "稳健性、结论），不得使用工程/办公流程词（执行、跑、降级、返工、填报、闭环）；"
+        "无法获得的数据或无法完成的设计如实描述（正向写法：未估计/未报告/数据缺口/识别边界），"
+        "且仅限客观不可得且已尝试获取的情形——可执行部分必须规划实际执行，不得用「待执行/受限估计」一类"
+        "状态占位词命名产出；本条仅约束 description/expected_output/verification_method 等"
+        "人类可读字段，不改变 evidence_spec 等机械字段。\n"
         "只输出JSON，不要有多余文字：\n"
         '{"steps": [{"id": "s1", "description": "步骤描述", "expected_output": "预期可验证产出（含文件类型和字数要求）", '
         '"verification_method": "如何验证（如：调用 word_count 确认字数>2000）", "dependencies": [], "status": "pending", '
         '"boundary": "本步骤边界约束（可选：明令禁止触碰/修改/依赖的对象或范围；无则省略该字段）", '
         '"tools": ["本步骤主要需要的工具名（可选，从可用工具中选取，如 web_search/browser/terminal/pdf_export；'
         '不确定就省略该字段）"], "delegable": true或省略——信息收集/多源检索类步骤标 true'
-        '（执行时将委派 delegate_task 子代理完成，不烧主循环上下文）}]}'
+        '（执行时将委派 delegate_task 子代理完成，不烧主循环上下文），'
+        '"evidence_spec": 需要实际执行/计算的步骤给出（见规则 14），否则省略}]}'
     )
 
     VERIFIER_SYSTEM_PROMPT = (
@@ -3931,9 +4371,10 @@ intent 只能是以下之一：
         "   e) kill list：是否出现 style.md 中的禁用表达/句式；\n"
         "   f) 伏笔：应回收的伏笔是否遗漏。\n"
         "   任一违反 → 标记 partial，issues 具体指出违反的设定条目（引用设定原文）。\n"
-        "7. 未执行占位检查：若用户提示中给出『未执行占位标记（机械扫描）』，且当前步骤预期产出"
-        "要求实际结果（数据/计算/统计/实证结果表），而文件内容以『待执行/待填报/不填报数值/占位』"
-        "代替结果、只给出设计与方案，则不得判 complete——判 partial，并在 issues/diagnosis 中"
+        "7. 未执行占位检查（agentic）：若用户提示的『交付物内容摘录』或『未执行占位』判定"
+        "显示当前步骤产出以『待执行/受限估计/待填报/不填报数值』等留白"
+        "代替结果、只给出设计与方案，且预期要求实际结果（数据/计算/统计/实证结果表），"
+        "则不得判 complete——判 partial，并在 issues/diagnosis 中"
         "列出未执行的交付项。\n"
         "合理推测或基于公开资料的整理是可以接受的，但必须被明确标注为估算/公开数据，不得伪装成实测。\n"
         "workspace 文件快照按目录分组列出，包含全部已知文件；不要仅因某文件不在列表开头就断定其缺失。\n"
@@ -3964,8 +4405,16 @@ intent 只能是以下之一：
         "Web 界面（内置浏览器禁止访问 localhost），但允许{self_eval_hint}"
         "进行真实评测，且应设计为'提交任务 + 分轮轮询'的异步模式；"
         "也可分析已有会话记录、日志与公开资料，均需标注数据来源与限制。\n"
+        "7. 若某步骤的 expected_output 要求数值结果（系数/标准误/显著性/统计量等），"
+        "该步骤必须带 evidence_spec（kind/must_run/receipt.cmds/receipt.outputs/on_failure），"
+        "outputs 为真实执行会产出的文件；不得以设计或说明代替执行。\n"
+        "8. 步骤文本的语域必须匹配目标领域：研究/学术类目标的步骤描述、expected_output 与 "
+        "verification_method 使用研究语域，不得使用工程/办公流程词（执行、跑、降级、返工、"
+        "填报、闭环）描述研究活动，不得用「待执行/受限估计/待填报」一类状态占位词命名产出"
+        "（正向写法：未估计/未报告/数据缺口/识别边界，且仅限客观不可得且已尝试获取的情形）；本条仅约束"
+        "人类可读字段，不改变 evidence_spec 等机械字段。\n"
         "只输出完整的新计划JSON（与原计划同结构，步骤可带可选 \"tools\" 字段——该步骤主要需要的工具名、"
-        "以及可选 \"boundary\" 字段——本步骤的边界约束（禁止触碰/修改的对象或范围），不确定就省略）：\n"
+        '以及可选 "boundary" 字段——本步骤的边界约束（禁止触碰/修改的对象或范围），不确定就省略）：\n'
         '{"steps": [...]}'
     )
 
@@ -4164,6 +4613,9 @@ intent 只能是以下之一：
     LOCAL_PATCH_SYSTEM_PROMPT = (
         "你是单步骤修复器。只重写给定步骤（保持 id 与 dependencies 不变），"
         "使其可执行、可验证；不得新增文件清理/移动/删除类操作。\n"
+        "若该步骤的 expected_output 要求数值结果（系数/标准误/显著性/统计量等），"
+        "必须给出 evidence_spec（kind/must_run/receipt.cmds/receipt.outputs/on_failure），"
+        "outputs 为真实执行会产出的文件。\n"
         "输出 JSON：{\"steps\": [<仅该步骤的完整对象>]}（只输出 JSON）。"
     )
 
@@ -4376,6 +4828,190 @@ intent 只能是以下之一：
             return [f"交付物 {p} 仅 {size}B（要求 ≥{mb}B）"]
         return []
 
+    def _declared_output_files(self) -> List[str]:
+        """W1a: declared output files (reverse step order, evidence_spec
+        outputs included, workspace-relative only)."""
+        plan = self._conv.deathmatch_plan if isinstance(self._conv.deathmatch_plan, dict) else {}
+        out: List[str] = []
+        for s in reversed([x for x in (plan.get("steps") or []) if isinstance(x, dict)]):
+            files: List[Any] = []
+            for key in ("output_files", "writes"):
+                v = s.get(key)
+                if isinstance(v, list):
+                    files.extend(v)
+            _es = s.get("evidence_spec") if isinstance(s.get("evidence_spec"), dict) else {}
+            _es_receipt = _es.get("receipt") if isinstance(_es.get("receipt"), dict) else {}
+            if isinstance(_es_receipt.get("outputs"), list):
+                files.extend(_es_receipt.get("outputs"))
+            for f in files:
+                p = _safe_workspace_path(f)
+                if p and p not in out:
+                    out.append(p)
+        return out
+
+    async def _judge_unexecuted_placeholders(
+        self, workspace_path: str, files: Any, obligation_context: str = ""
+    ) -> Dict[str, Any]:
+        """r7（用户红线：占位判定必须 agentic）: fresh-context structured LLM
+        judgment over the bounded full-text deliverable excerpt. Fail-open on
+        LLM failure (event recorded); cached by (obligation context + excerpt)
+        content hash — M1/M5（A4.9 r2）: 任务要求上下文变化时重判，不命中旧缓存。"""
+        resolved: List[str] = []
+        for x in (files or []):
+            p = _safe_workspace_path(x)
+            if p and p not in resolved:
+                resolved.append(p)
+        if not resolved:
+            resolved = self._declared_output_files()
+        if not resolved:
+            return {"has_unexecuted_placeholders": False, "evidence": []}
+        excerpt = _read_deliverable_excerpt(workspace_path, resolved)
+        if not excerpt:
+            # r9（A4.9 Gap B）：契约已武装且声明了交付物，但一个都读不到 →
+            # 保守返回 judge_failed（比较器转 issue），不得静默通过。
+            self._record_event(
+                "placeholder_judge_failed", reason="no_readable_deliverable",
+            )
+            return {"has_unexecuted_placeholders": False, "evidence": [],
+                    "judge_failed": True}
+        content = _build_placeholder_judge_content(excerpt, obligation_context)
+        key = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        cached = _PLACEHOLDER_JUDGE_CACHE.get(key)
+        if isinstance(cached, dict):
+            return cached
+        result: Dict[str, Any] = {"has_unexecuted_placeholders": False, "evidence": []}
+        parsed: Any = None
+        try:
+            from app.services.agentic_judge import judge_json
+            parsed = await judge_json(
+                _PLACEHOLDER_JUDGE_PROMPT,
+                content,
+                task="execution_placeholders",
+                default=None,
+                timeout=120.0,
+            )
+        except Exception as exc:
+            logger.warning("execution-placeholder judgment failed (fail-open): %s", exc)
+            parsed = None
+        if not isinstance(parsed, dict):
+            # r8（A4.9 Critical）：judge_json 失败/超时返回 None（不抛异常）——
+            # 必须显式记录事件且**不缓存**未判定结果（否则瞬时故障会永久解武装）。
+            self._record_event(
+                "placeholder_judge_failed", reason="judge_unavailable",
+            )
+            return {"has_unexecuted_placeholders": False, "evidence": [],
+                    "judge_failed": True}
+        result["has_unexecuted_placeholders"] = bool(
+            parsed.get("has_unexecuted_placeholders")
+        )
+        ev = parsed.get("evidence")
+        if isinstance(ev, list):
+            result["evidence"] = [str(x)[:200] for x in ev[:3]]
+        if len(_PLACEHOLDER_JUDGE_CACHE) > _PLACEHOLDER_JUDGE_MAX_CACHE:
+            _PLACEHOLDER_JUDGE_CACHE.clear()
+        _PLACEHOLDER_JUDGE_CACHE[key] = result
+        return result
+
+    def _obligation_criteria_enabled(self) -> bool:
+        """W1a kill switch (config.toml [deathmatch] obligation_criteria_enabled)."""
+        return bool(config.deathmatch_obligation_criteria_enabled)
+
+    def _obligation_criteria(self) -> List[Dict[str, Any]]:
+        """W1a r6: obligations are emitted only when the goal is agentically
+        judged to require real execution (`_execution_need_cached`) and is not
+        a creative goal. No keyword/intent enumeration participates."""
+        if not self._obligation_criteria_enabled():
+            return []
+        goal = str(getattr(self._conv, "deathmatch_goal", "") or "")
+        if _is_creative_goal(goal):
+            return []
+        if not _execution_need_cached(goal):
+            return []
+        plan = self._conv.deathmatch_plan if isinstance(self._conv.deathmatch_plan, dict) else {}
+        steps = plan.get("steps") if isinstance(plan, dict) else []
+        _steps = steps if isinstance(steps, list) else []
+        return _build_obligation_criteria(
+            _steps, _evidence_step_ids_cached(goal, _steps)
+        )
+
+    async def _judge_steps_needing_evidence_spec(
+        self, steps: List[Dict[str, Any]]
+    ) -> Optional[set]:
+        """r8（替代 _NUMERIC_OUTPUT_RE）：agentic 判定哪些步骤承诺数值/执行
+        结果、必须携带 evidence_spec。失败返回 None 且不缓存 + 事件。"""
+        if not config.deathmatch_obligation_criteria_enabled:
+            return set()
+        _steps = [s for s in (steps or []) if isinstance(s, dict)]
+        if not _steps:
+            return set()
+        goal = str(getattr(self._conv, "deathmatch_goal", "") or "")
+        bucket = _evidence_step_ids_bucket(goal, _steps)
+        cached = _EVIDENCE_STEP_IDS_CACHE.get(bucket)
+        if cached is not None:
+            return set(cached)
+        listing = "\n".join(
+            f"- {s.get('id')}: {str(s.get('expected_output') or '')[:200]}"
+            for s in _steps
+        )
+        parsed: Any = None
+        try:
+            from app.services.agentic_judge import judge_json
+            parsed = await judge_json(
+                "你是计划核验器。对每个步骤 id 判断：该步骤的预期产出是否承诺"
+                "**实际执行/计算/取数后的数值结果**（如系数、统计量、回归表、"
+                "基准数据、实测指标）；纯文字梳理、方案描述、章节撰写（不含数值"
+                "结果）不算。\n"
+                '输出JSON：{"step_ids": ["s5", ...]}（只列需要真实执行结果的步骤）',
+                listing,
+                task="evidence_spec_steps",
+                default=None,
+                timeout=120.0,
+            )
+        except Exception as exc:
+            logger.warning("evidence-spec step judgment failed: %s", exc)
+            parsed = None
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("step_ids"), list):
+            self._record_event("evidence_step_judge_failed", reason="judge_unavailable")
+            return None
+        ids = {str(x)[:40] for x in parsed.get("step_ids") or []}
+        if len(_EVIDENCE_STEP_IDS_CACHE) > _EVIDENCE_STEP_IDS_MAX_CACHE:
+            _EVIDENCE_STEP_IDS_CACHE.clear()
+        _EVIDENCE_STEP_IDS_CACHE[bucket] = sorted(ids)
+        return ids
+
+    def _apply_obligations(self, *, initial: bool = False) -> int:
+        """r5/r6: persist obligations into the append-only contract at plan
+        write time. Epoch guard (I4): a conversation that never armed the
+        contract is not retro-gated by later patches/replans — only the
+        initial plan (`initial=True`) or an already-armed contract adds
+        obligations. Idempotent (dedupe by text); returns the number added."""
+        if not self._obligation_criteria_enabled():
+            return 0
+        stored = getattr(self._conv, "deathmatch_acceptance_criteria", None) or []
+        if not isinstance(stored, list):
+            stored = []
+        armed = any(
+            isinstance(c, dict)
+            and (
+                c.get("obligation")
+                or (c.get("check") or {}).get("kind") == "markers"
+            )
+            for c in stored
+        )
+        if not initial and not armed:
+            return 0
+        obligations = self._obligation_criteria()
+        if not obligations:
+            return 0
+        before = len(_merge_criteria(stored, []))
+        merged = _merge_criteria(_merge_criteria(stored, []) + obligations, [])
+        added = len(merged) - before
+        if added <= 0:
+            return 0
+        self._conv.deathmatch_acceptance_criteria = merged
+        self._record_event("obligations_applied", count=added, initial=bool(initial))
+        return added
+
     async def _run_gate_command(self, command: str, workspace_path: str) -> List[str]:
         """Execute a gate command inside the code-execution sandbox.
         Returns [] on pass; an issue list on failure. Internal errors are
@@ -4460,6 +5096,49 @@ intent 只能是以下之一：
                         f"[{c.get('id')}] {i}"
                         for i in await self._run_gate_command(check.get("cmd"), workspace_path)
                     ]
+                elif check.get("kind") in ("execution_content", "markers"):
+                    # r7/r8：agentic 占位判定（fresh-context 结构化 LLM；失败 fail-open+事件）；
+                    # "markers" 为 r5 旧契约的兼容别名（A4.9 r8 #6）。
+                    _files = [
+                        p for p in (check.get("paths") or [])
+                        if isinstance(p, str) and p.strip()
+                    ]
+                    if not _files:
+                        _files = self._declared_output_files()
+                    if not bool(check.get("allow")):
+                        if _files:
+                            _plan = (
+                                self._conv.deathmatch_plan
+                                if isinstance(self._conv.deathmatch_plan, dict) else {}
+                            )
+                            _ctx = _placeholder_judge_obligation_context(
+                                goal=str(getattr(self._conv, "deathmatch_goal", "") or ""),
+                                criteria_texts=[str(c.get("text") or "")],
+                                steps=[
+                                    x for x in (_plan.get("steps") or [])
+                                    if isinstance(x, dict)
+                                ],
+                                files=_files,
+                            )
+                            _verdict = await self._judge_unexecuted_placeholders(
+                                workspace_path, _files, _ctx
+                            )
+                            if _verdict.get("has_unexecuted_placeholders"):
+                                _ev = "；".join(_verdict.get("evidence") or [])
+                                issues.append(
+                                    f"[{c.get('id')}] 交付物含未执行占位（agentic 判定）"
+                                    + (f"：{_ev[:400]}" if _ev else "")
+                                )
+                            elif _verdict.get("judge_failed"):
+                                issues.append(
+                                    f"[{c.get('id')}] 未执行占位判定不可用"
+                                    "（交付物缺失/不可读或 judge 失败）——按保守处理，请重试"
+                                )
+                        else:
+                            # r8（A4.9 #8）：武装的契约却定位不到交付物 → 不得空转通过
+                            issues.append(
+                                f"[{c.get('id')}] 无法定位交付物文件，未执行占位判定未执行"
+                            )
         except Exception as exc:
             logger.warning("goal comparator failed (fail-closed): %s", exc)
             self._record_event("comparator", error=str(exc)[:200], phase="error")
@@ -4525,11 +5204,27 @@ intent 只能是以下之一：
             # instead of "once, then legacy stall".
             new_step["attempts"] = int(step.get("attempts") or 0)
             new_step["recovery"] = "local_patch_applied"
+            # W1a（A4.9 r1 M2）：patch 若省略 evidence_spec，保留旧规格——
+            # 执行义务不得经 local_patch 静默消失（冻结 hash 会同步变化）。
+            if (step.get("evidence_spec") or {}) and not (new_step.get("evidence_spec") or {}):
+                new_step["evidence_spec"] = step.get("evidence_spec")
             candidate_steps[idx] = new_step
-            if _validate_plan_protocol({"steps": candidate_steps}, None):
+            # r8（#4b/#5）：M3 作用域由 agentic 步骤判定给出（仅当该步骤被判定
+            # 承诺数值结果时才强制 evidence_spec）；判定失败/未命中 → 不强制。
+            _judged_ids = await self._judge_steps_needing_evidence_spec([new_step])
+            _require_ids = (
+                {str(step.get("id"))}
+                if _judged_ids and str(step.get("id")) in _judged_ids
+                else None
+            )
+            if _validate_plan_protocol(
+                {"steps": candidate_steps}, None,
+                require_evidence_spec_ids=_require_ids,
+            ):
                 return False
             self._conv.deathmatch_plan = {"steps": candidate_steps}
             self._conv.deathmatch_plan_version = (self._conv.deathmatch_plan_version or 0) + 1
+            self._apply_obligations()
             self._record_event(
                 "local_patch", step_id=str(step.get("id")),
                 issues=[str(i)[:200] for i in (issues or [])[:5]],
@@ -4688,8 +5383,54 @@ intent 只能是以下之一：
         else:
             self._record_event("plan_audit", issues=[], repaired=False)
 
+        _old_version = int(self._conv.deathmatch_plan_version or 0)
+        if config.deathmatch_obligation_criteria_enabled:
+            _need = await _ensure_execution_judged(str(self._conv.deathmatch_goal or ""))
+            if _need is None:
+                # r9（A4.9 Gap A）：触发判定不可用 → fail-closed，不写计划
+                # （version 保持 0；后续 replan 重试判定并可按 initial 武装）。
+                self._record_event(
+                    "execution_need_judge_failed", reason="judge_unavailable",
+                )
+                return None
+            # r8（A4.9 #5）：哪些步骤承诺数值/执行结果 → agentic 步骤判定
+            # （替代 _NUMERIC_OUTPUT_RE）；缺 evidence_spec → 有界修复，失败
+            # fail-closed（plan=None 走通用目标循环，不武装步骤门）。
+            _required = await self._judge_steps_needing_evidence_spec(
+                plan.get("steps") or []
+            )
+            if _required:
+                _issues = _validate_plan_protocol(
+                    plan, None, require_evidence_spec_ids=_required
+                )
+                if _issues:
+                    logger.info(
+                        "PEVR planner: evidence_spec missing (%s) — one repair",
+                        "; ".join(_issues[:3]),
+                    )
+                    _raw2 = await self._llm_generate(
+                        llm, system_prompt,
+                        user_prompt
+                        + "\n\n【必须修复】以下步骤承诺数值结果但缺少 evidence_spec：\n- "
+                        + "\n- ".join(_issues[:6])
+                        + "\n请为这些步骤补充 evidence_spec 后重新输出完整 JSON 计划"
+                        "（只输出 JSON）。",
+                    )
+                    _plan2 = await self._parse_plan_with_repair(
+                        _raw2, user_prompt, llm, system_prompt=system_prompt,
+                    )
+                    _ok = bool(_plan2) and not _validate_plan_protocol(
+                        _plan2, None, require_evidence_spec_ids=_required
+                    )
+                    plan = _plan2 if _ok else None
+                    if plan is None:
+                        self._record_event("evidence_spec_repair_failed")
+        if plan is None:
+            self._conv.deathmatch_plan = None
+            return None
         self._conv.deathmatch_plan = plan
-        self._conv.deathmatch_plan_version = (self._conv.deathmatch_plan_version or 0) + 1
+        self._conv.deathmatch_plan_version = _old_version + 1
+        self._apply_obligations(initial=(_old_version == 0))
         return plan
 
     def _parse_plan(self, raw: str) -> Optional[Dict[str, Any]]:
@@ -4772,6 +5513,7 @@ intent 只能是以下之一：
                 "done_check": _normalize_done_check(
                     s.get("done_check"), str(s.get("verification_method", ""))
                 ),
+                "evidence_spec": _normalize_evidence_spec(s.get("evidence_spec")),
                 "attempts": _attempts,
                 "recovery": str(s.get("recovery") or "idle")[:20],
             })
@@ -5028,87 +5770,8 @@ intent 只能是以下之一：
         ext = _os.path.splitext(str(path))[1].lower()
         return ext not in DeathmatchManager._BINARY_FILE_EXTENSIONS
 
-    @staticmethod
-    def _scan_unexecuted_placeholders(
-        workspace_path: str,
-        files: Any,
-        *,
-        max_files: int = _PLACEHOLDER_SCAN_MAX_FILES,
-    ) -> str:
-        """Deterministic evidence: unexecuted placeholder markers inside
-        deliverable files (2026-09-20, conv a104fbc5).
-
-        Returns a bounded evidence block listing each file with its hit
-        count and sample lines, or "" when nothing was found. Never raises;
-        missing/binary/oversized entries are skipped. This is EVIDENCE for
-        the verifier/judge prompts, not a completion verdict — a legitimate
-        "数据不可得" annotation agreed by the user's acceptance criteria must
-        still be judge-able as complete.
-        """
-        if not workspace_path:
-            return ""
-        try:
-            wanted: List[str] = []
-            for fp in (files or []):
-                p = str(fp or "").strip()
-                if not p or p in wanted:
-                    continue
-                if not DeathmatchManager._is_text_file(p):
-                    continue
-                wanted.append(p)
-                if len(wanted) >= max(1, int(max_files)):
-                    break
-            if not wanted:
-                return ""
-            # A4.9 r3：文件上限必须披露（未扫描 ≠ 无占位）
-            _valid_count = 0
-            for fp in (files or []):
-                p = str(fp or "").strip()
-                if not p or not DeathmatchManager._is_text_file(p):
-                    continue
-                _valid_count += 1
-            lines: List[str] = []
-            for rel in wanted:
-                abs_path = rel if _os.path.isabs(rel) else _os.path.join(workspace_path, rel)
-                if not _os.path.isfile(abs_path):
-                    continue
-                try:
-                    with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-                        content = fh.read(_PLACEHOLDER_SCAN_MAX_BYTES)
-                except OSError:
-                    continue
-                hits = 0
-                samples: List[str] = []
-                for line in content.splitlines():
-                    if not any(m in line for m in _PLACEHOLDER_MARKERS):
-                        continue
-                    hits += 1
-                    if len(samples) < _PLACEHOLDER_SCAN_MAX_SAMPLES:
-                        samples.append(" ".join(line.split())[:_PLACEHOLDER_SCAN_SAMPLE_CHARS])
-                if hits:
-                    detail = f"- {rel}: 命中 {hits} 处"
-                    if samples:
-                        detail += " | 示例: " + "；".join(f"「{s}」" for s in samples)
-                    lines.append(detail)
-            if _valid_count > len(wanted):
-                lines.append(
-                    f"（扫描上限 {max_files} 个文件：另有 {_valid_count - len(wanted)} 个未扫描"
-                    f"——未扫描 ≠ 无占位）"
-                )
-            if not lines:
-                return ""
-            text = (
-                "未执行占位标记（机械扫描：交付物内容含"
-                "『待执行/待填报/不填报数值/占位』等未执行标记）:\n"
-                + "\n".join(lines)
-            )
-            if len(text) > _PLACEHOLDER_EVIDENCE_CHARS:
-                text = text[: _PLACEHOLDER_EVIDENCE_CHARS - 12] + "\n…(扫描截断)"
-            return text
-        except Exception as exc:
-            logger.debug("placeholder scan failed: %s", exc)
-            return ""
-
+    # r7：`_scan_unexecuted_placeholders`（关键词 marker 扫描）已删除——
+    # 未执行占位判定改为 agentic（`_judge_unexecuted_placeholders`）。
     def _read_prior_file_snippets(
         self,
         steps: List[Dict[str, Any]],
@@ -5454,7 +6117,9 @@ intent 只能是以下之一：
                     _p = str(_f.get("path") or "").strip()
                     if _p and _p not in _cur_outputs:
                         _cur_outputs.append(_p)
-                _placeholder_ev = self._scan_unexecuted_placeholders(
+                # r7: 评审者需要看到交付物**内容**（而非仅文件名/片段）才能对
+                # 未执行占位作语义判断——注入有界全文摘录（agentic 判定输入）。
+                _deliverable_excerpt = _read_deliverable_excerpt(
                     workspace_path, _cur_outputs
                 )
                 _step_json = json.dumps(current_step, ensure_ascii=False)
@@ -5485,7 +6150,7 @@ intent 只能是以下之一：
                     )
                     + f"此前已完成步骤的产出:\n{prior_outputs or '(无)'}\n\n"
                     f"文件内容片段（前序步骤产物 + 本轮新产出/变更文件，均为开头+结尾）:\n{prior_file_snippets}\n\n"
-                    + (f"{_placeholder_ev}\n\n" if _placeholder_ev else "")
+                    + (f"{_deliverable_excerpt}\n\n" if _deliverable_excerpt else "")
                     + f"Agent最近回复:\n{_head_tail_truncate(last_response, 2000)}\n\n"
                     f"workspace文件快照:\n{files_desc}\n\n"
                     + (
@@ -5518,8 +6183,9 @@ intent 只能是以下之一：
                     f"9) 边界完整性：若当前步骤声明了 boundary 边界约束，检查本轮产出/变更是否违反"
                     f"（越界修改、覆盖或引用被禁止的对象）。违反→标记 partial，"
                     f"并在 issues 中引用被违反的边界原文。\n"
-                    f"10) 未执行占位检查：若上方机械扫描列出本步骤产出中的未执行占位标记"
-                    f"（待执行/待填报/不填报数值/占位），而步骤预期要求实际结果，"
+                    f"10) 未执行占位检查（agentic）：若上方『交付物内容摘录』或『未执行占位』"
+                    f"判定显示本步骤产出以留白（待执行/受限估计/待填报/不填报数值）"
+                    f"代替实际结果，而步骤预期要求实际结果，"
                     f"不得判 complete——判 partial 并在 issues/diagnosis 中列出未执行交付项。\n"
                     f"只有当步骤产出确实满足预期时才标记为 complete。"
                 )
@@ -5937,8 +6603,36 @@ intent 只能是以下之一：
                 for _k in ("continuity_brief", "output_summary", "output_files"):
                     if old.get(_k) and not s.get(_k):
                         s[_k] = old[_k]
+            _old_version = int(self._conv.deathmatch_plan_version or 0)
+            if config.deathmatch_obligation_criteria_enabled:
+                # r8（A4.9 #4）：首次成功计划可能是 replan（初始计划解析失败）
+                # ——必须同样做执行判定并允许 initial 武装；瞬时判定失败记录事件。
+                _need = await _ensure_execution_judged(
+                    str(self._conv.deathmatch_goal or "")
+                )
+                _armed = any(
+                    isinstance(c, dict)
+                    and (
+                        c.get("obligation")
+                        or (c.get("check") or {}).get("kind") == "markers"
+                    )
+                    for c in (
+                        getattr(self._conv, "deathmatch_acceptance_criteria", None) or []
+                    )
+                )
+                if _need is None and not _armed:
+                    # r9（A4.9 Gap A）：触发判定故障且契约未武装 → 不写计划，
+                    # 等下一次 replan 重试（不得永久解武装）。
+                    self._record_event(
+                        "execution_need_judge_failed", reason="judge_unavailable",
+                    )
+                    return None
+                await self._judge_steps_needing_evidence_spec(
+                    new_plan.get("steps") or []
+                )
             self._conv.deathmatch_plan = new_plan
-            self._conv.deathmatch_plan_version = (self._conv.deathmatch_plan_version or 0) + 1
+            self._conv.deathmatch_plan_version = _old_version + 1
+            self._apply_obligations(initial=(_old_version == 0))
             return new_plan
         return None
 

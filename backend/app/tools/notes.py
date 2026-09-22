@@ -173,6 +173,24 @@ def _permission_needed_payload(action: str, details: Dict[str, Any]) -> str:
     )
 
 
+def _append_note_content(existing: Optional[str], addition: str) -> str:
+    """Append ``addition`` to a note body, normalizing the separator.
+
+    Used by the chunked-write protocol (create_note 开头 + append_note 分批追加)
+    that keeps a single tool call from ever carrying more than the model's
+    output budget. A blank line separates chunks; an existing trailing newline
+    (or a leading newline on the addition) is never doubled.
+    """
+    existing = existing or ""
+    if not existing:
+        return addition
+    if existing.endswith("\n\n") or addition.startswith("\n"):
+        return existing + addition
+    if existing.endswith("\n"):
+        return existing + "\n" + addition
+    return existing + "\n\n" + addition
+
+
 async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
     action = (args.get("action") or "").lower()
     user = kwargs.get("user")
@@ -360,6 +378,36 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
                 ensure_ascii=False,
             )
 
+        if action == "append_note":
+            note_id = args.get("note_id")
+            if not note_id:
+                return json.dumps({"error": "note_id is required for append_note"}, ensure_ascii=False)
+            addition = args.get("content")
+            if not isinstance(addition, str) or not addition.strip():
+                return json.dumps({"error": "content is required for append_note"}, ensure_ascii=False)
+            from sqlalchemy import select
+            from app.db.database import Notebook, Note
+            result = await db.execute(
+                select(Note).join(Notebook, Notebook.id == Note.notebook_id)
+                .where(Note.id == note_id, Notebook.user_id == user.id)
+            )
+            note = result.scalar_one_or_none()
+            if not note:
+                return json.dumps({"error": f"Note '{note_id}' not found"}, ensure_ascii=False)
+            note.content = _append_note_content(note.content, addition)
+            await db.commit()
+            await db.refresh(note)
+            return json.dumps(
+                {
+                    "success": True,
+                    "id": note.id,
+                    "title": note.title or "无标题",
+                    "content_length": len(note.content or ""),
+                    "message": f"已向笔记《{note.title or '无标题'}》追加内容",
+                },
+                ensure_ascii=False,
+            )
+
         if action == "delete_note":
             note_id = args.get("note_id")
             if not note_id:
@@ -389,11 +437,12 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
 
 async def _notes_tool_with_permission(args: Dict[str, Any], **kwargs) -> str:
     action = (args.get("action") or "").lower()
-    write_actions = ("create_note", "update_note", "delete_note", "create_notebook", "update_notebook", "delete_notebook")
+    write_actions = ("create_note", "update_note", "append_note", "delete_note", "create_notebook", "update_notebook", "delete_notebook")
     if not args.get("_permission_granted") and action in write_actions:
         permission_key_map = {
             "create_note": "note_create",
             "update_note": "note_edit",
+            "append_note": "note_edit",
             "delete_note": "note_delete",
             "create_notebook": "notebook_create",
             "update_notebook": "notebook_edit",
@@ -402,6 +451,7 @@ async def _notes_tool_with_permission(args: Dict[str, Any], **kwargs) -> str:
         description_map = {
             "create_note": "Agent 请求创建笔记",
             "update_note": "Agent 请求修改笔记内容",
+            "append_note": "Agent 请求向笔记追加内容",
             "delete_note": "Agent 请求删除笔记",
             "create_notebook": "Agent 请求创建新笔记本",
             "update_notebook": "Agent 请求修改笔记本名称",
@@ -429,8 +479,10 @@ registry.register(
         "name": "notes",
         "description": (
             "访问并操作用户的笔记本与笔记。支持读取笔记本列表、笔记列表、笔记内容，"
-            "对笔记本进行创建、重命名、删除，以及对笔记进行新增、修改、删除。"
-            "重要：写入操作（新增/修改/删除笔记或笔记本）只有在用户在当前对话中明确要求时才可执行，"
+            "对笔记本进行创建、重命名、删除，以及对笔记进行新增、修改、追加、删除。"
+            "写入长内容时必须分块：先用 create_note 写入开头部分，再用 append_note "
+            "分批追加（每次约 800 字以内），避免单次超长调用被输出上限截断。"
+            "重要：写入操作（新增/修改/追加/删除笔记或笔记本）只有在用户在当前对话中明确要求时才可执行，"
             "严禁主动、自发地对笔记进行任何写入操作。"
             "即使用户已授权笔记编辑权限，也不得在没有用户明确指令的情况下修改笔记内容。"
             "如果用户要求向一个不存在的笔记本中添加笔记，应先使用 create_notebook 创建该笔记本，"
@@ -447,6 +499,7 @@ registry.register(
                         "get_note",
                         "create_note",
                         "update_note",
+                        "append_note",
                         "delete_note",
                         "create_notebook",
                         "update_notebook",
@@ -460,7 +513,7 @@ registry.register(
                 },
                 "note_id": {
                     "type": "string",
-                    "description": "笔记 ID（get_note / update_note / delete_note 使用）",
+                    "description": "笔记 ID（get_note / update_note / append_note / delete_note 使用）",
                 },
                 "title": {
                     "type": "string",
@@ -468,7 +521,7 @@ registry.register(
                 },
                 "content": {
                     "type": "string",
-                    "description": "笔记内容（create_note / update_note 使用）",
+                    "description": "笔记内容（create_note / update_note 使用；append_note 时为要追加到末尾的文本，建议单次不超过约 800 字）",
                 },
                 "name": {
                     "type": "string",

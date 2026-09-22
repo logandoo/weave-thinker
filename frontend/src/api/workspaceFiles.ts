@@ -43,6 +43,10 @@ export function buildOfficePdfUrl(relPath: string): string {
   return `/api/files/office-pdf?path=${encodeURIComponent(relPath)}${tokenParam()}`
 }
 
+export function buildOfficeHtmlUrl(relPath: string): string {
+  return `/api/files/office-html?path=${encodeURIComponent(relPath)}${tokenParam()}`
+}
+
 export async function fetchDirectory(
   relPath: string,
   signal?: AbortSignal,

@@ -32,8 +32,10 @@ from app.services.workspace_files_service import build_folder_zip, list_director
 from app.services.office_preview_service import (
     OfficePreviewFailed,
     OfficePreviewUnavailable,
+    convert_to_html,
     convert_to_pdf,
     ensure_soffice,
+    is_spreadsheet as is_spreadsheet_office,
     is_supported as is_supported_office,
 )
 
@@ -359,4 +361,100 @@ async def office_pdf(
         media_type="application/pdf",
         filename=resolved.with_suffix(".pdf").name,
         content_disposition_type="inline",
+    )
+
+
+@router.get("/office-html")
+async def office_html(
+    path: str = Query(..., description="Workspace-relative or in-workspace spreadsheet path"),
+    token: Optional[str] = Query(None, description="JWT token for link-based auth"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Convert a spreadsheet to a sanitized, self-contained HTML preview.
+
+    2026-09-21: PDF pagination split wide tables across pages and clipped
+    long cell text at page boundaries; the Calc HTML export keeps every sheet
+    as one natural-width table (horizontal scroll in the viewer) with wrapped
+    text and charts inlined as images. The document is sanitized server-side
+    and served to a sandboxed iframe. ``400`` for non-spreadsheets, ``501``
+    when LibreOffice/preview is unavailable and ``422`` on conversion failure
+    — the frontend then falls back to ``/office-pdf`` and finally to its
+    client-side renderer.
+    """
+    user = await _authenticate(credentials, token, db)
+    workspace = await ensure_user_workspace(db, user.id, user.username)
+
+    try:
+        resolved = await asyncio.to_thread(
+            resolve_workspace_file, path, workspace.root_path
+        )
+    except (WorkspacePathError, OSError, ValueError) as exc:
+        logger.info("office-html rejected path=%r", path)
+        raise _not_found() from exc
+
+    if not is_spreadsheet_office(resolved.name):
+        raise HTTPException(status_code=400, detail="Not a spreadsheet file")
+
+    if not config.office_preview_enabled or not config.office_preview_html_enabled:
+        raise HTTPException(
+            status_code=501,
+            detail={"code": "office_preview_unavailable", "message": "Office preview conversion is disabled"},
+        )
+
+    soffice = await ensure_soffice(config.office_preview_soffice_path)
+    if not soffice:
+        raise HTTPException(
+            status_code=501,
+            detail={"code": "office_preview_unavailable", "message": "LibreOffice is not installed"},
+        )
+
+    try:
+        fd = await asyncio.to_thread(_open_regular_nofollow, resolved)
+    except OSError as exc:
+        logger.info("office-html rejected (open) path=%r: %s", path, exc)
+        raise _not_found() from exc
+    try:
+        src_stat = os.fstat(fd)
+        tmp_src = await asyncio.to_thread(
+            _spool_fd_to_temp, fd, resolved.suffix, config.office_preview_cache_dir
+        )
+    except OSError as exc:
+        logger.warning("office-html spool failed path=%r: %s", path, exc)
+        raise HTTPException(status_code=500, detail="Preview preparation failed") from exc
+    finally:
+        os.close(fd)
+
+    try:
+        html_path = await convert_to_html(
+            tmp_src,
+            soffice=soffice,
+            cache_dir=config.office_preview_cache_dir,
+            timeout=config.office_preview_timeout_seconds,
+            max_cache_mb=config.office_preview_cache_max_mb,
+            cache_identity=str(resolved),
+            cache_stat=(src_stat.st_mtime_ns, src_stat.st_size),
+        )
+    except OfficePreviewUnavailable as exc:
+        raise HTTPException(
+            status_code=501,
+            detail={"code": "office_preview_unavailable", "message": str(exc)[:200]},
+        ) from exc
+    except OfficePreviewFailed as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "office_preview_failed", "message": str(exc)[:200]},
+        ) from exc
+    finally:
+        _safe_unlink(str(tmp_src))
+
+    return FileResponse(
+        path=str(html_path),
+        media_type="text/html",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            # direct/top-level opens of the token URL get the same lockdown as
+            # the sandboxed iframe (A4.9 2026-09-21)
+            "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'",
+        },
     )

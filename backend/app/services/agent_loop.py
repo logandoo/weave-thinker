@@ -13,7 +13,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Set, Tupl
 
 from app.services.llm_service import LLMService
 from app.tools.registry import registry
-from app.services.retry_utils import coerce_tool_args, repair_tool_call_arguments, sanitize_messages_surrogates, jittered_backoff
+from app.services.retry_utils import coerce_tool_args, decide_tool_dispatch, plan_tool_calls_for_round, repair_tool_call_arguments, sanitize_messages_surrogates, jittered_backoff
 from app.services.tool_result_budget import maybe_persist_tool_result, enforce_turn_budget, BudgetConfig, DEFAULT_BUDGET
 from app.services.tool_result_digest import digest_tool_results_batch, DigestConfig, DEFAULT_DIGEST_TOOLS
 from app.services.numeric_provenance_gate import evaluate_numeric_provenance
@@ -400,7 +400,163 @@ def _truncate_marked(text: str, limit: int) -> str:
     return t[:limit] + "… [截断]"
 
 
-def _guardrail_user_anchor(turn_question: str, *, limit: int = 300) -> str:
+# 用户消息保真（2026-09-21，conv a104fbc5「又无法通过评估」r2，用户指令）：
+# 协调器（前 800 字符）、审计员（前 800 字符）、用户背景事实（前 300 字符）、
+# 守卫锚点（前 300 字符）此前一律 head-only 截断。当用户消息是「长粘贴 +
+# 尾部诉求」（6182 字符表格 + 「…这些受限估计是为什么？」）时，真正的诉求
+# 不可见：协调器 focus 误判为「请审阅/补全表格」→ 审计员据此以「答非所问」
+# hard reject 正确答案（一次修复后仍拒 → 出货「未通过全部自动质量检查」）。
+#
+# r1 曾以 head+tail（保头尾、切除中间）修复，被用户否决：「一定会继续出现
+# 类似问题」。SOTA 核实（2026-09-21）：
+#   - codex：正常发送路径对 Message 零截断（仅工具输出 middle-out，
+#     `context_manager/history.rs`）；用户消息在压缩中按整条 newest-first
+#     保留 ≤20k tokens（`compact.rs:639-717`）；超窗显式
+#     `ContextWindowExceeded`（`session/turn.rs:1404-1408`）；输入边界
+#     `MAX_USER_INPUT_TEXT_CHARS=1<<20` 显式拒绝（`protocol/src/user_input.rs`）。
+#   - opencode：用户文本原样进 prompt、无长度上限（`session/message-v2.ts`）；
+#     压力由整条消息边界的选择/裁剪（V1 `compaction.ts`）与受保护区
+#     （最后 2 个用户轮次 + 最近 40k tokens）承担。
+# 本实现：最新用户消息逐字全文，永不切开；历史消息按整条 token 预算管理
+# （超预算从最旧整条丢弃并显式披露）——信息完整性 > 省 token。
+_COORDINATOR_HISTORY_TOKEN_BUDGET = 20000
+_AUDIT_USER_FACT_TOKEN_BUDGET = 8000
+_COORDINATOR_MAX_MESSAGES = 6
+
+
+def _coordinator_recent_messages(
+    messages: Sequence[Dict[str, Any]],
+    *,
+    max_messages: int = _COORDINATOR_MAX_MESSAGES,
+    token_budget: int = _COORDINATOR_HISTORY_TOKEN_BUDGET,
+) -> List[Dict[str, Any]]:
+    """协调器上下文的最近消息（逐字全文；超预算从最旧整条丢弃）。
+
+    - 最新一条 user 消息无论多大都保留全文（它是本轮的意图来源，
+      codex/opencode 正常路径同样零截断）；窗口 `max_messages` 先于
+      意图定位也不行——最新 user 消息若落在窗口外会被显式补回
+      （A4.9 F2：`messages[-N:]` 不能吞掉本轮意图）；
+    - 其余消息从新到旧整条纳入直到 token 预算耗尽即停（保持「最近 K 条」
+      连续语义，不跳条；与 codex 压缩溢出循环 `compact.rs` remove_first_item
+      同为整条策略）；
+    - 任何用户消息都**不被改写**；未纳入的消息以独立前导 system 消息显式
+      披露计数（用户原则：信息完整性 > 省 token，静默省略被禁止）；
+    - tool 角色消息照旧过滤（严格 API 不接受悬空 tool 消息）。
+    """
+    eligible = [
+        m for m in messages
+        if m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str) and m["content"].strip()
+    ]
+    if not eligible:
+        return []
+    latest_user = next(
+        (m for m in reversed(eligible) if m.get("role") == "user"), None)
+    window = list(messages[-max_messages:])
+    if latest_user is not None and latest_user not in window:
+        window.insert(0, latest_user)
+    candidates = [
+        {"role": m["role"], "content": m["content"]}
+        for m in window
+        if m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str) and m["content"].strip()
+    ]
+    if not candidates:
+        return []
+    latest_user_idx = next(
+        (i for i in range(len(candidates) - 1, -1, -1)
+         if candidates[i]["role"] == "user"),
+        None,
+    )
+    from app.services.context_compressor import estimate_text_tokens_rough
+    kept: List[Dict[str, Any]] = []
+    used = 0
+    for i in range(len(candidates) - 1, -1, -1):
+        _tk = estimate_text_tokens_rough(candidates[i]["content"])
+        if i != latest_user_idx and used + _tk > token_budget:
+            # 预算耗尽：更旧的消息（含本窗口外）全部不纳入。但「最新 user
+            # 永不丢」不变量优先——窗口补回时它位于更旧位置（A4.9 r2 N1），
+            # 此时必须显式保回（顺序仍为对话顺序）。
+            if latest_user_idx is not None and latest_user_idx < i:
+                kept.append(candidates[latest_user_idx])
+            break
+        kept.append(candidates[i])
+        used += _tk
+    kept.reverse()
+    # omitted = 窗口外 + 窗口内被预算截断的 user/assistant 消息总数
+    omitted = max(0, len(eligible) - len(kept))
+    if omitted:
+        return [{
+            "role": "system",
+            "content": f"[注：更早的 {omitted} 条消息未纳入本路由上下文]",
+        }] + kept
+    return kept
+
+
+# legacy 模式（synthetic directives 关闭）把 harness 指令作为裸 user 消息注入——
+# 审计/NPG 的用户消息集合必须排除它们，避免把系统指令当作「用户陈述的事实」。
+_AUDIT_DIRECTIVE_OPENERS = (
+    "你刚才生成的回答草稿", "内部完整性校验未通过", "【轮次核对】",
+    "【数值核对闸门】", "请基于压缩后的上下文", "请基于以上工具调用结果",
+    "你的上一个回答被截断", "你的上一个工具调用因为内容过长",
+    "请重新完整回答",
+)
+
+
+def _audit_user_facts_text(
+    messages: Sequence[Dict[str, Any]],
+    *,
+    max_items: int = 3,
+    token_budget: int = _AUDIT_USER_FACT_TOKEN_BUDGET,
+) -> str:
+    """审计员「用户背景事实」文本：此前用户消息逐字纳入（整条，超预算整条跳过）。
+
+    - 最新一条用户消息不注入（它已是审计上下文的 headline，逐字展示）；
+    - 逐条（新→旧）整条纳入直到预算/条数上限；超预算的消息整条跳过并
+      显式披露计数（绝不切开）；
+    - directive 开头的合成 user 消息排除（legacy 模式兼容，既有契约）。
+    """
+    _raw_user_msgs: List[str] = []
+    for _um in reversed(messages):
+        if _um.get("role") != "user" or _um.get("synthetic"):
+            continue
+        _raw = str(_um.get("content") or "").strip()
+        if not _raw or _raw.startswith(_AUDIT_DIRECTIVE_OPENERS):
+            continue
+        _raw_user_msgs.append(_raw)
+    if len(_raw_user_msgs) < 2:
+        return ""
+    from app.services.context_compressor import estimate_text_tokens_rough
+    facts: List[str] = []
+    skipped = 0
+    skip_reason = ""
+    used = 0
+    for _raw in _raw_user_msgs[1:]:  # [0] = 最新一条（已 headline 展示）
+        if len(facts) >= max_items:
+            skipped = len(_raw_user_msgs) - 1 - len(facts)
+            skip_reason = "条数上限"
+            break
+        _tk = estimate_text_tokens_rough(_raw)
+        if used + _tk > token_budget:
+            skipped = len(_raw_user_msgs) - 1 - len(facts)
+            skip_reason = "上下文预算"
+            break
+        facts.append(_raw)
+        used += _tk
+    note = (
+        f"（另有 {skipped} 条更早的用户消息未纳入：{skip_reason}）"
+        if skipped else ""
+    )
+    if not facts:
+        # 全部未纳入也必须显式披露（A4.9 F4：不得静默丢弃背景事实）
+        return note
+    out = "\n".join(reversed(facts))
+    if note:
+        out += f"\n{note}"
+    return out
+
+
+def _guardrail_user_anchor(turn_question: str) -> str:
     """Anchor a guardrail directive to the user's actual message for THIS turn
     (2026-09-20, conv a104fbc5).
 
@@ -408,11 +564,17 @@ def _guardrail_user_anchor(turn_question: str, *, limit: int = 300) -> str:
     request in the model's reading: a post-delivery critique ("写得糟糕，
     实证全是占位") became "本轮需要联网核实", and the shipped answer was
     "数据无误、无需修改". Returns "" when the question is empty (the
-    directives then render without the anchor)."""
-    q = " ".join((turn_question or "").split())
+    directives then render without the anchor).
+
+    2026-09-21（同会话复发，用户指令）：锚点必须携带用户消息**全文原样**——
+    原 head-only 前 300 字符在「长粘贴+尾部诉求」时锚到的仍是粘贴头部，
+    实际诉求不可见；head+tail 亦被用户否决（中间仍可能切断诉求）。
+    空白折叠（`" ".join(split())`）同样属字符删除（A4.9 F3）——仅
+    `strip()` 用于空判定，正文逐字保留。"""
+    q = (turn_question or "").strip()
     if not q:
         return ""
-    return f"用户最新消息：{q[:limit]}{'…' if len(q) > limit else ''}\n"
+    return f"用户最新消息：{q}\n"
 
 
 def _guardrail_intent_clause() -> str:
@@ -498,22 +660,37 @@ _AUDIT_CHUNK_COVERAGE_NOTE = (
     "相关片段与声称未经二次核对，请对未展开部分保持甄别。）"
 )
 
+# 审计因上下文预算未能执行说明（2026-09-21 A4.9 F7，conv a104fbc5 波）：
+# 用户消息保真后 headline 不再设上界，极端长消息（> 审计 prompt 预算 ~120k
+# tokens）在全部降级（缩草稿窗/收证据正文）后仍超预算——审计调用可能被
+# provider 拒绝并走 fail-open（未审计出货）。未审计出货不得静默：独立文案
+# 如实说明「未能完成发送前复核」。
+_AUDIT_BUDGET_UNAUDITED_NOTE = (
+    "\n\n---\n（说明：本轮上下文（用户消息/资料）超出自动质量检查的预算，"
+    "未能完成发送前的自动复核；请谨慎参考并核对关键信息。）"
+)
+
 
 def _consume_low_confidence_note(
     state: "AgentLoopState", *, coverage_only: bool = False,
 ) -> "Optional[str]":
-    """一次性消费低置信/覆盖不完整说明（尊重 low_confidence_note_enabled）。
+    """一次性消费低置信/覆盖不完整/未审计说明（尊重 low_confidence_note_enabled）。
 
-    两种来源文案不同：存在性核对 degraded/uncovered（已确认有出处）vs 分块
-    覆盖不完整（未覆盖段未核验）。开关 false 时两者都静默（既有回滚契约）。"""
+    三种来源文案不同：存在性核对 degraded/uncovered（已确认有出处）· 分块
+    覆盖不完整（未覆盖段未核验）· 审计因上下文预算未执行（完全未审计）。
+    开关 false 时三者都静默（既有回滚契约）。"""
     _low = bool(getattr(state, "audit_low_confidence", False))
     _cov = bool(getattr(state, "audit_chunk_coverage_incomplete", False))
-    if not (_low or _cov):
+    _budget = bool(getattr(state, "audit_budget_unaudited", False))
+    if not (_low or _cov or _budget):
         return None
     state.audit_low_confidence = False
     state.audit_chunk_coverage_incomplete = False
+    state.audit_budget_unaudited = False
     if not config.agent_audit_low_confidence_note_enabled:
         return None
+    if _budget:
+        return _AUDIT_BUDGET_UNAUDITED_NOTE
     if coverage_only:
         return _AUDIT_CHUNK_COVERAGE_NOTE if _cov else None
     return _AUDIT_CHUNK_COVERAGE_NOTE if _cov else _AUDIT_LOW_CONFIDENCE_NOTE
@@ -1328,13 +1505,21 @@ _AUDIT_TRUNCATION_MARKERS = (
 _AUDIT_CONTRADICTION_MARKERS = ("矛盾", "不一致")
 _AUDIT_UNSUPPORTED_MARKERS = ("无依据", "无证据", "凭空", "编造")
 _AUDIT_SELF_CONTAINED_MARKERS = ("悬空", "指代", "上一版", "被拒草稿", "自足", "独立")
+# M4（A4.9 r2）：语域/复述类拒（判据 10/11）归入 style 族，纳入同族 stall cut
+# 预算保护（此前落 other 族被豁免，只能烧满 reject 预算）。
+_AUDIT_STYLE_MARKERS = (
+    "语义复述", "车轱辘", "研究语域", "工程流程词", "工程/流程词", "语域",
+    "重复展开", "复述",
+)
 
 
 def _audit_problem_family(source: str, problem: str) -> str:
     """审计判决的问题族（确定性分类，供同族 stall cut 与可见性闸门使用）。
 
     source 优先（npg/citation 各自成族）；其余按 problem 关键词分类，顺序
-    contradiction > unsupported > truncation > self_contained > other。
+    contradiction > unsupported > truncation > style > self_contained > other。
+    style 先于 self_contained：语域/复述问题常含"指代研究活动"等措辞，
+    会被 self_contained 的宽词误捕（A4.9 r2 M4 实施期发现）。
     """
     if source in ("npg", "citation", "claim_verify"):
         return source
@@ -1345,6 +1530,8 @@ def _audit_problem_family(source: str, problem: str) -> str:
         return "unsupported"
     if any(k in p for k in _AUDIT_TRUNCATION_MARKERS):
         return "truncation"
+    if any(k in p for k in _AUDIT_STYLE_MARKERS):
+        return "style"
     if any(k in p for k in _AUDIT_SELF_CONTAINED_MARKERS):
         return "self_contained"
     return "other"
@@ -2148,6 +2335,9 @@ class AgentLoopState:
     # 分块声称清单覆盖不完整（失败/超时/超块数上限/零声称块）——独立于存在性
     # 低置信：未覆盖段未核验，出货需专用说明（2026-09-20 SOTA wave）。
     audit_chunk_coverage_incomplete: bool = False
+    # 2026-09-21（A4.9 F7）：审计 prompt 超预算且审计调用失败 → 本轮完全未审计
+    # （fail-open 出货）。未审计出货不得静默：出货点消费后追加专用说明。
+    audit_budget_unaudited: bool = False
     # 2026-09-18（conv 3583d840）：本轮检索注入的长期记忆原文（chat.py 在 setup
     # 后写入 AgentLoop 实例并带入 state）。审计证据域将其作为 [M] 权威来源——
     # 与记忆一致的声称不得判编造（用户方向：记忆优先级最高，澄清体系负责纠错）。
@@ -3642,7 +3832,7 @@ def _build_salvage_prompt(state: "AgentLoopState", last_user_msg: str) -> str:
     _q = (state.turn_question or last_user_msg or "").strip()
     prompt = (
         "请基于对话中已有的工具调用结果，直接、完整地回答用户本轮的问题：\n"
-        f"「{_q[:600]}」\n"
+        f"「{_q}」\n"  # 2026-09-21 A4.9 F6：用户问题逐字全文（原 [:600] head-only）
     )
     if state.turn_focus:
         prompt += f"本轮意图聚焦：{state.turn_focus[:400]}\n"
@@ -3731,7 +3921,7 @@ def _build_selection_prompt(state: "AgentLoopState", last_user_msg: str, stash: 
     prompt = (
         "本轮回答在发送前的内部质量审计中被多次打回。以下是全部历史草稿与各自的审计意见，"
         "以及本轮已获取的工具调用结果（对话上文）。\n\n"
-        f"用户本轮的问题：「{_q[:600]}」\n"
+        f"用户本轮的问题：「{_q}」\n"  # 2026-09-21 A4.9 F6：逐字全文（原 [:600]）
     )
     if state.turn_focus:
         prompt += f"本轮意图聚焦：{state.turn_focus[:400]}\n"
@@ -4683,6 +4873,23 @@ class AgentLoop:
         "并允许草稿引用用户本轮更正；\n"
         "   - 不得指示写手否认 [M]/[S] 中已有的事实、"
         "或要求写手声称“无法确认/无法提供”该事实。\n\n"
+        "10. 草稿内部不得语义复述（车轱辘话检查）：同一结论、同一认错点或同一论据"
+        "不得在多个小节换说法反复展开；判定阈值——同一内容在 3 处及以上出现"
+        "（含结语回扣）且未增加新信息，即属内部语义复述 → 判不合格"
+        "（reject，problem 指明合并为一处陈述，只讲一次）。"
+        "豁免：摘要/结论对同一结论的单次、一句话以内的有限回扣、用户明确要求的先总后分结构、"
+        "或该小节承担导航/结构作用时，不算复述。"
+        "注意与第 3 条区分：第 3 条管“与对话历史重复”，本条管【单条草稿内部】的重复。\n"
+        "11. 领域语域检查（仅当用户任务为学术/研究/写作类：论文、研究报告、实证分析、"
+        "文献综述、创作评估等；以代码执行完成的数据处理/软件/工程/运维类问答不适用）："
+        "草稿须以研究语域表述研究活动，不得用工程/流程词指代研究活动（跑估计、"
+        "降级或删除、返工、填报、闭环、执行状态、交付物、闸门、占位、降级协议"
+        "——「执行」仅在作流程/状态词时算，如“执行策略/执行彻底”；"
+        "“执行稳健性检验/执行回归”等常规学术搭配不算）；"
+        "数据与识别限制按研究惯例表述（未估计/未报告/数据缺口/识别边界，且仅限客观不可得"
+        "情形——把可执行而未执行的工作写成“未估计”同样不合格），不得自造状态标签"
+        "（如「受限估计」）充当结果说明。为解释或引用用户原词而提及上述词汇不算违规。"
+        "违反 → reject，problem 给出应替换的研究语域表述。软件/工程类任务不适用本条。\n\n"
         + _AUDIT_TEMPORAL_CONFLICT_RULE +
         "【数字核对硬性约束（2026-08-18，conv 7dc7a0d5；2026-09-02 B7 边界修订）】\n"
         "对草稿中数字/计算结果的核对，唯一合法的 reject 依据是 <evidence-ledger> 中"
@@ -4760,7 +4967,7 @@ class AgentLoop:
         "或与完整可见证据直接矛盾 → verdict=reject，按“凭空编造/无依据作答”处理；\n"
         "6. 声称的证据完全缺失且模型可补读（如文件从未读取、问题需要新信息）"
         "→ verdict=needs_evidence，problem 指明“立即调用工具补充证据后再回答”。\n\n"
-        "8. 草稿窗口截断纪律：若草稿正文标注“中间省略/未展示”，"
+        "12. 草稿窗口截断纪律：若草稿正文标注“中间省略/未展示”，"
         "不得对未展示的中段内容判 reject 或 needs_evidence——未展示 ≠ 不存在；"
         "若本轮提供【分块声称清单】，中段声称以清单为准逐条核验；"
         "清单覆盖率 <100% 或存在未提取声称的片段时，相关片段不得作为合格依据，"
@@ -5282,39 +5489,26 @@ class AgentLoop:
         # degraded/uncovered 接收置位，出货点消费一次后清零，杜绝陈旧标记串稿。
         state.audit_low_confidence = False
         state.audit_chunk_coverage_incomplete = False
-        context_parts = [f"用户最新消息：{last_user_msg[:800]}"]
+        # F7：每次审计入口复位「未审计」标记——它只描述**本次**审计结果；
+        # 仅当本次超预算且调用失败（fail-open）时重新置位。
+        state.audit_budget_unaudited = False
+        # 2026-09-21（conv a104fbc5，用户指令）：最新用户消息逐字全文（零截断）——
+        # head-only 800 字符曾使审计员看不到长粘贴消息尾部的真实诉求
+        # （「…受限估计是为什么？」），把「解释原因」的正确答案误判为
+        # 「答非所问」；head+tail 亦被否决（中间仍可能切断诉求）。SOTA 对齐
+        # 见 `_coordinator_recent_messages` 上方注释。
+        context_parts = [f"用户最新消息：{last_user_msg}"]
         # 用户背景事实注入（2026-08-21 复盘, conv efaf8f9c）：审计员上下文
         # 只有最新消息+工具台账，看不到早期轮次用户自己陈述的事实（如
         # 64GB/Q8 硬件），把「用户说的事实」误判为「无证据声称」→ 拒绝
-        # 循环。注入最近用户消息：草稿引用用户语境事实 ≠ 编造。
-        _user_facts = []
-        _directive_openers = (
-            "你刚才生成的回答草稿", "内部完整性校验未通过", "【轮次核对】",
-            "【数值核对闸门】", "请基于压缩后的上下文", "请基于以上工具调用结果",
-            "你的上一个回答被截断", "你的上一个工具调用因为内容过长",
-            "请重新完整回答",
-        )
-        for _um in reversed(state.messages):
-            if _um.get("role") == "user" and not _um.get("synthetic"):
-                _raw = str(_um.get("content") or "").strip()
-                if not _raw:
-                    continue
-                # legacy mode (synthetic directives disabled) injects
-                # directives as bare user messages — exclude them so audit
-                # context never presents harness instructions as user facts.
-                if _raw.startswith(_directive_openers):
-                    continue
-                _uc = _raw
-                if len(_uc) > 300:
-                    _uc = _uc[:300] + "…"
-                _user_facts.append(_uc)
-                if len(_user_facts) >= 3:
-                    break
-        if _user_facts:
+        # 循环。注入此前用户消息（逐字整条；超预算整条跳过并披露）：
+        # 草稿引用用户语境事实 ≠ 编造。
+        _user_facts_text = _audit_user_facts_text(state.messages)
+        if _user_facts_text:
             context_parts.append(
-                "对话历史中用户自己陈述的背景事实（最近3条——草稿引用这些不属"
-                "编造，不得按\u201c无证据声称\u201d拒绝）：\n"
-                + "\n".join(reversed(_user_facts))
+                "对话历史中用户自己陈述的背景事实（此前用户消息，逐字；"
+                "草稿引用这些不属编造，不得按\u201c无证据声称\u201d拒绝）：\n"
+                + _user_facts_text
             )
         if state.turn_focus:
             context_parts.append(f"本轮意图（协调器判断）：{state.turn_focus[:400]}")
@@ -5427,7 +5621,7 @@ class AgentLoop:
                     str(m.get("content") or "")
                     for m in state.messages
                     if m.get("role") == "user" and not m.get("synthetic")
-                    and not str(m.get("content") or "").startswith(_directive_openers)
+                    and not str(m.get("content") or "").startswith(_AUDIT_DIRECTIVE_OPENERS)
                 ]
                 _npg_tools = []
                 for _tr in state.tool_results:
@@ -5633,6 +5827,13 @@ class AgentLoop:
                 _est_guard("\n\n".join(context_parts)), _audit_prompt_budget,
                 _draft_cut, _evidence_text_idx is not None,
             )
+        # F7（A4.9）：用户消息 headline 逐字全文后不再设上界——全部降级后仍超预算
+        # 时，审计调用可能被 provider 拒绝并走 fail-open（未审计出货）。fail-open
+        # 路径据此置位 `audit_budget_unaudited`，出货时附加「未能完成自动复核」说明
+        # （未审计出货不得静默）。
+        _audit_over_budget = (
+            _est_guard("\n\n".join(context_parts)) > _audit_prompt_budget
+        )
         _assistant_name = getattr(self, "_audit_assistant_name", None) or "AI助手"
         audit_messages = [
             {"role": "system", "content": self._AUDITOR_SYSTEM_TEMPLATE.replace("__ASSISTANT_NAME__", _assistant_name)},
@@ -5669,6 +5870,8 @@ class AgentLoop:
                 # fail-open stays (a broken auditor must never block a good
                 # answer) but it is no longer SILENT — an un-audited ship during
                 # a provider outage is exactly the condition worth alerting on.
+                if _audit_over_budget:
+                    state.audit_budget_unaudited = True
                 logger.warning(
                     "audit_metric outcome=fail_open reason=exception error=%s — accepting draft",
                     str(exc)[:160],
@@ -5691,12 +5894,16 @@ class AgentLoop:
             _remand = _citation_remand_verdict(state, draft)
             if _remand is not None:
                 return _remand
+            if _audit_over_budget:
+                state.audit_budget_unaudited = True
             logger.warning("audit_metric outcome=fail_open reason=bad_json raw=%s — accepting draft", raw[:160])
             return None
         if not isinstance(result, dict):
             _remand = _citation_remand_verdict(state, draft)
             if _remand is not None:
                 return _remand
+            if _audit_over_budget:
+                state.audit_budget_unaudited = True
             logger.warning("audit_metric outcome=fail_open reason=non_dict — accepting draft")
             return None
         ok_val = result.get("ok")
@@ -6259,7 +6466,7 @@ class AgentLoop:
         2026-08-01). Returns None on any failure so the caller can fall back
         to the raw question.
         """
-        question = (user_question or "").strip()[:600]
+        question = (user_question or "").strip()  # 2026-09-21 A4.9 F6：逐字全文（原 [:600]）
         if not question:
             return None
         raw = None
@@ -6382,14 +6589,11 @@ class AgentLoop:
         # matching tool responses; sending either verbatim makes strict APIs
         # (DeepSeek) reject the call with HTTP 400, silently disabling the
         # coordinator for the whole conversation (conv f75236d2, 2026-07-20).
-        recent_msgs: List[Dict[str, Any]] = []
-        for msg in messages[-6:]:
-            role = msg.get("role", "user")
-            if role not in ("user", "assistant"):
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, str) and content.strip():
-                recent_msgs.append({"role": role, "content": content[:800]})
+        # conv a104fbc5（2026-09-21，用户指令）：原「前 800 字符」head-only
+        # 使协调器看不到长粘贴消息尾部的诉求，focus 误读为「请审阅/补全表格」
+        # ——改为逐字全文（超预算丢最旧整条），契约见
+        # `_coordinator_recent_messages`。
+        recent_msgs: List[Dict[str, Any]] = _coordinator_recent_messages(messages)
 
         identity_clause = ""
         if self._identity_context:
@@ -7987,25 +8191,15 @@ class AgentLoop:
                     }
 
                     if valid_tool_calls:
-                        # 上线前参数归一化（2026-08-21 dflash2 事故）：模型
-                        # 可能发出截断 JSON 参数的 tool_call——执行侧早已
-                        # 修复，但 assistant 消息里若保留截断串，vLLM 服务端
-                        # 解析 tool_calls.arguments 会 400
-                        # （"Expecting value: line 1 column 10"）→ 空答案
-                        # 重试再 400 → Agent loop error。所有 outgoing
-                        # tool_calls 参数必须是合法 JSON（修复或 {}）。
-                        for _tc in valid_tool_calls:
-                            _raw_args = _tc.get("function", {}).get("arguments")
-                            if not isinstance(_raw_args, str):
-                                _tc.setdefault("function", {})["arguments"] = "{}"
-                                continue
-                            try:
-                                json.loads(_raw_args)
-                            except json.JSONDecodeError:
-                                _tc["function"]["arguments"] = repair_tool_call_arguments(
-                                    _raw_args, _tc.get("function", {}).get("name", "?")
-                                )
-                        assistant_msg["tool_calls"] = valid_tool_calls
+                        # 截断守卫 + 供应商安全归一化（顺序关键，A4.9 C1）：
+                        # 必须对**原始**参数先做派发计划（截断 → 不执行 + 回
+                        # 可行动错误），再生成给上游的合法 JSON 副本。绝不就地
+                        # 改写 valid_tool_calls——旧顺序（先 repair→"{}"）会让
+                        # 守卫永远看不到截断载荷（conv fcb2e60a 同类复发）。
+                        # 上游约束（2026-08-21 dflash2）：outgoing tool_calls
+                        # 参数必须是合法 JSON（修复或 {}），否则 vLLM 400。
+                        _dispatch_plan, _safe_tool_calls = plan_tool_calls_for_round(valid_tool_calls)
+                        assistant_msg["tool_calls"] = _safe_tool_calls
 
                         can_parallel = (
                             config.agent_tool_loop_parallel_tool_calls
@@ -8041,22 +8235,30 @@ class AgentLoop:
                                 coros = []
                                 for tc in valid_tool_calls:
                                     tool_name = tc["function"]["name"]
-                                    try:
-                                        tool_args = json.loads(tc["function"]["arguments"])
-                                    except json.JSONDecodeError:
-                                        repaired = repair_tool_call_arguments(tc["function"]["arguments"], tool_name)
-                                        try:
-                                            tool_args = json.loads(repaired)
-                                        except json.JSONDecodeError:
-                                            tool_args = {}
-
+                                    # 截断守卫（conv fcb2e60a 同类）：计划在
+                                    # 归一化之前由原始参数产生；不可解析参数
+                                    # 绝不以 {} 派发——回可行动截断错误，不执行。
+                                    tool_args, _args_error = decide_tool_dispatch(_dispatch_plan, tc)
                                     yield {
                                         "tool_call": {
                                             "call_id": tc["id"],
                                             "name": tool_name,
-                                            "arguments": tool_args,
+                                            "arguments": tool_args if tool_args is not None else {},
                                         }
                                     }
+                                    if _args_error is not None:
+                                        async def _truncated_result(_tc=tc, _name=tool_name, _msg=_args_error):
+                                            return ToolCallResult(
+                                                call_id=_tc["id"],
+                                                name=_name,
+                                                arguments={},
+                                                result=_msg,
+                                                error=True,
+                                            )
+                                        coros.append((tc, {}, asyncio.wait_for(
+                                            _truncated_result(), timeout=5.0,
+                                        )))
+                                        continue
                                     _turn_text, _turn_tr = self._current_turn_context(state)
                                     _guarded, _hard = self._tool_liveness_coro(tool_name, self._execute_single_tool(
                                         tc["id"], tool_name, tool_args, session_factory, user, conversation, assistant,
@@ -8212,14 +8414,25 @@ class AgentLoop:
                                     })
                                     continue
 
-                                try:
-                                    tool_args = json.loads(tc["function"]["arguments"])
-                                except json.JSONDecodeError:
-                                    repaired = repair_tool_call_arguments(tc["function"]["arguments"], tool_name)
-                                    try:
-                                        tool_args = json.loads(repaired)
-                                    except json.JSONDecodeError:
-                                        tool_args = {}
+                                # 截断守卫（conv fcb2e60a 同类）：不可解析参数
+                                # 绝不以 {} 派发；回可行动截断错误并继续本轮。
+                                tool_args, _args_error = decide_tool_dispatch(_dispatch_plan, tc)
+                                if _args_error is not None:
+                                    yield {
+                                        "tool_call": {
+                                            "call_id": tc["id"],
+                                            "name": tool_name,
+                                            "arguments": {},
+                                        }
+                                    }
+                                    tool_results_map[tc["id"]] = ToolCallResult(
+                                        call_id=tc["id"],
+                                        name=tool_name,
+                                        arguments={},
+                                        result=_args_error,
+                                        error=True,
+                                    )
+                                    continue
 
                                 yield {
                                     "tool_call": {
@@ -9573,7 +9786,7 @@ class AgentLoop:
         if state.total_tool_calls > 0:
             synth_prompt = (
                 "所有工具调用已完成。现在请回答用户本轮提出的这个问题：\n"
-                f"「{_latest_q[:600]}」\n"
+                f"「{_latest_q}」\n"  # 2026-09-21 A4.9 F6：逐字全文（原 [:600]）
             )
             if state.turn_focus:
                 synth_prompt += f"本轮意图聚焦：{state.turn_focus[:400]}\n"
@@ -9588,7 +9801,7 @@ class AgentLoop:
         else:
             synth_prompt = (
                 "请进行深度思考后，给出对用户这个问题的最终回答：\n"
-                f"「{_latest_q[:600]}」\n"
+                f"「{_latest_q}」\n"  # 2026-09-21 A4.9 F6：逐字全文（原 [:600]）
             )
             if state.turn_focus:
                 synth_prompt += f"本轮意图聚焦：{state.turn_focus[:400]}\n"

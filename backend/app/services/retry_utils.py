@@ -141,6 +141,136 @@ def repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         return "{}"
 
 
+def parse_tool_arguments(raw: Optional[str]) -> Optional[dict]:
+    """Parse accumulated tool-call arguments, fail-closed.
+
+    Returns the parsed dict for complete payloads (including ones repaired by
+    adding missing closing braces after a COMPLETE value), `{}` for missing
+    arguments (no-param calls), and **None** when the payload is genuinely
+    truncated (cut mid-string) or is valid JSON that is not an object.
+
+    Callers MUST NOT dispatch a call whose parse returns None with empty
+    arguments: production incident conv fcb2e60a (voice notes.create_note)
+    showed the silent `{}` fallback executing a *different* call, which the
+    tool answered with "Unknown action" and the model retried the identical
+    overlong call until the round budget ran out.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, str):
+        # a non-string payload (dict/list/…) is not a provider-shaped argument
+        # string — fail closed instead of silently dispatching `{}`.
+        return None
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    if parsed is not None:
+        # valid JSON but not an object — invalid tool arguments (all tool
+        # schemas declare type=object); fail closed rather than dispatch.
+        return None
+    repaired = repair_tool_call_arguments(raw)
+    if repaired.strip() == "{}" and raw.strip() not in ("{}", "None"):
+        # repair_tool_call_arguments uses "{}" as its unrepairable sentinel
+        return None
+    try:
+        parsed = json.loads(repaired)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def truncated_tool_args_feedback(tool_name: str) -> str:
+    """Actionable tool result for a call whose arguments were cut off by the
+    model's output budget (or are otherwise unparseable). The model must
+    shrink/chunk the payload instead of repeating the same overlong call."""
+    return json.dumps(
+        {
+            "error": (
+                f"工具 {tool_name} 的参数被截断或不是合法 JSON（输出长度超出上限），调用未执行。"
+                "请把长内容分块写入（如笔记：先 create_note 写开头，再用 append_note "
+                "分批追加，每次约 800 字以内）；查询类操作可直接重试；"
+                "不要原样重复上一次的超长调用。"
+            ),
+            "_truncated": True,
+        },
+        ensure_ascii=False,
+    )
+
+
+def plan_tool_call_for_dispatch(tool_call: dict) -> Tuple[Optional[dict], Optional[str]]:
+    """Decide how to handle one tool call's arguments.
+
+    Returns ``(args, None)`` to dispatch normally, or ``(None, feedback_json)``
+    when the arguments are unusable — the caller must NOT execute the call and
+    should feed ``feedback_json`` back to the model as the tool result.
+    """
+    fn = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+    name = fn.get("name", "?") if isinstance(fn, dict) else "?"
+    raw = fn.get("arguments") if isinstance(fn, dict) else None
+    args = parse_tool_arguments(raw)
+    if args is None:
+        return None, truncated_tool_args_feedback(name)
+    return args, None
+
+
+def decide_tool_dispatch(
+    plan: Dict[str, Tuple[Optional[dict], Optional[str]]],
+    tool_call: dict,
+) -> Tuple[Optional[dict], Optional[str]]:
+    """Look up one call's pre-computed dispatch decision (see
+    ``plan_tool_calls_for_round``); defensively re-plans if the call id is
+    missing from the plan (never dispatch an unmapped call with empty args)."""
+    tc_id = tool_call.get("id", "") if isinstance(tool_call, dict) else ""
+    args, error = plan.get(tc_id, (None, None))
+    if args is None and error is None:
+        return plan_tool_call_for_dispatch(tool_call)
+    return args, error
+
+
+def plan_tool_calls_for_round(
+    tool_calls: List[dict],
+) -> Tuple[Dict[str, Tuple[Optional[dict], Optional[str]]], List[dict]]:
+    """Plan dispatch for one assistant round AND build provider-safe copies.
+
+    MUST be called on the RAW tool_calls, BEFORE any provider-safety
+    normalization rewrites ``arguments`` (the 2026-08-21 dflash2 fix used to
+    rewrite unparseable args in place to the ``"{}"`` sentinel — planning
+    first is exactly what keeps a truncated call from being dispatched as
+    ``{}`` and answered "Unknown action").
+
+    Returns ``(plan, safe_calls)``:
+      * ``plan``       — ``{call_id: (args, None)}`` → dispatch, or
+                         ``(None, feedback_json)`` → fail closed with a
+                         synthesized actionable tool result;
+      * ``safe_calls`` — NEW dicts for the assistant message sent upstream /
+                         persisted: every ``arguments`` is valid JSON (parsed
+                         as-is, repaired, or ``"{}"`` when unusable). The
+                         input dicts are never mutated.
+    """
+    plan: Dict[str, Tuple[Optional[dict], Optional[str]]] = {}
+    safe_calls: List[dict] = []
+    for tc in tool_calls:
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        raw = fn.get("arguments") if isinstance(fn, dict) else None
+        args, error = plan_tool_call_for_dispatch(tc)
+        plan[tc.get("id", "") if isinstance(tc, dict) else ""] = (args, error)
+        if error is not None or not isinstance(raw, str):
+            safe_args = "{}"
+        else:
+            safe_args = raw
+            try:
+                json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                safe_args = repair_tool_call_arguments(raw, fn.get("name", "?"))
+        safe_calls.append({**tc, "function": {**fn, "arguments": safe_args}})
+    return plan, safe_calls
+
+
 async def retry_async(
     coro_factory: Callable[[], Any],
     max_retries: int = _DEFAULT_MAX_RETRIES,

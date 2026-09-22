@@ -27,6 +27,45 @@ def _consolidation_failure_action(failures: int, max_failures: int = _MAX_CONSEC
     return "hold" if failures < max_failures else "advance"
 
 
+# episode 合并内容更新（2026-09-22 修复）：双方 source_unit_ids 均为空数组
+# （'[]'）时，jsonb_agg 聚合 0 行返回 NULL → 违反 source_unit_ids NOT NULL
+# 约束（生产事故用户：NotNullViolation 被吞后事务中毒，下一站 rebalance
+# 误报 InFailedSQLTransactionError）。COALESCE 保证空并集落 '[]'；
+# NULLIF 顺带规范化空串（''::jsonb 是同类 cast 报错隐患）。
+_EPISODE_MERGE_CONTENT_SQL = text("""
+    UPDATE memory_episodes SET narrative = :n,
+            embedding = COALESCE(CAST(:emb AS vector), embedding),
+            embedding_model = COALESCE(:m, embedding_model),
+            source_unit_ids = (
+                SELECT COALESCE(jsonb_agg(DISTINCT x), '[]'::jsonb) FROM (
+                    SELECT jsonb_array_elements_text(NULLIF(source_unit_ids, '')::jsonb) AS x
+                    FROM memory_episodes WHERE id IN (:kept, :merged)
+                ) t
+            )::text,
+            updated_at = NOW() WHERE id = :kept
+""")
+
+
+async def _isolated_merge_item(db: AsyncSession, label: str, coro_factory) -> bool:
+    """Run ONE per-item DB unit inside a SAVEPOINT (2026-09-22, A4.9-discipline).
+
+    A failed item must never poison the outer transaction. Production
+    incident (a production user): the episode-merge UPDATE raised
+    NotNullViolation inside a per-item try/except that logged at DEBUG only
+    and had no savepoint — the aborted asyncpg transaction then surfaced in
+    the NEXT step as a misleading InFailedSQLTransactionError and the whole
+    consolidation run was rolled back. Returns the factory's truthy result;
+    failures are logged at WARNING and isolated to their own savepoint.
+    """
+    try:
+        async with db.begin_nested():
+            ok = await coro_factory()
+        return bool(ok)
+    except Exception:
+        logger.warning("consolidation item failed: %s", label, exc_info=True)
+        return False
+
+
 import re as _re
 
 
@@ -362,12 +401,12 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                 a_trust, a_w, b_trust, b_w = r[3], r[4], r[8], r[9]
                 keep_a = a_trust in ("user_stated", "user_authored") or (a_w or 0) >= (b_w or 0)
                 kept_id, merged_id = (r[0], r[5]) if keep_a else (r[5], r[0])
-                try:
-                    if await merge_concepts(db, kept_id, merged_id):
-                        result["dedup_merged"] += 1
-                        continue
-                except Exception:
-                    logger.debug("fast-path merge failed %s<-%s", kept_id, merged_id, exc_info=True)
+                if await _isolated_merge_item(
+                    db, f"concept fast merge {kept_id}<-{merged_id}",
+                    lambda _k=kept_id, _m=merged_id: merge_concepts(db, _k, _m),
+                ):
+                    result["dedup_merged"] += 1
+                    continue
             remaining.append(r)
         concept_pairs = remaining
 
@@ -427,11 +466,11 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
             a_trust, a_w, b_trust, b_w = r[3], r[4], r[8], r[9]
             keep_a = a_trust in ("user_stated", "user_authored") or (a_w or 0) >= (b_w or 0)
             kept_id, merged_id = (r[0], r[5]) if keep_a else (r[5], r[0])
-            try:
-                if await merge_concepts(db, kept_id, merged_id):
-                    result["dedup_merged"] += 1
-            except Exception:
-                logger.debug("merge_concepts failed %s<-%s", kept_id, merged_id, exc_info=True)
+            if await _isolated_merge_item(
+                db, f"concept merge {kept_id}<-{merged_id}",
+                lambda _k=kept_id, _m=merged_id: merge_concepts(db, _k, _m),
+            ):
+                result["dedup_merged"] += 1
 
     # episodic 合并判断（同批机制）
     for batch_start in range(0, len(epi_pairs), 10):
@@ -478,41 +517,36 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
             keep_a = (a_vf or datetime.max) <= (b_vf or datetime.max)
             kept_id, merged_id = (a_id, b_id) if keep_a else (b_id, a_id)
             merged_narr = (m.get("merged_narrative") or "")[:5000]
-            try:
-                if merged_narr:
-                    emb = await embed_text(merged_narr)
+
+            async def _do_episode_merge(_kept=kept_id, _merged=merged_id, _narr=merged_narr):
+                if _narr:
+                    emb = await embed_text(_narr)
                     await db.execute(
-                        text("""UPDATE memory_episodes SET narrative = :n,
-                                embedding = COALESCE(CAST(:emb AS vector), embedding),
-                                embedding_model = COALESCE(:m, embedding_model),
-                                source_unit_ids = (
-                                    SELECT jsonb_agg(DISTINCT x) FROM (
-                                        SELECT jsonb_array_elements_text(source_unit_ids::jsonb) AS x
-                                        FROM memory_episodes WHERE id IN (:kept, :merged)
-                                    ) t
-                                )::text,
-                                updated_at = NOW() WHERE id = :kept"""),
-                        {"n": merged_narr, "emb": _emb_to_pgvector(emb) if emb else None,
-                         "kept": kept_id, "merged": merged_id,
+                        _EPISODE_MERGE_CONTENT_SQL,
+                        {"n": _narr, "emb": _emb_to_pgvector(emb) if emb else None,
+                         "kept": _kept, "merged": _merged,
                          "m": _get_embedding_model() if emb else None},
                     )
                     # B1（2026-09-14）：合并后的叙事更新进 episode BM25 索引
                     try:
                         from app.services.memory_bm25 import update_episode_index
-                        update_episode_index(user_id, kept_id, merged_narr)
+                        update_episode_index(user_id, _kept, _narr)
                     except Exception:
                         logger.debug("episode bm25 index update failed", exc_info=True)
                 await db.execute(
                     text("UPDATE memory_episodes SET valid_to = NOW(), superseded_by = :kept, updated_at = NOW() WHERE id = :merged"),
-                    {"kept": kept_id, "merged": merged_id},
+                    {"kept": _kept, "merged": _merged},
                 )
                 await db.execute(
                     text("UPDATE memory_episodes SET merged_from = :merged WHERE id = :kept"),
-                    {"merged": merged_id, "kept": kept_id},
+                    {"merged": _merged, "kept": _kept},
                 )
+                return True
+
+            if await _isolated_merge_item(
+                db, f"episode merge {kept_id}<-{merged_id}", _do_episode_merge,
+            ):
                 result["episodes_merged"] += 1
-            except Exception:
-                logger.debug("episode merge failed %s<-%s", kept_id, merged_id, exc_info=True)
 
 
 async def _rebalance_clusters(db: AsyncSession, user_id: str, result: dict) -> None:
@@ -663,16 +697,20 @@ async def _update_relations(db: AsyncSession, user_id: str, result: dict) -> Non
         )
         if dup.fetchone():
             continue
-        try:
-            await create_relation(db, user_id, sid, tid, rtype, rel.get("description", "")[:500])
-            result["relations_created"] += 1
-            if rtype == "contradicts":
+
+        async def _do_relation(_sid=sid, _tid=tid, _rtype=rtype, _rel=rel):
+            await create_relation(db, user_id, _sid, _tid, _rtype, _rel.get("description", "")[:500])
+            if _rtype == "contradicts":
                 # contradicts 关系同步触发矛盾降权（§5.3.1a）
                 from app.services.memory_weight_service import apply_reinforcement_signal
-                await apply_reinforcement_signal(db, sid, "dreaming_contradiction")
-                await apply_reinforcement_signal(db, tid, "dreaming_contradiction")
-        except Exception:
-            logger.debug("create_relation failed", exc_info=True)
+                await apply_reinforcement_signal(db, _sid, "dreaming_contradiction")
+                await apply_reinforcement_signal(db, _tid, "dreaming_contradiction")
+            return True
+
+        # A4.9 r1 Important①：原实现 debug 级吞异常且无 savepoint——单条写失败
+        # 毒化事务，下一轮 dup 查询即 InFailedSQLTransactionError（整轮回滚）。
+        if await _isolated_merge_item(db, f"relation {sid}->{tid}:{rtype}", _do_relation):
+            result["relations_created"] += 1
 
 
 async def _run_weight_decay(db: AsyncSession, user_id: str, result: dict) -> None:
@@ -817,11 +855,12 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
             temperature=float(config.memory.get("dream_temperature", 0.2)),
             max_tokens=config.memory.get("dream_max_tokens") or None,
         )
-        try:
-            from app.services.memory_cost_governance_service import record_llm_call
-            await record_llm_call(db, user_id, "dream")
-        except Exception:
-            logger.debug("record_llm_call failed", exc_info=True)
+        # A4.9 r1 Important②：入账原为 debug 级吞异常且无 savepoint——失败会
+        # 毒化事务，使紧接着的 state 查询 InFailedSQLTransactionError（整轮回滚）。
+        from app.services.memory_cost_governance_service import record_llm_call
+        await _isolated_merge_item(
+            db, "dream billing record", lambda: record_llm_call(db, user_id, "dream"),
+        )
         resp = (resp or "").strip()
         # 2026-08-16 收尾修复：复用 subconscious 的 _extract_json_object（三段式：
         # 直解析 → lstrip 剥围栏 → {} 区间提取），兼容缩进围栏与散文包裹 JSON

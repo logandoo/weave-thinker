@@ -105,7 +105,7 @@ def permission_key_for_tool_request(tool_name: str, details: Optional[Dict[str, 
         action = (details.get("action") or "").lower()
         if action == "create_note":
             return "note_create"
-        if action == "update_note":
+        if action in ("update_note", "append_note"):
             return "note_edit"
         if action == "delete_note":
             return "note_delete"

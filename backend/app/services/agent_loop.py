@@ -1068,6 +1068,23 @@ _AUDIT_MAP_ABSENT_MARKERS = (
     "无引用编号对照表", "没有引用编号对照表", "缺少引用编号对照表",
     "无对照表", "对照表不存在", "对照表缺失",
 )
+# 「条目类型」假判词（conv 038e837a）：审计把「对照表条目=检索/浏览来源条目」
+# 误判为「编号错误」（「这些编号对应的是检索结果条目，非论文具体细节……请核实
+# 并修正引用编号」）——已由审计模板【引用编号对照表核对口径】的条目类型定义
+# 澄清阻断在源头。**不再做确定性闸门扩展**（A4.10 换向）：区分「类目错误
+# （前提可证伪）」与「指向错误来源（语义指控）」必须做语义判断，关键词分类器
+# 三轮复审双向误判（自撞 marker / 漏拦改述），正撞用户红线「语义判断归 LLM」。
+# 该形态在 advisory 策略下 needs_evidence 本就静默出货，无重生成伤害面。
+# 「修正/核实引用编号」类无效指令仍随缺失族假判词从句剔除（见下）。
+# 「修正/核实引用编号」类无效指令（随假判词从句剔除，不再与闸门说明自相矛盾）。
+# 「改用正确编号」不在列——那是「指向错误来源」族的措辞，不属本闸门。
+# A4.9 R2 Minor-1：去掉动词到「引用编号」间的自由窗口——窗口会吞掉
+# 「请核实数据来源并修正引用编号」里的真实要求。
+_AUDIT_RENUMBER_CLAUSE_RE = _re.compile(
+    r"(?:核实|修正|更正|改正|核对)(?:并)?(?:修正|更正|改正)?引用编号"
+)
+# 「指向错误来源」语义指控（conv 038e837a）：与「条目类型」类目错误的区分必须
+# 语义判断 → 归 LLM（A4.10 换向，见 _AUDIT_MAP_ABSENT_MARKERS 注释）。
 # 「对照表未列出」须绑定**编号有效性**语境（A4.9 R1 Important-2 + R2 N-1）：
 # 「对照表未列出各论文页数/作者数」「对照表未列出编号对应的页数」都是真命题
 # （对照表本就只含 id/标题/URL），不得命中假判词闸门——可证伪的只有「编号
@@ -1084,6 +1101,10 @@ _AUDIT_MAP_GATE_OTHER_MARKERS = (
     "截断", "未展示", "无法核对", "无法核实", "片段", "无对应", "无相应",
     "悬空", "指代", "上一版", "被拒草稿", "自足", "独立",
     "不完整", "省略",
+    # A4.9 R1 Important-2：保留句中的**具体**行动要求（补出处/注明来源）是真
+    # 问题——无硬标记词也会被纯接收吞掉（「请核实并修正引用编号，并补上 47%
+    # 数据的出处」曾整句归零）。
+    "出处", "补上", "注明来源", "给出来源",
 )
 # 假判词从句的**黏连词**（A4.9 R2 N-1 + R3 N-1 残余 + R4）：「无法核实/无法核对」
 # 既是编号有效性抱怨的自身措辞，也是 truncation 族真问题的高频措辞——只有
@@ -1104,6 +1125,7 @@ def _erase_map_absent_markers(clause: str) -> str:
     out = clause or ""
     for m in _AUDIT_MAP_ABSENT_MARKERS:
         out = out.replace(m, " ")
+    out = _AUDIT_RENUMBER_CLAUSE_RE.sub(" ", out)
     return _AUDIT_MAP_ABSENT_RE.sub(" ", out)
 
 
@@ -1139,10 +1161,12 @@ def _is_map_absent_clause(clause: str) -> bool:
 
 def _strip_map_absent_clauses(problem: str) -> str:
     """剔除对照表假判词从句（A4.9 R1 Minor-1：「请重新核对引用编号」类无效
-    指令随从句整体移除，不再与闸门说明自相矛盾）。按 。；; 切分，保序拼接。"""
+    指令随从句整体移除，不再与闸门说明自相矛盾）。按 。；; 切分，保序拼接。
+    A4.9 R1 Important-2：保留的从句只抹除「修正引用编号」无效指令本身，
+    不整句吞掉（「请核实并修正引用编号，并补上 47% 数据的出处」须保住后半句）。"""
     clauses = _re.split(r"(?<=[。；;])", problem or "")
     kept = [c for c in clauses if c.strip() and not _is_map_absent_clause(c)]
-    return "".join(kept).strip()
+    return _AUDIT_RENUMBER_CLAUSE_RE.sub(" ", "".join(kept)).strip()
 
 
 def _citation_map_false_premise(
@@ -1150,14 +1174,18 @@ def _citation_map_false_premise(
 ) -> "Tuple[bool, int]":
     """对照表假判词检测。返回 (是否命中, 台账条数)；未命中 (False, 0)。
 
-    命中条件：problem 含对照表缺失类措辞（编号语境）∧ 本轮引用台账非空 ∧
-    草稿全部 [N] 编号合法（verify.unknown 为空）——此时「无法核对编号」的
-    前提被证伪（对照表已渲染进审计上下文）。「指向错误来源」类语义指控
-    **不在**本闸门范围（确定性不可判，保持原判）；草稿确有越界编号 →
-    审计有合法理由，不介入（与存在性闸门同 fail-closed 哲学）。
+    命中条件：problem 含对照表缺失类措辞（编号语境）或条目类型/编号需修正类
+    措辞 ∧ 本轮引用台账非空 ∧ 草稿全部 [N] 编号合法（verify.unknown 为空）——
+    此时「无法核对编号」「编号需修正」的前提被证伪（对照表已渲染进审计上下文，
+    编号全部命中）。「指向错误来源」类语义指控**不在**本闸门范围（确定性不可判，
+    保持原判）；草稿确有越界编号 → 审计有合法理由，不介入（与存在性闸门同
+    fail-closed 哲学）。
     """
     p = problem or ""
-    if not any(k in p for k in _AUDIT_MAP_ABSENT_MARKERS) and not _AUDIT_MAP_ABSENT_RE.search(p):
+    if not (
+        any(k in p for k in _AUDIT_MAP_ABSENT_MARKERS)
+        or _AUDIT_MAP_ABSENT_RE.search(p)
+    ):
         return False, 0
     ledger = getattr(state, "citation_ledger", None)
     if ledger is None or ledger.size <= 0:
@@ -4917,6 +4945,9 @@ class AgentLoop:
         "指向该表；证据台账条目的 [N] 是工具结果序号，与引用编号无关，"
         "不得用作引用编号核对依据。对照表未列出且超出合法范围的编号按不存在处理"
         "（普通序号/枚举则忽略）。\n"
+        "对照表条目即来源条目（检索/浏览结果，仅含 id/标题/URL）；期刊名、刊期、"
+        "实验描述等细节出自来源正文（证据台账），引用编号指向来源条目即为合法引用——"
+        "「条目是检索结果而非论文细节」不构成编号错误，不得据此要求修正引用编号。\n"
         "【有检索但零引用（2026-09-10，生产冒烟观察）】\n"
         "若本轮调用了 web_search 且草稿实质使用了检索结果中的具体信息（具体数据/"
         "评测结论/型号参数等），但通篇没有任何 [N] 引用标记 → verdict=needs_evidence"

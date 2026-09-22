@@ -620,6 +620,29 @@ def _transform_tool_loop_results(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _display_sequence_keep_evidence(seq):
+    """压缩/重答时 display_sequence 的取舍——与客户端 dropDraftTextAfterLastTool
+    **镜像对称**（A4.9 R1 Important-3）：保留 reasoning/tool 与最后一张工具卡之前
+    的 text 项（cap_released 的预工具散文用户已看见，A4.9 I2 不得刷新即蒸发），
+    仅丢弃最后一张工具卡之后的草稿 text 项。
+    conv 038e837a：旧实现整表清空，把工具卡与思考一并抹掉，刷新后证据链缺失。"""
+    items = list(seq or [])
+    last_tool = -1
+    for i in range(len(items) - 1, -1, -1):
+        it = items[i]
+        if isinstance(it, dict) and it.get("type") in (
+            "tool_placeholder", "tool_call", "tool",
+        ):
+            last_tool = i
+            break
+    kept = []
+    for i, it in enumerate(items):
+        if isinstance(it, dict) and it.get("type") == "text" and i > last_tool:
+            continue
+        kept.append(it)
+    return kept
+
+
 def _build_content_fallback(joined_content: str, tool_results_json: str | None) -> str:
     if joined_content:
         return joined_content
@@ -2060,6 +2083,8 @@ async def chat_stream(
                 # message instead of persisting an empty/invisible turn.
                 _loop_error: str | None = None
                 current_reasoning_segment = ""
+                # A4.9 R2 N1：hold-cap 释放给用户的预工具散文快照（压缩时保留）。
+                _released_prose = ""
                 # 遵循词 canary streaming strip: hold-back tails. LLM deltas are
                 # 1-3 chars, so [遵循词:xxxxxx] is routinely split across chunks
                 # and per-chunk regex strip misses it (conv 6227fb26 leak).
@@ -2476,6 +2501,11 @@ async def chat_stream(
                                     # persisted answer — the user saw it and it
                                     # must not vanish on refresh (A4.9 I2).
                                     assistant_content = ""
+                                else:
+                                    # A4.9 R2 N1：快照已释放的预工具散文——压缩时
+                                    # 只保留它，其后（工具后）的草稿仍按契约丢弃，
+                                    # 否则「散文+旧稿+重答」三段拼接落库。
+                                    _released_prose = assistant_content
                                 # Held canary tails belong to the discarded
                                 # pre-tool draft — reset so no stale partial
                                 # marker is prepended to post-tool content.
@@ -2604,35 +2634,55 @@ async def chat_stream(
                                 await _put({"ping": True})
 
                             elif "compression" in event:
-                                # Canary/token-threshold compression fired
-                                # mid-turn: the model will re-answer with the
-                                # compacted context. Discard the pre-compression
-                                # draft so the PERSISTED answer is the
-                                # regenerated one, not a concatenation
-                                # (reviewer A4.9 fix: I2). Note: the draft was
-                                # already streamed live — the client shows it
-                                # until the "上下文压缩" step, which is
-                                # irreversible at the SSE layer (M2). The
-                                # token-threshold trigger fires before any
-                                # content, so resetting is a no-op there.
-                                # Tool accumulators are reset too (M3): tool
-                                # cards of the discarded draft would otherwise
-                                # attach to the regenerated message, but the
-                                # compression summary preserves their outcome.
+                                # 压缩 = 丢弃草稿文本、以压缩后上下文重答（A4.9 I2：
+                                # 持久化答案是重答稿，不是拼接稿）。
+                                # conv 038e837a（2026-09-22）修复两点：
+                                #   1. 工具证据三件套必须跨压缩存活——citation_ledger
+                                #      不随压缩重置，清空 tool_results_accumulated 会让
+                                #      落库 results[] 缩水（30→10），草稿合法 [N] 越界被
+                                #      sanitize_texts 误剥（角标/卡片全丢）。与 audit_reset
+                                #      （conv efaf8f9c）既定政策对齐：工具工作是本轮证据。
+                                #   2. 下发 audit_reset 做客户端时间轴清创（conv 827a6f78
+                                #      同族）——被丢弃的旧稿不再与重答同屏（重复生成）。
                                 logger.debug("Context compressed: %s", event["compression"])
-                                assistant_content = ""
-                                assistant_reasoning = ""
+                                # A4.9 R2 N1 / R3：_released_prose 只在散文确被
+                                # hold-cap 释放时置位（空串=从未释放）——它是释放
+                                # 事实的快照，不依赖压缩时刻的 cap_released
+                                # （on_tool_call 已复位该标志）。
+                                _keep_prose = _released_prose
+                                _had_dropped_text = bool(
+                                    assistant_content and assistant_content != _keep_prose
+                                ) or bool(content_segments)
+                                assistant_content = _keep_prose
+                                # trailing 思考段不静默丢弃（audit_reset A4 parity）：
+                                # 落盘为 reasoning_step，思考与工具不随草稿丢弃。
+                                reason_seg = current_reasoning_segment.strip()
+                                if reason_seg:
+                                    display_sequence.append({
+                                        "type": "reasoning_step",
+                                        "title": "💭 思考过程",
+                                        "content": reason_seg,
+                                    })
                                 current_reasoning_segment = ""
                                 content_segments = []
-                                display_sequence = []
-                                tool_results_accumulated = []
-                                tool_call_events_accumulated = []
-                                search_queries_used = []
-                                search_queries_by_call = {}
+                                _seq_before = len(display_sequence)
+                                display_sequence = _display_sequence_keep_evidence(display_sequence)
+                                _had_dropped_text = _had_dropped_text or (
+                                    len(display_sequence) != _seq_before
+                                )
                                 _canary_tail = ""
                                 _reasoning_canary_tail = ""
                                 _reasoning_meta_tail = ""
                                 _pre_tool_gate.reset()
+                                # 客户端清创：仅当确有草稿文本被丢弃才下发——
+                                # 无文本可丢的前置压缩（token-threshold/deathmatch
+                                # forced）保持既有 no-op，不得误删上一轮已落库文本
+                                # （A4.9 R1 Important-4）。死磕多轮流（turn 边界
+                                # 不在事件里）暂不下发：dropDraftTextAfterLastTool
+                                # 非 turn 作用域，会连带删掉上一轮已落库答案文本
+                                # （A4.9 R2 N3，已知边界）。
+                                if _had_dropped_text and _deathmatch_mgr is None:
+                                    await _put({"audit_reset": True})
                                 # 压缩前后 token 对比（含工具 schema 口径）——
                                 # 前端在「上下文压缩」步骤块内展示 X → Y tokens 变化。
                                 _comp = event["compression"] or {}
@@ -2643,7 +2693,11 @@ async def chat_stream(
                                 # token-badge refresh. Token-threshold
                                 # compressions (pre-turn maintenance) stay
                                 # visible as before.
-                                if not _comp.get("silent"):
+                                if not _comp.get("silent") or _had_dropped_text:
+                                    # A4 (2026-08-21)：canary 压缩静默（仅日志 +
+                                    # token 徽章）。但草稿被丢弃时用户会看见文本消失
+                                    # ——此时不再是「用户不可见」，必须补时间线步骤
+                                    # 说明（A4.9 R1 Minor-2）。
                                     from app.services.context_compressor import format_compression_step_content
                                     await _put({
                                         "agent_step": {

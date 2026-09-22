@@ -29,7 +29,7 @@
 | `ink-paper` | 墨韵纸间 | 贴边发丝线（1px `--skin-line` + 小圆角 + 宋体标题） | 宣纸暖底、朱砂点墨的文房气质 |
 | `mono-brutal` | 黑白构成 | 硬边直角（2–3px 黑框 + 偏移硬影 + 900 黑体标题） | 高对比黑白构成，橙色锐利点缀 |
 
-皮肤目录经 `GET /api/skins` 公开暴露（含 `token_contract_version`）。前端注册表 `frontend/src/config/skins.ts` 与后端 `backend/app/api/skins.py SKIN_CATALOG` **id 必须一致**（`tests/api/test_skin_api.py` + `frontend/e2e/skin_system.spec.ts` 双向断言）。
+皮肤目录经 `GET /api/skins` 公开暴露（含 `token_contract_version`）。前端注册表 `frontend/src/config/skins.ts` 与后端 `backend/app/api/skins.py SKIN_CATALOG` **id 必须一致**（开发侧双向断言保障；测试不随发行）。
 
 ## 3. 令牌契约（Token Contract）
 
@@ -156,7 +156,7 @@ html[data-skin="example-skin"] .reasoning-menu {
 2. 组件覆写必须 `html[data-skin="<id>"] .x` 前缀（0,2,1）；裸 `[data-skin] .x`（0,1,1）压不过 scoped。
 3. 移动端覆写必须防压基线：桌面规则（如 `position:relative`）会压过移动基线（`position:fixed`）→ 移动豁免块补 `!important`。
 4. 每皮肤必须同时定义 light + dark 两组令牌；dark 块选择器双属性优先级最高、放最后。
-5. 对比度：正文 ≥ 4.5:1；主按钮白字可读（参考 `design/mockups/tests/check_contrast.mjs`）。wave-12 起**深色全表面审计**为纪律：`tests/w12_capture.py` 自建 DOM 审计器（getComputedStyle 全树行走含祖先链复合背景/gradient 首停靠色 + icon-only 探针 + disabled 按 WCAG 1.4.11 记豁免），改皮肤或加 UI 表面后手工跑一遍。
+5. 对比度：正文 ≥ 4.5:1；主按钮白字可读（开发侧有对比度检查脚本）。wave-12 起**深色全表面审计**为纪律：自建 DOM 审计器（开发侧脚本）（getComputedStyle 全树行走含祖先链复合背景/gradient 首停靠色 + icon-only 探针 + disabled 按 WCAG 1.4.11 记豁免），改皮肤或加 UI 表面后手工跑一遍。
 6. **级联 hover 陷阱（wave-12 血泪）**：组件 scoped `.x[data-v]:hover:not(:disabled)` 特异性 (0,5,0) 压皮肤 (0,4,1)——**鼠标划过即触发**（静态探针全绿、流式中翻车）。每个 :hover/:active 皮肤覆写都要对组件 scoped 同族选择器算特异性（`[data-v]`+伪类常数在 (0,4,0)~(0,5,0)），压不过时用重复类名 `(0,5,1)+` 锁死全部互动态。
 7. **dark 成对（wave-12 起）**：wave-5~11 八轮的病根=组件级覆写只写浅色硬编码、dark 只逐点名补 → 系统性浅底浅字（assistmenu 45 fail 基线）。新表面必须 light/dark 成对交付；只补用户点名项=教训（wave-13 首轮 3 hover → 二报同族 17 处），收到点报立刻 grep 同色族全补。
 8. **`--color-border` 禁作 hover 底色（wave-16）**：mono 下 `--color-border`=#111 → 黑底黑字（代码窗复制钮用户现场）；hover 底色用专门语义或 `color-mix(in srgb, var(--color-text) 12%, var(--color-hover))` 全皮自适应（实测 ≈12.4:1）。
@@ -205,11 +205,11 @@ html[data-skin="example-skin"] .reasoning-menu {
 
 ## 8. 解耦审计（wave-11 基线，backlog 更新至 wave-15/16）
 
-`tests/skin_audit.py`（输出 `tests/skin_audit_report.md`，CI 化前可手工跑）：
+皮肤审计脚本（输出报告；开发侧，测试不随发行）：
 
 - **红线 1**：全部组件 `.vue` 的 scoped style 中 `[data-skin` 选择器 = **0**（皮肤知识单点存于 `styles/themes/*.css` + 运行时注册表）✅
 - **红线 2**：JS 皮肤-id 条件分支（白名单 `stores/skin.ts` `config/skins.ts` `api/skins.ts` `index.html` 预引导外）= **0** ✅
-- **余量 backlog（非阻断，历史遗留硬编码色，wave-15/16 后刷新）**：ChatArea 40 · Sidebar 36 · ChatInput 34 · VoiceChat 31 · MemoryPanel 26 · SkillsPanel 25 · TaskProgress 25 · NoteEditor 24 · …（全表 `tests/skin_audit_report.md` §3，重跑 `python3 tests/skin_audit.py` 再生）。对比 wave-11 口径：BackgroundTaskPanel 53→10（后台任务面板 Material 色 28 处令牌化）、ChatArea 107→40（死磕状态条/盘问卡/附件卡 54 处令牌化）。这些色带在上传皮肤下仍保持青野基调，列入后续波次 token 化。
+- **余量 backlog（非阻断，历史遗留硬编码色，wave-15/16 后刷新）**：ChatArea 40 · Sidebar 36 · ChatInput 34 · VoiceChat 31 · MemoryPanel 26 · SkillsPanel 25 · TaskProgress 25 · NoteEditor 24 · …（全表见开发侧审计报告，重跑审计脚本再生）。对比 wave-11 口径：BackgroundTaskPanel 53→10（后台任务面板 Material 色 28 处令牌化）、ChatArea 107→40（死磕状态条/盘问卡/附件卡 54 处令牌化）。这些色带在上传皮肤下仍保持青野基调，列入后续波次 token 化。
 
 **判定**：内置三套皮肤与上传皮肤对本节六界面 + 第 3 节全部令牌面，均可经「令牌覆写 + 组件覆写」完成样式替换，无单独写死路径；已知例外 = backlog 色带（上表）。
 
@@ -235,9 +235,9 @@ html[data-skin="example-skin"] .reasoning-menu {
 - 测试只跑 **8158 生产构建**（`./scripts/project_build.sh`；占用时 `stop.sh/start.sh` PID 文件方式重启，禁 pkill 模式匹配）。**改源码后必须重新构建再测**——8158 验收面是构建产物，忘构建=测旧 bundle（wave-14 教训）。
 - 皮肤回归 spec 全集（`frontend/e2e/`）：`skin_system.spec.ts`（内置三皮肤组件对齐，6 例）· `skin_wave8/9/10.spec.ts`（逐波元素对齐）· `skin_wave11.spec.ts`（六界面 + 上传流）· `skin_wave14.spec.ts`（登录页 6 组合 + 明暗翻转 + sidebar 两行等宽/中心线 ±1px）· `skin_wave15.spec.ts`（五盲区：后台任务/死磕状态条/草稿箱/附件卡/盘问卡，6 例）· `skin_wave16.spec.ts`（mono 四盲区 + 公式/mermaid 卡 + 复制钮 hover，8 例）· `skin_wave17.spec.ts`（wave-17/17b：sidebar 二级菜单六组 + 分组编辑卡三皮 + 移动端会话左划色板×2 态 + 笔记页头部/卡/附属面 + np 侧栏左划交互 + 桌面回归 + 卡片无遮罩/np 方条/左划内容尺寸，31 例）· `mobile_voice_mode_toggle_return.spec.ts`（移动端三皮肤语音浮层）；生产构建取证 `skin_wave8_prod.spec.ts`。
 - e2e 造数配方（wave-15 沉淀，可复用）：后台任务=POST /api/agent-tasks；草稿=localStorage `weaver_drafts_v1`；附件=route-mock GET /api/conversations/{id}（selectConversation 走详情端点内嵌 messages）；死磕状态条=SQL 种 deathmatch_mode/status（ConversationUpdate 不可写）；盘问卡=route-mock POST /api/chat/stream SSE `deathmatch_verdict`（grillingQuestions 只经 SSE 进入）。
-- 深色全表面对比度：`tests/w12_capture.py` DOM 审计器（见第 5 节红线 5），skin 波次收尾必跑。
-- 后端 API 测试：`tests/api/test_skin_api.py`（目录/偏好 22 断言）· `tests/api/test_skin_upload.py`（上传 23 断言）；运行需后端在位（默认 `https://localhost:8158`）。
-- 媒体证据评级走 mm-sensor（`tests/mm_ratings/`），不外发设计稿；像素级视觉留用户目检（wave-13 用户裁决：本模型无图像输入，降级=计算样式 oracle 断言 mockup 精确值）。
+- 深色全表面对比度：自建 DOM 审计器（开发侧脚本）（见第 5 节红线 5），skin 波次收尾必跑。
+- 后端 API 测试（目录/偏好 22 断言 · 上传 23 断言；测试不随发行）；运行需后端在位（默认 `https://localhost:8158`）。
+- 媒体证据评级走 mm-sensor（评级记录不随发行），不外发设计稿；像素级视觉留用户目检（wave-13 用户裁决：本模型无图像输入，降级=计算样式 oracle 断言 mockup 精确值）。
 
 ## 11. 社区皮肤路线图
 

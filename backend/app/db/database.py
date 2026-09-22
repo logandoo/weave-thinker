@@ -647,7 +647,7 @@ class AgentTask(Base):
     # F1（2026-09-14）：运行中补充消息（JSON 数组 [{id, content, created_at}]，
     # worker 每 5s 轮询推入 interjection_queue 并在投递后清空；可空）
     pending_messages = Column(Text, nullable=True)
-    # D-轻（2026-09-22 durable execution 波）：断点续跑快照（JSON
+    # 断点续跑快照（JSON
     # {version,cursor,messages,budget_used,elapsed,updated_at}）。有值时
     # 启动恢复置 resumable 并从 cursor 续跑；无值维持旧行为（标 failed）。
     checkpoint = Column(Text, nullable=True)
@@ -660,7 +660,7 @@ class AgentTask(Base):
 
 
 class DurableJob(Base):
-    """D-重（2026-09-22）：durable job runner 的持久作业句柄。
+    """持久作业（durable job runner）的作业句柄。
 
     execute_code/process/terminal 的 5h+ 重作业提交为 detached 子进程作业：
     状态机 queued→leased→running→{succeeded,failed,cancelled,unknown}（迁移
@@ -719,7 +719,7 @@ class DurableJobArtifact(Base):
 
 
 class SideEffectLedger(Base):
-    """副作用台账（D-轻）：幂等键 v2 含 call_id，重放同 call 命中即跳过（failed 允许重试）。
+    """副作用台账：幂等键含 call_id，重放同 call 命中即跳过（failed 允许重试）。
 
     键格式见 app.services.durable_types.make_key（keyed on cursor+call_id 不是 seq）。
     """

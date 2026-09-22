@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""side_effect_ledger — D-轻（2026-09-22）副作用台账：重放不重复执行。
+"""side_effect_ledger — 副作用台账：重放不重复执行。
 
-协议（Hub v2）：幂等键 make_key(principal_type, principal_id, cursor, tool_name, call_id)，
+协议：幂等键 make_key(principal_type, principal_id, cursor, tool_name, call_id)，
 keyed on cursor 不是 seq（重放同一步得同 key；dev.to 2026-08 生产教训）。
 
 语义（write-before-invoke / result-before-advance）：
@@ -31,7 +31,7 @@ async def begin(store: LedgerStore, principal_type: str, principal_id: str,
                 cursor: int, tool_name: str, call_id: str) -> Optional[str]:
     """写前登记 pending；重复返回 None（=已记录 → 调用方跳过执行）。
 
-    A4.9 R2 N4：既有记录为 failed 时允许重试（原子失败=外部效果未完成，
+    既有记录为 failed 时允许重试（原子失败=外部效果未完成，
     可安全重放）——把行改回 pending 并返回 key；done/pending/unknown 不重放。
     """
     key = make_key(principal_type, principal_id, int(cursor), tool_name, call_id)
@@ -52,7 +52,7 @@ async def begin(store: LedgerStore, principal_type: str, principal_id: str,
         if fn is None:
             await store.update(key, "pending", None)
             return key
-        # R6：原子 failed→pending（条件更新）——并发下不覆盖刚写入的 done
+        # 原子 failed→pending（条件更新）——并发下不覆盖刚写入的 done
         return key if await fn(key, "failed", "pending") else None
     return None
 
@@ -75,7 +75,7 @@ async def should_skip(store: LedgerStore, principal_type: str, principal_id: str
     row = await store.get(key)
     if row is None:
         return False
-    # A4.9 R2 N4：failed 允许重试（不得把失败的 attempt 当成功吞掉）；
+    # failed 允许重试（不得把失败的 attempt 当成功吞掉）；
     # pending/done/unknown 一律不重放（write-before-invoke：宁可不双写）。
     return row.get("status") != "failed"
 
@@ -125,7 +125,7 @@ class SqlLedgerStore:
             await db.commit()
 
     async def update_if(self, key, expected_status, status):
-        """R6：条件更新（CAS）——status==expected 才迁移；返回是否生效。"""
+        """条件更新（CAS）——status==expected 才迁移；返回是否生效。"""
         from sqlalchemy import update as sa_update
         from app.db.database import AsyncSessionLocal, SideEffectLedger
         async with AsyncSessionLocal() as db:

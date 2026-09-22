@@ -1421,11 +1421,11 @@ class Config:
 
     @property
     def agent_background_tasks_max_concurrent(self) -> int:
-        # P2（2026-09-22 durable execution 波）：并发钳制 [1,8]（0/负数→1、99→8）
+        # 并发钳制 [1,8]（0/负数→1、99→8）
         from app.services.durable_types import clamp_concurrency
         return clamp_concurrency(self.agent_background_tasks.get("max_concurrent_tasks", 3))
 
-    # ---- Durable jobs（D-重, 2026-09-22）：5h+ 重作业持久执行 ----
+    # ---- Durable jobs：5h+ 重作业持久执行 ----
 
     @property
     def agent_durable_jobs(self) -> dict:

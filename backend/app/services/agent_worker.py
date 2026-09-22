@@ -69,7 +69,7 @@ class AgentWorker:
         self._poll_task: asyncio.Task | None = None
         self._running_task_ids: set[str] = set()
         self._worker_tasks: set[asyncio.Task] = set()
-        # D-轻（A4.9 R1 C5）：优雅停机标记——drain 中断的任务落 resumable 非 cancelled
+        # 优雅停机标记——drain 中断的任务落 resumable 非 cancelled
         self._draining = False
 
     async def start(self) -> None:
@@ -102,7 +102,7 @@ class AgentWorker:
         recovered = 0
         try:
             async with AsyncSessionLocal() as db:
-                # A4.9 R1 I9：多实例下不踩踏对端活任务——心跳 120s 内的 active
+                # 多实例下不踩踏对端活任务——心跳 120s 内的 active
                 # worker 视为存活，其名下任务不由本实例恢复（单机模式 alive 为空=旧行为）
                 alive_others: list = []
                 if shared_state.is_db_enabled:
@@ -141,7 +141,7 @@ class AgentWorker:
                     )
                     result = await db.execute(stmt)
                     recovered += result.rowcount
-                    # D-轻（2026-09-22）：有 checkpoint → resumable（sweeper 领取续跑），
+                    # 有 checkpoint → resumable（sweeper 领取续跑），
                     # 无 → failed（旧行为）；completed_at 置空（任务未终结）。
                     stmt_res = (
                         update(AgentTask)
@@ -166,7 +166,7 @@ class AgentWorker:
             logger.exception("Failed to recover orphaned agent tasks")
 
     async def stop(self) -> None:
-        # A4.9 R2 C5：先置 drain 标记——CancelledError 分支据此落 resumable
+        # 先置 drain 标记——CancelledError 分支据此落 resumable
         # （此前 _draining 从未置 True，_mark_drained 为死代码）
         self._draining = True
         if self._poll_task is not None:
@@ -179,7 +179,7 @@ class AgentWorker:
         if self._worker_tasks:
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
             self._worker_tasks.clear()
-        # D-轻 drain（2026-09-22）：停机打断的任务落 resumable（有快照）而非 failed
+        # 停机打断的任务落 resumable（有快照）而非 failed
         try:
             await self._recover_orphaned_tasks(force=True)
         except Exception:
@@ -192,7 +192,7 @@ class AgentWorker:
         while True:
             try:
                 await self._poll_pending_tasks()
-                # A4.9 R2 N1：周期陈旧恢复——硬杀对端 worker 的心跳窗口（120s）
+                # 周期陈旧恢复——硬杀对端 worker 的心跳窗口（120s）
                 # 过期后，其 running/claimed 任务被 force=False 扫回（stale>N 分钟），
                 # 否则仅启动一次的对账会让这些任务永久搁浅。
                 _recovery_tick += 1
@@ -213,7 +213,7 @@ class AgentWorker:
             stmt = (
                 select(AgentTask)
                 .where(
-                    # D-轻：resumable（有 checkpoint 的被中断任务）与 pending 同等可领
+                    # resumable（有 checkpoint 的被中断任务）与 pending 同等可领
                     AgentTask.status.in_(("pending", "resumable")),
                     AgentTask.task_type != "grilling",
                 )
@@ -243,10 +243,10 @@ class AgentWorker:
 
     async def _preflight_pending_tool_calls(self, messages, *, task_id, cursor, user,
                                             conversation, assistant, workspace_path):
-        """A4.9 R2 N3：恢复时重派 checkpoint 中未回填的 tool_calls。
+        """恢复时重派 checkpoint 中未回填的 tool_calls。
 
         语义：done/pending/unknown → 合成已记录结果或跳过（宁可 不双写）；
-        无记录 → 执行并回填台账；failed → 允许重试（N4）。随后补齐 tool 结果
+        无记录 → 执行并回填台账；failed → 允许重试。随后补齐 tool 结果
         消息，主循环从该边界继续（at-least-once）。
         """
         import json as _json
@@ -285,12 +285,12 @@ class AgentWorker:
                 continue
             _args, _args_error = decide_tool_dispatch(_plan, tc)
             if _args_error is not None:
-                # R3 NEW-1：截断调用——合成反馈，绝不派发、不记台账（后续可重试）
+                # 截断调用——合成反馈，绝不派发、不记台账（后续可重试）
                 out.append({"role": "tool", "tool_call_id": call_id, "name": name,
                             "content": _args_error})
                 continue
             _args = _args if isinstance(_args, dict) else {}
-            # R3 NEW-2：与后台任务同级的权限门（denied ops 不因恢复而绕过）
+            # 与后台任务同级的权限门（denied ops 不因恢复而绕过）
             try:
                 if not _perm_cb(_conv_id, name, "", dict(_args)):
                     result_text = _json.dumps(
@@ -446,7 +446,7 @@ class AgentWorker:
 
             messages.append({"role": "user", "content": task.goal or ""})
 
-            # D-轻（2026-09-22）：有 checkpoint → 全量回放快照 messages + 消费计数
+            # 有 checkpoint → 全量回放快照 messages + 消费计数
             # 续算（State-Aware 恢复：重建下一次上下文视图，不做有损摘要）。
             resume_preused = 0
             if getattr(task, "checkpoint", None):
@@ -454,7 +454,7 @@ class AgentWorker:
                     from app.services.task_checkpoint import parse_checkpoint, plan_resume
                     _cp = parse_checkpoint(task.checkpoint)
                     messages, resume_preused = plan_resume(_cp)
-                    # A4.9 R2 N3：重派在飞机 tool_calls（台账去重）后再续跑；
+                    # 重派在飞机 tool_calls（台账去重）后再续跑；
                     # cursor=checkpoint.budget_used（即该迭代 consume 后的计数）。
                     messages = await self._preflight_pending_tool_calls(
                         messages, task_id=task_id, cursor=int(resume_preused),
@@ -465,7 +465,7 @@ class AgentWorker:
                 except ValueError:
                     logger.exception("checkpoint unusable (loud error honored) — starting fresh")
 
-            # D-轻：checkpoint 回调（1s 节流；fail-open）
+            # checkpoint 回调（1s 节流；fail-open）
             _cp_last = 0.0
 
             async def _checkpoint_cb(cp, _task_id=task_id):
@@ -851,7 +851,7 @@ class AgentWorker:
                 _pending_poller.cancel()
                 with suppress(asyncio.CancelledError):
                     await _pending_poller
-            # D-轻 drain（A4.9 R1 C5）：优雅停机打断 → resumable（保留快照）而非
+            # 优雅停机打断 → resumable（保留快照）而非
             # cancelled；用户显式取消（_cancelled 正常返回路径）仍 cancelled。
             if self._draining:
                 await self._mark_drained(task_id)
@@ -1008,7 +1008,7 @@ class AgentWorker:
             logger.exception("Failed to mark task %s as cancelled", task_id)
 
     async def _mark_drained(self, task_id: str) -> None:
-        """D-轻（A4.9 R2 C5 / R3 NEW-3）：优雅停机中断 → resumable（有快照）/failed（无）。
+        """优雅停机中断 → resumable（有快照）/failed（无）。
 
         状态守卫：仅 running/claimed 可被 drain 改写——绝不把已 completed /
         cancelled / 等终态复活为 resumable（违反「显式取消仍 cancelled」）。

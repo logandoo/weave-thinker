@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""workspace_lock_service — P1（2026-09-22 durable execution 波）。
+"""workspace_lock_service — per-path 写锁 + 同路径分波并行。
 
 两件事：
 1. `path_lock(user_id, path)`：per-(user, path) asyncio.Lock——跨任务/跨并发写
@@ -29,7 +29,7 @@ def _norm_path(path: str) -> str:
 
 
 def canonical_key_path(workspace_path: Any, raw: str) -> str:
-    """A4.9 R2 I8：把 path/file_path 统一为绝对规范键——相对路径 join 工作区，
+    """把 path/file_path 统一为绝对规范键——相对路径 join 工作区，
     realpath 消解 ../ 与符号链接（目标不存在时也安全）。"""
     if not raw:
         return ""
@@ -71,7 +71,7 @@ def _tc_path(tc: Dict[str, Any], workspace_path: Any = None) -> Optional[str]:
             return None
     if not isinstance(args, dict):
         return None
-    p = args.get("path") or args.get("file_path")  # A4.9 R1 I8：别名同键
+    p = args.get("path") or args.get("file_path")  # 别名同键
     if not isinstance(p, str) or not p:
         return None
     return canonical_key_path(workspace_path, p) if workspace_path else _norm_path(p)
@@ -81,7 +81,7 @@ def partition_write_waves(tool_calls: List[Dict[str, Any]],
                           workspace_path: Any = None) -> List[List[Dict[str, Any]]]:
     """贪心最早波放置：同波内路径两两不同；同路径按模型顺序先后入波。
 
-    A4.9 R2 I8：带 workspace_path 时路径规范化为绝对键（相对/绝对/符号链接同键）。
+    带 workspace_path 时路径规范化为绝对键（相对/绝对/符号链接同键）。
     """
     if not tool_calls:
         return []

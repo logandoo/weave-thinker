@@ -295,11 +295,14 @@ async def terminal(args: dict, **kwargs) -> str:
             "_permission_description": f"命令请求访问工作区外路径: {outside_path}",
         }, ensure_ascii=False)
 
-    # D-重（2026-09-22）：durable=true → 提交持久作业立即返回句柄（脱出 120s 内联顶）。
+    # durable=true → 提交持久作业立即返回句柄（脱出 120s 内联顶）。
     if args.get("durable"):
         _uid = str(getattr(kwargs.get("user"), "id", "") or "")
         if not _uid:
             return json.dumps({"error": "durable terminal job requires an authenticated user"},
+                              ensure_ascii=False)
+        if not config.agent_durable_jobs_enabled:
+            return json.dumps({"error": "持久作业已被配置禁用（[agent.durable_jobs] enabled=false）"},
                               ensure_ascii=False)
         from app.services.job_runner_service import get_job_runner
         job = await get_job_runner().submit(

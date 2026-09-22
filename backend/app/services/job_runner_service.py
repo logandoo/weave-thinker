@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""job_runner_service — D-重（2026-09-22 durable execution 波）durable job runner。
+"""job_runner_service — 持久作业（durable job runner）。
 
-职责（docs/PLAN_durable_execution_wave.md T3 / Consistency Hub）：
+职责：
 - execute_code/process/terminal 的 5h+ 重作业 → detached 子进程持久执行：
   后端重启不杀作业（start_new_session），退出回执 = 作业目录 exit_code 文件。
 - 状态机 queued→leased→running→{succeeded,failed,cancelled,unknown}
@@ -50,7 +50,7 @@ _MAX_ARTIFACTS = 50
 
 
 class JobStore(Protocol):
-    """作业存储缝（Hub：恢复凭据而非仅远端状态）。"""
+    """作业存储缝（恢复凭据而非仅远端状态）。"""
 
     async def get(self, job_id: str) -> Optional[Dict[str, Any]]: ...
     async def get_by_key(self, key: str) -> Optional[Dict[str, Any]]: ...
@@ -100,7 +100,7 @@ def read_exit_code(job_dir: Path) -> Optional[int]:
 
 
 def read_log_chunk(log_path: Any, offset: Any, max_chunk: int = 262_144) -> Tuple[str, int]:
-    """日志游标增量读取（不重复、不丢尾；R6 有界读：单次至多 max_chunk 字节）。"""
+    """日志游标增量读取（不重复、不丢尾；有界读：单次至多 max_chunk 字节）。"""
     off = max(0, int(offset or 0))
     if not log_path:
         return "", off
@@ -116,7 +116,7 @@ def read_log_chunk(log_path: Any, offset: Any, max_chunk: int = 262_144) -> Tupl
     with open(p, "rb") as f:
         f.seek(off)
         data = f.read(max(1, int(max_chunk)))
-    # R6 复审 N1：分片边界安全——回退尾部不完整 UTF-8 序列（下一读从完整码点开始），
+    # 分片边界安全——回退尾部不完整 UTF-8 序列（下一读从完整码点开始），
     # 避免 CJK 密集日志在每次分片处产生替换符且字节永不返回。
     if off + len(data) < size:
         import codecs
@@ -132,7 +132,7 @@ _DT_FIELDS = ("created_at", "started_at", "finished_at", "lease_until", "cancel_
 
 
 def _norm_dt(value: Any) -> Any:
-    """R6：ISO 字符串 → datetime（DateTime 列写入前显式规范化，不赌驱动强转）。"""
+    """ISO 字符串 → datetime（DateTime 列写入前显式规范化，不赌驱动强转）。"""
     if isinstance(value, str):
         try:
             return datetime.fromisoformat(value)
@@ -177,7 +177,7 @@ def _pid_alive(pid: Any) -> bool:
 
 
 def _kill_process_group(pid: Any) -> None:
-    """SIGTERM 作业进程组（A4.9 R1 I3：先验 pgid==pid——作业经 start_new_session
+    """SIGTERM 作业进程组（先验 pgid==pid——作业经 start_new_session
     自任组长；不匹配=pid 疑似被回收复用，拒绝误杀）。"""
     try:
         pid = int(pid)
@@ -223,7 +223,7 @@ class JobRunner:
         else:
             inner = spec["command"]
         run_sh = d / "run.sh"
-        # A4.9 R1 I7：inner 用子壳 ( … ) 包裹——命令含 exit/exec/set -e 只终止
+        # inner 用子壳 ( … ) 包裹——命令含 exit/exec/set -e 只终止
         # 子壳，包装壳仍能写 exit_code 回执；cd 失败也落 126 回执（不再跳过）。
         run_sh.write_text(
             "#!/bin/sh\n"
@@ -253,11 +253,14 @@ class JobRunner:
 
     async def submit(self, *, user_id: str, source: str, spec: Dict[str, Any],
                      idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+        if not config.agent_durable_jobs_enabled:
+            # 兜底：禁用态下绝不静默排队（execute_code/terminal durable 亦经此）
+            raise ValueError("durable jobs disabled by config ([agent.durable_jobs] enabled=false)")
         validate_spec(spec)
         if idempotency_key:
             existing = await self.store.get_by_key(idempotency_key)
             if existing:
-                # A4.9 R1 I1：全局键不跨用户放行（防键抢占/键嗅探取 job_id）
+                # 全局键不跨用户放行（防键抢占/键嗅探取 job_id）
                 if str(existing.get("user_id")) != str(user_id):
                     raise ValueError("idempotency_key belongs to another user")
                 return dict(existing)
@@ -289,7 +292,7 @@ class JobRunner:
         return dict(job)
 
     async def _owned_row(self, job_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
-        """所有权门（A4.9 R1 C2 IDOR 修复）：非属主一律 not found（不泄露存在性）。"""
+        """所有权门（IDOR 防护）：非属主一律 not found（不泄露存在性）。"""
         row = await self.store.get(job_id)
         if row is None:
             raise KeyError(f"job not found: {job_id}")
@@ -303,7 +306,7 @@ class JobRunner:
     async def logs(self, job_id: str, offset: int, user_id: Optional[str] = None) -> Tuple[str, int]:
         row = await self._owned_row(job_id, user_id)
         chunk, next_offset = read_log_chunk(row.get("log_path") or (self.job_dir(job_id) / "run.log"), offset)
-        # R6：日志消费落 WAL（JobLogOffset）——有实际新字节才记，fail-open
+        # 日志消费落 WAL（JobLogOffset）——有实际新字节才记，fail-open
         if chunk:
             try:
                 await self._event(job_id, "JobLogOffset", {"from": int(offset or 0), "to": int(next_offset)})
@@ -321,7 +324,7 @@ class JobRunner:
     async def cancel(self, job_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
         """cancel 回执四态（Hub）：requested|acknowledged|too_late|failed。
 
-        R3 NEW-4：CAS 冲突时重读新鲜行并**重应用**取消意图（不再丢取消）；
+        CAS 冲突时重读新鲜行并**重应用**取消意图（不再丢取消）；
         至多两轮，过期即 failed（可重试）。
         """
         try:
@@ -365,7 +368,7 @@ class JobRunner:
             return {"job_id": job_id, "cancel_state": "failed", "error": str(exc)}
 
     async def _save_cas(self, row: Dict[str, Any], expected_state: str) -> bool:
-        """A4.9 R2 I5：状态条件写（compare-and-set）——其他写者已推进时不覆盖。"""
+        """状态条件写（compare-and-set）——其他写者已推进时不覆盖。"""
         fn = getattr(self.store, "save_cas", None)
         if fn is None:
             await self.store.save(row)
@@ -376,7 +379,7 @@ class JobRunner:
                         error: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """终态结算（含 unknown→failed 的人工裁定路径）。产物扫描在成功/失败均执行。
 
-        A4.9 R2 I5：CAS 写入——与 cancel/并发 step 竞态时重读新鲜行重验迁移，
+        CAS 写入——与 cancel/并发 step 竞态时重读新鲜行重验迁移，
         绝不把已终态盖回 running、也不覆盖他人的 cancel 标记。
         """
         for _ in range(3):
@@ -422,7 +425,7 @@ class JobRunner:
 
     async def _running_rows(self) -> List[Dict[str, Any]]:
         # 运行面很小（max_concurrent ≤8）：lease_next/list_jobs 已够用；此处按
-        # list_jobs 全扫过滤 running（单箱单 worker 拓扑，够用且无额外 store 面）。
+        # list_jobs 全扫过滤 running（单实例 worker 轮询拓扑，够用且无额外 store 面）。
         out: List[Dict[str, Any]] = []
         for uid in {self._last_user_ids()}:
             for j in await self.store.list_jobs(uid, 200):
@@ -556,7 +559,7 @@ class SqlJobStore:
             await db.commit()
 
     async def save_cas(self, job, expected_state):
-        """A4.9 R2 I5：SELECT ... FOR UPDATE 事务内比较 state 后整体回写。"""
+        """SELECT ... FOR UPDATE 事务内比较 state 后整体回写。"""
         from sqlalchemy import select
         from app.db.database import AsyncSessionLocal, DurableJob
         async with AsyncSessionLocal() as db:
@@ -582,7 +585,7 @@ class SqlJobStore:
     async def append_event(self, job_id, seq, event_type, payload):
         from sqlalchemy.exc import IntegrityError
         from app.db.database import AsyncSessionLocal, DurableJobEvent
-        # A4.9 R1 I6：max+1 非原子 → UNIQUE 撞车重取 seq 重试一次
+        # max+1 非原子 → UNIQUE 撞车重取 seq 重试一次
         for attempt in range(2):
             use_seq = seq if attempt == 0 else await self.next_seq(job_id)
             try:
@@ -633,7 +636,7 @@ class SqlJobStore:
         from sqlalchemy import select
         from app.db.database import AsyncSessionLocal, DurableJob
         async with AsyncSessionLocal() as db:
-            # A4.9 R1 I4：FOR UPDATE SKIP LOCKED 保证原子领取；lease_until 落库
+            # FOR UPDATE SKIP LOCKED 保证原子领取；lease_until 落库
             result = await db.execute(
                 select(DurableJob).where(DurableJob.state == "queued")
                 .order_by(DurableJob.created_at).limit(1)

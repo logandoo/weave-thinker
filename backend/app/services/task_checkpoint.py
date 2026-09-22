@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""task_checkpoint — D-轻（2026-09-22）断点续跑快照（State-Aware 恢复语义）。
+"""task_checkpoint — 断点续跑快照（恢复即重建下一次上下文视图）。
 
-Hub：checkpoint JSON {version,cursor,messages,budget_used,elapsed,updated_at,
+格式：checkpoint JSON {version,cursor,messages,budget_used,elapsed,updated_at,
 dropped_messages?}；CHECKPOINT_VERSION 来自 durable_types（回滚遇新版本 loud
 error）；恢复=从 checkpoint 全量回放 messages（不做有损摘要——恢复即重建下一次
 上下文视图，State-Aware Runtime 2026-07 教训）。
@@ -29,12 +29,12 @@ def _slim_message(m: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_checkpoint(*, cursor: int, messages: List[Dict[str, Any]], budget_used: int,
                      elapsed: float = 0.0, max_bytes: int = 2_000_000) -> Dict[str, Any]:
-    """构建快照；超 max_bytes（**字节**，R6 修正：UTF-8 精确）时从最旧整条丢弃
+    """构建快照；超 max_bytes（**字节**，UTF-8 精确）时从最旧整条丢弃
     并显式披露计数（信息完整性原则）；单次线性扫描，无 O(n²) 重序列化。"""
     slim = [_slim_message(m) for m in messages]
     sizes = [len(json.dumps(m, ensure_ascii=False).encode("utf-8")) for m in slim]
     dropped = 0
-    total = sum(sizes) + 2 * len(sizes) + 512  # 数组分隔符 + 字段余量（R6 N2）
+    total = sum(sizes) + 2 * len(sizes) + 512  # 数组分隔符 + 字段余量
     while len(slim) > 1 and total > max_bytes:
         total -= sizes.pop(0)
         slim.pop(0)

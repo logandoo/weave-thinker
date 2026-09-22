@@ -389,7 +389,7 @@ $$"""),
     ("user_model_providers_provider_not_null", """UPDATE user_model_providers SET provider = '' WHERE provider IS NULL"""),
     ("user_model_providers_provider_default", "ALTER TABLE user_model_providers ALTER COLUMN provider SET DEFAULT ''"),
     ("user_model_providers_provider_not_null_enforce", "ALTER TABLE user_model_providers ALTER COLUMN provider SET NOT NULL"),
-    # ── durable execution 波（2026-09-22）：D-轻 checkpoint/resume + D-重 job runner。
+    # ── durable 执行：检查点续跑 + 持久作业。
     # 与 memory v2 无关，必须置于 pgvector_extension 之前（同上方约定）。
     ("agent_tasks_checkpoint", "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS checkpoint TEXT"),
     ("durable_jobs", """CREATE TABLE IF NOT EXISTS durable_jobs (

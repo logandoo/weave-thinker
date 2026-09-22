@@ -1,9 +1,7 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""durable_types — durable execution 波共享类型（Consistency Hub 唯一实现）。
-
-来源：docs/PLAN_durable_execution_wave.md Consistency Hub。
+"""durable_types — 持久执行共享类型（写并行 / 断点续跑 / 持久作业共用）。
 - CHECKPOINT_VERSION：agent_tasks.checkpoint JSON 的 schema 版本（回滚遇新版本 loud error）
 - can_transition：durable_jobs 状态机合法迁移白名单（终态不可逆；unknown 仅 reconcile 可出、
   只允许结算为 failed）
@@ -43,7 +41,7 @@ def can_transition(from_state: Any, to_state: Any) -> bool:
 
 def make_key(principal_type: str, principal_id: str, cursor: int, tool_name: str,
              call_id: str) -> str:
-    """副作用台账幂等键（Hub 格式 v2，A4.9 R1 C3 修正：含 call_id——
+    """副作用台账幂等键（含 call_id——
 
     仅 (cursor, tool_name) 会让同轮两次同类调用（P1 异文件并行）互相碰撞，
     第二次被伪造成「已执行」而实际未写。call_id 是重放身份（checkpoint 的

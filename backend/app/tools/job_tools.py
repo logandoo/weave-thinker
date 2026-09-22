@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""job_tools — D-重 durable job runner 的 agent 工具面（toolset=system）。
+"""job_tools — 持久作业（durable job runner）的 agent 工具面（toolset=system）。
 
-六工具契约（docs/PLAN_durable_execution_wave.md T3 / Consistency Hub）：
+六工具契约：
 - job_submit(kind, command|code, workdir?, timeout_seconds?, idempotency_key?)
   → 立即返回句柄 {job_id, state}（5h+ 作业的入口；timeout_seconds=0=不限）
 - job_status(job_id) / job_logs(job_id, offset) / job_cancel(job_id) /
@@ -33,8 +33,10 @@ async def job_submit(args: Dict[str, Any], **kwargs) -> str:
     user_id = str(getattr(user, "id", "") or "")
     if not user_id:
         return _err("job_submit 需要已登录用户")
+    if not config.agent_durable_jobs_enabled:
+        return _err("持久作业已被配置禁用（[agent.durable_jobs] enabled=false）")
     kind = args.get("kind")
-    # C1（A4.9 R1）：与 terminal/execute_code 同级的执行前校验（fail-closed）
+    # 与 terminal/execute_code 同级的执行前校验（fail-closed）
     if kind == "shell":
         from app.tools.terminal import _validate_command, _command_accesses_outside_workspace
         _v = _validate_command(str(args.get("command") or ""))
@@ -62,7 +64,7 @@ async def job_submit(args: Dict[str, Any], **kwargs) -> str:
             workspace_root=str(config.workspace_root.resolve()))
         if _safety:
             return _err(f"Code failed safety check: {_safety}")
-    # I2（A4.9 R1）：workdir 禁闭——normpath 消解 .. 后必须在工作区前缀内
+    # workdir 禁闭——normpath 消解 .. 后必须在工作区前缀内
     workdir = None
     _ws = str(kwargs.get("workspace_path") or "").rstrip("/")
     _ws_real = os.path.realpath(_ws) if _ws else ""
@@ -95,7 +97,7 @@ async def job_submit(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _caller_id(kwargs: Dict[str, Any]) -> Any:
-    """C2（A4.9 R1）：工具层归属传递——非属主一律 not found。"""
+    """工具层归属传递——非属主一律 not found。"""
     return str(getattr(kwargs.get("user"), "id", "") or "") or None
 
 
@@ -168,7 +170,7 @@ registry.register(
     },
     handler=job_submit,
     is_async=True,
-    permission_key="terminal_execution",  # C1（A4.9 R1）：与 terminal 同级执行权
+    permission_key="terminal_execution",  # 与 terminal 同级执行权
     description="提交持久长作业（5h+）并立即返回句柄",
     emoji="🧰",
 )

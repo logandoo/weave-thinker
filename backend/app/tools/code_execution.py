@@ -385,19 +385,22 @@ async def generate_and_execute_code(args: dict, **kwargs) -> str:
     if safety_error:
         return json.dumps({"error": f"Generated code failed safety check: {safety_error}"}, ensure_ascii=False)
 
-    # D-重（2026-09-22）：durable=true → 提交持久作业立即返回句柄
+    # durable=true → 提交持久作业立即返回句柄
     # （detached 子进程，跳过内联 240s 总顶；5h+ 重作业的真实需求出口）。
     if args.get("durable"):
         _uid = str(getattr(kwargs.get("user"), "id", "") or "")
         if not _uid:
             return json.dumps({"error": "durable execute_code job requires an authenticated user"},
                               ensure_ascii=False)
+        if not config.agent_durable_jobs_enabled:
+            return json.dumps({"error": "持久作业已被配置禁用（[agent.durable_jobs] enabled=false）"},
+                              ensure_ascii=False)
         if args.get("use_tools"):
             return json.dumps(
                 {"error": "durable=true 不支持 use_tools（PTC 为进程内桥，持久作业不可用）"},
                 ensure_ascii=False)
         from app.services.job_runner_service import get_job_runner
-        # R6：持久作业落在稳定工作区（scratch 是本次调用的临时目录，重启后即失）
+        # 持久作业落在稳定工作区（scratch 是本次调用的临时目录，重启后即失）
         _durable_workdir = str(kwargs.get("workspace_path") or "").strip() or str(exec_cwd)
         _spec = {"kind": "python", "code": code, "workdir": _durable_workdir}
         if args.get("timeout_seconds") is not None:

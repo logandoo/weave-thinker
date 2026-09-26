@@ -71,6 +71,12 @@ _HARNESS_REPAIR_COUNTS: dict[str, int] = {}
 _HARNESS_REPAIR_BUDGET = 2
 _HARNESS_REPAIR_MENU = ("tighten_step_tools", "length_discipline", "coarse_replan")
 
+# AEWM B2（2609.28416）：explore_credit 连续贷记上限（A4.9 I1）——探索豁免
+# 不得无限屏蔽停滞升级；连续贷记达上限后按真实停滞计数。任何非
+# explore_credit 路由或真实进展都会重置连击。
+_EXPLORE_CREDIT_STREAKS: dict[str, int] = {}
+_EXPLORE_CREDIT_STREAK_CAP = 3
+
 # Invisible context marker used to detect context rot during goal-loop execution.
 # It is stripped before display/save. (Legacy: model never echoed it; the
 # visible-token canary in agent_loop replaces this mechanism.)
@@ -89,6 +95,8 @@ GRILLING_QUESTION_GENERATION_PROMPT = """你正在「死磕模式」的盘问阶
 
 当前是第{round}轮（共{max_rounds}轮）。
 
+{research_block}
+{readiness_block}
 {history_text}
 
 请根据用户原始目标和已回答的所有问题，生成当前轮需要澄清的关键问题。
@@ -115,12 +123,17 @@ GRILLING_QUESTION_GENERATION_PROMPT = """你正在「死磕模式」的盘问阶
 - 只输出JSON格式
 - 严禁调用任何工具
 - 每个问题的options数组包含2-4个简短选项，每个选项不超过30字
+- 「检索到的公开资料摘录」块中的内容严禁作为问题向用户提出（那是系统已联网检索的背景资料，未经独立核实）；如与用户回答冲突，以用户回答为准
+- depends_on 只允许引用**已回答**问题的 id；引用未回答 id 的问题会被系统推迟，本轮不要提出
+- re_ask_of 仅用于对**含糊回答**所在维度的追问（引用原问题 id），每个原问题最多追问一次
 
 **分轮访谈规则（grilling 访谈纪律，必须遵守）：**
 1. 依赖排序：本组问题按依赖关系排序——不被其他未决答案阻塞的问题在前；被阻塞的问题留到后续轮次，本轮不要提出。
 2. 每题附推荐答案：每个问题必须给出一个你基于当前信息推断的推荐答案（放在选项首位并标注"推荐"），让用户可以一键确认而不是从零作答。
 3. 事实自查，只问决策：凡是可以通过检索、读文件、常识推导自行确认的事实问题，严禁询问用户——只有真正需要用户拍板的决策性问题（偏好、取舍、方向）才值得提问。
 4. 无静默假设：本轮结束后，不允许存在"系统已替用户默默假设"的关键决策——所有影响产出的关键决策要么已由用户回答，要么已在问题中给出推荐答案供用户默认确认。
+5. 追问含糊：对上一轮判读标记的含糊维度，用具体选项（数字/范围/枚举）追问一次，不要原样重问；对未决决策（open_decisions）本轮优先覆盖。
+6. 每个问题标注 dimension（该问题解决的决策维度，2-6字）与 deepens（若在既有维度上深入，填被深入问题的 id，否则留空）。
 
 输出格式：
 ```json
@@ -130,13 +143,17 @@ GRILLING_QUESTION_GENERATION_PROMPT = """你正在「死磕模式」的盘问阶
       "id": "q1",
       "question": "问题内容",
       "recommendation": "推荐答案或分析",
-      "options": ["选项1", "选项2", "选项3"]
+      "options": ["选项1", "选项2", "选项3"],
+      "dimension": "维度名",
+      "depends_on": [],
+      "re_ask_of": "",
+      "deepens": ""
     }}
   ]
 }}
 ```"""
 
-GRILLING_ROUND_SYNTHESIS_PROMPT = """你正在「死磕模式」中，用户已经回答了第{round}轮盘问问题。请根据用户的原始目标、前几轮回答和本轮回答，判断是否需要继续盘问。
+GRILLING_ROUND_SYNTHESIS_PROMPT = """你正在「死磕模式」中，用户已经回答了第{round}轮盘问问题。请根据用户的原始目标、前几轮回答和本轮回答，做一次结构化判读（readiness report），判断是否需要继续盘问。
 
 原始目标：{query}
 
@@ -145,15 +162,31 @@ GRILLING_ROUND_SYNTHESIS_PROMPT = """你正在「死磕模式」中，用户已�
 已回答的问题：
 {qa_pairs}
 
+判读标准：
+- 关键决策全部明确、回答具体（有数字/枚举/明确取舍）→ should_continue=false，可以合成最终目标
+- 仍有影响产出的关键决策未定，或同一维度被含糊作答 → should_continue=true
+- 本轮未发现新的未决决策且各维度回答具体 → diminishing_returns=true（收益递减，即使还有轮次也应收束）
+- assumed_defaults：用户未表态但你已按推荐答案默认采纳的决策（逐条列出；收束后会显式写入目标，不允许隐式假设）
+- vague_dimensions：回答含糊（如"随便""都行""尽快"）的决策维度名
+- open_decisions：尚未拍板、影响产出的决策点
+
 请输出JSON：
 {{
   "should_continue": true,
-  "reason": "简短原因"
+  "reason": "简短原因",
+  "open_decisions": ["未决决策1"],
+  "vague_dimensions": ["含糊维度1"],
+  "assumed_defaults": ["默认假设1"],
+  "diminishing_returns": false
 }}
 
 should_continue=true 表示还需要继续盘问以明确目标；false 表示信息已足够，可以合成最终目标。"""
 
 
+# 注意：GRILLING_SYSTEM_PROMPT 是单题串行盘问的旧提示词，当前零调用方
+# （get_grilling_system_prompt 仅为兼容保留）。多轮盘问实际用
+# GRILLING_QUESTION_GENERATION_PROMPT。2026-09-25 复核：规则已与
+# facts-before-ask 纪律对齐，防止未来接线带回旧纪律。
 GRILLING_SYSTEM_PROMPT = """你正在「死磕模式」的盘问阶段。用户有一个重要任务需要完成，你需要通过深入盘问来获取足够的信息。
 
 你的工作：
@@ -173,6 +206,8 @@ GRILLING_SYSTEM_PROMPT = """你正在「死磕模式」的盘问阶段。用户�
 - 每次只问一个问题
 - 基于用户的回答深入追问
 - 不要跳过重要的决策分支
+- 事实自查，只问决策：能通过检索/常识确认的事实问题严禁询问用户（与多轮盘问的
+  facts-before-ask 纪律一致）；只有用户能拍板的决策才提问
 - 严禁调用任何工具（搜索、代码执行等），盘问阶段只能进行文本对话
 - 盘问完成后，清晰地总结目标，并以 [GOAL_SUMMARY] 标签标记最终目标描述
 """
@@ -183,7 +218,7 @@ GRILLING_SYNTHESIS_PROMPT = """你正在「死磕模式」中，用户已经回�
 
 {previous_context}
 
-盘问问答：
+{assumed_defaults_block}盘问问答：
 {qa_pairs}
 
 请生成一个完整的目标描述，包含：
@@ -191,8 +226,26 @@ GRILLING_SYNTHESIS_PROMPT = """你正在「死磕模式」中，用户已经回�
 2. 所有约束条件
 3. 关键决策点的确认结果
 4. 执行方向
+5. 若有「已采用的默认假设」，必须逐条显式写入目标描述（标注为默认假设），不得隐式采用
 
 直接输出目标描述，不要有多余的寒暄。"""
+
+GRILLING_FACT_RESEARCH_PROMPT = """你正在「死磕模式」的盘问前置事实自查阶段。请判断用户目标中哪些是**事实类问题**（可以通过公开资料/检索核实，不需要用户拍板），哪些是**决策类问题**（只有用户能决定）。
+
+用户原始目标：{query}
+
+{history_text}
+
+只输出JSON：
+{{
+  "fact_questions": ["可通过检索核实的事实问题1", "..."]
+}}
+
+规则：
+- 只列出事实类问题（如标准规范、产品参数、公开数据、术语定义），最多{max_queries}条，能合并的合并
+- 决策类问题（偏好、取舍、预算、风格、范围）严禁出现在列表里——那些必须问用户
+- 若目标中没有需要核实的事实问题，输出空列表
+- 只输出JSON，不要输出其他内容"""
 
 CONTINUATION_PROMPT_TEMPLATE = (
     "[死磕模式 — 继续推进目标 {turn_label}]\n"
@@ -501,6 +554,248 @@ _INFO_GATHERING_TOOLS = frozenset({
 # was falsely stalled (conv f81c408a: word_count turns counted as no
 # progress → 3 stalls → partial_complete despite ongoing work).
 _SHORT_VERIFICATION_TOOLS = frozenset({"word_count", "grep"})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Grilling helpers (SOTA 盘问：结构化 readiness 报告 + 问题过滤)
+# ──────────────────────────────────────────────────────────────────────
+
+def _flatten_grilling_qa(history: Any) -> List[str]:
+    """Flatten ``deathmatch_grilling_qa_history`` into prompt lines.
+
+    History entries are ``{"round": N, "qa_pairs": [...]}`` (NOT flat Q/A
+    dicts) — plan generation previously read ``h.get('question')`` off the
+    round entry and silently produced an empty Q&A block.
+    """
+    lines: List[str] = []
+    if not isinstance(history, list):
+        return lines
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        round_num = entry.get("round", "?")
+        for pair in entry.get("qa_pairs") or []:
+            if not isinstance(pair, dict):
+                continue
+            dim = pair.get("dimension") or ""
+            dim_part = f"（维度: {dim}）" if dim else ""
+            lines.append(
+                f"Q[{round_num}]{dim_part}: {pair.get('question', '')}\n"
+                f"A: {pair.get('answer', '')}"
+            )
+        readiness = entry.get("readiness")
+        if isinstance(readiness, dict):
+            for d in readiness.get("assumed_defaults") or []:
+                lines.append(f"默认假设[{round_num}]: {d}")
+    return lines
+
+
+def _parse_grilling_readiness(raw: str) -> Dict[str, Any]:
+    """Parse the round-synthesis readiness report. Fail-open → keep rounds."""
+    empty = {
+        "should_continue": True, "reason": "", "open_decisions": [],
+        "vague_dimensions": [], "assumed_defaults": [],
+        "diminishing_returns": False,
+    }
+    if not raw or not raw.strip():
+        return empty
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:]
+    data = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        match = _JSON_OBJECT_RE.search(text)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        return empty
+
+    def _str_list(key: str) -> List[str]:
+        raw_list = data.get(key, [])
+        if not isinstance(raw_list, list):
+            return []
+        out = []
+        for item in raw_list:
+            s = str(item).strip() if item is not None else ""
+            if s:
+                out.append(s)
+        return out
+
+    val = str(data.get("should_continue", "true")).strip().lower()
+    return {
+        "should_continue": val not in ("false", "no", "0"),
+        "reason": str(data.get("reason", "") or ""),
+        "open_decisions": _str_list("open_decisions"),
+        "vague_dimensions": _str_list("vague_dimensions"),
+        "assumed_defaults": _str_list("assumed_defaults"),
+        "diminishing_returns": str(
+            data.get("diminishing_returns", "false")
+        ).strip().lower() in ("true", "yes", "1"),
+    }
+
+
+def _readiness_block_for_questions(report: Any) -> str:
+    """Render the readiness report as guidance for the next question round."""
+    if not isinstance(report, dict) or not report:
+        return ""
+    parts = ["【上一轮判读（readiness）】"]
+    open_decisions = report.get("open_decisions") or []
+    vague = report.get("vague_dimensions") or []
+    defaults = report.get("assumed_defaults") or []
+    if open_decisions:
+        parts.append("未决决策（本轮优先覆盖）：")
+        parts.extend(f"- {d}" for d in open_decisions)
+    if vague:
+        parts.append("含糊维度（用具体选项追问一次，不要原样重问）：")
+        parts.extend(f"- {d}" for d in vague)
+    if defaults:
+        parts.append("已默认采纳的假设（可择机给用户确认机会，勿重复已问角度）：")
+        parts.extend(f"- {d}" for d in defaults)
+    if len(parts) == 1:
+        return ""
+    return "\n".join(parts) + "\n\n"
+
+
+def _assumed_defaults_block(report: Any) -> str:
+    if not isinstance(report, dict):
+        return ""
+    defaults = report.get("assumed_defaults") or []
+    if not defaults:
+        return ""
+    lines = ["【已采用的默认假设（必须在目标描述中显式写明，不得隐式假设）】"]
+    lines.extend(f"- {d}" for d in defaults)
+    return "\n".join(lines) + "\n\n"
+
+
+def _normalize_question_text(text: str) -> str:
+    return _re.sub(r"[\s\W_]+", "", (text or "")).lower()
+
+
+def _sanitize_research_field(text: Any, limit: int) -> str:
+    """Bounded, single-line rendering of untrusted search metadata."""
+    s = str(text or "")
+    s = _re.sub(r"[\x00-\x1f\x7f]+", " ", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    if len(s) > limit:
+        s = s[:limit] + "…"
+    return s
+
+
+_TRIAGE_ROUTES = ("state_revision", "replan", "explore_credit")
+_TRIAGE_LABELS = ("critical", "exploratory", "noisy")
+
+
+def _parse_action_triage(raw: str) -> Optional[Dict[str, Any]]:
+    """Parse the stall action-triage verdict (AEWM Action Judge 三分法).
+    Strict: unknown route/label → None → fail-open to the legacy path."""
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1:]
+    data = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        match = _JSON_OBJECT_RE.search(text)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+    if not isinstance(data, dict):
+        return None
+    route = str(data.get("route") or "").strip()
+    label = str(data.get("label") or "").strip()
+    if route not in _TRIAGE_ROUTES or label not in _TRIAGE_LABELS:
+        return None
+    # A4.9 M2：route/label 配对校验（label 不是装饰）——不配对即 fail-open。
+    pairing_ok = (
+        (route == "explore_credit" and label == "exploratory")
+        or (route == "state_revision" and label == "noisy")
+        or (route == "replan" and label in ("critical", "noisy"))
+    )
+    if not pairing_ok:
+        return None
+    claims_raw = data.get("noisy_claims") or []
+    if not isinstance(claims_raw, list):
+        claims_raw = []
+    # A4.9 I5：claims 是 LLM 派生文本（可能间接携带网络内容）——单行化、
+    # 剥尖括号、截断后再进入提示词链。
+    claims = [
+        _sanitize_research_field(str(c), 150).replace("<", "").replace(">", "")
+        for c in claims_raw
+    ]
+    claims = [c for c in claims if c]
+    return {
+        "route": route,
+        "label": label,
+        "noisy_claims": claims[:5],
+        "note": _sanitize_research_field(data.get("note") or "", 200)
+                .replace("<", "").replace(">", ""),
+    }
+
+
+def _filter_grilling_questions(
+    questions: List[Dict[str, Any]], history: Any,
+) -> List[Dict[str, Any]]:
+    """Mechanical grilling guards (SAGE/TKQR 启发）:
+
+    - defer questions whose ``depends_on`` ids are not yet answered;
+    - drop questions duplicating an already-asked text (normalized);
+    - allow at most ONE ``re_ask_of`` follow-up per original question.
+    """
+    answered_ids: set = set()
+    asked_norms: set = set()
+    re_asked: set = set()
+    for entry in history or []:
+        if not isinstance(entry, dict):
+            continue
+        for pair in entry.get("qa_pairs") or []:
+            if not isinstance(pair, dict):
+                continue
+            qid = str(pair.get("question_id") or "").strip()
+            if qid:
+                answered_ids.add(qid)
+            norm = _normalize_question_text(pair.get("question", ""))
+            if norm:
+                asked_norms.add(norm)
+            ra = str(pair.get("re_ask_of") or "").strip()
+            if ra:
+                re_asked.add(ra)
+
+    kept: List[Dict[str, Any]] = []
+    kept_norms: set = set()
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        deps = q.get("depends_on") or []
+        if isinstance(deps, list):
+            dep_ids = [str(d).strip() for d in deps if str(d).strip()]
+            if any(d not in answered_ids for d in dep_ids):
+                continue  # blocked → defer to a later round
+        re_ask_of = str(q.get("re_ask_of") or "").strip()
+        if re_ask_of:
+            # Only a follow-up to an answered question, and only once.
+            if re_ask_of not in answered_ids or re_ask_of in re_asked:
+                continue
+        norm = _normalize_question_text(q.get("question", ""))
+        if not norm or norm in asked_norms or norm in kept_norms:
+            continue
+        kept_norms.add(norm)
+        kept.append(q)
+    return kept
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1786,6 +2081,8 @@ DEATHMATCH_SYNC_FIELDS = (
     "deathmatch_acceptance_criteria", "deathmatch_failed_directions",
     "deathmatch_pause_state", "deathmatch_events",
     "deathmatch_no_progress_replans",
+    # AEWM 波：证伪台账（anti task-state contamination）
+    "deathmatch_retracted_claims",
 )
 
 
@@ -2000,13 +2297,29 @@ class DeathmatchManager:
         for h in history:
             round_num = h.get("round", "?")
             qa_pairs = h.get("qa_pairs", [])
+            if not qa_pairs and isinstance(h.get("readiness"), dict):
+                # A4.9 Minor：readiness 兄弟条目不渲染成空的"第N轮回答"。
+                rep = h["readiness"]
+                summary_bits = []
+                if rep.get("open_decisions"):
+                    summary_bits.append("未决: " + "、".join(rep["open_decisions"][:5]))
+                if rep.get("assumed_defaults"):
+                    summary_bits.append("默认假设: " + "、".join(rep["assumed_defaults"][:5]))
+                parts.append(
+                    f"\n--- 第{round_num}轮判读 ---"
+                    + ("；".join(summary_bits) if summary_bits else "（无未决决策）")
+                )
+                continue
             parts.append(f"\n--- 第{round_num}轮回答（本轮已覆盖的角度）---")
             for pair in qa_pairs:
-                parts.append(f"  问题: {pair.get('question', '')}")
+                dim = pair.get("dimension") or ""
+                dim_part = f"（维度: {dim}）" if dim else ""
+                parts.append(f"  问题{dim_part}: {pair.get('question', '')}")
                 parts.append(f"  回答: {pair.get('answer', '')}")
             # Hint at what dimensions this round covered to help progressive deepening
             covered = ", ".join(
-                pair.get("question", "")[:40] for pair in qa_pairs
+                (pair.get("dimension") or pair.get("question", "")[:40])
+                for pair in qa_pairs
             )
             parts.append(f"  → 本轮已触及: {covered}")
         parts.append(
@@ -2016,6 +2329,61 @@ class DeathmatchManager:
             "3) 如果以上回答已经非常完整，可以精简问题数量"
         )
         return "\n".join(parts)
+
+    def _record_grilling_readiness(self, round_number: int, report: Dict[str, Any]) -> None:
+        """Persist the round readiness report into the QA history (no schema
+        change: a sibling entry without ``qa_pairs``)."""
+        history = self._current_qa_history()
+        history.append({"round": round_number, "readiness": report})
+        self._conv.deathmatch_grilling_qa_history = history
+
+    def _latest_readiness(self) -> Dict[str, Any]:
+        for entry in reversed(self._current_qa_history()):
+            if isinstance(entry, dict) and isinstance(entry.get("readiness"), dict):
+                return entry["readiness"]
+        return {}
+
+    def _completion_memory_entry(self) -> str:
+        """ScienceBuddy（2609.17523）启发：任务收束时把目标+验收要点+关键决策
+        沉淀为记忆条目，供后续任务检索（持续学习闭环）。"""
+        goal = (self._conv.deathmatch_goal or "").strip()
+        lines = ["[死磕任务收束记录]", f"目标: {goal[:300]}"]
+        criteria = self._conv.deathmatch_acceptance_criteria or []
+        texts = [str(c.get("text", "")).strip() for c in criteria if isinstance(c, dict)]
+        texts = [t for t in texts if t][:5]
+        if texts:
+            lines.append("验收要点: " + "；".join(texts))
+        readiness = self._latest_readiness()
+        decisions = [
+            *(readiness.get("assumed_defaults") or []),
+            *(readiness.get("open_decisions") or []),
+        ]
+        if decisions:
+            lines.append("关键决策/默认假设: " + "；".join(str(d) for d in decisions[:5]))
+        lines.append("（自动记录，供后续任务参考）")
+        return "\n".join(lines)
+
+    async def _persist_completion_memory(self) -> None:
+        """写回用户记忆（file memory + subconscious 钩子）。失败 fail-open，
+        绝不阻断收束。"""
+        if not config.deathmatch_completion_memory_write_enabled:
+            return
+        # A4.9 Minor：无 user_id 时 memory 工具会落入 _shared 跨用户共享存储，
+        # 多租户下会泄漏目标文本——直接跳过。
+        if not getattr(self._conv, "user_id", None):
+            return
+        try:
+            content = self._completion_memory_entry()
+            from app.tools.memory import memory as memory_tool
+            await memory_tool(
+                {"action": "add", "target": "agent", "content": content},
+                user_id=self._conv.user_id,
+            )
+        except Exception:
+            logger.debug(
+                "deathmatch completion memory write failed (fail-open)",
+                exc_info=True,
+            )
 
     def complete_grilling(self, goal: str) -> None:
         self._conv.deathmatch_status = "active"
@@ -2296,6 +2664,53 @@ class DeathmatchManager:
             logger.debug("harness repair pick failed: %s", exc)
         return None
 
+    async def _triage_stall_actions(
+        self,
+        reason: str,
+        verify_result: Optional[Dict[str, Any]],
+        last_response: str,
+    ) -> Optional[Dict[str, Any]]:
+        """AEWM Action Judge（2609.28416）：停滞现场的动作分诊。
+
+        把最近一轮的行动判为 critical/exploratory/noisy 并路由修复方式
+        （noisy=状态修订 / critical=重规划 / exploratory=探索贷记不计惩罚）。
+        agentic 判定（无关键词表）；失败返回 None = fail-open 走既有路径。"""
+        try:
+            from app.services.agentic_judge import judge_json
+            steps = (self._conv.deathmatch_plan or {}).get("steps") or []
+            progress = self._format_plan_progress() if steps else "(无计划)"
+            parsed = await judge_json(
+                "你是死磕循环的行动分诊器。给定停滞现场，判断最近一轮行动的类别"
+                "（AEWM 三分法）并选择修复路线。只输出JSON。",
+                f"停滞原因: {reason[:300]}\n"
+                f"验证问题: {str((verify_result or {}).get('issues') or [])[:300]}\n"
+                f"最近产出摘要: {_truncate(last_response or '', 400)}\n"
+                f"计划进度:\n{progress}\n\n"
+                "三分法：\n"
+                "- critical：闭合关键缺口/取必要证据/必要状态变更的关键行动，其失败=关键路径失败\n"
+                "- exploratory：合理降低不确定性或试探合理分支的探索行动（检索/试错取证），"
+                "暂时无产出不等于无效\n"
+                "- noisy：低期望进展——重复、无关、违反约束或错误方向（原地打转）\n\n"
+                "路由：\n"
+                "- explore_credit：行动属 exploratory 且在实质降低不确定性（不计停滞惩罚，继续推进）\n"
+                "- state_revision：行动属 noisy（原地打转/重复）——撤回其断言并改写当前步骤行动\n"
+                "- replan：关键路径失败/证据缺失/计划本身过期，需要重规划\n\n"
+                '输出JSON：{"route": "explore_credit|state_revision|replan", '
+                '"label": "critical|exploratory|noisy", '
+                '"noisy_claims": ["被证伪或无依据的断言1"], "note": "一句话依据"}',
+                task="stall_triage",
+                default=None,
+                # 停滞时刻可容忍一次判定延迟，但不得长挂（原 120s 会把停滞
+                # 处置拖成两分钟）；超时/异常一律 fail-open。
+                timeout=30.0,
+            )
+            if not isinstance(parsed, dict):
+                return None
+            return _parse_action_triage(json.dumps(parsed, ensure_ascii=False))
+        except Exception as exc:
+            logger.debug("stall action triage failed (fail-open): %s", exc)
+            return None
+
     async def _handle_stall(
         self,
         reason: str,
@@ -2495,6 +2910,86 @@ class DeathmatchManager:
             last_response, "continue", verify_result,
             reason=f"stall {count} (autonomy): {reason}",
         )
+        # AEWM（2609.28416）B2：停滞现场动作分诊——noisy=状态修订（改状态
+        # 而非堆指导语，B3）、critical=重规划、exploratory=探索贷记不计惩罚。
+        # 失败/关闭 → fail-open 走下方既有 repair→replan 路径。
+        if config.deathmatch_stall_triage_enabled:
+            try:
+                triage = await self._triage_stall_actions(reason, verify_result, last_response)
+            except Exception as exc:
+                logger.warning("stall triage failed (fail-open): %s", exc)
+                triage = None
+            if triage:
+                route = triage.get("route")
+                self._record_event(
+                    "stall_triage", route=route, label=triage.get("label"),
+                    note=triage.get("note", ""),
+                )
+                # A4.9 I1：explore_credit 有界——连续贷记达上限、或已到硬阈值
+                # （该走 episode reset）时，探索豁免让位于真实停滞升级。
+                streak = _EXPLORE_CREDIT_STREAKS.get(self._conv.id, 0)
+                credit_allowed = (
+                    streak < _EXPLORE_CREDIT_STREAK_CAP
+                    and count < config.deathmatch_stall_hard_threshold
+                )
+                if route == "explore_credit":
+                    if credit_allowed:
+                        _EXPLORE_CREDIT_STREAKS[self._conv.id] = streak + 1
+                        self._conv.deathmatch_verify_failures = max(0, count - 1)
+                        logger.info(
+                            "deathmatch stall triage: explore_credit %d/%d (turn %d) — %s",
+                            streak + 1, _EXPLORE_CREDIT_STREAK_CAP,
+                            self._conv.deathmatch_turns, triage.get("note", "")[:100],
+                        )
+                        return None
+                    logger.info(
+                        "deathmatch stall triage: explore_credit denied "
+                        "(streak %d cap %d, count %d) — treating as real stall",
+                        streak, _EXPLORE_CREDIT_STREAK_CAP, count,
+                    )
+                elif route == "state_revision":
+                    # A4.9 I2：状态修订消耗 harness 修复预算（每停滞 episode
+                    # ≤2 次）——结构性坏计划最终仍会被 replan 兜住，不会无限
+                    # 化妆式改写步骤。
+                    used = _HARNESS_REPAIR_COUNTS.get(self._conv.id, 0)
+                    if used < _HARNESS_REPAIR_BUDGET:
+                        for claim in (triage.get("noisy_claims") or []):
+                            self._record_retracted_claim(
+                                claim, reason=triage.get("note", ""), source="triage",
+                            )
+                        # B3：直接改状态（改写当前步骤行动）而非追加指导语。
+                        step = None
+                        for s in ((self._conv.deathmatch_plan or {}).get("steps") or []):
+                            if s.get("status") == "in_progress":
+                                step = s
+                                break
+                        if step is None:
+                            step = self._get_next_pending_step()
+                        patched = False
+                        if step:
+                            try:
+                                patched = bool(await self._local_patch_step(
+                                    step,
+                                    [f"分诊判为噪声行动：{triage.get('note') or reason}"[:200]],
+                                ))
+                            except Exception as exc:
+                                logger.warning("state revision patch failed: %s", exc)
+                        if patched:
+                            _HARNESS_REPAIR_COUNTS[self._conv.id] = used + 1
+                            _EXPLORE_CREDIT_STREAKS.pop(self._conv.id, None)
+                            self._record_reflection(
+                                last_response, "continue", verify_result,
+                                reason=f"state revision (AEWM, budget {used + 1}/{_HARNESS_REPAIR_BUDGET}): "
+                                       f"{triage.get('note', '')[:120]}",
+                            )
+                            if count >= config.deathmatch_stall_hard_threshold:
+                                self._conv.deathmatch_verify_failures = 0
+                                _HARNESS_REPAIR_COUNTS.pop(self._conv.id, None)
+                            return None
+                    # 预算耗尽/修订不适用 → 回退既有 repair→replan 路径。
+                # 任何非 explore_credit 路由（含被拒的贷记）都是真实停滞——
+                # 重置探索连击。
+                _EXPLORE_CREDIT_STREAKS.pop(self._conv.id, None)
         if replan:
             _repaired = False
             try:
@@ -2732,6 +3227,20 @@ class DeathmatchManager:
         if next_step:
             plan_progress = self._format_plan_progress()
             prior_steps_context = self._format_prior_steps_context(next_step)
+            # GAVEL 前置检查：依赖未满足时显式预警，不静默推进。
+            precondition = self._step_precondition_block(next_step)
+            if precondition:
+                prior_steps_context = (
+                    f"{prior_steps_context}\n{precondition}"
+                    if prior_steps_context else precondition
+                )
+            # AEWM B1：step 专用续跑同样携带证伪台账（anti-contamination）。
+            _retracted_step_block = self._retracted_claims_block()
+            if _retracted_step_block:
+                prior_steps_context = (
+                    f"{prior_steps_context}\n{_retracted_step_block}"
+                    if prior_steps_context else _retracted_step_block
+                )
             prompt = STEP_CONTINUATION_PROMPT_TEMPLATE.format(
                 goal=self._conv.deathmatch_goal,
                 turn=turn,
@@ -2823,6 +3332,10 @@ class DeathmatchManager:
         _failed_block = self._failed_directions_block()
         if _failed_block:
             prompt = prompt + "\n\n" + _failed_block
+        # AEWM B1: 证伪台账——被推翻的断言不得再作为依据（anti-contamination）。
+        _retracted_block = self._retracted_claims_block()
+        if _retracted_block:
+            prompt = prompt + "\n\n" + _retracted_block
         # B2: agent-maintained handoff file — the agent keeps PROGRESS.md in
         # the workspace root (current step / done / next / blockers) and
         # re-reads it at the start of each round, so it can self-heal across
@@ -3047,6 +3560,10 @@ class DeathmatchManager:
         _settled = self._build_settled_block()
         if _settled:
             parts.append(_settled)
+        # AEWM B1: 证伪台账——judge 不得把被推翻的断言当事实（anti-contamination）。
+        _retracted = self._retracted_claims_block()
+        if _retracted:
+            parts.append(_retracted)
         if tool_results:
             trace = "\n".join(
                 f"[{getattr(tr, 'name', '?')}] {_truncate(str(getattr(tr, 'result', '') or ''), 200)}"
@@ -3629,6 +4146,16 @@ intent 只能是以下之一：
         if not completed_tasks:
             return False
 
+        # 复核补漏（A4.9 I2 同类缺口）：僵尸恢复也是目标合成路径——合成前先做
+        # readiness 判读并落档，assumed_defaults 才能显式写入合成目标/计划
+        #（无静默假设）。与轮末同下限：少于 2 条回答不咨询（fail-open）。
+        answered = [p for p in (self._qa_pair_from_task(t) for t in completed_tasks)
+                    if p.get("answer")]
+        if len(answered) >= 2:
+            report = await self._grilling_readiness_report(db)
+            if not report.get("_failed"):
+                self._record_grilling_readiness(current_round, report)
+
         goal = await self._synthesize_goal_from_answers(db)
         await self._draft_bible_from_grilling(db, goal)
         self.complete_grilling(goal)
@@ -3681,6 +4208,8 @@ intent 只能是以下之一：
             questions_per_round=questions_per_round,
             history_text=self._format_history_for_prompt(),
             previous_context=previous_context,
+            research_block=await self._grilling_research_block(query),
+            readiness_block=_readiness_block_for_questions(self._latest_readiness()),
         )
 
         # E4（2026-09-14，默认关）：grilling 前注入小预算用户记忆（fail-open）
@@ -3729,6 +4258,10 @@ intent 只能是以下之一：
 
             questions = self._parse_grilling_questions(raw)
             if questions:
+                questions = _filter_grilling_questions(
+                    questions, self._current_qa_history(),
+                )
+            if questions:
                 last_raw = raw
                 break
             last_raw = raw
@@ -3771,6 +4304,10 @@ intent 只能是以下之一：
                     "question": q["question"],
                     "recommendation": q.get("recommendation", ""),
                     "options": q.get("options", []),
+                    "dimension": q.get("dimension", ""),
+                    "depends_on": q.get("depends_on", []),
+                    "re_ask_of": q.get("re_ask_of", ""),
+                    "deepens": q.get("deepens", ""),
                     "original_query": query,
                     "grilling_round": current_round,
                 }, ensure_ascii=False),
@@ -3830,11 +4367,18 @@ intent 只能是以下之一：
                 if not isinstance(opts, list):
                     opts = []
                 opts = [str(o) for o in opts if o]
+                deps = q.get("depends_on", [])
+                if not isinstance(deps, list):
+                    deps = []
                 result.append({
                     "id": q.get("id", f"q{i+1}"),
                     "question": str(q["question"]),
                     "recommendation": str(q.get("recommendation", "")),
                     "options": opts,
+                    "dimension": str(q.get("dimension", "") or ""),
+                    "depends_on": [str(d) for d in deps if str(d).strip()],
+                    "re_ask_of": str(q.get("re_ask_of", "") or ""),
+                    "deepens": str(q.get("deepens", "") or ""),
                 })
         return result
 
@@ -3883,6 +4427,25 @@ intent 只能是以下之一：
             "total": total_count,
         }
 
+    def _qa_pair_from_task(self, task: Any) -> Dict[str, Any]:
+        ctx = {}
+        if task.context:
+            try:
+                ctx = json.loads(task.context)
+            except Exception:
+                pass
+        return {
+            "question_id": ctx.get("question_id", ""),
+            "question": ctx.get("question", task.goal or ""),
+            "recommendation": ctx.get("recommendation", ""),
+            "answer": task.result or "",
+            "dimension": ctx.get("dimension", ""),
+            "re_ask_of": ctx.get("re_ask_of", ""),
+            # 与旧实现一致：缺失 grilling_round 键的遗留任务按第 1 轮归档
+            #（否则每轮 _finish 都会重复收集历史任务）。
+            "round": ctx.get("grilling_round", 1),
+        }
+
     async def _finish_grilling_round(self, db: AsyncSession) -> Dict[str, Any]:
         """Advance to the next grilling round or synthesize the final goal.
 
@@ -3894,7 +4457,6 @@ intent 只能是以下之一：
             return {"status": "error", "message": "not in grilling phase"}
 
         current_round = self._conv.deathmatch_grilling_round or 1
-        max_rounds = self._conv.deathmatch_grilling_round_total or self._max_grilling_rounds()
 
         # Collect completed tasks for the current round.
         stmt = (
@@ -3911,35 +4473,41 @@ intent 只能是以下之一：
 
         qa_pairs = []
         for task in completed_tasks:
-            ctx = {}
-            if task.context:
-                try:
-                    ctx = json.loads(task.context)
-                except Exception:
-                    pass
-            task_round = ctx.get("grilling_round", 1)
-            if task_round != current_round:
+            pair = self._qa_pair_from_task(task)
+            if pair.get("round") != current_round:
                 continue
-            qa_pairs.append({
-                "question_id": ctx.get("question_id", ""),
-                "question": ctx.get("question", task.goal or ""),
-                "recommendation": ctx.get("recommendation", ""),
-                "answer": task.result or "",
-            })
+            qa_pairs.append(pair)
 
         self._add_to_qa_history(current_round, qa_pairs)
         await db.flush()
+        return await self._advance_or_finish_round(db, qa_pairs)
 
-        # E1: LLM decides whether to continue grilling (the
-        # GRILLING_ROUND_SYNTHESIS_PROMPT was previously dead). When the
-        # answers already cover the goal, end grilling early instead of
-        # forcing all configured rounds. Fail-open → keep the fixed rounds.
-        # Minimum-round floor (A4.9 Important 5): never consult the LLM
-        # before round 2 or with zero answers — sparse input would yield a
-        # weak synthesized goal on an LLM misjudgment.
+    async def _advance_or_finish_round(
+        self, db: AsyncSession, qa_pairs: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Shared round tail: readiness-gated advance vs goal synthesis.
+
+        A1: both the per-question path and the round-based path consult the
+        same readiness report (previously only the per-question path did, and
+        ``submit_grilling_round`` carried a TODO and always ran out the
+        configured rounds). Minimum-round floor (A4.9 Important 5): never
+        consult the LLM before round 2 or with zero answers.
+        """
+        current_round = self._conv.deathmatch_grilling_round or 1
+        max_rounds = self._conv.deathmatch_grilling_round_total or self._max_grilling_rounds()
+
         should_continue = current_round < max_rounds
-        if should_continue and current_round >= 2 and qa_pairs:
-            should_continue = await self._should_continue_grilling(db)
+        report: Optional[Dict[str, Any]] = None
+        # A4.9 Important 2：即使在最后一轮也要判读并落档 readiness——否则
+        # 轮次耗尽路径上目标合成/计划生成读到的是过期报告，"无静默假设"失效。
+        if current_round >= 2 and qa_pairs:
+            report = await self._grilling_readiness_report(db)
+            if not report.get("_failed"):
+                self._record_grilling_readiness(current_round, report)
+            if should_continue:
+                should_continue = bool(report.get("should_continue", True))
+                if report.get("diminishing_returns") and not report.get("open_decisions"):
+                    should_continue = False
 
         if should_continue:
             self._conv.deathmatch_grilling_round = current_round + 1
@@ -3948,21 +4516,40 @@ intent 只能是以下之一：
             await db.flush()
 
             original_query = await self._extract_original_query(db)
-            questions = await self.generate_grilling_questions(
-                query=original_query,
-                db=db,
-                user_id=self._conv.user_id,
-                assistant_id=self._conv.assistant_id,
-            )
-            await db.commit()
-            return {
-                "status": "next_round",
-                "round": self._conv.deathmatch_grilling_round,
-                "max_rounds": max_rounds,
-                "grilling_completed": 0,
-                "grilling_total": len(questions),
-                "questions": questions,
-            }
+            # A4.9 Important 1：出题失败（含机械过滤清空）不得 500 主 UI 提交
+            # 路径（会回滚用户已提交的答案）——降级为按现有回答收束。
+            try:
+                questions = await self.generate_grilling_questions(
+                    query=original_query,
+                    db=db,
+                    user_id=self._conv.user_id,
+                    assistant_id=self._conv.assistant_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "grilling question generation failed (%s) — degrading to "
+                    "goal synthesis with the answers collected so far", exc,
+                )
+                self._record_event(
+                    "grilling_questions_failed",
+                    reason=str(exc)[:200], round=current_round,
+                )
+                questions = None
+                # 恢复被预增的轮次/计数——收束状态不留虚高轮次（r2 cosmetic）。
+                self._conv.deathmatch_grilling_round = current_round
+                self._conv.deathmatch_grilling_total = 0
+                self._conv.deathmatch_grilling_completed = 0
+            if questions:
+                await db.commit()
+                return {
+                    "status": "next_round",
+                    "round": self._conv.deathmatch_grilling_round,
+                    "max_rounds": max_rounds,
+                    "grilling_completed": 0,
+                    "grilling_total": len(questions),
+                    "questions": questions,
+                }
+            # Degrade: fall through to synthesis with what we have.
 
         try:
             goal = await self._synthesize_goal_from_answers(db)
@@ -3991,10 +4578,9 @@ intent 只能是以下之一：
             "goal": goal,
         }
 
-    async def _should_continue_grilling(self, db: AsyncSession) -> bool:
-        """E1: ask the LLM whether the grilling answers so far suffice to
-        synthesize the goal. Fail-open True (keep the fixed round schedule)
-        on any error so grilling can never wedge."""
+    async def _grilling_readiness_report(self, db: AsyncSession) -> Dict[str, Any]:
+        """A2/S0（readiness gate，Stellar Colosseum 2609.15983 启发）：轮末结构化
+        判读。失败 fail-open → 继续固定轮次，永不卡死盘问。"""
         try:
             original = await self._extract_original_query(db)
             history = self._format_history_for_prompt()
@@ -4010,19 +4596,126 @@ intent 只能是以下之一：
                 f"原始目标:\n{original or ''}\n\n盘问历史:\n{history or '(无)'}",
                 temperature=0.0,
             )
-            parsed = self._parse_json_object(raw) or {}
-            val = str(parsed.get("should_continue", "true")).strip().lower()
-            continue_grilling = val not in ("false", "no", "0")
+            report = _parse_grilling_readiness(raw)
             logger.info(
-                "PEVR grilling LLM round decision: should_continue=%s (round %d)",
-                continue_grilling, self._conv.deathmatch_grilling_round,
+                "PEVR grilling readiness report: should_continue=%s diminishing=%s "
+                "open=%d vague=%d defaults=%d (round %d)",
+                report["should_continue"], report["diminishing_returns"],
+                len(report["open_decisions"]), len(report["vague_dimensions"]),
+                len(report["assumed_defaults"]), self._conv.deathmatch_grilling_round,
             )
-            return continue_grilling
+            return report
         except Exception as exc:
             logger.warning(
-                "Grilling continuation judgment failed (%s) — keep fixed rounds", exc
+                "Grilling readiness judgment failed (%s) — keep fixed rounds", exc
             )
-            return True
+            return {
+                "should_continue": True,
+                "reason": f"readiness judgment failed: {exc}",
+                "open_decisions": [], "vague_dimensions": [],
+                "assumed_defaults": [], "diminishing_returns": False,
+                # A4.9 Minor：失败兜底不落档（否则会遮蔽上一轮真实报告的
+                # assumed_defaults）。
+                "_failed": True,
+            }
+
+    async def _should_continue_grilling(self, db: AsyncSession) -> bool:
+        """E1: bool view of the readiness report (kept for compatibility)."""
+        report = await self._grilling_readiness_report(db)
+        return bool(report.get("should_continue", True))
+
+    async def _grilling_search(self, query: str) -> List[Dict[str, str]]:
+        """Search seam for the pre-grill fact research (overridable in tests)."""
+        from app.services.search_service import WebSearchService
+        service = WebSearchService()
+        if not service.is_available:
+            return []
+        hits = await service.search(query)
+        out = []
+        for hit in hits[:2]:
+            out.append({
+                "title": str(getattr(hit, "title", "") or ""),
+                "snippet": str(getattr(hit, "snippet", "") or getattr(hit, "content", "") or ""),
+                "url": str(getattr(hit, "url", "") or ""),
+            })
+        return out
+
+    async def _grilling_research_block(self, query: str) -> str:
+        """A4（facts-before-ask，grill-me「先自查再提问」纪律）：出题前有界联网
+        核实事实类问题，结论注入出题提示词；任何失败 fail-open 返回空串。"""
+        if not config.deathmatch_grilling_research_enabled:
+            return ""
+        max_queries = max(1, config.deathmatch_grilling_research_max_queries)
+        try:
+            llm = self._make_llm()
+            raw = await self._llm_generate(
+                llm,
+                GRILLING_FACT_RESEARCH_PROMPT.format(
+                    query=query or "",
+                    history_text=self._format_history_for_prompt(),
+                    max_queries=max_queries,
+                ),
+                f"原始目标:\n{query or ''}",
+                temperature=0.0,
+            )
+            data = self._parse_json_object(raw) or {}
+            fact_questions = data.get("fact_questions") or []
+            if not isinstance(fact_questions, list):
+                return ""
+            fact_questions = [str(q).strip() for q in fact_questions if str(q).strip()]
+            if not fact_questions:
+                return ""
+        except Exception:
+            logger.debug("grilling fact-question extraction failed (fail-open)", exc_info=True)
+            return ""
+
+        # A4.9 Important 3：检索摘录是不可信内容（COV-11）——标题/摘要/URL
+        # 全部有界、过注入扫描，且标注不得冒充"已核实事实"。
+        try:
+            from app.services.memory_security import scan_injection as _scan
+        except Exception:  # pragma: no cover - scanner always importable
+            _scan = None
+        lines = [
+            "【检索到的公开资料摘录（未经独立核实，仅供背景参考）】"
+            "禁止就以下内容向用户提问；与用户回答冲突时一律以用户回答为准。"
+        ]
+        found = False
+        for fq in fact_questions[:max_queries]:
+            try:
+                hits = await self._grilling_search(fq)
+            except Exception:
+                logger.debug("grilling fact search failed (fail-open)", exc_info=True)
+                hits = []
+            if not hits:
+                continue
+            kept_hits = []
+            for h in hits:
+                title = _sanitize_research_field(h.get("title", ""), 80)
+                snippet = _sanitize_research_field(h.get("snippet", ""), 200)
+                url = _sanitize_research_field(h.get("url", ""), 120)
+                blob = f"{title}\n{snippet}\n{url}"
+                if _scan is not None:
+                    try:
+                        hit_pattern = _scan(blob)
+                    except Exception:
+                        hit_pattern = None
+                    if hit_pattern:
+                        logger.warning(
+                            "grilling research hit dropped (injection scan): %s",
+                            hit_pattern,
+                        )
+                        continue
+                kept_hits.append((title, snippet, url))
+            if not kept_hits:
+                continue
+            found = True
+            fq_label = _sanitize_research_field(fq, 120)
+            lines.append(f"- 问题「{fq_label}」：")
+            for title, snippet, url in kept_hits:
+                lines.append(f"  · {title}：{snippet}（{url}）")
+        if not found:
+            return ""
+        return "\n".join(lines) + "\n\n"
 
     async def submit_grilling_round(
         self,
@@ -4043,7 +4736,6 @@ intent 只能是以下之一：
             return {"status": "error", "message": "not in grilling phase"}
 
         current_round = self._conv.deathmatch_grilling_round or 1
-        max_rounds = self._conv.deathmatch_grilling_round_total or self._max_grilling_rounds()
 
         stmt = (
             select(AgentTask)
@@ -4083,22 +4775,13 @@ intent 只能是以下之一：
             task = pending_tasks.get(task_id)
             if not task:
                 continue
-            ctx = {}
-            if task.context:
-                try:
-                    ctx = json.loads(task.context)
-                except Exception:
-                    pass
             task.status = "completed"
             task.result = answer
             task.progress = 1.0
             task.completed_at = datetime.utcnow()
-            qa_pairs.append({
-                "question_id": ctx.get("question_id", ""),
-                "question": ctx.get("question", task.goal or ""),
-                "recommendation": ctx.get("recommendation", ""),
-                "answer": answer,
-            })
+            pair = self._qa_pair_from_task(task)
+            pair["answer"] = answer
+            qa_pairs.append(pair)
 
         self._add_to_qa_history(current_round, qa_pairs)
         self._conv.deathmatch_grilling_completed = (
@@ -4106,59 +4789,9 @@ intent 只能是以下之一：
         )
         await db.flush()
 
-        # Decide whether to advance to next round or synthesize goal.
-        if current_round < max_rounds:
-            # TODO: optionally call LLM to decide should_continue; for now always
-            # advance through configured max rounds to ensure depth.
-            self._conv.deathmatch_grilling_round = current_round + 1
-            self._conv.deathmatch_grilling_total = 0
-            self._conv.deathmatch_grilling_completed = 0
-            await db.flush()
-
-            original_query = await self._extract_original_query(db)
-            questions = await self.generate_grilling_questions(
-                query=original_query,
-                db=db,
-                user_id=self._conv.user_id,
-                assistant_id=self._conv.assistant_id,
-            )
-            await db.commit()
-            return {
-                "status": "next_round",
-                "round": self._conv.deathmatch_grilling_round,
-                "max_rounds": max_rounds,
-                "grilling_completed": 0,
-                "grilling_total": len(questions),
-                "questions": questions,
-            }
-
-        # Final round complete: synthesize goal and transition to active.
-        try:
-            goal = await self._synthesize_goal_from_answers(db)
-        except Exception as exc:
-            logger.exception(
-                "Goal synthesis failed for conversation %s, using fallback", self._conv.id
-            )
-            goal = await self._extract_original_query(db) or ""
-        await self._draft_bible_from_grilling(db, goal)
-        self.complete_grilling(goal)
-        # W1a: draft the acceptance criteria for the frozen goal (fail-open;
-        # the plan-core audit and the goal comparator consume them).
-        try:
-            await self._synthesize_acceptance_criteria()
-        except Exception as exc:
-            logger.warning("criteria synthesis failed (non-blocking): %s", exc)
-        # PEVR: generate structured plan after grilling completes.
-        try:
-            await self.generate_goal_plan(db)
-        except Exception as exc:
-            logger.warning("PEVR planner failed (non-blocking): %s", exc)
-        return {
-            "status": "grilling_complete",
-            "completed": len(qa_pairs),
-            "total": len(qa_pairs),
-            "goal": goal,
-        }
+        # A1: readiness-gated advance vs goal synthesis — shared with the
+        # per-question path (was: always advance through configured rounds).
+        return await self._advance_or_finish_round(db, qa_pairs)
 
     async def _extract_original_query(self, db: AsyncSession) -> str:
         """Recover the user's original task query from messages or context."""
@@ -4267,6 +4900,7 @@ intent 只能是以下之一：
             query=original_query,
             qa_pairs="\n\n".join(qa_pairs),
             previous_context=previous_context,
+            assumed_defaults_block=_assumed_defaults_block(self._latest_readiness()),
         )
 
         llm = self._make_llm()
@@ -4725,6 +5359,111 @@ intent 只能是以下之一：
             lines.append(f"- {mark} {str(e.get('reason') or e.get('family'))[:150]}")
         lines.append("</failed_directions>")
         return "\n".join(lines)
+
+    # ── AEWM（2609.28416）B1：证伪台账（anti task-state contamination）──
+    # 与 settled_ledger（正向定案，禁翻案）语义相反：这里记被证伪的断言/
+    # 假设，注入续跑/评判/重规划提示词，禁止其继续作为后续决策依据。
+
+    _RETRACTED_CLAIMS_CAP = 25
+
+    def _retracted_claims(self) -> List[Dict[str, Any]]:
+        raw = getattr(self._conv, "deathmatch_retracted_claims", None) or []
+        return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+    def _record_retracted_claim(
+        self, summary: str, *, reason: str = "", source: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """记录一条被证伪的断言（去重、有界、never raises）。
+
+        A4.9 I5：summary/reason 是 LLM 派生文本（分诊/仲裁/验证）——写入前
+        压平控制符、剥尖括号（防 </retracted_claims> 标签逃逸）并截断。
+        A4.9 M1：去重命中时把条目移到队尾，反复证伪的断言不会老化出
+        渲染窗口（[-8:]）。
+        """
+        try:
+            summary = _sanitize_research_field(summary, 200).replace("<", "").replace(">", "")
+            reason = _sanitize_research_field(reason, 200).replace("<", "").replace(">", "")
+            if not summary:
+                return None
+            entries = self._retracted_claims()
+            for i, e in enumerate(entries):
+                if str(e.get("summary") or "") == summary:
+                    e["count"] = int(e.get("count") or 1) + 1
+                    if reason:
+                        e["reason"] = reason
+                    e["ts"] = _time.time()
+                    entries.append(entries.pop(i))  # 刷新到队尾（M1）
+                    self._conv.deathmatch_retracted_claims = entries
+                    return e
+            entry = {
+                "summary": summary,
+                "reason": reason,
+                "source": str(source or "")[:20],
+                "count": 1,
+                "turn": self._conv.deathmatch_turns or 0,
+                "ts": _time.time(),
+            }
+            entries.append(entry)
+            self._conv.deathmatch_retracted_claims = entries[-self._RETRACTED_CLAIMS_CAP:]
+            self._record_event(
+                "retracted_claim", summary=summary[:150], source=entry["source"],
+            )
+            return entry
+        except Exception as exc:
+            logger.debug("retracted claim record failed: %s", exc)
+            return None
+
+    def _retracted_claims_block(self) -> str:
+        items = self._retracted_claims()
+        if not items:
+            return ""
+        lines = [
+            "<retracted_claims>",
+            "以下断言/假设已被证伪（验证、实测或仲裁推翻），不得再作为依据——"
+            "不得进入任何推理、产出或完成判定；如需相关结论必须重新取证。",
+            "（注意：撤回针对的是**当时的声称及其失效依据**，不禁止基于全新证据"
+            "重新认证同一事项。）",
+        ]
+        for e in items[-8:]:
+            why = f"（证伪依据：{str(e.get('reason') or '')[:80]}）" if e.get("reason") else ""
+            lines.append(f"- ❌ {str(e.get('summary') or '')[:150]}{why}")
+        lines.append("</retracted_claims>")
+        return "\n".join(lines)
+
+    def _retract_reopened_step_claims(
+        self, reopened: List[str], deleted: List[str], detail: str = "",
+    ) -> None:
+        """完整性违规重开步骤时撤回其「已完成/已交付」声称（G3 写入点）。
+
+        A4.9 I3：同时把 settled_ledger 里对应 step_complete 条目标记为已撤回，
+        否则「已定案不得翻案」与「已被证伪不得依据」会同时注入同一批提示词。
+        A4.9 I4：撤回对象是**当时那条声称**（带轮次与失效依据），不是该步骤
+        的永久封禁——重新产出后可基于新证据重新认证。
+        """
+        turn = self._conv.deathmatch_turns or 0
+        files_part = ("；失效依据交付物：" + ", ".join(str(d) for d in (deleted or [])[:5])) if deleted else ""
+        detail_part = f"{str(detail or '')[:80]}" if detail else ""
+        for sid in (reopened or [])[:5]:
+            sid = _sanitize_research_field(sid, 40)
+            self._record_retracted_claim(
+                f"第{turn}轮『步骤 {sid} 已完成/已交付』的声称",
+                reason=_sanitize_research_field(
+                    f"{detail_part}{files_part}".strip("；"), 200),
+                source="integrity",
+            )
+        try:
+            ledger = self._settled_ledger()
+            changed = False
+            for e in ledger:
+                if str(e.get("step_id") or "") in set(reopened or []):
+                    e["retracted"] = True
+                    e["retracted_reason"] = _sanitize_research_field(
+                        detail_part or "交付物已从工作区消失", 120)
+                    changed = True
+            if changed:
+                self._conv.deathmatch_settled_ledger = ledger
+        except Exception as exc:
+            logger.debug("settled ledger retract-mark failed: %s", exc)
 
     def _bump_no_progress_replan(self) -> bool:
         """W2b: count a no-progress replan; True when the cap is reached."""
@@ -5296,6 +6035,26 @@ intent 只能是以下之一：
             )
         return None
 
+    def _build_plan_user_prompt(self) -> str:
+        """Plan-decomposition input: goal + FULL grilling Q&A + readiness
+        conclusions (Stellar Colosseum readiness gate — decompose only with
+        the resolved decision tree in view; no silent assumptions)."""
+        goal = self._conv.deathmatch_goal or ""
+        qa_lines = _flatten_grilling_qa(self._conv.deathmatch_grilling_qa_history or [])
+        qa_history = "\n".join(qa_lines)
+        readiness = self._latest_readiness()
+        conclusions = []
+        if readiness.get("open_decisions"):
+            conclusions.append("未决决策（计划不得替用户拍板，须按推荐默认显式标注）：")
+            conclusions.extend(f"- {d}" for d in readiness["open_decisions"])
+        if readiness.get("assumed_defaults"):
+            conclusions.append("已采用的默认假设（必须写进步骤约束，不得隐式）：")
+            conclusions.extend(f"- {d}" for d in readiness["assumed_defaults"])
+        concl_block = (
+            "\n\n【盘问结论】\n" + "\n".join(conclusions) if conclusions else ""
+        )
+        return f"用户目标:\n{goal}\n\n盘问问答:\n{qa_history or '(无)'}{concl_block}"
+
     async def generate_goal_plan(self, db: AsyncSession) -> Optional[Dict[str, Any]]:
         """Generate a structured plan right after grilling completes.
 
@@ -5310,17 +6069,7 @@ intent 只能是以下之一：
         if not goal.strip():
             return None
 
-        qa_history = ""
-        try:
-            hist = self._conv.deathmatch_grilling_qa_history or []
-            if hist:
-                qa_history = "\n".join(
-                    f"Q: {h.get('question','')} A: {h.get('answer','')}" for h in hist
-                )
-        except Exception:
-            qa_history = ""
-
-        user_prompt = f"用户目标:\n{goal}\n\n盘问问答:\n{qa_history or '(无)'}"
+        user_prompt = self._build_plan_user_prompt()
         llm = self._make_llm()
         system_prompt = self.PLAN_SYSTEM_PROMPT.replace("{self_eval_hint}", self._self_eval_hint())
         raw = await self._llm_generate(
@@ -5628,6 +6377,28 @@ intent 只能是以下之一：
             if s.get("status") == "pending":
                 return s
         return None
+
+    def _unmet_dependencies(self, step: Dict[str, Any]) -> List[str]:
+        """GAVEL 前置检查（2609.19315）：返回该步骤尚未完成的依赖 id。"""
+        plan = self._conv.deathmatch_plan or {}
+        steps = plan.get("steps") or []
+        done_ids = {s.get("id") for s in steps if s.get("status") == "done"}
+        unmet = []
+        for d in (step.get("dependencies") or []):
+            if d not in done_ids:
+                unmet.append(str(d))
+        return unmet
+
+    def _step_precondition_block(self, step: Dict[str, Any]) -> str:
+        """依赖未满足时的显式预警（不静默推进；语义性偏差仍留给 replan）。"""
+        unmet = self._unmet_dependencies(step)
+        if not unmet:
+            return ""
+        deps = ", ".join(unmet)
+        return (
+            f"\n【前置检查】依赖步骤 {deps} 尚未完成，其产出可能缺失。"
+            "不得静默假设其已完成：要么先补齐其产出，要么在本轮开头明确说明为何可跳过。\n"
+        )
 
     def _format_plan_progress(self) -> str:
         """Render plan progress as a compact summary for the continuation prompt."""
@@ -6070,6 +6841,10 @@ intent 只能是以下之一：
                 result["issues"] = list(result.get("issues") or []) + [
                     "已重开受影响步骤：" + ", ".join(reopened[:5])
                 ]
+                # AEWM B1：重开=其完成/交付声称被证伪，撤回以防污染后续判定。
+                self._retract_reopened_step_claims(
+                    reopened, deleted_protected, integrity_issue,
+                )
 
         # LLM verification: evaluate the current step's completion.
         # This is the ONLY mechanism that can mark a step as done.
@@ -6161,6 +6936,11 @@ intent 只能是以下之一：
                     + (
                         f"{self._build_settled_block()}\n\n"
                         if self._build_settled_block()
+                        else ""
+                    )
+                    + (
+                        f"{self._retracted_claims_block()}\n\n"
+                        if self._retracted_claims_block()
                         else ""
                     )
                     + f"请评估当前步骤是否已完成：\n"
@@ -6554,6 +7334,10 @@ intent 只能是以下之一：
         _failed_block = self._failed_directions_block()
         if _failed_block:
             user_prompt += "\n\n" + _failed_block
+        # AEWM B1: 新计划不得重建在被证伪的断言上。
+        _retracted_block = self._retracted_claims_block()
+        if _retracted_block:
+            user_prompt += "\n\n" + _retracted_block
         # C2 harness repair (coarse_replan, one-shot): the last stall judged
         # the plan too fine-grained — ask for a coarser plan this time.
         if getattr(self, "_replan_coarse", False):
@@ -7215,6 +7999,13 @@ intent 只能是以下之一：
                         "type": "reconcile_continue",
                         "summary": f"judge 判完成被仲裁驳回：{str(_recon_reason)[:150]}",
                     })
+                    # AEWM B1：「目标已完成」声称被仲裁证伪——撤回以防后续
+                    # 判定/产出继续建立在该声称上。
+                    self._record_retracted_claim(
+                        "「目标已完成」的声称",
+                        reason=_truncate(str(_recon_reason), 200),
+                        source="reconcile",
+                    )
                     if verify_result and verify_result.get("progress"):
                         # Genuine progress → reset stall counter (matches the
                         # normal-progress reset in the partial branch below).
@@ -7241,6 +8032,13 @@ intent 只能是以下之一：
                         "verify_result": verify_result,
                     }
                 if _recon_decision == "stall":
+                    # A4.9 M3：stall 裁决同样是「目标已完成」声称被推翻——
+                    # 与 continue 裁决一致地撤回（B1 覆盖同类仲裁结果）。
+                    self._record_retracted_claim(
+                        "「目标已完成」的声称",
+                        reason=_truncate(str(_recon_reason), 200),
+                        source="reconcile",
+                    )
                     _stall = await self._handle_stall(
                         f"reconciliation=stall: {_recon_reason[:150]}",
                         verify_result, last_response,
@@ -7301,6 +8099,8 @@ intent 只能是以下之一：
             except Exception as exc:
                 logger.warning("deathmatch final deliverables collection failed: %s", exc)
                 self._final_attachments = []
+            # ScienceBuddy 持续学习：收束教训回写记忆（fail-open，不阻断收束）。
+            await self._persist_completion_memory()
             return {
                 "status": "done",
                 "should_continue": False,
@@ -7746,7 +8546,9 @@ intent 只能是以下之一：
 
     def _build_settled_block(self) -> str:
         """Compact settled-verdict block for judge/verifier prompts: settled
-        items must not be re-litigated without NEW evidence."""
+        items must not be re-litigated without NEW evidence. A4.9 I3: entries
+        marked retracted (integrity reopen) are rendered as withdrawn so this
+        block never contradicts <retracted_claims> about the same step."""
         ledger = self._settled_ledger()
         if not ledger:
             return ""
@@ -7754,10 +8556,16 @@ intent 只能是以下之一：
             "<settled_verdicts>",
             "以下判定已定案——除非出现新证据（新文件/新测试输出/用户新指令），不得翻案：",
         ]
-        for e in ledger[-8:]:
+        shown = 0
+        for e in reversed(ledger):
+            if shown >= 8:
+                break
+            shown += 1
+            mark = "[已撤回] " if e.get("retracted") else ""
             lines.append(
-                f"- [{e.get('type')}] {str(e.get('summary') or '')[:150]}（第{e.get('turn', '?')}轮）"
+                f"- {mark}[{e.get('type')}] {str(e.get('summary') or '')[:150]}（第{e.get('turn', '?')}轮）"
             )
+        lines.reverse()
         lines.append("</settled_verdicts>")
         return "\n".join(lines)
 

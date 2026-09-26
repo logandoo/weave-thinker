@@ -1701,6 +1701,33 @@ class Config:
         return bool(self.deathmatch.get("verify_enabled", False))
 
     @property
+    def deathmatch_grilling_research_enabled(self) -> bool:
+        """盘问前置事实自查（facts-before-ask，2026-09-25 SOTA 波）：出题前用
+        有界联网检索核实事实类问题，结论注入出题提示词（只问决策）。默认开；
+        检索不可用/失败一律 fail-open，不影响出题。"""
+        return bool(self.deathmatch.get("grilling_research_enabled", True))
+
+    @property
+    def deathmatch_grilling_research_max_queries(self) -> int:
+        """每轮盘问前置事实检索的问题上限（默认 3）。"""
+        return int(self.deathmatch.get("grilling_research_max_queries", 3))
+
+    @property
+    def deathmatch_completion_memory_write_enabled(self) -> bool:
+        """死磕收束时把目标+验收要点+关键决策写回用户记忆（file memory +
+        subconscious 钩子），供后续任务检索（ScienceBuddy 持续学习启发）。
+        默认开；写入失败 fail-open，不阻断收束。"""
+        return bool(self.deathmatch.get("completion_memory_write_enabled", True))
+
+    @property
+    def deathmatch_stall_triage_enabled(self) -> bool:
+        """停滞动作分诊（AEWM 2609.28416 Action Judge 启发）：停滞现场由 LLM
+        把最近行动分诊为 critical/exploratory/noisy 并分流——noisy=状态修订
+        （撤回断言+改写步骤）、critical=重规划、exploratory=探索贷记不计惩罚。
+        默认开；分诊失败 fail-open 走既有 repair→replan 路径。"""
+        return bool(self.deathmatch.get("stall_triage_enabled", True))
+
+    @property
     def deathmatch_verify_max_retries(self) -> int:
         return int(self.deathmatch.get("verify_max_retries", 20))
 
@@ -1994,11 +2021,33 @@ class Config:
         A4.9 R2 Minor)."""
         return int(self.agent_citation.get("remand_min_chars", 200))
 
+    @property
+    def agent_citation_remand_max_per_turn(self) -> int:
+        """零引用 remand 每轮上限（2026-09-25，conv 1a24a04a A4.9 R1
+        Important-1）。默认 2：修复稿仍零 [N] 时第二次 remand 拦截静默出货；
+        第三次起放行给 LLM 审计员（有界，不烧预算循环）。1 = 旧 one-shot 行为。
+        最小 1。"""
+        return max(1, int(self.agent_citation.get("remand_max_per_turn", 2)))
+
     # ---- Response auditor (发送前质量审计) ----
 
     @property
     def agent_audit(self) -> dict:
         return self.agent.get("audit", {})
+
+    @property
+    def agent_audit_history_grounding_max_items(self) -> int:
+        """审计证据域历史窗——grounding 类（web_search/browser/MCP）工具结果的
+        独立窗口（2026-09-25，conv 1a24a04a）。旧实现 6 条混排，被更近轮次的
+        notes/memory/execute_code 占满后历史检索证据零入选 → NPG 跨轮假阳性。
+        0 = 不纳入历史 grounding 证据。"""
+        return int(self.agent_audit.get("history_grounding_max_items", 20))
+
+    @property
+    def agent_audit_history_other_max_items(self) -> int:
+        """审计证据域历史窗——非 grounding 类历史工具结果窗口（默认 6，即
+        2026-09-25 前的混排窗口语义）。0 = 不纳入。"""
+        return int(self.agent_audit.get("history_other_max_items", 6))
 
     @property
     def agent_audit_policy(self) -> str:
@@ -2562,6 +2611,16 @@ class Config:
 
     @property
     def memory_retrieval(self) -> dict:
+        """[memory.retrieval] —— 检索/注入行为开关。注入预算键：
+        injection_total_token_budget（默认 2000）· injection_monopoly_share
+        （默认 0.7，Proteus 2608.16844 启发的单段垄断钳制：单段超预算时最多
+        占 share 份额，为后续段保留新鲜容量）· injection_min_relevance* ·
+        injection_max_episodic/concept/subconscious。
+        链接扩展键（WFM 2609.18182，代码默认关）：concept_link_expansion_enabled
+        · concept_link_expansion_max（每轮并入上限，默认 3）·
+        concept_link_expansion_units（unit 种子窗，默认 5）·
+        concept_link_expansion_score（链接候选基础分，默认 0.45）——
+        unit→concept 拓扑召回 + concept→unit 源条目摘录并置。"""
         return self.memory.get("retrieval", {})
 
     @property

@@ -1080,12 +1080,13 @@ export const useChatStore = defineStore('chat', () => {
       }))
   }
 
-  // 继续旧会话后置顶（2026-09-15）：侧栏顺序 = 后端 list_conversations 的
-  // ORDER BY —— (sort_order asc, 最近一条用户消息 desc)，纯函数见
-  // stores/conversationOrder.ts（单测 frontend/tests/workflows/test_conversation_order.cjs）。
-  // 发送新消息时把该会话提升到 sort_order=0 并刷新 last_user_message_at，使其
-  // 立刻跳到所在分组/时间分类的最上方；后端在写入用户消息时做同样的持久化提升
-  // （chat.py），因此刷新后顺序保持一致。
+  // 继续旧会话后置顶（2026-09-15；2026-09-26 起重新生成同口径）：侧栏顺序 =
+  // 后端 list_conversations 的 ORDER BY —— (sort_order asc, 最近活动 desc)，
+  // 纯函数见 stores/conversationOrder.ts（单测
+  // frontend/tests/workflows/test_conversation_order.cjs）。
+  // 发送新消息 / 编辑重发 / 重新生成时把该会话提升到 sort_order=0 并刷新
+  // last_user_message_at（=最近活动时间），使其立刻跳到所在分组/时间分类的最
+  // 上方；后端在 chat.py 相应分支做同样的持久化提升，刷新后顺序保持一致。
   //
   // _pendingPromotions：本地乐观置顶的 convId → 前值快照。并发快照
   // （loadConversations / refreshConversation 的 GET）可能在本次发送的服务端提交
@@ -2228,6 +2229,9 @@ export const useChatStore = defineStore('chat', () => {
 
     const targetMessage = existingMessages[targetIndex]
     messages.value[convId] = existingMessages.slice(0, targetIndex)
+    // 重新生成 = 最新操作（2026-09-26）：乐观置顶，服务端在 chat.py
+    // regenerate 分支持久化 sort_order=0，活动时间随新助手消息落库推进。
+    promoteConversationToTop(convId)
     beginStreaming(convId)
 
     const abortController = new AbortController()
@@ -2250,6 +2254,7 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const assistantStore = useAssistantStore()
       let supersededRejected = false
+      let busyRejected = false
       await chatApi.streamChat(
         {
           conversation_id: convId,
@@ -2263,6 +2268,7 @@ export const useChatStore = defineStore('chat', () => {
         {
           ...callbacks,
           signal: abortController.signal,
+          onConversationBusy: () => { busyRejected = true },
           onConversationSuperseded: () => { supersededRejected = true },
         },
       )
@@ -2271,6 +2277,18 @@ export const useChatStore = defineStore('chat', () => {
         // bubble; resync from the DB (same semantics as sendMessage).
         endStreaming(convId)
         void refreshConversation(convId)
+        return
+      }
+      if (busyRejected) {
+        // 另一 run 占用中：请求未到达服务端（零写入）——恢复被裁掉的消息并
+        // 回滚乐观置顶（A4.9 R1 I-1）。refresh 追平（同会话另一流已落库新
+        // 活动）则回滚自动 no-op；refresh 失败宁可保留置顶也不盲回滚（与发送
+        // 路径的 A4.9 R3/R4 口径一致）。
+        currentError.value = '该会话已有正在进行的回答，请稍后重试。'
+        endStreaming(convId)
+        if (await refreshConversation(convId)) {
+          rollbackPromotion(convId)
+        }
         return
       }
       if (s.streaming) {
@@ -2294,7 +2312,14 @@ export const useChatStore = defineStore('chat', () => {
       }
       currentError.value = e.message || '重新生成失败'
       endStreaming(convId)
-      await refreshConversation(convId)
+      // 请求可能未到达服务端（网络失败=零写入）；也可能死于 trim/sort_order
+      // 已提交但新助手消息未落库的窗口（此时 refresh 未追平 → 回滚本地置顶，
+      // 与服务端 sort_order=0 短暂分歧，下一次 loadConversations 自愈——与发送
+      // 路径同形态，A4.9 R2 Minor-2 记录）。服务端已落库新助手消息则 refresh
+      // 追平清标记，回滚自动 no-op（A4.9 R1 I-1）。
+      if (await refreshConversation(convId)) {
+        rollbackPromotion(convId)
+      }
     } finally {
       if (s.abortController === abortController) s.abortController = null
     }
@@ -2311,6 +2336,8 @@ export const useChatStore = defineStore('chat', () => {
     if (targetIndex === -1) return
 
     messages.value[convId] = existingMessages.slice(0, targetIndex)
+    // 重新生成（强制检索结果）= 最新操作：与 regenerateLastAssistantMessage 同样置顶。
+    promoteConversationToTop(convId)
     beginStreaming(convId)
 
     const abortController = new AbortController()
@@ -2333,6 +2360,7 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const assistantStore = useAssistantStore()
       let supersededRejected = false
+      let busyRejected = false
       await chatApi.streamChat(
         {
           conversation_id: convId,
@@ -2347,6 +2375,7 @@ export const useChatStore = defineStore('chat', () => {
         {
           ...callbacks,
           signal: abortController.signal,
+          onConversationBusy: () => { busyRejected = true },
           onConversationSuperseded: () => { supersededRejected = true },
         },
       )
@@ -2355,6 +2384,15 @@ export const useChatStore = defineStore('chat', () => {
         // bubble; resync from the DB (same semantics as sendMessage).
         endStreaming(convId)
         void refreshConversation(convId)
+        return
+      }
+      if (busyRejected) {
+        // 同 regenerateLastAssistantMessage：零写入拒绝 → 回滚乐观置顶。
+        currentError.value = '该会话已有正在进行的回答，请稍后重试。'
+        endStreaming(convId)
+        if (await refreshConversation(convId)) {
+          rollbackPromotion(convId)
+        }
         return
       }
       if (s.streaming) {
@@ -2378,7 +2416,10 @@ export const useChatStore = defineStore('chat', () => {
       }
       currentError.value = e.message || '重新生成失败'
       endStreaming(convId)
-      await refreshConversation(convId)
+      // 同 regenerateLastAssistantMessage：refresh 追平则 no-op，否则回滚置顶。
+      if (await refreshConversation(convId)) {
+        rollbackPromotion(convId)
+      }
     } finally {
       if (s.abortController === abortController) s.abortController = null
     }

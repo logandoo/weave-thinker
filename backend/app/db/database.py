@@ -226,6 +226,10 @@ class Conversation(Base):
     # no-flip-without-new-evidence rule. MUST be ORM-mapped (A4.9 W2-C1:
     # an unmapped attribute silently persists nothing across requests).
     deathmatch_settled_ledger = Column(JSON, nullable=True)
+    # AEWM 波（2026-09-25，arXiv 2609.28416 anti-contamination）：证伪台账
+    # —— 被验证器/仲裁/分诊证伪的断言与假设。与 settled_ledger（正向定案，
+    # 禁翻案）语义相反：这里是反向禁用（不得再作为后续决策依据）。
+    deathmatch_retracted_claims = Column(JSON, nullable=True)
     deathmatch_last_verification_result = Column(JSON, nullable=True)
     deathmatch_verify_failures = Column(Integer, default=0)   # consecutive verifier non-complete
     deathmatch_human_gate = Column(Text, nullable=True)       # structured human-gate report
@@ -651,6 +655,7 @@ class AgentTask(Base):
     # {version,cursor,messages,budget_used,elapsed,updated_at}）。有值时
     # 启动恢复置 resumable 并从 cursor 续跑；无值维持旧行为（标 failed）。
     checkpoint = Column(Text, nullable=True)
+    worker_id = Column(String(36), nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

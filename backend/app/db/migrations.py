@@ -645,6 +645,8 @@ $$"""),
     ("conversations_deathmatch_pause_state", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_pause_state JSON"),
     ("conversations_deathmatch_events", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_events JSON"),
     ("conversations_deathmatch_no_progress_replans", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_no_progress_replans INTEGER DEFAULT 0"),
+    # AEWM 借鉴波（2026-09-25）：证伪台账（anti task-state contamination）
+    ("conversations_deathmatch_retracted_claims", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_retracted_claims JSONB"),
 ]
 
 

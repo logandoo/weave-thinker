@@ -50,6 +50,15 @@ class ActiveAgentState:
     provisional: bool = False
     reserved_at: float = 0.0
 
+    # conv 5228db60 兜底①：绑定的本进程 agent task。done-callback / stop 端点
+    # 据此 identity 判定 running-claim 是否孤儿（task 已死而槽仍在）。
+    task_handle: Optional[asyncio.Task] = None
+    # 跨 worker 活 run 的本地恢复镜像（get() recovery 置位）——sweep_orphans
+    # 仅在 owner 心跳已死时回收（A4.9 R1 #2）；owner 活着=真身在别的 worker，
+    # 误杀会放行并发双跑。
+    recovered_cross_worker: bool = False
+    owner_worker_id: Optional[str] = None
+
     # 插话队列（2026-08-29）：interject 端点把运行中 run 的用户插话投入此
     # 队列；chat.py 在 agent_loop.run() 时把它传给 loop，loop 在迭代边界
     # drain。生命周期随本 state（unregister 即弃），跨 worker 不恢复
@@ -140,6 +149,10 @@ _SNAPSHOT_SAVE_INTERVAL = 15  # seconds between periodic snapshot saves
 # (slow providers can take >60s), and the endpoint refreshes reserved_at at
 # setup milestones. The reaper is only a backstop for setup-dead requests.
 _PROVISIONAL_TTL_SECONDS = 180
+
+# conv 038e837a 遗留③ / conv 5228db60：adopted+running 且无本地活 task 的
+# 孤儿 running-claim 超过该秒数即回收（stop-cancel 逃逸窗口的最后防线）。
+_ORPHAN_ADOPTED_TTL_SECONDS = 300
 
 
 class ActiveAgentRegistry:
@@ -329,6 +342,14 @@ class ActiveAgentRegistry:
                 state.completed_data = snapshot.get("completed_data")
                 state.error = snapshot.get("error")
                 state.is_running = snapshot.get("is_running", False)
+                # 镜像来源标记（sweep_orphans 据此做 owner 心跳复核）。
+                # 判定异常时 fail-safe 记 True（视为跨 worker，宁可不回收）。
+                try:
+                    state.owner_worker_id = saved_worker
+                    state.recovered_cross_worker = (saved_worker != shared_state.worker_id)
+                except Exception:
+                    state.owner_worker_id = saved_worker
+                    state.recovered_cross_worker = True
 
                 async with self._lock:
                     self._agents[conversation_id] = state
@@ -354,6 +375,105 @@ class ActiveAgentRegistry:
                         "Failed to delete agent state for %s from shared store",
                         conversation_id, exc_info=True,
                     )
+
+    async def release_if_task_dead(
+        self, conversation_id: str, expected_task: "asyncio.Task"
+    ) -> bool:
+        """Release a running-claim whose owning task is dead (conv 5228db60).
+
+        ``task.cancel()`` can land BEFORE the agent task's main try/finally
+        (which owns ``unregister``) is entered — the CancelledError handler
+        never runs and the adopted slot leaks conversation_busy forever. This
+        primitive is the identity-checked escape hatch for exactly that case:
+        called from the task's done-callback (兜底①), the stop endpoint (兜底③),
+        and any other owner-aware cleanup site.
+
+        Returns True only when a slot was actually popped. Identity-checked:
+        ``expected_task`` (when given) must equal the slot's ``task_handle``;
+        a live (not done) handle is never released — its own finally cleans up.
+        """
+        if expected_task is None:
+            # A4.9 R1 #6：无 identity 的释放请求一律拒绝（fail-closed）——
+            # 可省 identity 的 API 其失效模式是放行并发双跑。
+            return False
+        async with self._lock:
+            current = self._agents.get(conversation_id)
+            if current is None:
+                return False
+            if current.task_handle is not expected_task:
+                return False
+            handle = current.task_handle
+            if handle is not None and not handle.done():
+                return False
+            current.is_running = False
+            self._agents.pop(conversation_id, None)
+            logger.info("Released orphaned adopted slot: %s", conversation_id)
+        if shared_state.is_db_enabled:
+            try:
+                await shared_state.delete_agent_state(conversation_id)
+            except Exception:
+                pass
+        return True
+
+    async def sweep_orphans(self) -> int:
+        """Reap orphaned adopted running-claims (038e837a 遗留③ / 5228db60).
+
+        Third reaper class alongside provisional>180s and not-running>300s:
+        ``is_running and not provisional`` entries whose owning task is absent
+        or done, older than _ORPHAN_ADOPTED_TTL_SECONDS. Cross-worker mirrors
+        are swept ONLY when the owner worker's heartbeat is dead (a live run's
+        mirror is never touched — killing it would permit a double-run); an
+        inconclusive heartbeat check fails SAFE (treated as alive). Deletes the
+        shared-state row too (A4.9 R1 #1): leaving it lets get() recovery
+        resurrect a fresh mirror within the 180s distrust window and re-wedge
+        the conversation. Async + self-locking (re-verify identity before pop).
+        """
+        now = time.time()
+        candidates = []
+        async with self._lock:
+            for cid, st in list(self._agents.items()):
+                if not st.is_running or st.provisional:
+                    continue
+                handle = st.task_handle
+                if handle is not None and not handle.done():
+                    continue
+                last_claim = st.reserved_at or st._created_at
+                if (now - last_claim) <= _ORPHAN_ADOPTED_TTL_SECONDS:
+                    continue
+                candidates.append((cid, st))
+        swept = []
+        for cid, st in candidates:
+            if st.recovered_cross_worker:
+                try:
+                    owner_alive = (
+                        await shared_state.is_worker_active(st.owner_worker_id)
+                        if (shared_state.is_db_enabled and st.owner_worker_id)
+                        else True
+                    )
+                except Exception:
+                    owner_alive = True
+                if owner_alive:
+                    continue
+            async with self._lock:
+                if self._agents.get(cid) is not st:
+                    continue
+                self._agents.pop(cid, None)
+                st.is_running = False
+            logger.warning(
+                "Reaped orphaned adopted slot (no live local task): %s (age=%ds)",
+                cid, int(now - (st.reserved_at or st._created_at)),
+            )
+            swept.append(cid)
+        for cid in swept:
+            if shared_state.is_db_enabled:
+                try:
+                    await shared_state.delete_agent_state(cid)
+                except Exception:
+                    logger.warning(
+                        "Failed to delete shared agent state for %s", cid,
+                        exc_info=True,
+                    )
+        return len(swept)
 
     async def start_cleanup(self) -> None:
         async with self._lock:
@@ -393,6 +513,9 @@ class ActiveAgentRegistry:
                     if current is not None and current.provisional and (now - current.reserved_at > _PROVISIONAL_TTL_SECONDS):
                         self._agents.pop(cid, None)
                         logger.warning("Reaped setup-dead provisional reservation: %s", cid)
+            # conv 038e837a 遗留③ / conv 5228db60：孤儿 adopted running-claim
+            # 超时回收（第三类）。sweep_orphans 自持锁 + 删 shared 行。
+            await self.sweep_orphans()
 
     async def _snapshot_loop(self) -> None:
         """Periodically persist agent state snapshots for cross-worker recovery."""

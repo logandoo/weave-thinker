@@ -208,14 +208,20 @@ def _chunked_ids(values: List[str], size: int = 200):
         yield values[index:index + size]
 
 
-async def _get_last_user_message_times(
+async def _get_last_activity_times(
     db: AsyncSession, conversation_ids: List[str]
 ) -> dict[str, Optional[datetime]]:
+    """每会话的最近活动时间 = MAX(messages.created_at)（全角色）。
+
+    2026-09-26 起不再限 role='user'：重新生成/后台任务只产生助手消息，也
+    算作会话的最新操作，应推进侧栏排序键。响应字段名沿用
+    ``last_user_message_at``（API/前端契约不变）。
+    """
     if not conversation_ids:
         return {}
     result = await db.execute(
         select(Message.conversation_id, func.max(Message.created_at).label("last_user_message_at"))
-        .where(Message.conversation_id.in_(conversation_ids), Message.role == "user")
+        .where(Message.conversation_id.in_(conversation_ids))
         .group_by(Message.conversation_id)
     )
     return {row[0]: row[1] for row in result.all()}
@@ -264,9 +270,11 @@ async def list_conversations(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # 最近活动子查询：MAX(messages.created_at) 全角色（2026-09-26；不再限
+    # role='user'，重新生成/后台任务产生的助手消息同样推进排序）。label 沿用
+    # 响应字段名 last_user_message_at（API 契约不变）。
     last_msg_subq = (
         select(Message.conversation_id, func.max(Message.created_at).label("last_user_message_at"))
-        .where(Message.role == "user")
         .group_by(Message.conversation_id)
         .subquery()
     )
@@ -857,11 +865,11 @@ async def get_conversation(
     )
     messages = msg_result.scalars().all()
 
-    # last_user_message_at 与 list_conversations 同口径（MAX(role='user')），
-    # 由已加载消息计算，零额外查询——刷新单会话时侧栏顺序/时间分类可用同一
-    # 权威时间戳（2026-09-15 继续会话置顶）。
+    # last_user_message_at 与 list_conversations 同口径（MAX 全角色
+    # created_at，2026-09-26 起含助手消息——重新生成也算最新操作），由已加载
+    # 消息计算，零额外查询——刷新单会话时侧栏顺序/时间分类可用同一权威时间戳。
     last_user_message_at = max(
-        (m.created_at for m in messages if m.role == "user" and m.created_at),
+        (m.created_at for m in messages if m.created_at),
         default=None,
     )
 
@@ -960,7 +968,7 @@ async def update_conversation(
 
     await db.commit()
     await db.refresh(conversation)
-    last_user_times = await _get_last_user_message_times(db, [conversation.id])
+    last_user_times = await _get_last_activity_times(db, [conversation.id])
     return _conversation_response(
         conversation, last_user_times.get(conversation.id)
     )
@@ -1025,7 +1033,7 @@ async def move_conversation(
     conversation.group_id = move_data.group_id
     await db.commit()
     await db.refresh(conversation)
-    last_user_times = await _get_last_user_message_times(db, [conversation.id])
+    last_user_times = await _get_last_activity_times(db, [conversation.id])
     return _conversation_response(
         conversation, last_user_times.get(conversation.id)
     )

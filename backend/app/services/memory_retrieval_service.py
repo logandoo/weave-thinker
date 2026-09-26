@@ -176,6 +176,12 @@ async def _retrieve_with_meta_inner(
             db, user_id, concept_candidates, stage0, query_text,
         )
 
+    # WFM（2609.18182）残余闭环：unit→concept 链接召回（file 记忆条目沿
+    # source_unit_ids 拓扑把关联概念并入候选；默认关，`concept_link_expansion_enabled` 开）。
+    concept_candidates = await _stage2b_link_expansion(
+        db, user_id, concept_candidates, sub_candidates, epi_candidates,
+    )
+
     try:
         candidates = await _stage3_embedding_rerank(
             db, user_id, query_text, concept_candidates, epi_candidates, sub_candidates, stage0,
@@ -1136,6 +1142,159 @@ async def _stage2_description_expansion(
     return sorted(candidates, key=lambda c: c.score, reverse=True)[:50]
 
 
+def _flat_excerpt(text_value: str, limit: int = 120) -> str:
+    """单行、有界摘录（链接扩展展示用；标注省略符）。
+
+    A4.9 M3：控制符/零宽字符一并剥除（摘录进入提示词的信任边界同
+    检索摘录——内容是数据不是指令）。"""
+    s = re.sub(r"[\x00-\x1f\x7f\u200b-\u200f\u202a-\u202e\ufeff]", " ", text_value or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return (s[:limit] + "…") if len(s) > limit else s
+
+
+def _concept_line_with_link(line: str, excerpt: str) -> str:
+    """WFM（2609.18182）稠密+拓扑并存：概念行携带其源条目摘录。无摘录原样返回。"""
+    if not excerpt:
+        return line
+    return f"{line}｜源条目: {excerpt}"
+
+
+async def _fetch_linked_unit_excerpts(
+    db: AsyncSession, user_id: str, concept_ids: list[str],
+) -> dict[str, str]:
+    """concept→unit 链接读出：每个概念取其 source_unit_ids 里的首条原文摘录。
+
+    WFM 残余闭环：概念（稀疏拓扑）与其源文件记忆条目（稠密文档）在注入端
+    并存。失败 fail-open 返回空 dict。"""
+    out: dict[str, str] = {}
+    ids = [str(c) for c in (concept_ids or []) if c][:8]
+    if not ids:
+        return out
+    try:
+        result = await db.execute(
+            text("SELECT id, source_unit_ids FROM memory_concepts "
+                 "WHERE user_id = :u AND id = ANY(:ids)"),
+            {"u": user_id, "ids": ids},
+        )
+        rows = result.fetchall()
+        concept_units: dict[str, list[str]] = {}
+        unit_ids: list[str] = []
+        for row in rows:
+            try:
+                raw_units = json.loads(row[1]) if row[1] else []
+            except (json.JSONDecodeError, TypeError):
+                raw_units = []
+            # A4.9 M2：非列表值（dict/str）不按元素展开
+            units = (
+                [str(u) for u in raw_units if u][:2]
+                if isinstance(raw_units, list) else []
+            )
+            concept_units[row[0]] = units
+            for u in units:
+                if u not in unit_ids:
+                    unit_ids.append(u)
+        if not unit_ids:
+            return {}
+        unit_rows = await db.execute(
+            text("SELECT id, raw_text FROM subconscious_log "
+                 "WHERE user_id = :u AND id = ANY(:ids)"),
+            {"u": user_id, "ids": unit_ids[:16]},
+        )
+        texts = {r[0]: (r[1] or "") for r in unit_rows.fetchall()}
+        for cid, units in concept_units.items():
+            for u in units:
+                if texts.get(u):
+                    out[cid] = _flat_excerpt(texts[u])
+                    break
+        return out
+    except Exception:
+        logger.debug("linked unit excerpt fetch failed (fail-open)", exc_info=True)
+        return {}
+
+
+async def _stage2b_link_expansion(
+    db: AsyncSession, user_id: str,
+    concept_candidates: list[RetrievalCandidate],
+    sub_candidates: list[RetrievalCandidate],
+    epi_candidates: list[RetrievalCandidate],
+    *,
+    enabled: Optional[bool] = None,
+) -> list[RetrievalCandidate]:
+    """unit→concept 拓扑召回扩展（WFM 2609.18182 残余闭环）。
+
+    file 记忆条目经 subconscious 入库后，其 id 被概念抽取写进
+    ``memory_concepts.source_unit_ids``（写入侧链接早已存在），但检索侧
+    此前从不读它。本阶段沿该链接把命中 unit 的关联概念并入候选——缺失才
+    补（不改既有分，防"注入即 boost"自我强化），每轮有界，失败 fail-open。
+
+    A4.9 修复：①I2 已失效/被合并概念（valid_to 非空）不再复活；②I1/I3
+    链接候选属扩展源——未经 embedding/CE 确认时 `_cand_gate_score` 拒绝
+    （同 cluster/relation），score 只是确认前的排序基数，不是注入票；③M1
+    episodic 种子同窗扩展（episodes 的 id 同在 source_unit_ids）且返回新
+    列表不改调用方入参；④M2 source_unit_ids 非列表值防护 + 排序确定性。
+    """
+    if enabled is None:
+        enabled = bool(config.memory_retrieval.get("concept_link_expansion_enabled", False))
+    if not enabled:
+        return list(concept_candidates)
+    ret_cfg = config.memory_retrieval
+    max_add = max(1, int(ret_cfg.get("concept_link_expansion_max", 3)))
+    unit_window = max(1, int(ret_cfg.get("concept_link_expansion_units", 5)))
+    link_score = float(ret_cfg.get("concept_link_expansion_score", 0.45))
+    out = list(concept_candidates)
+    try:
+        seeds = (
+            sorted(sub_candidates or [], key=lambda c: c.score, reverse=True)
+            + sorted(epi_candidates or [], key=lambda c: c.score, reverse=True)
+        )[:unit_window]
+        if not seeds:
+            return out
+        existing_ids = {c.id for c in out}
+        added = 0
+        for seed in seeds:
+            if added >= max_add:
+                break
+            result = await db.execute(
+                text("SELECT id, canonical_name, description_short, description_full, "
+                     "weight, importance, source_trust, memory_type, aliases, "
+                     "last_recalled_at, stability, created_at "
+                     "FROM memory_concepts WHERE user_id = :u "
+                     "AND status IN ('active', 'silent') "
+                     "AND valid_to IS NULL "
+                     "AND source_unit_ids LIKE :pat "
+                     "ORDER BY weight DESC LIMIT 5"),
+                {"u": user_id, "pat": f'%"{seed.id}"%'},
+            )
+            for row in result.fetchall():
+                if added >= max_add:
+                    break
+                cid = row[0]
+                if cid in existing_ids:
+                    continue
+                existing_ids.add(cid)
+                added += 1
+                out.append(RetrievalCandidate(
+                    id=cid, tier="concept", score=link_score,
+                    content=row[2] or "",
+                    metadata={"canonical_name": row[1] or "",
+                              "description_full": row[3] or "",
+                              "weight": row[4] if row[4] is not None else 0.5,
+                              "importance": row[5] if row[5] is not None else 0.5,
+                              "source_trust": row[6] or "",
+                              "memory_type": row[7] or "",
+                              "aliases": row[8] or "",
+                              "last_recalled_at": row[9],
+                              "stability": row[10],
+                              "created_at": row[11],
+                              "valid_to": None,
+                              "source": "file_link_expansion",
+                              "link_unit_id": seed.id},
+                ))
+    except Exception:
+        logger.debug("stage2b link expansion failed (fail-open)", exc_info=True)
+    return out
+
+
 async def _stage3_embedding_rerank(
     db: AsyncSession, user_id: str, query_text: str,
     concept_candidates: list[RetrievalCandidate],
@@ -1390,7 +1549,9 @@ def _cand_gate_score(c) -> float:
     #   降级模式下扩展分 = seed.score×edge×decay 可 >1 → 与 BM25 同构保留 0.5 兜底
     #   （A4.9 wave2/3 审查 I2：防降级模式下扩展召回整层消失）
     src = c.metadata.get("source")
-    if src in _BM25_SOURCES or src in ("cluster_expansion", "relation_expansion"):
+    if src in _BM25_SOURCES or src in (
+        "cluster_expansion", "relation_expansion", "file_link_expansion",
+    ):
         s = c.score
         try:
             s = float(s)
@@ -2048,6 +2209,14 @@ async def _build_injection_context_ex(
         sections.append((_section_score("episodic"), "\n".join(lines)))
 
     if concept_slice:
+        # WFM：概念行并置其源文件记忆条目摘录（稠密+拓扑并存）。
+        linked_excerpts: dict[str, str] = {}
+        if ret_cfg.get("concept_link_expansion_enabled", False):
+            try:
+                linked_excerpts = await _fetch_linked_unit_excerpts(
+                    db, user_id, [c.id for c in concept_slice])
+            except Exception:
+                logger.debug("concept link excerpts failed (fail-open)", exc_info=True)
         lines = ["[相关概念 Concept]"]
         for c in concept_slice:
             name = c.metadata.get("canonical_name", "")
@@ -2062,7 +2231,8 @@ async def _build_injection_context_ex(
             valid_to = _to_dt(c.metadata.get("valid_to"))
             expired_tag = f" （已于 {valid_to.strftime('%Y-%m-%d')} 失效）" if valid_to else ""
             alias_part = f"（{aliases}）" if aliases else ""
-            lines.append(f"- {name}{alias_part}: {c.content}{tag}{expired_tag} [权重: {weight:.2f}]")
+            line = f"- {name}{alias_part}: {c.content}{tag}{expired_tag} [权重: {weight:.2f}]"
+            lines.append(_concept_line_with_link(line, linked_excerpts.get(c.id, "")))
         sections.append((_section_score("concept"), "\n".join(lines)))
 
     dream_text = await _get_latest_dream(db, user_id)
@@ -2145,9 +2315,13 @@ async def _build_injection_context_ex(
 
     # §5.6 注入总预算硬上限（injection_total_token_budget，默认 2000 token；
     # 中文按 1 字≈1 token 保守估算，超预算从最低优先级段开始丢弃）
+    # Proteus 垄断钳制：injection_monopoly_share（默认 0.7）限制单段最大份额。
     sections.sort(key=lambda s: s[0], reverse=True)
     budget = int(ret_cfg.get("injection_total_token_budget", 2000))
-    text, truncated, _used = _apply_token_budget_ex([s[1] for s in sections], budget)
+    text, truncated, _used = _apply_token_budget_ex(
+        [s[1] for s in sections], budget,
+        monopoly_share=float(ret_cfg.get("injection_monopoly_share", 0.7)),
+    )
     # E1（默认关）：陷阱缓解——头部确定性使用指令（不计入记忆预算；≤60 字符）
     if ret_cfg.get("injection_usage_instruction_enabled", False) and text:
         instruction = str(ret_cfg.get("injection_usage_instruction_text")
@@ -2174,24 +2348,35 @@ def _apply_token_budget(sections: list[str], budget: int) -> str:
     return text
 
 
-def _apply_token_budget_ex(sections: list[str], budget: int) -> tuple[str, bool, int]:
-    """_apply_token_budget 的带元数据版本：(text, truncated, used)。"""
+def _apply_token_budget_ex(
+    sections: list[str], budget: int, monopoly_share: float = 0.7,
+) -> tuple[str, bool, int]:
+    """_apply_token_budget 的带元数据版本：(text, truncated, used)。
+
+    Proteus（2608.16844 增量记忆激活）启发的「早段垄断钳制」：当某一段超过
+    总预算时，旧实现把它截到整份预算并丢弃所有后续段（早段独占全部容量，
+    后续内容无新鲜容量）。新实现将该段钳制在 ``monopoly_share`` 份额内并
+    继续为后续段保留残余容量。仅在「存在单段超预算」的垄断场景启用；
+    累计溢出场景保持旧语义（整段按优先级丢弃），未截断输出逐字节不变。
+    """
     kept: list[str] = []
     used = 0
     truncated = False
+    monopoly = budget > 0 and any(len(s) > budget for s in sections)
+    cap = max(int(budget * monopoly_share), 1) if monopoly else budget
     for section in sections:
         est = len(section)
         if used + est <= budget:
             kept.append(section)
             used += est
-        elif not kept:
-            kept.append(section[:budget])
-            used = budget
-            truncated = True
+            continue
+        truncated = True
+        if kept and not monopoly:
             break
-        else:
-            truncated = True
-            break
+        take = min(est, cap, max(budget - used, 0))
+        if take > 0:
+            kept.append(section[:take])
+            used += take
     text = "\n\n".join(kept)
     if truncated:
         text += _TRUNCATION_NOTE

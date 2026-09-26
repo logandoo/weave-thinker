@@ -78,7 +78,21 @@ def _track_detached_task(task: asyncio.Task, conv_id: str) -> None:
     """Register a detached agent task for cross-worker awareness."""
     _DETACHED_AGENT_TASKS[conv_id] = task
     def _on_done(t):
-        _DETACHED_AGENT_TASKS.pop(conv_id, None)
+        # A4.9 R1 #5：identity 守卫——stop→edit-resend supersede 场景下旧 task
+        # 的回调不得 pop 新 run 注册的条目（否则新 run 的 stop 找不到任务）。
+        if _DETACHED_AGENT_TASKS.get(conv_id) is t:
+            _DETACHED_AGENT_TASKS.pop(conv_id, None)
+        # 兜底①（conv 5228db60）：task 以任何形态死亡（含 pre-main-try 取消
+        # 逃逸）后，若 adopted 槽仍绑定在本 task 上即释放——identity 校验防
+        # 误删新 run 的槽；强引用防 GC 中断（模式同 _clarification_tasks）。
+        async def _release_orphan():
+            try:
+                await _agent_registry.release_if_task_dead(conv_id, expected_task=t)
+            except Exception:
+                logger.exception("Orphaned slot release failed for %s", conv_id)
+        _fut = asyncio.ensure_future(_release_orphan())
+        _INTERRUPT_BG_TASKS.add(_fut)
+        _fut.add_done_callback(_INTERRUPT_BG_TASKS.discard)
     task.add_done_callback(_on_done)
     if shared_state.is_db_enabled:
         async def _register():
@@ -1057,6 +1071,14 @@ async def chat_stream(
             conversation_id=conversation_id,
             regenerate_from_message_id=request.regenerate_from_message_id,
         )
+        # 重新生成 = 该会话的最新操作（2026-09-26 用户指令）：解除拖拽钉住
+        # （sort_order 置 0），使其在 (sort_order asc, 最近活动 desc) 排序下回到
+        # 所在分组/时间分类最上方；活动时间键随新助手消息落库后的
+        # MAX(messages.created_at)（全角色口径，conversation.py）推进。
+        # updated_at 由 onupdate 自动推进，不在这里显式写（A4.9 R1 M-5：排序
+        # 不变式不允许 updated_at 显式驱动）。
+        conversation.sort_order = 0
+        await db.commit()
     elif request.edit_message_id:
         conversation_messages = await _trim_messages_for_edit(
             db,
@@ -2053,7 +2075,7 @@ async def chat_stream(
             # detached re-run).
             _stream_buf = None
 
-            async def _agent_loop_task():
+            async def _agent_loop_impl():
                 # Shared with _run_tool_loop (enclosing scope): set when the
                 # deathmatch terminal status message (partial_complete/
                 # human_gate/paused) was persisted during per-turn handling —
@@ -3540,9 +3562,49 @@ async def chat_stream(
                     # a newer request) must never pop the new run's state.
                     await _agent_registry.unregister(_cap_conversation_id, expected=_agent_state)
 
+            async def _agent_loop_task():
+                """外层兜底（conv 5228db60）：task.cancel() 落在 impl 主
+                try/finally（unregister）之前时，CancelledError 清理链整段
+                逃逸 → adopted 槽永生。此包装把清理 finally 等价前移到协程
+                体首行；identity-checked，与内层重复调用为 no-op。"""
+                try:
+                    await _agent_loop_impl()
+                except asyncio.CancelledError:
+                    if getattr(_agent_state, "is_running", False):
+                        _agent_state.is_running = False
+                        try:
+                            await _agent_state.broadcast_done()
+                        except Exception:
+                            pass
+                        logger.info(
+                            "Stop-cancel escape-window conv=%s (pre-main-try cancel)",
+                            _cap_conversation_id,
+                        )
+                    raise
+                except Exception:
+                    if getattr(_agent_state, "is_running", False):
+                        _agent_state.is_running = False
+                        logger.exception(
+                            "Agent loop impl died before main-try for conv=%s",
+                            _cap_conversation_id,
+                        )
+                    raise
+                finally:
+                    try:
+                        await _agent_registry.unregister(
+                            _cap_conversation_id, expected=_agent_state
+                        )
+                    except Exception:
+                        pass
+
             _agent_task = asyncio.create_task(_agent_loop_task(), name=f"agent-loop-{conversation_id[:8]}")
             nonlocal detached_agent_task
             detached_agent_task = _agent_task
+            # 兜底①绑定（conv 5228db60）：done-callback 据此 identity 释放孤儿槽。
+            try:
+                _agent_state.task_handle = _agent_task
+            except Exception:
+                pass
             _track_detached_task(_agent_task, _cap_conversation_id)
 
             try:
@@ -4677,6 +4739,17 @@ async def stop_agent_stream(
     if task is not None and not task.done():
         task.cancel()
         logger.info("Stop endpoint: cancelled agent task for conversation %s", conversation_id)
+        # 兜底③（conv 5228db60）：cancel 落在主 try 之前时 task 自身的
+        # finally/unregister 不会运行——等 task 真正死透后 identity 兜底释放；
+        # 2s 超时未死透（真身在正常收尾）则不动，让其 finally 自洁。
+        try:
+            await asyncio.wait({task}, timeout=2.0)
+        except Exception:
+            pass
+        try:
+            await _agent_registry.release_if_task_dead(conversation_id, expected_task=task)
+        except Exception:
+            pass
         return {"status": "cancelled", "conversation_id": conversation_id}
     # No detached agent task: either the run is still in its setup phase (the
     # 4.8 session-lock slot is reserved but no task exists yet) or nothing is
@@ -4699,6 +4772,24 @@ async def stop_agent_stream(
     # distrust before returning it); marking it complete here would delete a
     # live run's recovery row and transiently permit a second concurrent run.
     return {"status": "not_running", "conversation_id": conversation_id}
+
+
+def _interject_target_alive(state) -> bool:
+    """interject 目标是否为活 run（conv 5228db60 兜底⑥）。
+
+    task 已死而 is_running=True 的孤儿槽若继续接单插话，消息会排进死队列的
+    interjection_queue —— commit-time 落库语义下永不消费即永不落库，用户
+    消息静默蒸发。判活口径与 release_if_task_dead 一致：无句柄=setup 期
+    （保留旧行为），有句柄且 done=死槽。
+    """
+    if state is None or not state.is_running:
+        return False
+    handle = getattr(state, "task_handle", None)
+    if handle is not None:
+        return not handle.done()
+    # 无句柄：setup 期（provisional）→ 活（旧行为保留）；adopted 无主 → 死槽
+    #（A4.9 R1 #3，PLAN Task3 ⑤ 原契约——插话进死队列=静默丢消息）。
+    return bool(state.provisional)
 
 
 @router.post("/stream/interject/{conversation_id}")
@@ -4740,7 +4831,9 @@ async def interject_agent_stream(
     if (conversation.deathmatch_status or "") in ("grilling", "active", "paused"):
         return {"status": "unsupported_mode", "conversation_id": conversation_id}
     state = _agent_registry.get_local(conversation_id)
-    if state is None or not state.is_running:
+    if not _interject_target_alive(state):
+        # 兜底⑥（conv 5228db60）：死槽诚实报 not_running（客户端回退普通
+        # 发送 → conversation_busy 可见反馈），绝不吞进死队列静默丢失。
         return {"status": "not_running", "conversation_id": conversation_id}
     if state.interjection_queue.qsize() >= 10:
         # 待注入积压上限（A4.9 M3）：全部会在下一迭代边界进入模型上下文，

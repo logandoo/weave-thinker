@@ -151,13 +151,17 @@ async def _get_workspace_root(db, user: Any) -> str:
 def _resolve_workspace_file(target: str, workspace_root: str) -> Optional[str]:
     """Resolve *target* to an existing file inside *workspace_root*.
 
-    Mirrors ``provide_file._resolve_within_workspace`` so pdf_export can
-    accept the same path forms the agent already uses for provide_file:
-    absolute path, workspace-relative path, or bare filename (recursive
-    search). Returns the resolved absolute path or ``None``.
+    Delegates to the single hardened resolver
+    ``app.services.workspace_paths.resolve_workspace_file`` (2026-09-19 security
+    wave) so pdf_export accepts the same path forms the agent already uses for
+    provide_file: absolute path, workspace-relative path, or bare filename
+    (recursive search). Returns the resolved absolute path or ``None``.
     """
-    from app.tools.provide_file import _resolve_within_workspace
-    return _resolve_within_workspace(target, workspace_root)
+    from app.services.workspace_paths import WorkspacePathError, resolve_workspace_file
+    try:
+        return str(resolve_workspace_file(target, workspace_root))
+    except WorkspacePathError:
+        return None
 
 
 # Text-like file extensions that can be rendered as PDF via the markdown

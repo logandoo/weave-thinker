@@ -599,6 +599,10 @@ injection_usage_instruction_enabled = false
 injection_usage_instruction_text = "以上历史记忆可能过时或不适用于当前任务，请结合当前对话判断。"
 listwise_verifier_enabled = false
 listwise_verifier_timeout_ms = 8000
+concept_link_expansion_enabled = true
+concept_link_expansion_max = 3
+concept_link_expansion_units = 5
+concept_link_expansion_score = 0.45
 
 
 [secrets]

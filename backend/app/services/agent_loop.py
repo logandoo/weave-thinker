@@ -819,7 +819,8 @@ _AUDIT_TEMPORAL_CONFLICT_RULE = (
 # failure under unconstrained regeneration; VeriHarness admissible
 # alternatives (arXiv 2607.14167).
 _AUDIT_GUIDANCE_LOCALIZED_CLAUSE = (
-    "【修正方式】只修改上面点名的内容；草稿中其余未被点名且未被审计判定的内容保持原样，"
+    "【修正方式】只修改上面点名的内容；草稿中其余未被点名且未被审计判定的内容保持原样——"
+    "包括全部 [N] 引用标记及其位置，严禁删除、改动或重排引用编号；"
     "严禁整篇重写——整篇重写会破坏已修正的内容并引入新的错误。"
     "修正后必须输出完整独立、可直接发布的回答全文。"
 )
@@ -1618,7 +1619,13 @@ def _advisory_audit_action(
     - 其余（unverifiable / needs_evidence 的 LLM 软判决）→ 'ship'（仅建议）。
     """
     if repaired:
-        return "ship"
+        # 零引用闸门豁免（conv 1a24a04a，2026-09-25）：source="citation" 的
+        # remand 每轮上限 2 次（citation_remand_count 自限，不会循环）——首个
+        # （可能假阳性）闸门烧掉唯一 repair 后，通篇无 [N] 的检索轮草稿不得
+        # 静默出货。SOTA 对齐：恢复预算按失败类别独立（self-healing
+        # orchestrator 2606.01416 的 failure-class 预算处方；ADR-0007
+        # self-corrective RAG 的 rewrites/regeneration 分预算设计）。
+        return "repair" if source == "citation" else "ship"
     if verdict == "reject":
         return "repair"
     if source in ("npg", "citation"):
@@ -2523,8 +2530,12 @@ class AgentLoopState:
     # One-shot deterministic zero-citation remand (2026-09-15, conv 174182bc):
     # set when `_citation_remand_verdict` sent the draft back once for missing
     # [N] markers; further zero-citation drafts in the same turn fall back to
-    # the LLM auditor instead of burning the soft-reject budget.
+    # the LLM auditor instead of burning budget. 2026-09-25（conv 1a24a04a
+    # A4.9 R1）：一次性放宽为每轮上限 agent_citation_remand_max_per_turn（默认
+    # 2）——citation_remanded 保持「本轮已至少 remand 一次」语义，计数由
+    # citation_remand_count 承载。
     citation_remanded: bool = False
+    citation_remand_count: int = 0
     # Per-turn memory-read dedup (conv dfc40619 2026-08-09): (action, target)
     # pairs of SUCCESSFUL memory reads this turn. The coordinator turn-focus
     # directive persists across all iterations and the system prompt's
@@ -3560,16 +3571,37 @@ async def _build_audit_evidence(
     # fabrication). Tool-role messages not already covered this-turn.
     _hist = 0
     _hist_skipped = 0
+    # conv 1a24a04a（2026-09-25）：历史窗按类别分窗——旧实现 6 条混排，被更近
+    # 轮次的 notes/memory/execute_code 占满后，更早轮次的 web_search/browser
+    # 证据零入选 → NPG 对跨轮引用数值误报「未出现在任何工具输出中」（假阳性
+    # 消耗唯一 repair → 重生成丢 [N] → 零引用静默出货）。grounding 类独立窗口
+    # （默认 20 条），非 grounding 保持小窗（默认 6 条）。
+    _hist_grounding_cap = max(0, int(getattr(config, "agent_audit_history_grounding_max_items", 20) or 0))
+    _hist_other_cap = max(0, int(getattr(config, "agent_audit_history_other_max_items", 6) or 0))
+    _hist_grounding = 0
+    _hist_other = 0
+    _hist_grounding_skipped = 0
+    _hist_other_skipped = 0
     for _m in reversed(state.messages[:-1]):
         if _m.get("role") != "tool":
             continue
+        _name = str(_m.get("name") or "tool")
         _content = str(_m.get("content") or "")
-        _key = _evidence_content_key(str(_m.get("name") or "tool"), _content)
+        _key = _evidence_content_key(_name, _content)
         if _key in seen:
             continue
-        if _hist >= 6:
-            _hist_skipped += 1
-            continue
+        if _is_audit_grounding(_name):
+            if _hist_grounding >= _hist_grounding_cap:
+                _hist_skipped += 1
+                _hist_grounding_skipped += 1
+                continue
+            _hist_grounding += 1
+        else:
+            if _hist_other >= _hist_other_cap:
+                _hist_skipped += 1
+                _hist_other_skipped += 1
+                continue
+            _hist_other += 1
         seen.add(_key)
         _hist += 1
         # recency: 负值（越新越大，-1 > -2）——跨类别零重叠时本轮证据优先于历史
@@ -3694,7 +3726,8 @@ async def _build_audit_evidence(
     if _hist_skipped:
         ledger_lines.append(
             f"[历史窗] 另有 {_hist_skipped} 条更早轮次的工具结果未纳入台账"
-            f"（历史证据截断：窗口 6 条）——未展示 ≠ 不存在；"
+            f"（历史证据截断：grounding 窗口 {_hist_grounding_cap} 条，省略 {_hist_grounding_skipped} 条；"
+            f"非 grounding 窗口 {_hist_other_cap} 条，省略 {_hist_other_skipped} 条）——未展示 ≠ 不存在；"
             f"对未展示证据只能判 unverifiable 或 needs_evidence，严禁判 reject/编造。"
         )
     ledger = "<evidence-ledger>\n" + "\n".join(ledger_lines) + "\n</evidence-ledger>"
@@ -3770,17 +3803,24 @@ def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[Au
     fences masked, out-of-range ids are not citations), the draft is
     substantive (>= ``[agent.citation] remand_min_chars``; 0 = gate
     DISABLED, consistent with sibling knobs where 0 = off), and this turn
-    has not already been remanded. Returns a one-shot needs_evidence verdict
-    with a copy-edit guidance (add markers only, never rewrite; explicit
-    "search results unused" / "user forbade markers" outs) — the existing
-    soft-reject machinery regenerates the draft. One-shot by design: a model
-    that still cannot cite falls back to the LLM auditor, not to a
-    budget-burning loop.
+    has not already been remanded up to the per-turn cap. Returns a
+    needs_evidence verdict with a copy-edit guidance (add markers only, never
+    rewrite; explicit "search results unused" / "user forbade markers" outs) —
+    the existing soft-reject machinery regenerates the draft. Bounded per turn
+    (``agent_citation_remand_max_per_turn``, default 2 — A4.9 R1 2026-09-25:
+    a repaired draft that STILL has zero markers gets exactly one more remand
+    so it cannot ship silently): a model that still cannot cite falls back to
+    the LLM auditor, not to a budget-burning loop.
     """
     ledger = getattr(state, "citation_ledger", None)
     if ledger is None or ledger.size <= 0:
         return None
-    if state.citation_remanded:
+    # A4.9 R1 Important-1（conv 1a24a04a，2026-09-25）：one-shot 放宽为每轮
+    # 上限 2 次——remand 打回后的修复稿若仍零 [N]，第二次 remand 拦截静默
+    # 出货；上限 2 保持有界（第三次起放行给 LLM 审计员，不烧预算循环）。
+    # citation_remanded 布尔保持「本轮已至少 remand 一次」语义（既有测试/日志）。
+    _remand_max = max(1, int(getattr(config, "agent_citation_remand_max_per_turn", 2) or 2))
+    if getattr(state, "citation_remand_count", 0) >= _remand_max:
         return None
     draft = draft or ""
     _min_chars = int(getattr(config, "agent_citation_remand_min_chars", 200) or 0)
@@ -3792,6 +3832,7 @@ def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[Au
     if report.cited:
         return None
     state.citation_remanded = True
+    state.citation_remand_count = getattr(state, "citation_remand_count", 0) + 1
     logger.info(
         "audit_metric outcome=needs_evidence citation=remand cited=%d unknown=%d ledger=%d draft_chars=%d",
         len(report.cited), len(report.unknown), ledger.size, len(draft),

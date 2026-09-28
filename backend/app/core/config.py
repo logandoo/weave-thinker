@@ -20,7 +20,9 @@ def _parse_int(value) -> Optional[int]:
 class Config:
     def __init__(self, config_path: str = None):
         if config_path is None:
-            config_path = os.path.join(
+            # WEAVE_CONFIG_PATH（sync 波 2026-09-26）：测试/多实例部署的配置路径覆盖
+            env_cfg = os.environ.get("WEAVE_CONFIG_PATH")
+            config_path = env_cfg if env_cfg else os.path.join(
                 os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                 "config.toml"
             )
@@ -1227,6 +1229,32 @@ class Config:
         return self._config.get("workspace", {})
 
     @property
+    def sync(self) -> dict:
+        return self._config.get("sync", {})
+
+    @property
+    def sync_enabled(self) -> bool:
+        return bool(self.sync.get("enabled", True))
+
+    @property
+    def sync_memory_enabled(self) -> bool:
+        """记忆域（memory_episodes/memory_concepts）纳入同步（默认 true，可配置关闭）。"""
+        # 全量保真波默认 true（用户原则：同账户所有数据一致；向量各端本地重算）
+        return bool(self.sync.get("memory_enabled", True))
+
+    @property
+    def sync_blob_max_mb(self) -> int:
+        return int(self.sync.get("blob_max_mb", 100))
+
+    @property
+    def sync_blob_dir(self) -> Path:
+        raw = self.sync.get("blob_dir", "sync_blobs")
+        path = Path(raw)
+        if path.is_absolute():
+            return path
+        return (self.backend_root / path).resolve()
+
+    @property
     def workspace_root(self) -> Path:
         return self._resolve_project_path(
             self.workspace.get("root_dir", "user_workspaces"),
@@ -2028,6 +2056,17 @@ class Config:
         第三次起放行给 LLM 审计员（有界，不烧预算循环）。1 = 旧 one-shot 行为。
         最小 1。"""
         return max(1, int(self.agent_citation.get("remand_max_per_turn", 2)))
+
+    @property
+    def agent_citation_style(self) -> str:
+        """存档汇点（保存笔记/导出）默认引用样式逻辑 id（设计 §4.1-B）。论文/文件
+        产物路径应在规划期解析并显式传入，不依赖此默认。默认 gb-t-7714-numeric。"""
+        return str(self.agent_citation.get("style", "gb-t-7714-numeric"))
+
+    @property
+    def agent_citation_styles_dir(self) -> str:
+        """vendored CSL 样式目录（空=使用内置 app/citation_styles/）。"""
+        return str(self.agent_citation.get("styles_dir", ""))
 
     # ---- Response auditor (发送前质量审计) ----
 

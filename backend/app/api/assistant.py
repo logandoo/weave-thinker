@@ -35,6 +35,7 @@ def _serialize(a: Assistant) -> AssistantResponse:
         system_prompt=a.system_prompt,
         model_alias=getattr(a, "model_alias", None) or "",
         subtask_model_alias=getattr(a, "subtask_model_alias", None) or "",
+        citation_style=getattr(a, "citation_style", None) or "",
         created_at=a.created_at.isoformat(),
         updated_at=a.updated_at.isoformat(),
     )
@@ -64,6 +65,7 @@ async def create_assistant(
         system_prompt=assistant_data.system_prompt,
         model_alias=assistant_data.model_alias or None,
         subtask_model_alias=assistant_data.subtask_model_alias or None,
+        citation_style=assistant_data.citation_style or None,
     )
     db.add(assistant)
     await db.commit()
@@ -108,7 +110,7 @@ async def update_assistant(
 
     update_data = assistant_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        if field in ("model_alias", "subtask_model_alias") and value == "":
+        if field in ("model_alias", "subtask_model_alias", "citation_style") and value == "":
             value = None  # "" = 清除别名（存 NULL，回退 legacy/默认解析）
         setattr(assistant, field, value)
 

@@ -97,6 +97,19 @@
             </select>
             <div class="param-hint">为子任务（工具迭代、搜索决策等）使用独立模型；不选时复用主模型并自动关闭 thinking</div>
           </div>
+
+          <div class="divider"></div>
+
+          <div class="section-title">引用</div>
+
+          <div class="param-group">
+            <label class="param-label">引用格式</label>
+            <select v-model="formData.citation_style" class="param-input">
+              <option value="">默认（国标 GB/T 7714 顺序编码制）</option>
+              <option v-for="s in citationStyles" :key="s.id" :value="s.id">{{ s.label }}</option>
+            </select>
+            <div class="param-hint">保存到笔记/导出时的参考文献样式；论文任务可在对话中指定</div>
+          </div>
         </div>
 
         <div class="modal-footer">
@@ -114,6 +127,7 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import type { Assistant, AssistantFormData, ModelAlias } from '@/types'
 import { modelsApi } from '@/api/models'
+import api from '@/api/client'
 
 const props = defineProps<{
   visible: boolean
@@ -142,11 +156,19 @@ const defaultAlias = ref('')
 
 const llmAliases = computed(() => aliases.value.filter(a => a.kind === 'llm'))
 
+interface CitationStyleOption {
+  id: string
+  label: string
+}
+
+const citationStyles = ref<CitationStyleOption[]>([])
+
 const defaultFormData: AssistantFormData = {
   name: '',
   system_prompt: '',
   model_alias: '',
   subtask_model_alias: '',
+  citation_style: '',
 }
 
 const formData = ref<AssistantFormData>({ ...defaultFormData })
@@ -163,6 +185,12 @@ onMounted(async () => {
   } catch (e) {
     console.error('Failed to load model aliases:', e)
   }
+  try {
+    const { data } = await api.get('/citation-styles')
+    citationStyles.value = data.styles || []
+  } catch (e) {
+    console.error('Failed to load citation styles:', e)
+  }
 })
 
 watch(() => props.visible, (newVal) => {
@@ -172,6 +200,7 @@ watch(() => props.visible, (newVal) => {
       system_prompt: props.assistant.system_prompt,
       model_alias: props.assistant.model_alias || defaultAlias.value,
       subtask_model_alias: props.assistant.subtask_model_alias || '',
+      citation_style: props.assistant.citation_style || '',
     }
   } else if (newVal && !props.assistant) {
     formData.value = { ...defaultFormData }

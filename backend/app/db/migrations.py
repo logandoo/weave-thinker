@@ -12,6 +12,12 @@ _EXT_IDENT_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 
 
 STARTUP_MIGRATIONS = [
+    # per-user 同步绑定波（2026-09-28 部署补齐）：sync_state 扩列「云账号绑定+游标」
+    ("sync_state_binding_url", "ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS server_url VARCHAR(512)"),
+    ("sync_state_binding_user", "ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS cloud_username VARCHAR(255)"),
+    ("sync_state_binding_pass", "ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS cloud_password TEXT"),
+    ("sync_state_binding_enabled", "ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS sync_enabled BOOLEAN DEFAULT FALSE"),
+    ("sync_state_tls_verify", "ALTER TABLE sync_state ADD COLUMN IF NOT EXISTS tls_verify BOOLEAN DEFAULT TRUE"),
     ("assistants_use_custom_model", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS use_custom_model BOOLEAN DEFAULT FALSE"),
     ("assistants_custom_api_url", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS custom_api_url VARCHAR(500)"),
     ("assistants_custom_api_key", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS custom_api_key VARCHAR(500)"),
@@ -274,6 +280,7 @@ $$"""),
     # 只加列不删列（回滚安全）；旧 custom_* 字段后端保留 legacy 读取。
     ("assistants_model_alias", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS model_alias VARCHAR(64)"),
     ("assistants_subtask_model_alias", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS subtask_model_alias VARCHAR(64)"),
+    ("assistants_citation_style", "ALTER TABLE assistants ADD COLUMN IF NOT EXISTS citation_style VARCHAR(64)"),
     # 存量回填（幂等，仅 NULL 行）：无任何行级覆盖的默认助手 → 对应别名；
     # 带行级覆盖（custom_*）的行保持 NULL → legacy inline 端点继续生效。
     ("assistants_backfill_model_alias_default", """UPDATE assistants SET model_alias = 'deepseek'

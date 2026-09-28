@@ -431,6 +431,7 @@ import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import { useChatStore } from '@/stores/chat'
 import { useNotesStore } from '@/stores/notes'
+import { useAssistantStore } from '@/stores/assistant'
 import { liveReasoningTail } from '@/stores/streamReducer'
 import { useToast } from '@/composables/useToast'
 import { downloadBlob } from '@/composables/useDownload'
@@ -967,23 +968,55 @@ function closeExportDialog() {
   exportDialogStatus.value = 'exporting'
 }
 
-function processMessageContentForExport(m: { role: string; content: string; tool_results?: string }): string {
-  let text = m.content
-  if (m.role === 'assistant' && m.tool_results) {
-    text = stripExistingReferenceSection(text)
-    const indexMap = computeCitationIndexMap(m.content, m.tool_results)
-    if (indexMap.size > 0) {
-      text = renumberInlineCitations(text, indexMap)
+// 回答转笔记/导出的引用渲染：调后端 /api/citations/render（CSL 引擎，设计 §5.2），
+// 替换原前端自研生成器（审计 F1/F2/F3 根治：剥节口径统一/日期取元数据/零引用不出节）。
+// style_id 解析（设计 §4.1-B）：当前会话所属助手的 citation_style > 当前助手 > 服务端默认。
+function resolveActiveCitationStyle(): string {
+  try {
+    const assistantStore = useAssistantStore()
+    const conv = chatStore.conversations.find(c => c.id === chatStore.currentConversationId)
+    const a = assistantStore.assistants.find(x => x.id === conv?.assistant_id)
+      || assistantStore.assistants.find(x => x.id === assistantStore.currentAssistantId)
+    return a?.citation_style || ''
+  } catch {
+    return ''
+  }
+}
+
+async function renderMessageCitations(m: { role: string; content: string; tool_results?: string }): Promise<string> {
+  if (m.role !== 'assistant' || !m.tool_results) return m.content
+  try {
+    const { data } = await api.post('/citations/render', {
+      content: m.content,
+      tool_results: m.tool_results,
+      style_id: resolveActiveCitationStyle() || null,
+    })
+    let text = data.content ?? m.content
+    if (data.bibliography_section) text += data.bibliography_section
+    return text
+  } catch (e) {
+    console.error('citation render failed:', e)
+    return m.content
+  }
+}
+
+function appendImageAttachments(text: string, toolResultsJson?: string): string {
+  if (!toolResultsJson) return text
+  try {
+    const tr = JSON.parse(toolResultsJson)
+    const attachments = (tr?.attachments ?? []) as Array<{ name?: string; path?: string; type?: string }>
+    const imageAttachments = attachments.filter((a: any) => a.type === 'image' && a.path)
+    if (imageAttachments.length > 0) {
+      text += '\n\n' + imageAttachments.map((a: any) => `![${a.name || 'image'}](${a.path})`).join('\n')
     }
-    text += buildCitationsSection(m.tool_results, m.content)
-    try {
-      const tr = JSON.parse(m.tool_results)
-      const attachments = (tr?.attachments ?? []) as Array<{ name?: string; path?: string; type?: string }>
-      const imageAttachments = attachments.filter((a: any) => a.type === 'image' && a.path)
-      if (imageAttachments.length > 0) {
-        text += '\n\n' + imageAttachments.map((a: any) => `![${a.name || 'image'}](${a.path})`).join('\n')
-      }
-    } catch { /* ignore parse errors */ }
+  } catch { /* ignore parse errors */ }
+  return text
+}
+
+async function processMessageContentForExport(m: { role: string; content: string; tool_results?: string }): Promise<string> {
+  let text = await renderMessageCitations(m)
+  if (m.role === 'assistant' && m.tool_results) {
+    text = appendImageAttachments(text, m.tool_results)
   }
   return text
 }
@@ -993,11 +1026,11 @@ async function handleDownloadSingle() {
   showExportDialog()
   try {
     const selected = chatStore.currentMessages.filter(m => selectedMessageIds.value.has(m.id))
-    const items = selected.map(m => ({
+    const items = await Promise.all(selected.map(async (m) => ({
       title: m.role === 'user' ? '用户' : '助手',
-      content: processMessageContentForExport(m),
+      content: await processMessageContentForExport(m),
       role: m.role,
-    }))
+    })))
     const response = await api.post('/conversations/export-pdf', {
       items,
       action: 'single',
@@ -1022,11 +1055,11 @@ async function handleDownloadBulk() {
   showExportDialog()
   try {
     const selected = chatStore.currentMessages.filter(m => selectedMessageIds.value.has(m.id))
-    const items = selected.map((m, _idx) => ({
+    const items = await Promise.all(selected.map(async (m, _idx) => ({
       title: m.role === 'user' ? '用户' : '助手',
-      content: processMessageContentForExport(m),
+      content: await processMessageContentForExport(m),
       role: m.role,
-    }))
+    })))
     const response = await api.post('/conversations/export-pdf', {
       items,
       action: 'bulk',
@@ -1085,130 +1118,20 @@ function openNotebookPicker() {
   showPicker.value = true
 }
 
-function extractPublishDateFromUrl(url: string): string {
-  // Try to extract a date from URL path like /2026/04/12/ or /2026-04-12/
-  const m = url.match(/\/(20[12]\d)[\/\-](0[1-9]|1[0-2])[\/\-]?(0[1-9]|[12]\d|3[01])?/)
-  if (m) {
-    const year = m[1]
-    const month = m[2]
-    const day = m[3]
-    if (day) return `${year}年${parseInt(month)}月${parseInt(day)}日`
-    return `${year}年${parseInt(month)}月`
-  }
-  // Try year-only pattern like /2026/
-  const ym = url.match(/\/(20[12]\d)\//)
-  if (ym) return `${ym[1]}年`
-  return ''
-}
-
-function buildCitationsSection(toolResultsJson: string, messageContent: string): string {
-  try {
-    const data = JSON.parse(toolResultsJson)
-    const results = Array.isArray(data) ? data : (data.results ?? [])
-    if (!results.length) return ''
-
-    // Find which citation numbers [N] are actually used in the message
-    const usedIndices = new Set<number>()
-    const citationRe = /\[(\d{1,2})\]/g
-    let match: RegExpExecArray | null
-    while ((match = citationRe.exec(messageContent)) !== null) {
-      usedIndices.add(parseInt(match[1], 10))
-    }
-    if (usedIndices.size === 0) {
-      results.forEach((_: any, i: number) => usedIndices.add(i + 1))
-    }
-
-    // Sequential renumber: map original indices to 1,2,3... in sorted order
-    const sortedIndices = Array.from(usedIndices).sort((a, b) => a - b)
-    const indexMap = new Map<number, number>()
-    sortedIndices.forEach((oldIdx, i) => indexMap.set(oldIdx, i + 1))
-
-    const lines: string[] = []
-    for (const oldIdx of sortedIndices) {
-      const r = results[oldIdx - 1]
-      if (!r) continue
-      let domain = ''
-      try { domain = new URL(r.url).hostname.replace(/^www\./, '') } catch { domain = r.url }
-      const pubDate = extractPublishDateFromUrl(r.url)
-      const dateStr = pubDate ? ` (${pubDate})` : ''
-      const newIdx = indexMap.get(oldIdx)!
-      lines.push(`[${newIdx}] "${r.title}." *${domain}.* ${r.url}${dateStr}.`)
-    }
-    if (!lines.length) return ''
-    return `\n\n---\n\n**参考来源**\n\n${lines.join('\n\n')}`
-  } catch {
-    return ''
-  }
-}
-
-function stripExistingReferenceSection(content: string): string {
-  const headerRe = /(?:\n\n?---[^\S\n]*\n+)?(?:^|\n)[^\S\n]*(?:#{1,6}[^\S\n]*|\*{1,2}[^\S\n]*)?(?:参考文献|参考资料|References|Sources|Reference)[^\S\n]*(?:\*{1,2})?[^\S\n]*\n[\s\S]*$/i
-  return content.replace(headerRe, '').trimEnd()
-}
-
-function renumberInlineCitations(content: string, indexMap: Map<number, number>): string {
-  if (indexMap.size === 0) return content
-  const parts = content.split(/(```[\s\S]*?```|`[^`\n]+`)/g)
-  return parts.map((part, i) => {
-    if (i % 2 === 1) return part
-    return part.replace(/\[(\d{1,2})\]/g, (_match, num) => {
-      const oldNum = parseInt(num, 10)
-      const newNum = indexMap.get(oldNum)
-      return newNum !== undefined ? `[${newNum}]` : `[${oldNum}]`
-    })
-  }).join('')
-}
-
-function computeCitationIndexMap(messageContent: string, toolResultsJson: string): Map<number, number> {
-  try {
-    const data = JSON.parse(toolResultsJson)
-    const results = Array.isArray(data) ? data : (data.results ?? [])
-    if (!results.length) return new Map()
-
-    const usedIndices = new Set<number>()
-    const citationRe = /\[(\d{1,2})\]/g
-    let match: RegExpExecArray | null
-    while ((match = citationRe.exec(messageContent)) !== null) {
-      usedIndices.add(parseInt(match[1], 10))
-    }
-    if (usedIndices.size === 0) {
-      results.forEach((_: any, i: number) => usedIndices.add(i + 1))
-    }
-
-    const sortedIndices = Array.from(usedIndices).sort((a, b) => a - b)
-    const indexMap = new Map<number, number>()
-    sortedIndices.forEach((oldIdx, i) => indexMap.set(oldIdx, i + 1))
-    return indexMap
-  } catch {
-    return new Map()
-  }
-}
-
 async function handleSaveToNotebook(notebookId: string) {
   showPicker.value = false
   const selected = chatStore.currentMessages.filter(m => selectedMessageIds.value.has(m.id))
   if (selected.length === 0) return
-  const content = selected.map(m => {
+  const parts: string[] = []
+  for (const m of selected) {
     const role = m.role === 'user' ? '**用户**' : '**助手**'
-    let text = m.content
+    let text = await renderMessageCitations(m)
     if (m.role === 'assistant' && m.tool_results) {
-      text = stripExistingReferenceSection(text)
-      const indexMap = computeCitationIndexMap(m.content, m.tool_results)
-      if (indexMap.size > 0) {
-        text = renumberInlineCitations(text, indexMap)
-      }
-      text += buildCitationsSection(m.tool_results, m.content)
-      try {
-        const tr = JSON.parse(m.tool_results)
-        const attachments = (tr?.attachments ?? []) as Array<{ name?: string; path?: string; type?: string }>
-        const imageAttachments = attachments.filter((a: any) => a.type === 'image' && a.path)
-        if (imageAttachments.length > 0) {
-          text += '\n\n' + imageAttachments.map((a: any) => `![${a.name || 'image'}](${a.path})`).join('\n')
-        }
-      } catch { /* ignore parse errors */ }
+      text = appendImageAttachments(text, m.tool_results)
     }
-    return `${role}\n\n${text}`
-  }).join('\n\n---\n\n')
+    parts.push(`${role}\n\n${text}`)
+  }
+  const content = parts.join('\n\n---\n\n')
   const titleText = selected[0].content.replace(/[#*`\n]/g, '').trim().slice(0, 30)
   const title = `对话记录: ${titleText || '对话片段'}`
   try {

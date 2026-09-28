@@ -285,3 +285,52 @@ doc.save("/path/to/output.docx")
 - `omml_helper` 使用 `WAVETHINKER_MML2OMML_XSL` 环境变量（沙箱自动注入）定位官方 XSL 文件，
   无需自行查找路径；若 XSL 缺失会自动降级 mathml2omml（此时需在 stdout 中说明）。
 
+
+## 参考文献与角标（学术引用，论文/报告必读）
+
+论文/报告类 docx 产物的引用处理原则：**正文只写 `[N]` 角标，参考文献节由系统生成**。
+完稿步骤应先 `workspace_write` 写出含 `[N]` 的 md 稿，调 `citation_render(file_path=…, style_id=…)`
+渲染，再用下面的配方把渲染结果落成 docx（或直接把渲染后 md 转 docx）。
+
+### 文内角标渲染（按样式族）
+
+`citation_render` 渲染后的文本中：
+- **编号上标族**（GB/T 7714 顺序编码制 / AMA）：正文为上标角标——GB 形态 `<sup>[N]</sup>`（带方括号）、AMA 形态 `<sup>N</sup>`（纯数字）；写入 docx 时拆成上标 run（真上标，非 ^ 字符），角标文字按渲染形态保留；
+- **编号方括号族**（IEEE / Vancouver）：正文为 `[N]` 平排——普通 run；
+- **作者-年族**（APA / Harvard / Chicago-AD / GB 作者-年份制）：正文已是 `(作者, 年)` 或 `(作者 年)` 文本（标点随样式）——普通 run；
+- **作者-页族**（MLA）：正文已是 `(作者, 页码/篇名)` 文本——普通 run；
+- **注释族**（Chicago-NB / GB 注释制）：正文为上标序号 `<sup>N</sup>`（无方括号），文末「注释」节为注释文本（首见全注、复见短注）——上标 run + 尾注段落。
+
+```python
+# 上标 run 配方：把段落文本中的 <sup>…</sup> 拆为真上标
+# （角标文字按渲染形态保留：GB 为 [1]、AMA/注释族为 1）
+import re
+from docx.shared import Pt
+
+def add_text_with_citation_sups(paragraph, text: str):
+    for part in re.split(r'(<sup>[\d\[\]]+</sup>)', text):
+        if not part:
+            continue
+        m = re.fullmatch(r'<sup>([\d\[\]]+)</sup>', part)
+        if m:
+            run = paragraph.add_run(m.group(1))
+            run.font.superscript = True   # 真上标（Word 格式属性）
+        else:
+            paragraph.add_run(part.replace('<sup>', '').replace('</sup>', ''))
+```
+
+### 参考文献节排版
+
+- 标题用内置样式「标题 2」，文字「参考文献」（中文样式）或按 citation_render 输出的节标题；
+- 条目段落**悬挂缩进**（GB/T 7714 与 APA 均要求）：
+
+```python
+from docx.shared import Cm
+p = doc.add_paragraph(entry_text)   # entry_text = citation_render 的文献表条目
+p.paragraph_format.first_line_indent = Cm(-0.75)   # 悬挂
+p.paragraph_format.left_indent = Cm(0.75)
+p.paragraph_format.space_after = Pt(3)
+```
+
+- 文献表条目**禁止手写/改写**：直接使用 citation_render 输出的条目文本（HTML 的
+  `<i>` 标签转 Word 斜体 run，`<sup>` 同上标配方）；条目顺序与编号以渲染输出为准。

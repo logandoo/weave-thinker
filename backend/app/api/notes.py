@@ -849,12 +849,23 @@ def _materialize_echarts_blocks(
     content: str,
     *,
     as_markdown: bool = False,
+    placeholder_sink: dict | None = None,
 ) -> str:
     """Render all ```echarts fences in *content* to SVG images.
 
     Called at the start of the PDF/MD export pipelines. Falls back to an
     escaped <pre> per-fence when rendering fails so exports never break on
     invalid chart options.
+
+    When *placeholder_sink* is given (HTML/PDF pipeline), the rendered blocks
+    are stored into that dict keyed by their placeholder token and the tokens
+    stay in *content* — the caller restores them AFTER Markdown parsing.
+    Inlining rendered SVG into the Markdown source is unsafe: the parser
+    mangles the SVG's ``<style><![CDATA[…]]></style>`` (blank line ends the
+    raw-HTML block, the ``]]>`` terminator gets escaped to ``<p>]]&gt;</p>``)
+    and WeasyPrint's CDATA consumption then runs to EOF, swallowing every
+    following element into the SVG ``<style>`` node (conv b8dcedc8 note
+    export: everything after the first chart silently vanished).
     """
     if not content or "echarts" not in content:
         return content or ""
@@ -868,15 +879,24 @@ def _materialize_echarts_blocks(
             _echarts_result_html(svg, as_markdown=as_markdown)
             if svg else _echarts_fallback_html(option)
         )
-        content = content.replace(key, rendered)
+        if placeholder_sink is not None:
+            placeholder_sink[key] = rendered
+        else:
+            content = content.replace(key, rendered)
     return content
 
 
 def _process_echarts_svg(svg_content: str) -> str:
     """Apply the same PDF-specific SVG cleanups as mermaid diagrams.
 
-    ECharts SVG output carries most presentation attributes inline; we still
-    inline any <style> rules (WeasyPrint ignores <style> inside SVG), fix the
+    ECharts SVG output carries most presentation attributes inline; we bake
+    any <style> rules into inline attributes (``_inline_svg_styles``; WeasyPrint
+    does not apply CSS from <style> inside SVG), then DROP residual <style>
+    blocks entirely. Dropping is load-bearing: the blocks wrap their CSS in
+    ``<![CDATA[…]]>`` and any downstream Markdown/HTML parser that escapes the
+    ``]]>`` terminator leaves WeasyPrint consuming CDATA to EOF — every
+    following element vanishes into the SVG <style> node (conv b8dcedc8).
+    Hover-only rules are meaningless in print anyway. Then fix the
     font-family so CJK text uses the PDF font, strip width/height so the
     viewBox governs scaling, and cap the size to fit the A4 page.
     """
@@ -886,6 +906,9 @@ def _process_echarts_svg(svg_content: str) -> str:
     )
     svg_content = _strip_foreign_objects(svg_content)
     svg_content = _inline_svg_styles(svg_content)
+    svg_content = re.sub(
+        r'<style\b[^>]*>[\s\S]*?</style>', '', svg_content,
+    )
 
     svg_content = re.sub(r'font-family:[^;"]*;?', '', svg_content)
     svg_content = re.sub(r'font-family="[^"]*"', '', svg_content)
@@ -1837,10 +1860,15 @@ def _markdown_to_html_with_mermaid(content: str) -> str:
 
     from html import escape as _html_escape
 
-    # 0. Render ECharts fences to inline SVG images FIRST so the fenced-code
-    # protection below does not consume them. Exports never break on invalid
-    # chart JSON — failed charts become escaped <pre> fallbacks.
-    content = _materialize_echarts_blocks(content, as_markdown=False)
+    # 0. Render ECharts fences to SVG blocks held as PLACEHOLDERS (restored
+    # after Markdown parsing like mermaid/math/code). Exports never break on
+    # invalid chart JSON — failed charts become escaped <pre> fallbacks.
+    # Placeholder protection is load-bearing: see _materialize_echarts_blocks
+    # docstring (conv b8dcedc8 — inlined SVG CDATA made the parser swallow
+    # everything after the first chart).
+    content = _materialize_echarts_blocks(
+        content, as_markdown=False, placeholder_sink=placeholders,
+    )
 
     # 1a. Collect Mermaid code fences — DEFER rendering so we can batch
     # all diagrams + math into a single Playwright session.

@@ -346,15 +346,22 @@ async def bulk_delete_conversations(
             ))
             .values(status="cancelled", next_run_at=None)
         )
-        await db.execute(
-            delete(Message).where(Message.conversation_id.in_(batch_ids))
-        )
+        # sync 波上游（2026-09-26）：messages/conversations 属同步域——必须走 ORM
+        # 逐行删除以触发 sync_capture 事件+墓碑（Core delete() 绕过 mapper 事件）。
+        # ChatSession/ScheduledTask 非同步域，保留 Core DML。
+        orphan_msgs = (await db.execute(
+            select(Message).where(Message.conversation_id.in_(batch_ids))
+        )).scalars().all()
+        for msg in orphan_msgs:
+            await db.delete(msg)
         await db.execute(
             delete(ChatSession).where(ChatSession.conversation_id.in_(batch_ids))
         )
-        await db.execute(
-            delete(Conversation).where(Conversation.id.in_(batch_ids))
-        )
+        convs = (await db.execute(
+            select(Conversation).where(Conversation.id.in_(batch_ids))
+        )).scalars().all()
+        for conv in convs:
+            await db.delete(conv)
 
     await db.commit()
     return BulkDeleteResponse(status="ok", deleted_count=len(valid_ids))
@@ -662,11 +669,12 @@ async def move_conversation_group(
 
     group.assistant_id = move_data.assistant_id
     # Conversations inside the group move with it (groups are assistant-scoped).
-    await db.execute(
-        update(Conversation)
-        .where(Conversation.group_id == group.id)
-        .values(assistant_id=move_data.assistant_id)
-    )
+    # sync 波上游：ORM 逐行更新以触发 sync_capture。
+    moved_convs = (await db.execute(
+        select(Conversation).where(Conversation.group_id == group.id)
+    )).scalars().all()
+    for conv in moved_convs:
+        conv.assistant_id = move_data.assistant_id
     await db.commit()
     await db.refresh(group)
 
@@ -705,11 +713,12 @@ async def delete_conversation_group(
         raise HTTPException(status_code=404, detail="Group not found")
 
     if delete_conversations:
-        # Delete all conversations in the group
+        # Delete all conversations in the group（sync 上游：同步域 ORM 逐行删除）
         conv_result = await db.execute(
-            select(Conversation.id).where(Conversation.group_id == group_id)
+            select(Conversation).where(Conversation.group_id == group_id)
         )
-        conv_ids = [row[0] for row in conv_result.all()]
+        conv_rows = conv_result.scalars().all()
+        conv_ids = [c.id for c in conv_rows]
         for batch_ids in _chunked_ids(conv_ids):
             await db.execute(
                 update(ScheduledTask)
@@ -719,22 +728,23 @@ async def delete_conversation_group(
                 ))
                 .values(status="cancelled", next_run_at=None)
             )
-            await db.execute(
-                delete(Message).where(Message.conversation_id.in_(batch_ids))
-            )
+            orphan_msgs = (await db.execute(
+                select(Message).where(Message.conversation_id.in_(batch_ids))
+            )).scalars().all()
+            for msg in orphan_msgs:
+                await db.delete(msg)
             await db.execute(
                 delete(ChatSession).where(ChatSession.conversation_id.in_(batch_ids))
             )
-            await db.execute(
-                delete(Conversation).where(Conversation.id.in_(batch_ids))
-            )
+        for conv in conv_rows:
+            await db.delete(conv)
     else:
-        # Move conversations out of the group
-        await db.execute(
-            update(Conversation)
-            .where(Conversation.group_id == group_id)
-            .values(group_id=None)
-        )
+        # Move conversations out of the group（sync 上游：ORM 逐行更新触发捕获）
+        out_convs = (await db.execute(
+            select(Conversation).where(Conversation.group_id == group_id)
+        )).scalars().all()
+        for conv in out_convs:
+            conv.group_id = None
 
     await db.delete(group)
     await db.commit()
@@ -765,9 +775,10 @@ async def bulk_delete_groups(
 
     if delete_data.delete_conversations:
         conv_result = await db.execute(
-            select(Conversation.id).where(Conversation.group_id.in_(valid_group_ids))
+            select(Conversation).where(Conversation.group_id.in_(valid_group_ids))
         )
-        conv_ids = [row[0] for row in conv_result.all()]
+        conv_rows = conv_result.scalars().all()
+        conv_ids = [c.id for c in conv_rows]
         for batch_ids in _chunked_ids(conv_ids):
             await db.execute(
                 update(ScheduledTask)
@@ -777,26 +788,32 @@ async def bulk_delete_groups(
                 ))
                 .values(status="cancelled", next_run_at=None)
             )
-            await db.execute(
-                delete(Message).where(Message.conversation_id.in_(batch_ids))
-            )
+            # sync 上游：同步域 ORM 逐行删除；ChatSession 非同步域保留 Core
+            orphan_msgs = (await db.execute(
+                select(Message).where(Message.conversation_id.in_(batch_ids))
+            )).scalars().all()
+            for msg in orphan_msgs:
+                await db.delete(msg)
             await db.execute(
                 delete(ChatSession).where(ChatSession.conversation_id.in_(batch_ids))
             )
-            await db.execute(
-                delete(Conversation).where(Conversation.id.in_(batch_ids))
-            )
+        for conv in conv_rows:
+            await db.delete(conv)
     else:
-        await db.execute(
-            update(Conversation)
-            .where(Conversation.group_id.in_(valid_group_ids))
-            .values(group_id=None)
-        )
+        # sync 上游：ORM 逐行更新触发捕获
+        out_convs = (await db.execute(
+            select(Conversation).where(Conversation.group_id.in_(valid_group_ids))
+        )).scalars().all()
+        for conv in out_convs:
+            conv.group_id = None
 
-    for batch_ids in _chunked_ids(valid_group_ids):
-        await db.execute(
-            delete(ConversationGroup).where(ConversationGroup.id.in_(batch_ids))
-        )
+    # 全量保真波（评审 I2）：conversation_groups 属同步域——ORM 逐行删除触发
+    # sync_capture 事件+墓碑（Core delete() 绕过 mapper 事件，远端留幽灵分组）
+    groups_to_delete = (await db.execute(
+        select(ConversationGroup).where(ConversationGroup.id.in_(valid_group_ids))
+    )).scalars().all()
+    for grp in groups_to_delete:
+        await db.delete(grp)
 
     await db.commit()
     return {"status": "ok", "deleted_count": len(valid_group_ids), "deleted_conversations": delete_data.delete_conversations}
@@ -809,14 +826,17 @@ async def reorder_conversations(
     current_user: User = Depends(get_current_user)
 ):
     for item in reorder_data.items:
-        await db.execute(
-            update(Conversation)
-            .where(
+        # sync 上游：ORM 逐行更新触发捕获；user_id 守卫与原 Core WHERE 一致
+        conv = (await db.execute(
+            select(Conversation).where(
                 Conversation.id == item.id,
                 Conversation.user_id == current_user.id
             )
-            .values(sort_order=item.sort_order, group_id=item.group_id)
-        )
+        )).scalar_one_or_none()
+        if conv is None:
+            continue
+        conv.sort_order = item.sort_order
+        conv.group_id = item.group_id
     await db.commit()
     return {"status": "ok"}
 
@@ -828,14 +848,16 @@ async def reorder_groups(
     current_user: User = Depends(get_current_user)
 ):
     for item in reorder_data.items:
-        await db.execute(
-            update(ConversationGroup)
-            .where(
+        # 全量保真波（评审 I2）：ORM 逐行更新触发捕获；user_id 守卫与原 Core WHERE 一致
+        grp = (await db.execute(
+            select(ConversationGroup).where(
                 ConversationGroup.id == item.id,
                 ConversationGroup.user_id == current_user.id
             )
-            .values(sort_order=item.sort_order)
-        )
+        )).scalar_one_or_none()
+        if grp is None:
+            continue
+        grp.sort_order = item.sort_order
     await db.commit()
     return {"status": "ok"}
 

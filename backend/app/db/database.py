@@ -3,7 +3,7 @@
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, Float, Integer, JSON, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Boolean, Float, Integer, JSON, UniqueConstraint, BigInteger, Index, PrimaryKeyConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from pgvector.sqlalchemy import Vector
 from datetime import datetime
@@ -136,6 +136,7 @@ class Assistant(Base):
     # [endpoints.<alias>]）；NULL = 未显式选择（legacy provider_type/custom_* 语义）。
     model_alias = Column(String(64), nullable=True)
     subtask_model_alias = Column(String(64), nullable=True)
+    citation_style = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -870,6 +871,112 @@ class WebSearchResult(Base):
     snippet = Column(Text, nullable=True)
     published_date = Column(String(10), nullable=True)
     extra = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SyncEvent(Base):
+    """append-only 同步变更日志（sync 波 2026-09-26 自 weave-thinker-client 上游；Joplin delta 模式）。
+
+    seq 自增即客户端游标；payload=全行快照 JSON（delete 为 None）。由
+    app/services/sync_capture.py 的 mapper 事件在同事务内 connection.execute
+    写入；delta 端点按 (entity_type, entity_id) 窗口内压缩（四规则）。
+    捕获域=conversations/messages/notes/notebooks/assistants
+    （+memory_enabled 时 memory_episodes/memory_concepts）。"""
+    __tablename__ = "sync_events"
+
+    seq = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String(40), nullable=False)
+    entity_id = Column(String(36), nullable=False)
+    op = Column(String(10), nullable=False)  # create | update | delete
+    payload = Column(JSONB, nullable=True)
+    origin_device = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_sync_events_user_seq", "user_id", "seq"),
+    )
+
+
+class SyncTombstone(Base):
+    """删除墓碑（业务表全硬删除，同步必须显式记录删除事实）。"""
+    __tablename__ = "sync_tombstones"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String(40), nullable=False)
+    entity_id = Column(String(36), nullable=False)
+    deleted_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "entity_type", "entity_id", name="uq_sync_tombstone"),
+    )
+
+
+class SyncDevice(Base):
+    """设备注册/撤销（delta 携带 device_id 时抑制 origin 回显；撤销断写+设备级读）。"""
+    __tablename__ = "sync_devices"
+
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(255), nullable=True)
+    platform = Column(String(40), nullable=True)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SyncBlob(Base):
+    """内容寻址文件元数据（workspace 文件同步底座；sha256 即天然去重键）。
+
+    复合主键 (sha256, user_id)：同一内容跨用户各持一行（越权 404 语义），
+    底层文件按 sha256 全局只存一份。"""
+    __tablename__ = "sync_blobs"
+
+    sha256 = Column(String(64), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    size = Column(BigInteger, nullable=False, default=0)
+    path = Column(String(512), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("sha256", "user_id", name="pk_sync_blobs"),
+    )
+
+
+class SyncState(Base):
+    """客户端同步游标/云账号绑定（每本地用户一行；per-user 绑定波扩列）。
+
+    push_cursor=已推送到远端的最大本地 seq（本地 sync_events 即出站队列）；
+    pull_cursor=已从远端应用的最大远端 seq。device_id 首周期生成并持久。
+    server_url/cloud_username/cloud_password/enabled = 该用户的云端绑定。"""
+    __tablename__ = "sync_state"
+
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    device_id = Column(String(64), nullable=False)
+    push_cursor = Column(BigInteger, default=0)
+    pull_cursor = Column(BigInteger, default=0)
+    last_sync_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    server_url = Column(String(512), nullable=True)
+    cloud_username = Column(String(255), nullable=True)
+    cloud_password = Column(Text, nullable=True)  # 本机同盒威胁模型（D-13，成文）
+    sync_enabled = Column(Boolean, default=False)
+    tls_verify = Column(Boolean, default=True)  # 自签内网服务器置 false（D-15）
+
+
+class SyncConflict(Base):
+    """LWW 败方留痕：pull 时本地更新被远端覆盖 / push 时远端拒收。"""
+    __tablename__ = "sync_conflicts"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String(40), nullable=False)
+    entity_id = Column(String(36), nullable=False)
+    direction = Column(String(10), nullable=False)  # push | pull
+    reason = Column(String(40), nullable=False)  # lww_remote_newer | lww_local_newer | skipped_remote | apply_error
+    local_updated_at = Column(DateTime, nullable=True)
+    remote_updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

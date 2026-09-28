@@ -1,8 +1,10 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from app.tools.registry import registry
@@ -10,6 +12,37 @@ from app.core.config import get_config
 
 logger = logging.getLogger(__name__)
 config = get_config()
+
+_NOTE_CITE_RE = re.compile(r"\[\d{1,3}\]")
+
+
+def _maybe_render_note_citations(content: str, kwargs: dict) -> str:
+    """agent 写入笔记前内建引用渲染（已知限制 #1 修复，2026-09-27 用户裁定）。
+
+    内容含 [N] 且本轮有 web_search 条目（current_turn_tool_results）时，先渲染为
+    最终形态（正文按样式变换 + 参考文献节）再落库；无角标/无条目 → 原样返回。
+    适用 create_note/update_note 全量写；append_note 分块写不调用（参考文献节
+    须在文末，分块无法定位终稿——长文档应由 agent 显式调 citation_render）。
+    """
+    if not content or not _NOTE_CITE_RE.search(content):
+        return content
+    raw = kwargs.get("current_turn_tool_results", "") or ""
+    if not raw:
+        return content
+    from app.tools.citation_render import _entries_from_turn_tool_results
+    entries = _entries_from_turn_tool_results(raw)
+    if not entries:
+        return content
+    from app.services.citation_style_service import render_citations
+    try:
+        style_id = getattr(kwargs.get("assistant"), "citation_style", None) or None
+        rendered = render_citations(content, entries, style_id=style_id)
+    except Exception as exc:
+        logger.warning("note citation render failed, keep raw content: %s", exc)
+        return content
+    if not rendered.bibliography_section:
+        return content
+    return rendered.content + rendered.bibliography_section
 
 
 async def _get_db():
@@ -319,7 +352,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
 
         if action == "create_note":
             title = args.get("title") or "无标题"
-            content = args.get("content") or ""
+            content = await asyncio.to_thread(_maybe_render_note_citations, args.get("content") or "", kwargs)
             notebook_id = args.get("notebook_id")
             if notebook_id:
                 nb = await _resolve_notebook(db, notebook_id, user.id)
@@ -365,7 +398,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
             if "title" in args:
                 note.title = args["title"] or note.title
             if "content" in args:
-                note.content = args["content"]
+                note.content = await asyncio.to_thread(_maybe_render_note_citations, args["content"], kwargs)
             await db.commit()
             await db.refresh(note)
             return json.dumps(
@@ -482,6 +515,9 @@ registry.register(
             "对笔记本进行创建、重命名、删除，以及对笔记进行新增、修改、追加、删除。"
             "写入长内容时必须分块：先用 create_note 写入开头部分，再用 append_note "
             "分批追加（每次约 800 字以内），避免单次超长调用被输出上限截断。"
+            "引用渲染规则：create_note/update_note 写入含 [N] 引用的内容时会自动生成参考文献节"
+            "（来源=本轮检索结果）；append_note 不做引用渲染——分块写作含引用的长文档时，"
+            "完稿后必须调用 citation_render(file_path=…) 统一渲染，避免参考文献节沉到文档中段。"
             "重要：写入操作（新增/修改/追加/删除笔记或笔记本）只有在用户在当前对话中明确要求时才可执行，"
             "严禁主动、自发地对笔记进行任何写入操作。"
             "即使用户已授权笔记编辑权限，也不得在没有用户明确指令的情况下修改笔记内容。"

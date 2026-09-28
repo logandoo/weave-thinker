@@ -26,35 +26,17 @@ def _sanitize_filename(name: str) -> str:
     return name[:80]
 
 
-_BIBLIOGRAPHY_HEADER_RE = re.compile(
-    r'(?:\n\n?---[^\S\n]*\n+)?(?:^|\n)[^\S\n]*(?:#{1,6}[^\S\n]*|\*{1,2}[^\S\n]*)?'
-    r'(?:参考文献|参考资料|参考来源|References|Sources|Reference)[^\S\n]*'
-    r'(?:\*{1,2})?[^\S\n]*\n[\s\S]*$',
-    re.IGNORECASE,
-)
-_CITATION_RE = re.compile(r'\[(\d{1,2})\]')
-_PUBLISH_DATE_RE = re.compile(r'/(20[12]\d)[/\-](0[1-9]|1[0-2])[/\-]?(0[1-9]|[12]\d|3[01])?')
+async def _append_citations_section(content: str, tool_results_json: str, style_id: Optional[str] = None) -> str:
+    """按目标引用样式渲染正文 [N] 并追加标准参考文献节（设计 §5.3）。
 
-
-def _extract_publish_date(url: str) -> str:
-    m = _PUBLISH_DATE_RE.search(url)
-    if not m:
-        ym = re.match(r'.*?/(20[12]\d)/', url)
-        return f'{ym.group(1)}年' if ym else ''
-    year, month, day = m.group(1), m.group(2), m.group(3)
-    if day:
-        return f'{year}年{int(month)}月{int(day)}日'
-    return f'{year}年{int(month)}月'
-
-
-def _append_citations_section(content: str, tool_results_json: str) -> str:
-    """Strip any existing bibliography section and append a fresh one built
-    from the web_search results stored in tool_results. Mirrors the frontend
-    buildCitationsSection logic so PDF exports include references."""
+    2026-09-27 起改由 citation_style_service 统一渲染（CSL 引擎），替换原自研
+    混合格生成器（审计 F1/F2/F3：剥节口径统一含「参考来源」+冒号容错；日期取
+    条目 published_date 不再从 URL 猜；零引用不再全列结果）。style_id 缺省
+    回落助手 citation_style > 全局默认（A4.9 ①）。"""
     import json as _json
 
     try:
-        data = _json.loads(tool_results_json)
+        data = _json.loads(tool_results_json) if isinstance(tool_results_json, str) else tool_results_json
     except Exception:
         return content
 
@@ -62,46 +44,27 @@ def _append_citations_section(content: str, tool_results_json: str) -> str:
     if not results:
         return content
 
-    body = _BIBLIOGRAPHY_HEADER_RE.sub('', content).rstrip()
-
-    used = set()
-    for m in _CITATION_RE.finditer(content):
-        used.add(int(m.group(1)))
-    if not used:
-        used = set(range(1, len(results) + 1))
-
-    sorted_idx = sorted(used)
-    index_map = {old: new for new, old in enumerate(sorted_idx, 1)}
-
-    lines = []
-    for old in sorted_idx:
-        r = results[old - 1] if old - 1 < len(results) else None
-        if not r:
+    entries = []
+    for i, r in enumerate(results):
+        if not isinstance(r, dict) or not r.get('url'):
             continue
-        url = r.get('url', '')
-        try:
-            domain = url.split('/')[2].replace('www.', '') if '/' in url and len(url.split('/')) > 2 else url
-        except Exception:
-            domain = url
-        pub_date = _extract_publish_date(url)
-        date_str = f' ({pub_date})' if pub_date else ''
-        new_idx = index_map[old]
-        title = r.get('title', '')
-        lines.append(f'[{new_idx}] "{title}." *{domain}.* {url}{date_str}.')
+        entries.append({
+            "id": r.get("id") if isinstance(r.get("id"), int) else i + 1,
+            "url": r.get("url"),
+            "title": r.get("title") or "",
+            "snippet": r.get("snippet") or "",
+            "published_date": r.get("published_date") or "",
+            "author": r.get("author") or "",
+            "site_name": r.get("site_name") or "",
+            "type": r.get("type") or "",
+        })
 
-    if not lines:
-        return body
+    from app.services.citation_style_service import render_citations
 
-    # Renumber inline citations in code-free text
-    parts = re.split(r'(```[\s\S]*?```|`[^`\n]+`)', body)
-    for i, part in enumerate(parts):
-        if i % 2 == 0:
-            parts[i] = _CITATION_RE.sub(
-                lambda mm: f'[{index_map.get(int(mm.group(1)), int(mm.group(1)))}]', part
-            )
-    body = ''.join(parts)
-
-    return body + '\n\n---\n\n**参考来源**\n\n' + '\n\n'.join(lines)
+    rendered = await asyncio.to_thread(render_citations, content, entries, style_id=style_id)
+    if not rendered.bibliography_section:
+        return content
+    return rendered.content + rendered.bibliography_section
 
 
 async def _ensure_export_dir(workspace_root: str) -> Path:
@@ -221,6 +184,14 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                     "file_path": str(file_path),
                     "download_url": f"/api/files/download?path={str(file_path)}",
                     "size": len(pdf_bytes),
+                    "generated_files": [
+                        {
+                            "name": filename,
+                            "rel_path": f"pdf_exports/{filename}",
+                            "size": len(pdf_bytes),
+                            "type": "pdf",
+                        }
+                    ],
                     "message": f"已导出笔记《{note.title or '无标题'}》PDF",
                 },
                 ensure_ascii=False,
@@ -298,6 +269,14 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                     "file_path": str(out_path),
                     "download_url": f"/api/files/download?path={str(out_path)}",
                     "size": len(pdf_bytes),
+                    "generated_files": [
+                        {
+                            "name": filename,
+                            "rel_path": f"pdf_exports/{filename}",
+                            "size": len(pdf_bytes),
+                            "type": "pdf",
+                        }
+                    ],
                     "message": f"已导出工作区文件《{Path(resolved).name}》为 PDF",
                 },
                 ensure_ascii=False,
@@ -315,12 +294,13 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
             if not conversation:
                 return json.dumps({"error": f"Conversation '{conversation_id}' not found"}, ensure_ascii=False)
             messages = await _load_messages(db, conversation_id)
+            _style_id = getattr(kwargs.get("assistant"), "citation_style", None) or None
             lines = []
             for msg in messages:
                 role = "用户" if msg.role == "user" else "助手"
                 body = msg.content or ""
                 if msg.role == "assistant" and getattr(msg, "tool_results", None):
-                    body = _append_citations_section(body, msg.tool_results)
+                    body = await _append_citations_section(body, msg.tool_results, style_id=_style_id)
                 lines.append(f"## {role}\n\n{body}\n")
 
             # Append the current turn's in-progress assistant content if
@@ -333,7 +313,7 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                 body = current_turn_content
                 current_turn_tool_results = kwargs.get("current_turn_tool_results", "")
                 if current_turn_tool_results:
-                    body = _append_citations_section(body, current_turn_tool_results)
+                    body = await _append_citations_section(body, current_turn_tool_results, style_id=_style_id)
                 lines.append(f"## 助手\n\n{body}\n")
 
             content = "\n".join(lines)
@@ -357,6 +337,14 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                     "file_path": str(file_path),
                     "download_url": f"/api/files/download?path={str(file_path)}",
                     "size": len(pdf_bytes),
+                    "generated_files": [
+                        {
+                            "name": filename,
+                            "rel_path": f"pdf_exports/{filename}",
+                            "size": len(pdf_bytes),
+                            "type": "pdf",
+                        }
+                    ],
                     "message": f"已导出对话《{conversation.title or '无标题'}》PDF",
                 },
                 ensure_ascii=False,
@@ -383,7 +371,9 @@ registry.register(
             "export_conversation（按对话 ID 导出整个对话）、"
             "export_file（导出工作区 Markdown/文本文件，如 report.md）。\n"
             "注意：export_note 的 note_id 必须是笔记 UUID 不是文件名；"
-            "导出工作区文件请用 export_file。导出完成后系统渲染下载按钮。"
+            "导出工作区文件请用 export_file。导出成功后产物会作为下载卡片提供给用户；"
+            "用户明确索要文件时，须再调用 `provide_file` 提供该 PDF 作兜底"
+            "（同名去重不会重复出卡）。"
         ),
         "parameters": {
             "type": "object",

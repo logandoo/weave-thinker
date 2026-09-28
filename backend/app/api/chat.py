@@ -223,13 +223,19 @@ def _is_scratch_path(path: str | None) -> bool:
 def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[dict]:
     """Compute the download-card set from accumulated tool results.
 
-    Explicit-only contract (user directive 2026-09-18, prod conv 8b382ad8):
-    download cards come **solely** from successful ``provide_file`` and
-    ``provide_folder`` calls (2026-09-19) — the agent's explicit delivery
-    intent, per the tools' own contracts. Byproducts of ``terminal`` /
-    ``execute_code`` / ``code_execution`` / ``pdf_export`` are never surfaced:
-    an analysis turn that clones or reads reference trees must not offer the
-    analyzed files as downloads (prod: 278 cards from ``_refs/*``).
+    Explicit-delivery contract (user directive 2026-09-18 prod conv 8b382ad8;
+    revised 2026-09-27 for pdf_export, user ruling D-302, prod conv b8dcedc8):
+    download cards come from the agent's **explicit delivery tools** —
+    ``provide_file`` / ``provide_folder`` (2026-09-19) and ``pdf_export``
+    (2026-09-27: a successful export IS the user-facing deliverable the user
+    asked for; conv b8dcedc8 exported a note PDF that never surfaced as a
+    card). Byproducts of ``terminal`` / ``execute_code`` / ``code_execution``
+    are never surfaced: an analysis turn that clones or reads reference trees
+    must not offer the analyzed files as downloads (prod: 278 cards from
+    ``_refs/*``).
+
+    Same-file dedup keeps a single card when the agent also calls
+    ``provide_file`` on an already-exported file (name-keyed, largest size).
 
     Single source of truth shared by the persist-time transform
     (``_transform_tool_loop_results``) and the live SSE path, so the live card
@@ -241,12 +247,14 @@ def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[
     """
     provided_attachments: list[dict] = []
     for tr in tool_results_accumulated:
-        if tr.get("name") not in ("provide_file", "provide_folder"):
+        if tr.get("name") not in ("provide_file", "provide_folder", "pdf_export"):
             continue
         raw_result = tr.get("result", "")
         try:
             parsed = json.loads(raw_result) if raw_result else {}
         except (json.JSONDecodeError, TypeError):
+            continue
+        if tr.get("name") == "pdf_export" and not parsed.get("success"):
             continue
         for gf in parsed.get("generated_files") or []:
             if isinstance(gf, dict):
@@ -520,6 +528,10 @@ def _transform_tool_loop_results(
                             "url": h.get("url", ""),
                             "snippet": snippet,
                             "published_date": h.get("published_date"),
+                            # 引用格式波盲区①：作者/站点元数据必须随持久化透传，
+                            # 否则存笔记主链路拿不到 author（作者-年制样式失效）。
+                            "author": h.get("author"),
+                            "site_name": h.get("site_name"),
                         })
             # M-2: empty rounds no longer set search_failed per-round — the
             # flag is derived at the end from the call/success counters.

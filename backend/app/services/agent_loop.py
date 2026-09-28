@@ -771,6 +771,9 @@ _AUDIT_RETRY_BREVITY_HINT = (
 _DM_STEP_TOOL_CORE = frozenset({
     "workspace_read", "workspace_write", "workspace_glob", "execute_code",
     "calculate", "memory", "notes", "provide_file", "word_count",
+    # 引用格式波（2026-09-27 A4.9 ②）：论文完稿工具必须在步骤核心集内，
+    # 否则步骤 tools 子集 fail-closed 会拒绝通稿「必须调用」的 citation_render。
+    "citation_render",
     # MCP 渐进发现（2026-09-02）：MCP schema 已入延迟池，dm 步骤若需 MCP
     # 能力必须能先 search_tools 检索（A4.9 Important-1：否则 dm 计划合法
     # 声明的 MCP 工具既不被 offer 也无法发现，静默死路）。

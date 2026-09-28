@@ -224,9 +224,10 @@ class ASRVocabularyService:
     async def _write_vocabulary_id(
         self, user_id: str, db: AsyncSession, vocabulary_id: str | None
     ) -> None:
-        await db.execute(
-            update(UserAsrHotword)
-            .where(UserAsrHotword.user_id == user_id)
-            .values(dashscope_vocabulary_id=vocabulary_id)
-        )
+        # 全量保真波（评审 M4）：热词属同步域——ORM 逐行更新触发捕获
+        rows = (await db.execute(
+            select(UserAsrHotword).where(UserAsrHotword.user_id == user_id)
+        )).scalars().all()
+        for row in rows:
+            row.dashscope_vocabulary_id = vocabulary_id
         await db.commit()

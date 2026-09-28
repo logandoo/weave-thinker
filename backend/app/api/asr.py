@@ -123,8 +123,13 @@ async def save_asr_hotwords(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    # Delete existing hotwords for the user
-    await db.execute(delete(UserAsrHotword).where(UserAsrHotword.user_id == current_user.id))
+    # Delete existing hotwords for the user（全量保真波：热词属同步域——ORM 逐行
+    # 删除触发 sync_capture 事件+墓碑（Core delete() 绕过 mapper 事件））
+    stale = (await db.execute(
+        select(UserAsrHotword).where(UserAsrHotword.user_id == current_user.id)
+    )).scalars().all()
+    for hw in stale:
+        await db.delete(hw)
 
     # Insert new hotwords
     inserted = []

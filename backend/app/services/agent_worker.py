@@ -906,11 +906,13 @@ class AgentWorker:
             await asyncio.sleep(5)
 
     def _extract_attachments(self, tool_results_accumulated: list[dict]) -> list[dict]:
-        """Explicit-only policy (user directive 2026-09-18, prod conv 8b382ad8).
+        """Explicit-delivery policy (user directive 2026-09-18, prod conv 8b382ad8;
+        revised 2026-09-27 for pdf_export, user ruling D-302, prod conv b8dcedc8).
 
-        Download cards come solely from successful ``provide_file`` and
-        ``provide_folder`` calls (2026-09-19) — the agent's explicit delivery
-        intent. Byproducts of execute_code / terminal / other file-producing
+        Download cards come from the agent's explicit delivery tools —
+        ``provide_file`` / ``provide_folder`` (2026-09-19) and ``pdf_export``
+        (2026-09-27: a successful export IS the user-facing deliverable).
+        Byproducts of execute_code / terminal / other file-producing
         tools are never auto-attached: an analysis background task must not
         offer the files it analyzed. Dedup key: ``rel_path`` (or legacy
         absolute ``path``), so both card generations work.
@@ -928,7 +930,7 @@ class AgentWorker:
             provided_attachments.append(entry)
 
         for tr in tool_results_accumulated:
-            if tr.get("name") not in ("provide_file", "provide_folder"):
+            if tr.get("name") not in ("provide_file", "provide_folder", "pdf_export"):
                 continue
             raw_result = tr.get("result", "")
             if not raw_result:
@@ -936,6 +938,8 @@ class AgentWorker:
             try:
                 parsed = json.loads(raw_result)
             except (json.JSONDecodeError, TypeError):
+                continue
+            if tr.get("name") == "pdf_export" and not parsed.get("success"):
                 continue
             for f in parsed.get("generated_files") or []:
                 if isinstance(f, dict):

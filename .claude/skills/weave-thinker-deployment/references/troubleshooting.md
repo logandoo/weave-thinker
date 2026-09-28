@@ -19,6 +19,11 @@ APT_MIRROR=mirrors.tuna.tsinghua.edu.cn      # 只填主机名，不带 http(s):
 
 分步定位（看构建日志里各 step 的耗时）：`npm ci` 慢 → 换 NPM_REGISTRY；apt 慢 → 换 APT_MIRROR；pip 慢 → 换 PIP_INDEX_URL（阿里云 PyPI 不一定更快，瓶颈可能是本机出口带宽——可换镜像对比测速）。基础镜像拉取慢 → 配 registry 加速（见第 5 节）。
 
+**特例（2026-09-27 引用格式波亲历）**：`citeproc-py==0.11.1` 的 wheel 在清华 tuna 镜像返回 **403 Forbidden**（官方 PyPI 正常）——若 pip 安装日志卡在该包 403，处置（任一）：
+- 对该包单独走官方源：`pip install citeproc-py==0.11.1 -i https://pypi.org/simple/`（Dockerfile 里可拆成独立 RUN 行）；
+- PIP_INDEX_URL 换阿里云 `https://mirrors.aliyun.com/pypi/simple/` 对比可达性；
+- 完全离线环境：预下载 wheel 进构建上下文，`pip install ./vendor/citeproc_py-0.11.1-py3-none-any.whl`。
+
 ## 2. 容器起不来 / 重启循环
 
 **现象**：`docker compose ps` 显示 `Restarting`；`docker compose logs app` 有报错。

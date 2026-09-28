@@ -105,6 +105,8 @@ GRILLING_QUESTION_GENERATION_PROMPT = """你正在「死磕模式」的盘问阶
 首先判断用户目标属于什么类型：
 - 文学创作类（小说、故事、诗歌、剧本等）→ 关注主题、风格、篇幅、叙事视角、情感基调等
 - 技术分析类（报告、分析、数据、代码等）→ 关注数据源、分析方法、输出格式、质量标准等
+- 论文/学术写作类（论文、文献综述、学位论文、学术报告等）→ 除上述外，关注**引用格式**：
+  学科与格式未在用户目标中说明时，用一个盘问问题覆盖（选项示例：GB/T 7714 顺序编码制〔推荐·中文默认〕、APA、Chicago 注释制、IEEE、无需特定格式）；
 - 创意设计类（方案、策划、设计等）→ 关注目标受众、风格定位、关键要素、交付形式等
 - 通用任务类 → 综合判断
 
@@ -268,6 +270,9 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "10. 超长内容必须分块写入：单次 execute_code/文件写入的内容不要超过约1500字，"
     "每写完一块用 workspace_read 读取上一块结尾确认衔接一致后再继续；"
     "严禁一次性生成数千字而不做衔接检查，严禁在写作过程中改变风格、人物、设定或情节。\n"
+    "11. 论文/报告类文件完稿时必须调用 citation_render 工具（传 file_path，style_id 用计划中的 "
+    "citation_style 或用户指定的引用格式）渲染标准文内引用与参考文献节，严禁手写参考文献条目；"
+    "正文引用保持 [N] 角标写法。\n"
 )
 
 # Step-specific continuation prompt: directs the agent to work on ONE plan step at a time.
@@ -305,6 +310,9 @@ STEP_CONTINUATION_PROMPT_TEMPLATE = (
     "14. 超长内容必须分块写入：单次 execute_code/文件写入的内容不要超过约1500字。"
     "每写完一块，用 workspace_read 读取上一块的结尾，确认衔接一致后再继续写下一块；"
     "严禁一次性生成数千字而不做衔接检查，严禁在写作过程中改变风格、人物、设定或情节。\n"
+    "15. 论文/报告类文件完稿时必须调用 citation_render 工具（传 file_path，style_id 用计划中的 "
+    "citation_style 或用户指定的引用格式）渲染标准文内引用与参考文献节，严禁手写参考文献条目；"
+    "正文引用保持 [N] 角标写法。\n"
 )
 
 REPETITION_DETECTED_PROMPT = (
@@ -379,6 +387,11 @@ JUDGE_SYSTEM_PROMPT = (
     "（计算/统计/实证/数据/基准），则不得判 done——必须判 continue，并要求在实际可得范围内"
     "完成执行或明确向用户说明降级；仅当验收标准或用户明确允许该留白（如已同意数据不可得）"
     "并已在 reason 中引用该依据时，方可判 done。\n\n"
+    "引用格式判据（可选，仅当计划声明了 citation_style 或目标要求特定引用格式时）："
+    "论文/报告类交付物若正文含 [N] 引用角标或声明引用了检索来源，则文末应有与 "
+    "citation_style 相符的参考文献节（如'参考文献/References'，条目由 citation_render 生成），"
+    "缺失时不得判 done（reason 指明需完稿调用 citation_render）；"
+    "聊天消息中的参考节不作为交付物证据。\n\n"
     "证据映射要求（A2b）：判定 DONE 时，reason 必须引用具体证据——文件路径、"
      "测试/命令输出、或回复中实际展示的产出内容。"
      "'看起来完成了'、'已经全部完成'、'所有内容已交付'等空口声明不构成证据；"
@@ -4949,7 +4962,7 @@ intent 只能是以下之一：
         "11. 执行 Agent 已内置以下工具：web_search（联网搜索）、browser / browser_navigate / "
         "browser_snapshot 等（网页浏览与交互）、terminal（shell 命令）、execute_code（Python 代码执行）、"
         "pdf_export（PDF 导出）、provide_file / provide_folder（文件/文件夹卡片）、workspace_read（读取工作区文件）、"
-        "word_count（字数统计）、memory、notes。规划步骤时必须直接利用这些内置能力；"
+        "word_count（字数统计）、citation_render（学术引用渲染，论文/报告完稿生成标准参考文献）、memory、notes。规划步骤时必须直接利用这些内置能力；"
         "需要浏览或操作网页时一律使用内置 browser 系列工具，严禁规划'安装/搭建第三方自动化工具链'的步骤"
         "（如安装 Playwright/Selenium 做浏览器自动化、自建爬虫框架）。\n"
         "12. 关于评测/操作本系统自身（Weave Thinker）的步骤：内置 browser 系列工具按设计"
@@ -4972,8 +4985,18 @@ intent 只能是以下之一：
         "且仅限客观不可得且已尝试获取的情形——可执行部分必须规划实际执行，不得用「待执行/受限估计」一类"
         "状态占位词命名产出；本条仅约束 description/expected_output/verification_method 等"
         "人类可读字段，不改变 evidence_spec 等机械字段。\n"
+        "16. 论文/报告类目标的引用格式：若用户在目标或盘问结果中指定了引用格式"
+        "（如 APA/Chicago/GB/T 7714/IEEE/Vancouver），或学科默认明确适用"
+        "（心理学等社科=apa、历史/艺术=chicago-notes、工程/计算机=ieee、医学=vancouver、"
+        "中文课程论文/学位论文=gb-t-7714-numeric），必须在计划顶层输出 \"citation_style\" "
+        "字段（值为样式 id：apa/mla/chicago-notes/chicago-author-date/ieee/vancouver/ama/"
+        "harvard/gb-t-7714-numeric/gb-t-7714-author-date），并在产出论文/报告文件的步骤 "
+        "expected_output 中注明'完稿调用 citation_render 渲染参考文献'。"
+        "学科与格式无法确定时省略该字段（盘问阶段未被覆盖的，完稿渲染时回落助手配置/"
+        "全局默认，不做静默错配）；非论文/报告类目标省略该字段。\n"
         "只输出JSON，不要有多余文字：\n"
-        '{"steps": [{"id": "s1", "description": "步骤描述", "expected_output": "预期可验证产出（含文件类型和字数要求）", '
+        '{"citation_style": "样式id（可选，论文/报告类目标时给出，见规则 16）", '
+        '"steps": [{"id": "s1", "description": "步骤描述", "expected_output": "预期可验证产出（含文件类型和字数要求）", '
         '"verification_method": "如何验证（如：调用 word_count 确认字数>2000）", "dependencies": [], "status": "pending", '
         '"boundary": "本步骤边界约束（可选：明令禁止触碰/修改/依赖的对象或范围；无则省略该字段）", '
         '"tools": ["本步骤主要需要的工具名（可选，从可用工具中选取，如 web_search/browser/terminal/pdf_export；'
@@ -5047,9 +5070,11 @@ intent 只能是以下之一：
         "填报、闭环）描述研究活动，不得用「待执行/受限估计/待填报」一类状态占位词命名产出"
         "（正向写法：未估计/未报告/数据缺口/识别边界，且仅限客观不可得且已尝试获取的情形）；本条仅约束"
         "人类可读字段，不改变 evidence_spec 等机械字段。\n"
+        "9. 若原计划含顶层 \"citation_style\"（论文/报告类目标的引用格式），新计划必须原样回显该字段"
+        "（如 \"citation_style\": \"apa\"）——引用格式跨重规划保持不变，除非用户改了要求。\n"
         "只输出完整的新计划JSON（与原计划同结构，步骤可带可选 \"tools\" 字段——该步骤主要需要的工具名、"
         '以及可选 "boundary" 字段——本步骤的边界约束（禁止触碰/修改的对象或范围），不确定就省略）：\n'
-        '{"steps": [...]}'
+        '{"citation_style": "样式id（原计划有则必带）", "steps": [...]}'
     )
 
     def _self_eval_hint(self) -> str:
@@ -5961,7 +5986,12 @@ intent 只能是以下之一：
                 require_evidence_spec_ids=_require_ids,
             ):
                 return False
-            self._conv.deathmatch_plan = {"steps": candidate_steps}
+            patched = {"steps": candidate_steps}
+            # A4.9 ②：局部补丁不丢顶层 citation_style
+            for _k in ("citation_style",):
+                if (self._conv.deathmatch_plan or {}).get(_k):
+                    patched[_k] = self._conv.deathmatch_plan[_k]
+            self._conv.deathmatch_plan = patched
             self._conv.deathmatch_plan_version = (self._conv.deathmatch_plan_version or 0) + 1
             self._apply_obligations()
             self._record_event(
@@ -6266,7 +6296,25 @@ intent 只能是以下之一：
                 "attempts": _attempts,
                 "recovery": str(s.get("recovery") or "idle")[:20],
             })
-        return {"steps": norm} if norm else None
+        return self._plan_with_citation_style(obj, norm) if norm else None
+
+    @staticmethod
+    def _plan_with_citation_style(obj: Dict[str, Any], steps_norm: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """组装解析后的计划：保留顶层 citation_style（A4.9 ②：解析层丢字段会使
+        规则 16/续轮 11/judge 引用判据的引用目标不存在）。未知样式 id 静默丢弃
+        （渲染端仍可兜底），合法 id 透传。"""
+        plan_out: Dict[str, Any] = {"steps": steps_norm}
+        cs = obj.get("citation_style")
+        if isinstance(cs, str) and cs.strip():
+            try:
+                from app.services.citation_style_service import STYLE_REGISTRY
+                if cs.strip() in STYLE_REGISTRY:
+                    plan_out["citation_style"] = cs.strip()
+                else:
+                    logger.warning("plan citation_style %r unknown — dropped", cs)
+            except Exception as exc:
+                logger.warning("plan citation_style resolve failed: %s", exc)
+        return plan_out
 
     async def _parse_plan_with_repair(
         self,
@@ -6325,6 +6373,11 @@ intent 只能是以下之一：
         if not steps:
             return ""
         lines = ["<deathmatch_plan>", "当前执行计划（PEVR）:"]
+        # 盲区②：执行器必须能看到计划的 citation_style——规则 15/16 让它用它，
+        # 计划摘要若不含该字段，指令指向不存在的可见信息。
+        cs = plan.get("citation_style")
+        if isinstance(cs, str) and cs.strip():
+            lines.append(f"  引用格式: {cs.strip()}（论文/报告完稿调用 citation_render 时 style_id 用此值）")
         for s in steps:
             mark = {"done": "[x]", "in_progress": "[~]", "pending": "[ ]"}.get(
                 s.get("status", "pending"), "[ ]"
@@ -7387,6 +7440,13 @@ intent 只能是以下之一：
                 for _k in ("continuity_brief", "output_summary", "output_files"):
                     if old.get(_k) and not s.get(_k):
                         s[_k] = old[_k]
+            # A4.9 ②：replan 不丢顶层 citation_style——新计划未回显该字段时
+            # 沿用旧计划的值（REPLANNER 提示词未强制回显，静默丢失=引用格式
+            # 悄悄回落全局默认）。
+            if not new_plan.get("citation_style"):
+                _old_cs = (self._conv.deathmatch_plan or {}).get("citation_style")
+                if _old_cs:
+                    new_plan["citation_style"] = _old_cs
             _old_version = int(self._conv.deathmatch_plan_version or 0)
             if config.deathmatch_obligation_criteria_enabled:
                 # r8（A4.9 #4）：首次成功计划可能是 replan（初始计划解析失败）

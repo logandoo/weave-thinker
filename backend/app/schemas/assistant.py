@@ -4,6 +4,19 @@
 from pydantic import BaseModel, field_validator
 
 
+def _validate_citation_style(value: str, *, allow_empty: bool) -> str:
+    """citation_style 合法性：必须是 citation_style_service 注册表中的样式 id。
+    "" = 继承全局默认（设计 §4.1-B）。"""
+    if not value:
+        if allow_empty:
+            return value
+        raise ValueError("citation_style 不能为空（合法取值见 GET /api/citation-styles）")
+    from app.services.citation_style_service import STYLE_REGISTRY
+    if value not in STYLE_REGISTRY:
+        raise ValueError(f"unknown citation style: {value!r}（合法取值见 GET /api/citation-styles）")
+    return value
+
+
 def _validate_alias(value: str, *, allow_empty: bool) -> str:
     """model_alias 合法性：必须存在于 model_gateway 注册表（未知别名 422）。
     Internal purpose aliases (vlm 等) are infrastructure endpoints, not
@@ -28,6 +41,7 @@ class AssistantBase(BaseModel):
     # 统一由后端 config_model.toml 管理，不再经助手接口暴露）。
     model_alias: str = "deepseek"
     subtask_model_alias: str = ""  # "" = 跟随主模型
+    citation_style: str = ""  # "" = 继承全局默认（设计 §4.1-B）
 
     @field_validator("model_alias")
     @classmethod
@@ -40,6 +54,11 @@ class AssistantBase(BaseModel):
     @classmethod
     def _check_subtask_alias(cls, v: str) -> str:
         return _validate_alias(v, allow_empty=True)
+
+    @field_validator("citation_style")
+    @classmethod
+    def _check_citation_style(cls, v: str) -> str:
+        return _validate_citation_style(v, allow_empty=True)
 
 
 class AssistantCreate(AssistantBase):
@@ -56,6 +75,7 @@ class AssistantUpdate(BaseModel):
     system_prompt: str | None = None
     model_alias: str | None = None
     subtask_model_alias: str | None = None
+    citation_style: str | None = None
 
     @field_validator("model_alias")
     @classmethod
@@ -72,11 +92,19 @@ class AssistantUpdate(BaseModel):
             return v
         return _validate_alias(v, allow_empty=True)
 
+    @field_validator("citation_style")
+    @classmethod
+    def _check_citation_style(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _validate_citation_style(v, allow_empty=True)
+
 
 class AssistantResponse(AssistantBase):
     # legacy 行（旧 custom 配置，无别名）如实报告为 ""，不冒名默认别名
     # （A4.9 复审 Important-4：否则首次保存会静默覆盖旧 custom 端点）。
     model_alias: str = ""
+    citation_style: str = ""
     id: str
     user_id: str
     created_at: str
@@ -95,6 +123,12 @@ class AssistantResponse(AssistantBase):
     @classmethod
     def _check_subtask_alias(cls, v: str) -> str:
         # 同上（A4.9 wave-3 复审 Important）：subtask 陈旧别名同样宽容序列化。
+        return v or ""
+
+    @field_validator("citation_style")
+    @classmethod
+    def _check_citation_style(cls, v: str) -> str:
+        # 同上：陈旧样式 id 宽容序列化，不因脏数据 500。
         return v or ""
 
     class Config:

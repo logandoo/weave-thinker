@@ -152,6 +152,8 @@ cd ..
 
 **句句有据**：`[N]` 引用编号由系统分配，模型只能引用真实存在的来源，编造的引用会在落库前被机械校验与 LLM 判定清除。存笔记或导出 PDF 时自动重建「参考来源」章节。
 
+**学术引用格式**：`[N]` 引用可按学科规范渲染为标准参考文献——内置 11 种样式（GB/T 7714 顺序编码制 / 作者-年份制 / 注释制、APA、MLA、Chicago 作者-年份制 / 注释制、Harvard、IEEE、Vancouver、AMA），保存笔记与导出 Word/PDF 含 `[N]` 引用时按样式生成参考文献节（默认 GB/T 7714 顺序编码制；助手设置优先，未设置回落全局默认）；文内引用覆盖编号括号、编号上标、作者-年份、作者-页码（MLA）、注释（首见全注、复见短注）五种形态，Word 导出角标为真上标对象；论文类长文在写作规划期锁定格式，完稿自动生成参考文献，不用手写；聊天回答保持 `[N]` 角标溯源，不追加参考文献节。
+
 **防幻觉体系**：发送前四态审计（accept / reject / unverifiable / needs_evidence）+ 拒绝预算与 salvage 重生成 + 遵循词 canary（长上下文防走神）+ 数值溯源闸门 NPG（关键数值须逐字溯源，默认记录、可配置强制拦截）。审计链路不静默截断：工具输出全量保留、超长自动存档并可回读核对；长回答按分块声称清单全稿核验，未覆盖片段显式标注并按低置信出货，绝不「看不到就当编造」。最新一条用户消息在意图判断、审计与守卫中逐字全文，长粘贴消息不会被截断误读；学术 / 研究类任务按研究语域组织（问题 → 假说 → 证据 → 结论），不混入工程流程话术。
 
 **三层记忆**：每日摘要与 dream、文件记忆（AGENT.md / USER.md）、v2 概念/情节/潜意识管线并存。五段混合召回（BM25 + embedding → 关系扩展 → rerank → LLM 打分 → RRF 融合），支持复现晋升、休眠淡忘、梦境整理与成本治理降级，pgvector 可选。记忆面板可见来源与权重，支持修正、遗忘与一键擦除。
@@ -159,6 +161,8 @@ cd ..
 **死磕模式**：先盘问再动手（最多 3 轮递进追问），随后进入 PEVR 目标循环；验证器要求工作区里有真实文件产出，幻影完成会被拦下；「待执行 / 待填写」的占位交付物无法通过完成判定，用说明、设计或计划代替真实结果同样会被拦下；你对结果的批评与返工要求会重新开启执行；停滞按重规划、部分交付、人工介入三级升级；状态全部落库，断网或隔夜可以续跑。
 
 **长任务持久执行**：长任务可提交为「持久作业」——脱离服务进程在后台独立运行，服务进程重启不中断（整机/容器重建除外：对账为「结果未知」，日志与回执保留），单作业不限时长，适合数小时级的批量计算、构建与数据处理；带退出回执、增量日志、产物登记与取消回执。后台任务逐轮自动落检查点，重启或优雅停机后从断点续跑而非从头再来；同轮多文件写入并行执行（同文件编辑仍严格按序），跨任务写同一文件有路径互斥与写前快照兜底。
+
+**联网同步**：多台设备登录同一账号即可同步会话与分组、笔记、助手配置（含模型供应商）、语音热词、技能、用户资料与记忆——只传增量，大文件走独立文件通道；设备可绑定 / 撤销 / 手动全量重同步，换绑不回灌旧改动；记忆默认纳入同步（可配置关闭）；自签证书的内网服务器可按设备绑定跳过证书校验。
 
 **全双工语音**：单条 WebSocket 上做流式识别与流式合成，播报中持续拾音，插话即时暂停并从断点续播；语义判端、近场声学门控、情绪应声、热词纠音；输出停滞自动回到聆听、语音识别掉线自动重连；语音里可以调用搜索、代码、笔记、记忆等工具，随口提的事自动转笔记，长内容的分块写入不再因单轮预算不足而失败。当前针对 DashScope FunASR 识别 + MiMo 合成组合调优，其他 ASR/TTS 供应商未经完整测试。
 
@@ -176,10 +180,10 @@ cd ..
 
 ## 内置工具与技能
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 49 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 10 项系统技能。
+后端 `app/tools/` 经 `registry.register()` 静态注册 50 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 10 项系统技能。
 
 <details>
-<summary>完整工具清单（49 个）</summary>
+<summary>完整工具清单（50 个）</summary>
 
 | 类别 | 工具函数 | 说明 |
 | --- | --- | --- |
@@ -199,6 +203,7 @@ cd ..
 | 文件工作区 | `workspace_read` / `workspace_glob` / `grep` / `diff` / `word_count` / `provide_file` / `provide_folder` | 读取、查找、对比、字数统计；文件与文件夹交付（预览/下载/整包 zip） |
 | 工作区写入 | `workspace_write` / `workspace_edit` / `workspace_snapshot` | 写入与精确编辑（先读后写 + 差异回执）、影子快照与一键回滚 |
 | 导出 | `pdf_export` | 笔记、对话记录、工作区文件导出 PDF |
+| 引用渲染 | `citation_render` | 按学术引用格式渲染 `[N]` 引用并生成参考文献节（11 种样式） |
 | 技能 | `skill_view` / `skill_manage` / `skill_run_script` | 加载 SKILL.md、创建用户技能、执行捆绑脚本 |
 | 语音 | `asr_transcribe` / `tts_synthesize` | 系统 ASR / TTS 端点开放给 agent |
 | 扩展 | MCP（动态） + `search_tools` | 运行时注册外部 MCP 工具服务；渐进式发现元工具 |
@@ -209,7 +214,7 @@ cd ..
 
 | 文件 | 内容 |
 | --- | --- |
-| `backend/config.toml` | 基础设施与行为：`[server]` `[security]` `[database]` `[workspace]` `[browser]` `[asr]` `[voice]` `[deathmatch]` `[memory.*]` `[agent.*]` `[mcp]` `[secrets]` |
+| `backend/config.toml` | 基础设施与行为：`[server]` `[security]` `[database]` `[workspace]` `[browser]` `[asr]` `[voice]` `[deathmatch]` `[memory.*]` `[agent.*]` `[mcp]` `[sync]`（可选，缺省走代码默认值）`[secrets]` |
 | `backend/config_model.toml` | 模型端点池 `[endpoints.*]`（LLM / VLM / ASR / TTS / Embedding / Rerank）、`[routing]` 用途路由、`[defaults]` 采样默认 |
 
 模板见 `backend/config.toml.example` 与 `backend/config_model.toml.example`，逐键说明在 `backend/app/core/config.py`。模型端点未填不阻塞启动，只在对应功能被调用时报缺配；`[database]` 与 `[security] jwt_secret_key` 必须填对，否则启动失败或使用公开的签名密钥。
@@ -220,9 +225,9 @@ cd ..
 frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI · 3 皮肤令牌体系）
                      │  /api/*（JWT）
 backend/    FastAPI + async SQLAlchemy 2.0
-  ├─ app/api/        20+ 路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/…）
-  ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出
-  ├─ app/tools/      工具体系（49 个工具函数 + MCP 动态扩展）
+  ├─ app/api/        23 个路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/sync/…）
+  ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出 · 联网同步
+  ├─ app/tools/      工具体系（50 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）
   └─ skills/         系统技能（SKILL.md 目录，Agent 可加载执行）
 webview-app/ Android WebView 壳（可选，JS 桥 window.WeaverNoteApp）

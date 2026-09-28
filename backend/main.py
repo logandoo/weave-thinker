@@ -17,7 +17,7 @@ logging.basicConfig(
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
 )
 
-from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api, user_settings
+from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api, user_settings, sync as sync_api, citations as citations_api
 from app.db.database import init_db, AsyncSessionLocal
 from app.core.config import get_config, clear_config_cache
 from app.services.agent_scheduler import agent_scheduler
@@ -86,6 +86,8 @@ app.include_router(memory_api.router)
 app.include_router(memory_api.admin_router)
 app.include_router(skins_api.router)
 app.include_router(user_settings.router)
+app.include_router(sync_api.router)
+app.include_router(citations_api.router)
 
 
 async def _memory_reprobe_after_reload() -> None:
@@ -139,6 +141,11 @@ async def startup_event():
     fonts_dir = os.path.join(os.path.dirname(__file__), "Fonts")
     os.makedirs(fonts_dir, exist_ok=True)
     await init_db()
+
+    # sync 波（2026-09-26 自 weave-thinker-client 上游）：注册 ORM 变更捕获；
+    # [sync].enabled 在发射期逐事件读取（端点侧同配置请求期 404），SIGHUP 热改不脱钩。
+    from app.services.sync_capture import register_sync_capture
+    register_sync_capture()
 
     # 死磕 DAG 波次 W2d：进程重启后残留的 active 目标循环不可能存活（SSE
     # 驱动随进程消失）——统一停泊为 paused + PAUSED 包，避免幽灵 active 状态。

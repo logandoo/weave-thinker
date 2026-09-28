@@ -397,7 +397,11 @@ function isRealDisplayMath(content: string): boolean {
  *   2. a Latin letter — variables `$x$`/`$t$`/`$W$`, `\\text{…}` bodies;
  *   3. a decimal point between digits — `$6.6$`, `$3.2$`;
  *   4. a digit plus an arithmetic/paren char — `$2+3$`, `$1/2$`,
- *      `$1-(1-5%)$` (op+paren), `$10>5$`.
+ *      `$1-(1-5%)$` (op+paren), `$10>5$`;
+ *   5. a digit:digit ratio/time chain — `$4:3$`, `$16:9$`, `$1:1$`,
+ *      `$20:9$`, `$3:2$`, `$4：3$` (conv 42402234: aspect ratios are the
+ *      common non-letter math shape; currency never carries a colon, so
+ *      this is safe — `备注1：3`-style text inside `$…$` is a fair math read).
  * Everything else (`$200$`, `$49 起，$`, `$1,000$`, `$19$二折起`, bare
  * integer `$7$` — documented coupon>integer-math tradeoff) is MONEY/TEXT:
  * the tokenizer declines and the `$` stays literal.
@@ -408,6 +412,7 @@ function isMathishInner(inner: string): boolean {
   if (LATEX_MARKER_RE.test(t)) return true
   if (/[A-Za-z]/.test(t)) return true
   if (/\d\.\d/.test(t)) return true
+  if (/\d[：:]\d/.test(t)) return true
   if (/\d/.test(t) && /[+\-*/=<>()]/.test(t)) return true
   return false
 }
@@ -1080,9 +1085,20 @@ export function renderMarkdownToHtml(content: string): string {
   }
 }
 
+// 参考文献节标题（渲染生成的 ## 参考文献 → h2 等）——节内条目 [N] 不再上标化
+// （已知限制 #6：笔记视图里文献表条目编号被误作正文角标）。
+// A4.9 M1：允许标题内嵌行内标签（## **参考文献**），并覆盖加粗段落形（**参考来源**）。
+const BIB_HEADING_HTML_RE = /<h[1-6][^>]*>(?:<[^>]+>)*[^<]*?(?:参考文献|参考资料|参考来源|References|Sources|Reference)[^<]*?(?:<\/[^>]+>)*<\/h[1-6]>|<p[^>]*>\s*(?:<strong>|<b>)\s*(?:参考文献|参考资料|参考来源|References|Sources|Reference)[：:]?\s*(?:<\/strong>|<\/b>)\s*<\/p>/i
+
 export function addCitationSuperscripts(html: string, hasResults: boolean, validSet?: Set<number>): string {
   if (!hasResults) return html
-  const parts = html.split(/(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>|<a[\s\S]*?<\/a>)/gi)
+  // 截断到参考文献节标题：正文区域才做角标上标化（节标题缺失时全文处理，兼容旧行为）
+  const bibMatch = html.match(BIB_HEADING_HTML_RE)
+  const bodyEnd = bibMatch ? (bibMatch.index ?? html.length) : html.length
+  const body = html.slice(0, bodyEnd)
+  const tail = html.slice(bodyEnd)
+  // <sup> 一并切分：citation_render 产出的 <sup>[N]</sup> 不会被再包一层（双层 sup 修复）
+  const parts = body.split(/(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>|<a[\s\S]*?<\/a>|<sup[\s\S]*?<\/sup>)/gi)
   return parts
     .map((part, i) => {
       if (i % 2 === 1) return part
@@ -1097,7 +1113,7 @@ export function addCitationSuperscripts(html: string, hasResults: boolean, valid
         return `<sup class="citation-ref" data-cite-index="${n}">[${n}]</sup>`
       })
     })
-    .join('')
+    .join('') + tail
 }
 
 export function renumberCitationSuperscripts(html: string, numMap: Map<number, number>): string {
@@ -1601,6 +1617,23 @@ export function htmlToMarkdown(html: string): string {
       .replace(/\[/g, '&#91;')
       .replace(/\]/g, '&#93;')
       .replace(/~/g, '&#126;')
+      // 引用形状方括号还原为字面：[N] 角标、[EB/OL]/[J] 等 GB 文献类型标志、
+      // [2026-09-27] 引用日期——它们来自渲染后 HTML（真实链接已走 <a> 分支）。
+      // 负前瞻 (?!&#93;后接 ( 或 :)（A4.9 I1）：防止「[12](https://evil)」或
+      // 「[12]: …」定义行被还原成活链接——还原范围严格限于非链接语境。
+      .replace(/&#91;(\d{4}(?:[-/.]\d{1,2}){1,2}|\d{1,3}|[A-Z]{1,4}(?:\/[A-Z]{1,3})?)&#93;(?![(:])/g, '[$1]')
+  }
+
+  // 引用角标（addCitationSuperscripts 生成的 <sup class="citation-ref" data-cite-index="N">[N]</sup>）
+  // 序列化时整体还原为纯文本 [N]：取 data-cite-index（缺省回退元素文本），
+  // 不做任何 markdown 转义，保证「渲染上标 ↔ 序列化还原」往返守恒。
+  // 其余 sup（数学/手动上标）不受影响，仍走原分支。
+  function citationRefPlainText(el: HTMLElement): string | null {
+    if (!el.classList.contains('citation-ref')) return null
+    const idx = (el.getAttribute('data-cite-index') || '').trim()
+    const text = (el.textContent || '').trim()
+    const num = /^\d{1,3}$/.test(idx) ? idx : text.replace(/^\[|\]$/g, '')
+    return '[' + num + ']'
   }
 
   // CommonMark flanking rules (simplified): if a `**`/`*` delimiter run
@@ -1969,7 +2002,11 @@ export function htmlToMarkdown(html: string): string {
             : '<s>' + kids() + '</s>'
           break
         }
-        case 'sup': out += '<sup>' + kids() + '</sup>'; break
+        case 'sup': {
+          const cite = citationRefPlainText(el)
+          out += cite !== null ? cite : '<sup>' + kids() + '</sup>'
+          break
+        }
         case 'sub': out += '<sub>' + kids() + '</sub>'; break
         case 'mark': {
           // Keep the transparent override on the tag in raw-HTML contexts so
@@ -2429,7 +2466,11 @@ export function htmlToMarkdown(html: string): string {
         if (isTransparentBackground(el)) { result = processChildren(el); break }
         result = '<mark>' + processChildren(el) + '</mark>'; break
       }
-      case 'sup': result = '<sup>' + processChildren(el) + '</sup>'; break
+      case 'sup': {
+        const cite = citationRefPlainText(el)
+        result = cite !== null ? cite : '<sup>' + processChildren(el) + '</sup>'
+        break
+      }
       case 'sub': result = '<sub>' + processChildren(el) + '</sub>'; break
       default: result = processChildren(el); break
     }

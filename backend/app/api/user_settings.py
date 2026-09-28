@@ -149,7 +149,6 @@ async def update_model_provider(
     }
     # A4.9 Important 修复：改 pg upsert（ON CONFLICT (user_id, kind, provider)）——
     # 唯一索引下并发双 PUT 不再产生重复行/IntegrityError。
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     for key, cfg in parsed.items():
         row = existing.get(key)
@@ -171,38 +170,25 @@ async def update_model_provider(
                 await db.delete(row)
             continue
         kind, provider = provider_svc.split_override_key(key)
-        values = {
-            "id": row.id if row is not None else str(uuid.uuid4()),
-            "user_id": user.id,
-            "kind": kind,
-            "provider": provider,
-            "enabled": cfg["enabled"],
-            "base_url": cfg["base_url"],
-            "model_name": cfg["model_name"],
-            "params_json": json.dumps(cfg["params"], ensure_ascii=False),
-            "created_at": row.created_at if row is not None else datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
-        }
-        if cfg["api_key"] is not None:
-            values["api_key"] = cfg["api_key"]
-        stmt = pg_insert(UserModelProvider).values(**values)
-        update_cols = {
-            "enabled": stmt.excluded["enabled"],
-            "base_url": stmt.excluded["base_url"],
-            "model_name": stmt.excluded["model_name"],
-            "params_json": stmt.excluded["params_json"],
-            "updated_at": stmt.excluded["updated_at"],
-        }
-        if cfg["api_key"] is not None:
-            update_cols["api_key"] = stmt.excluded["api_key"]
-        await db.execute(
-            stmt.on_conflict_do_update(
-                index_elements=["user_id", "kind", "provider"], set_=update_cols,
+        # 全量保真波（评审 I1）：供应商覆盖属同步域——改 ORM 路径使
+        # sync_capture mapper 事件逐行触发（Core pg_insert 绕过事件，UI 保存
+        # 永不出站）。row 已由上方既有 select 载入。
+        if row is None:
+            row = UserModelProvider(
+                id=str(uuid.uuid4()), user_id=user.id, kind=kind, provider=provider,
+                created_at=datetime.utcnow(),
             )
-        )
+            db.add(row)
+        row.enabled = cfg["enabled"]
+        row.base_url = cfg["base_url"]
+        row.model_name = cfg["model_name"]
+        row.params_json = json.dumps(cfg["params"], ensure_ascii=False)
+        if cfg["api_key"] is not None:
+            row.api_key = cfg["api_key"]
+        row.updated_at = datetime.utcnow()
     await db.commit()
-    # Core upsert 不经 ORM identity map；session expire_on_commit=False 时
-    # 再查询会命中旧实例（A4.9 修复轮实测：DB 已更新而响应回旧值）→ 显式过期。
+    # 历史上 Core upsert 旁路 identity map 需显式过期；现 ORM 路径下保留
+    # expire_all 作为防御（读响应前强制回源，代价一次 SELECT）。
     # 注意：expire_all 会连同 user 一起过期，uid 必须提前捕获（否则后续
     # user.id 触发 async 上下文中的同步懒加载 → MissingGreenlet 500）。
     uid = user.id

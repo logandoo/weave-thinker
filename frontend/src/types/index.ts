@@ -324,6 +324,7 @@ export interface Assistant {
   // 统一由后端 config_model.toml 管理，不再经接口暴露。
   model_alias: string
   subtask_model_alias: string
+  citation_style?: string
   created_at: string
   updated_at: string
 }
@@ -333,6 +334,7 @@ export interface AssistantFormData {
   system_prompt: string
   model_alias: string
   subtask_model_alias: string
+  citation_style: string
 }
 
 // GET /api/models 的别名条目（只含别名与能力，绝无 url/key/真实模型名）

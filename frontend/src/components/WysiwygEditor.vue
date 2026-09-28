@@ -68,7 +68,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { renderMarkdownToHtml, htmlToMarkdown, renderMermaidBlocks, renderEchartsBlocks, attachMathEditListeners } from '@/composables/useMarkdown'
+import { renderMarkdownToHtml, addCitationSuperscripts, htmlToMarkdown, renderMermaidBlocks, renderEchartsBlocks, attachMathEditListeners } from '@/composables/useMarkdown'
 
 const props = defineProps<{
   modelValue: string
@@ -1899,7 +1899,9 @@ watch(() => props.modelValue, async (newValue) => {
     suppressInputDepth.value++
     suppressChangeEmit = true
     try {
-      renderedContent.value = renderMarkdownToHtml(newValue || '')
+      // [N] 引用角标渲染为上标；htmlToMarkdown 的 citation-ref 分支会把
+      // <sup class="citation-ref">[N]</sup> 原样还原为 [N]，往返守恒。
+      renderedContent.value = addCitationSuperscripts(renderMarkdownToHtml(newValue || ''), true)
       await nextTick()
       if (editorRef.value) {
         normalizeEmptyListItems(editorRef.value)

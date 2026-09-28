@@ -24,6 +24,10 @@ class SearchHit:
     url: str
     snippet: str
     published_date: Optional[str] = field(default=None)
+    # 学术引用元数据（citation_style_service 消费；2026-09-27 引用格式波）：
+    # author/site_name 由 HTML 富化或 provider 原生字段填充，缺失不阻断。
+    author: Optional[str] = field(default=None)
+    site_name: Optional[str] = field(default=None)
     # 溯源元数据（落库用）：实际命中的搜索引擎与产生该 hit 的查询词。
     # 由 search() 在每个 provider 命中后填充，不进 format_hits 展示。
     provider: Optional[str] = field(default=None)
@@ -176,10 +180,82 @@ async def _extract_date_from_html(html: str) -> Optional[str]:
     return None
 
 
+def _extract_author_from_soup(soup) -> Optional[str]:
+    """Extract author from meta tags / JSON-LD (学术引用元数据，缺失不阻断）。"""
+    meta_props = ["article:author", "author", "parsely-author", "DC.creator", "citation_author"]
+    for prop in meta_props:
+        tag = (
+            soup.find("meta", attrs={"property": prop})
+            or soup.find("meta", attrs={"name": prop})
+            or soup.find("meta", attrs={"itemprop": prop})
+        )
+        if tag and tag.get("content"):
+            val = tag["content"].strip()
+            if val and len(val) < 200 and not val.lower().startswith("http"):
+                return val
+    for script_tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            import json
+            ld = json.loads(script_tag.string or "")
+            if isinstance(ld, list):
+                ld = ld[0] if ld else {}
+            a = ld.get("author")
+            if isinstance(a, dict):
+                a = a.get("name")
+            elif isinstance(a, list) and a:
+                first = a[0]
+                a = first.get("name") if isinstance(first, dict) else first
+            if isinstance(a, str) and a.strip() and len(a) < 200:
+                return a.strip()
+        except Exception:
+            continue
+    return None
+
+
+def _extract_site_name_from_soup(soup) -> Optional[str]:
+    """Extract site name from og:site_name / application-name。"""
+    for prop in ("og:site_name", "application-name"):
+        tag = (
+            soup.find("meta", attrs={"property": prop})
+            or soup.find("meta", attrs={"name": prop})
+        )
+        if tag and tag.get("content") and tag["content"].strip():
+            return tag["content"].strip()[:120]
+    return None
+
+
+async def _extract_meta_from_html(html: str) -> dict:
+    """一次解析抽取 {published_date, author, site_name}（引用元数据补全层）。"""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return {}
+
+    def _parse():
+        try:
+            return BeautifulSoup(html, "html.parser")
+        except Exception:
+            return None
+
+    soup = await asyncio.to_thread(_parse)
+    if soup is None:
+        return {}
+    return {
+        "published_date": await _extract_date_from_html(html),
+        "author": await asyncio.to_thread(_extract_author_from_soup, soup),
+        "site_name": await asyncio.to_thread(_extract_site_name_from_soup, soup),
+    }
+
+
 async def _fetch_publish_date(url: str, timeout: float = 5.0) -> Optional[str]:
     """Fetch a URL and try to extract the publish date from HTML.
     Uses httpx first; falls back to Playwright for JS-rendered pages."""
+    meta = await _fetch_page_meta(url, timeout=timeout)
+    return meta.get("published_date")
 
+
+async def _fetch_page_meta(url: str, timeout: float = 5.0) -> dict:
+    """Fetch a URL and extract citation metadata (date/author/site_name)。"""
     # --- Try httpx (fast, no JS) ---
     html = None
     try:
@@ -195,26 +271,33 @@ async def _fetch_publish_date(url: str, timeout: float = 5.0) -> Optional[str]:
         logger.debug("httpx fetch failed for %s", url)
 
     if html:
-        date = await _extract_date_from_html(html)
-        if date:
-            return date
+        return await _extract_meta_from_html(html)
 
-    return None
+    return {}
 
 
-async def _fetch_date_playwright(url: str, browser, timeout: float = 10.0) -> Optional[str]:
-    """Fetch a single URL with a shared Playwright browser and extract publish date."""
+async def _fetch_date_playwright(url: str, browser, timeout: float = 10.0) -> dict:
+    """Fetch a single URL with a shared Playwright browser and extract citation metadata."""
     try:
         page = await browser.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
             rendered_html = await page.content()
-            return await _extract_date_from_html(rendered_html[:200_000])
+            return await _extract_meta_from_html(rendered_html[:200_000])
         finally:
             await page.close()
     except Exception:
         logger.debug("Playwright fetch failed for %s", url)
-        return None
+        return {}
+
+
+def _apply_meta_to_hit(hit: SearchHit, meta: dict) -> None:
+    if meta.get("published_date") and not hit.published_date:
+        hit.published_date = meta["published_date"]
+    if meta.get("author") and not hit.author:
+        hit.author = meta["author"]
+    if meta.get("site_name") and not hit.site_name:
+        hit.site_name = meta["site_name"]
 
 
 async def _fetch_dates_for_hits(
@@ -222,19 +305,19 @@ async def _fetch_dates_for_hits(
     max_fetch: int = 4,
     use_playwright_fallback: bool = False,
 ) -> None:
-    """Concurrently fetch publish dates for the top hits in-place.
+    """Concurrently fetch citation metadata for the top hits in-place.
     First tries httpx for all URLs, then uses a single shared Playwright browser
-    for URLs where httpx didn't find a date."""
+    for URLs where httpx didn't find a date. (2026-09-27 起同窗抽取 author/
+    site_name——引用格式系统的元数据补全层，预算沿用 max_fetch。)"""
 
-    targets = [h for h in hits[:max_fetch] if not h.published_date]
+    targets = [h for h in hits[:max_fetch] if not h.published_date or not h.author]
     if not targets:
         return
 
     # Phase 1: httpx (fast, concurrent)
     async def _httpx_fetch(hit: SearchHit):
-        date = await _fetch_publish_date(hit.url)
-        if date:
-            hit.published_date = date
+        meta = await _fetch_page_meta(hit.url)
+        _apply_meta_to_hit(hit, meta)
 
     await asyncio.gather(*[_httpx_fetch(h) for h in targets], return_exceptions=True)
 
@@ -256,9 +339,8 @@ async def _fetch_dates_for_hits(
             browser = await p.chromium.launch(headless=True)
             try:
                 for hit in remaining:
-                    date = await _fetch_date_playwright(hit.url, browser)
-                    if date:
-                        hit.published_date = date
+                    meta = await _fetch_date_playwright(hit.url, browser)
+                    _apply_meta_to_hit(hit, meta)
             finally:
                 await browser.close()
     except Exception:
@@ -362,6 +444,11 @@ class WebSearchService:
                         url=hit.url,
                         snippet=hit.snippet,
                         published_date=hit.published_date,
+                        # 引用元数据落库（设计 §6.2，extra JSONB 列已存在）
+                        extra=(
+                            {k: v for k, v in (("author", hit.author), ("site_name", hit.site_name)) if v}
+                            or None
+                        ),
                     ))
                 await session.commit()
 
@@ -524,6 +611,7 @@ class WebSearchService:
             title = ""
             url = ""
             published = ""
+            author = ""
             snippet_parts: List[str] = []
 
             for line in block.split("\n"):
@@ -536,7 +624,11 @@ class WebSearchService:
                     pub_raw = line[10:].strip()
                     if pub_raw and pub_raw != "N/A":
                         published = _normalise_date(pub_raw) or ""
-                elif line.startswith("Author:") or line.startswith("Highlights:"):
+                elif line.startswith("Author:"):
+                    a_raw = line[7:].strip()
+                    if a_raw and a_raw != "N/A" and len(a_raw) < 200:
+                        author = a_raw
+                elif line.startswith("Highlights:"):
                     continue
                 elif line.startswith("[...]"):
                     continue
@@ -552,6 +644,7 @@ class WebSearchService:
                         url=url,
                         snippet=snippet,
                         published_date=published or None,
+                        author=author or None,
                     )
                 )
 

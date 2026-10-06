@@ -52,15 +52,24 @@ class ASRVocabularyService:
     def _api_key(self) -> str:
         ep = self._endpoint
         if ep is not None:
-            return str(ep.extra.get("dashscope_api_key", "") or "")
+            # 单一密钥原则（与 ASRService.dashscope_api_key 对齐）：顶层
+            # api_key 即当前 provider 密钥；旧 extra.dashscope_api_key 兜底。
+            return str(ep.api_key or "") or str(ep.extra.get("dashscope_api_key", "") or "")
         return self._asr_config.get("dashscope_api_key", "")
 
     @property
     def _target_model(self) -> str:
+        """与 ASRService.dashscope_model 逐跳一致（词表 target_model ≠ 识别
+        模型 = 热词静默失效；A4.9 R1-I1：终端回落曾分叉）。"""
+        from app.services.asr_service import DEFAULT_DASSCOPE_ASR_MODEL
+
         ep = self._endpoint
-        if ep is not None and ep.extra.get("dashscope_model"):
-            return ep.extra["dashscope_model"]
-        return self._asr_config.get("dashscope_model", "fun-asr-realtime")
+        if ep is not None:
+            resolved = str(getattr(ep, "model_name", "") or "") or str(
+                ep.extra.get("dashscope_model", "") or ""
+            )
+            return resolved or DEFAULT_DASSCOPE_ASR_MODEL
+        return self._asr_config.get("dashscope_model", DEFAULT_DASSCOPE_ASR_MODEL)
 
     @property
     def _prefix(self) -> str:
@@ -84,12 +93,14 @@ class ASRVocabularyService:
         }
 
     def _format_vocabulary(self, hotwords: list[dict]) -> list[dict]:
-        """Convert internal hotword dicts to the DashScope vocabulary format."""
+        """Convert internal hotword dicts to the DashScope vocabulary format.
+        权重 [1,5]（推荐 4）或 50（超级热词）。"""
         result = []
         for item in hotwords:
+            weight = int(item.get("weight", 4) or 4)
             entry: dict = {
                 "text": item["text"],
-                "weight": max(1, min(5, item.get("weight", 4))),
+                "weight": 50 if weight == 50 else max(1, min(5, weight)),
             }
             if item.get("lang"):
                 entry["lang"] = item["lang"]

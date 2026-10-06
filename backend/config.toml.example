@@ -49,6 +49,10 @@ Markdown格式要求（严格遵守，否则渲染会出错）：
 [agent.tools]
 mcp_progressive_enabled = true
 
+[agent.skills]
+force_inject = ["vibeweaver"]
+force_inject_max_chars = 60000
+
 [agent.process]
 max_sessions_per_user = 4
 idle_timeout_seconds = 1800
@@ -297,6 +301,22 @@ enabled = true
 timeout_seconds = 30
 max_timeout_seconds = 120
 
+[git_tool]
+enabled = true
+path = "git"
+timeout_seconds = 30
+
+[hooks]
+stop_hook_max_per_turn = 2
+stop_hook_max_per_conversation = 3
+
+[vibeweaver]
+enabled = true
+gate_enabled = true
+audit_enabled = true
+loop_guard_enabled = true
+red_ttl_hours = 24
+
 [code_execution]
 enabled = true
 timeout_seconds = 1800
@@ -316,6 +336,7 @@ ws_ping_interval = 20
 ws_ping_timeout = 20
 ws_close_timeout = 5
 max_sentence_silence = 800
+vad_model = "near_meeting_16k"
 mimo_partial_interval_seconds = 1.5
 mimo_partial_min_seconds = 0.5
 hotword_phonetic_correction = true
@@ -544,6 +565,7 @@ stage2_relation_max_neighbors = 5
 stage2_relation_max_new = 10
 stage2_relation_score_decay = 0.6
 stage2_relation_min_edge_weight = 0.3
+strategy_route_enabled = true
 rrf_k = 60
 rrf_weight_concept = 1.0
 rrf_weight_episodic = 1.5

@@ -185,6 +185,9 @@ class BrowserSession:
     last_activity: float = field(default_factory=time.time)
     ref_map: Dict[str, Any] = field(default_factory=dict)
     _op_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # P3/B5：Playwright 原生录像目录（context 创建即开录，活体 webm 可随时
+    # 保存为证据；会话关闭时清理）。
+    video_dir: str = ""
 
     def touch(self):
         self.last_activity = time.time()
@@ -261,6 +264,11 @@ class InteractiveBrowserService:
             browser = None
             context = None
             try:
+                # P3/B5：录像目录（Evidence 视频；显式保存才落到 output_files）
+                import tempfile
+                video_dir = await asyncio.to_thread(
+                    tempfile.mkdtemp, prefix=f"wt_browser_video_{conversation_id}_"
+                )
                 browser = await self._playwright.chromium.launch(
                     headless=True,
                     args=[
@@ -276,6 +284,8 @@ class InteractiveBrowserService:
                     locale="en-US",
                     java_script_enabled=True,
                     ignore_https_errors=bool(config.browser.get("ignore_https_errors", True)),
+                    record_video_dir=video_dir,
+                    record_video_size={"width": 1280, "height": 720},
                 )
                 await context.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -286,6 +296,7 @@ class InteractiveBrowserService:
                     browser=browser,
                     context=context,
                     page=page,
+                    video_dir=video_dir,
                 )
                 self._sessions[conversation_id] = session
                 logger.info("Created browser session for conversation: %s", conversation_id)
@@ -320,6 +331,12 @@ class InteractiveBrowserService:
             await session.browser.close()
         except Exception:
             pass
+        if session.video_dir:
+            try:
+                import shutil
+                await asyncio.to_thread(shutil.rmtree, session.video_dir, True)
+            except Exception:
+                pass
         logger.info("Closed browser session: %s", conversation_id)
 
     async def shutdown(self):
@@ -621,6 +638,61 @@ async def screenshot(session: BrowserSession, full_page: bool = False) -> dict:
         except Exception as e:
             logger.debug("Screenshot failed: %s", e)
             return {"success": False, "error": _sanitize_error(f"Screenshot failed: {e}")}
+
+
+async def save_video(session: BrowserSession, note: str = "") -> dict:
+    """P3/B5：把会话录像（Playwright 活体 webm）保存为证据文件。
+
+    录像在 context 创建时已开录（record_video_dir），本操作把当前已写入的
+    webm 拷贝到 output_files/。活体拷贝可能缺尾部 cluster（可播放）；
+    需要完整封装可在操作后 close 会话再取 page.video.save_as。
+    页内音频未随录像采集——工具返回 UNVERIFIED-audio 标记（见 APPENDIX §A1
+    的 MediaRecorder 模板，可经 browser_execute_js 自行采集）。
+    """
+    session.touch()
+    async with session._op_lock:
+        try:
+            import os
+            import shutil
+            from datetime import datetime
+            if not session.video_dir or not os.path.isdir(session.video_dir):
+                return {"success": False, "error": "recording not available on this session"}
+            candidates = [
+                os.path.join(session.video_dir, f)
+                for f in sorted(os.listdir(session.video_dir))
+                if f.endswith(".webm")
+            ]
+            if not candidates:
+                return {"success": False, "error": "no video written yet (navigate/interact first)"}
+            src = max(candidates, key=lambda p: os.path.getsize(p))
+            output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output_files")
+            os.makedirs(output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"browser_video_{timestamp}.webm"
+            filepath = os.path.join(output_dir, filename)
+            await asyncio.to_thread(shutil.copyfile, src, filepath)
+            return {
+                "success": True,
+                "path": filepath,
+                "filename": filename,
+                "bytes": os.path.getsize(filepath),
+                "url": session.page.url,
+                "note": note,
+                "audio": "UNVERIFIED-audio (页内音频未随录像采集；需要音频证据时用 APPENDIX §A1 模板经 browser_execute_js 采集)",
+            }
+        except Exception as e:
+            logger.debug("save_video failed: %s", e)
+            return {"success": False, "error": _sanitize_error(f"save_video failed: {e}")}
+
+
+async def video_status(session: BrowserSession) -> dict:
+    session.touch()
+    import os
+    if not session.video_dir or not os.path.isdir(session.video_dir):
+        return {"success": True, "recording": False}
+    files = [f for f in os.listdir(session.video_dir) if f.endswith(".webm")]
+    total = sum(os.path.getsize(os.path.join(session.video_dir, f)) for f in files)
+    return {"success": True, "recording": True, "clips": len(files), "bytes": total}
 
 
 async def go_back(session: BrowserSession) -> dict:

@@ -48,35 +48,51 @@
           {{ ref.filename }}
         </span>
       </div>
+      <!-- 渐进落库（2026-10-06，conv ae9aa092）：进程死亡/断连等非预期中断的
+           残稿徽标——内容即中断时点实况，用户可据此前文追问继续。 -->
+      <div v-if="message.role === 'assistant' && message.delivery_status === 'interrupted'" class="interrupt-badge" role="note">
+        ⚠ 本回答在生成过程中被中断（如服务重启），内容为中断时点实况，可能不完整
+      </div>
       <!-- Top reasoning block: only shown when there is NO reasoning_step in displaySequence -->
+      <!-- P0-1 懒挂载：折叠态不渲染 body（formattedReasoning 不求值），首开才挂载 -->
       <div v-if="message.reasoning_content && message.role === 'assistant' && !hasReasoningStep" class="reasoning-block">
-        <details>
-          <summary class="reasoning-summary">💭 思考过程</summary>
-          <div class="reasoning-text" v-html="formattedReasoning"></div>
+        <details @toggle="(e) => onLazyToggle('top-reasoning', e)">
+          <summary class="reasoning-summary">💭 思考过程<span v-if="topReasoningStubbed" class="trunc-badge">已截断 · 展开取全文</span></summary>
+          <div v-if="isLazyOpen('top-reasoning')" class="reasoning-text" v-html="formattedReasoning"></div>
         </details>
       </div>
-      <div v-if="message.role === 'assistant' && displaySequence.length > 0" class="alternating-content">
+      <div v-if="message.role === 'assistant' && displaySequence.length > 0" class="alternating-content" :id="bodyDomId">
         <template v-for="(item, idx) in displaySequence" :key="idx">
-          <div v-if="item.type === 'text'" class="text segment-text" v-html="formatTextWithCitations(item.content)"></div>
+          <template v-if="item.type === 'text'">
+            <div class="text segment-text" v-html="formatTextWithCitations(item.content)"></div>
+            <span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span>
+          </template>
           <div v-else-if="item.type === 'reasoning_step'" class="reasoning-block">
-            <details>
-              <summary class="reasoning-summary">{{ item.title || '💭 思考过程' }}</summary>
-              <div class="reasoning-text" v-html="renderMarkdownToHtml(item.content)"></div>
+            <details @toggle="(e) => onLazyToggle(`rs-${idx}`, e)">
+              <summary class="reasoning-summary">{{ item.title || '💭 思考过程' }}<span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
+              <div v-if="isLazyOpen(`rs-${idx}`)" class="reasoning-text" v-html="renderMarkdownToHtml(item.content)"></div>
             </details>
           </div>
           <ToolPartCard v-else-if="isToolSequenceItem(item)" :item="toToolPartItem(item)" />
           <div v-else class="agent-step-block">
-            <details>
-              <summary class="agent-step-summary">⚙️ {{ item.title || item.name }}</summary>
-              <div v-if="item.step_type === 'llm'" class="agent-step-markdown">
-                <StreamMarkdown :content="item.content" />
-              </div>
-              <div v-else class="agent-step-text" v-html="formatAgentStepContent(item.content)"></div>
+            <details @toggle="(e) => onLazyToggle(`as-${idx}`, e)">
+              <summary class="agent-step-summary">⚙️ {{ item.title || item.name }}<span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
+              <template v-if="isLazyOpen(`as-${idx}`)">
+                <div v-if="item.step_type === 'llm'" class="agent-step-markdown">
+                  <StreamMarkdown :content="item.content" />
+                </div>
+                <div v-else class="agent-step-text" v-html="formatAgentStepContent(item.content)"></div>
+              </template>
             </details>
           </div>
         </template>
       </div>
-      <div v-else class="text" v-html="formattedContent"></div>
+      <div v-else class="text" :id="message.role === 'assistant' ? bodyDomId : undefined" v-html="formattedContent"></div>
+      <div v-if="payloadAnyLoading" class="fetch-hint" role="status">正在取回全文…</div>
+      <div v-if="payloadAnyError" class="fetch-hint fetch-error" role="status">
+        全文取回失败，当前为截断预览
+        <button type="button" class="fetch-retry" @click.stop="retryFetchFull()">重试取回全文</button>
+      </div>
 
       <div v-if="message.role === 'assistant' && hasPersistedProcess && displaySequence.length === 0" class="persisted-process">
         <div v-if="parsedTaskPlan" class="agent-step-block agent-step-block--task">
@@ -380,6 +396,8 @@ import ToolPartCard from './ToolPartCard.vue'
 import MediaLightbox from './MediaLightbox.vue'
 import { useInlineImageZoom } from '@/composables/useInlineImageZoom'
 import { useChatStore } from '@/stores/chat'
+import { resolveDisplaySequence, forceFullBody } from '@/stores/streamReducer'
+import { isExternalizedStub } from '@/api/chat'
 import { classifyFile } from '@/composables/filePreview'
 import { buildDownloadUrl } from '@/api/workspaceFiles'
 import { downloadUrl } from '@/composables/useDownload'
@@ -461,6 +479,31 @@ const { confirm: showLinkConfirm } = useConfirmDialog()
 const { lightboxMedia, lightboxUrl, lightboxKind, openImageLightbox, closeLightbox, onLightboxDownload } =
   useInlineImageZoom()
 const contentRef = ref<HTMLElement | null>(null)
+// P0-1 懒挂载：折叠块 body 首次展开才挂载（VSCode/deepchat 模式）。
+// 首开后保留挂载（再折叠不卸载），避免重复渲染成本。
+const lazyOpenState = ref<Record<string, boolean>>({})
+function isLazyOpen(key: string): boolean {
+  return !!lazyOpenState.value[key]
+}
+function onLazyToggle(key: string, e: Event): void {
+  const open = (e.target as HTMLDetailsElement)?.open
+  if (open && !lazyOpenState.value[key]) {
+    lazyOpenState.value = { ...lazyOpenState.value, [key]: true }
+    // P2-1：折叠块带外置 stub → 展开时取回全文（preview 先渲染，全文到达响应式替换）
+    // B3：取回结果显式化——失败进入可重试态（role=status），绝不静默停在预览
+    // 2026-10-05 字段粒度：点哪个块就只取回哪个字段——思考块=reasoning_content；
+    // display_sequence 内的思考步/工具步内容住在 tool_results JSON 里。
+    const m = props.message as Record<string, unknown>
+    const field = key === 'top-reasoning' ? 'reasoning_content' : 'tool_results'
+    if (isExternalizedStub(m[field]) && props.message.conversation_id) {
+      void retryFetchFull(field)
+    }
+    nextTick(() => {
+      renderMermaidBlocks(contentRef.value)
+      renderEchartsBlocks(contentRef.value)
+    })
+  }
+}
 const previewIdx = ref<number | null>(null)
 // Currently previewed citation number (1-based, matches inline [N] markers).
 // null when no preview is open.
@@ -789,7 +832,11 @@ const _VOICE_TOOL_TITLES: Record<string, string> = {
 const parsedToolResultsData = computed<ToolResultsData | null>(() => {
   if (!props.message.tool_results) return null
   try {
-    const parsed = JSON.parse(props.message.tool_results)
+    let parsed = JSON.parse(props.message.tool_results)
+    // P2-1（评审 I5）：数组形 tool_results 的外置桩是 {meta..., items:[...]} 包装——解包回数组
+    if (parsed && !Array.isArray(parsed) && parsed._externalized && Array.isArray(parsed.items)) {
+      parsed = parsed.items
+    }
     // Old format: plain array — could be SearchResult[] or voice-mode flat tool results
     if (Array.isArray(parsed)) {
       // Detect voice-mode flat format: items have tool_call_id + name + content
@@ -1058,8 +1105,87 @@ const parsedAttachments = computed<Attachment[]>(() => {
 })
 
 const displaySequence = computed<DisplaySequenceItem[]>(() => {
-  return parsedToolResultsData.value?.display_sequence ?? []
+  // A2（conv 8c03ff8e 正文截断修复）：__truncated__ 的正文段换回全文——
+  // content_segments（桩内全量）→ message.content 逐级兜底，零请求。
+  // 工具/思考预览原样（性能收益不回吐；截断标记保留作徽标数据源）。
+  const resolved = resolveDisplaySequence(
+    parsedToolResultsData.value?.display_sequence ?? [],
+    parsedToolResultsData.value?.content_segments,
+    props.message.content,
+  )
+  // N2/criterion #8 终极兜底：末条回答任何情况下不得截断——未愈合时直接以
+  // 恒全量的 message.content 合并渲染（零请求、零依赖取回）。
+  return isLastAnswer.value ? forceFullBody(resolved, props.message.content) : resolved
 })
+
+// ─── 正文保真（2026-10-05 用户指令：正式回答绝对不可截断、折叠）─────────
+// 折叠夹（body clamp）已移除：任何回答正文都不再 max-height 折叠。保真由
+// resolveDisplaySequence 愈合（A2）+ isLastAnswer forceFullBody 兜底（#8）承担；
+// 截断只可能来自外置桩降级态，由 truncBadge 徽标 + payloadFetch 可重试承接。
+const bodyDomId = computed(() => `msg-body-${props.message.id}`)
+// 用户红线（criterion #8，2026-10-03）：最后一个 query 的回答任何情况下不得
+// 折叠或截断显示——isLastAnswer 恒免折叠；未愈合正文段走自愈取回（见下方 watch）。
+const isLastAnswer = computed(() => {
+  const list = chatStore.currentMessages || []
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i]
+    if (m && m.role === 'assistant') return m.id === props.message.id
+  }
+  return false
+})
+
+// B3：payload 取回的显式状态（loading / error+可重试）——红线：失败绝不静默停在预览
+// 按字段分状态（minor⑰ 全清）：双字段各自失败/重试互不覆盖——reasoning_content
+// 重试成功不得抹掉 tool_results 仍未愈合的失败态。loading/error 双提示独立显示
+// （A-m3：一域取回中不遮另一域的失败态）；重试逐字段单独判定（A-m2/B-m4：
+// 聚合布尔会把已愈合字段误标 error）。
+type PayloadFieldName = 'tool_results' | 'reasoning_content' | 'tool_calls'
+const payloadFetchByField = ref<Partial<Record<PayloadFieldName, 'loading' | 'error'>>>({})
+const payloadAnyLoading = computed(() =>
+  Object.values(payloadFetchByField.value).some((v) => v === 'loading'))
+const payloadAnyError = computed(() =>
+  Object.values(payloadFetchByField.value).some((v) => v === 'error'))
+
+async function retryFetchFull(field?: PayloadFieldName): Promise<void> {
+  // 重试目标：显式字段，否则全部 error 字段（模板重试钮=全失败域一并重试）
+  const targets: PayloadFieldName[] = field
+    ? [field]
+    : (Object.entries(payloadFetchByField.value)
+        .filter(([, st]) => st === 'error')
+        .map(([f]) => f) as PayloadFieldName[])
+  if (targets.length === 0) return
+  for (const f of targets) payloadFetchByField.value = { ...payloadFetchByField.value, [f]: 'loading' }
+  await Promise.all(targets.map(async (f) => {
+    const ok = await chatStore.ensureMessageFull(props.message.conversation_id, props.message.id, [f])
+    const next = { ...payloadFetchByField.value }
+    if (ok) delete next[f]
+    else next[f] = 'error'
+    payloadFetchByField.value = next
+  }))
+}
+
+function truncBadge(item: { __truncated__?: boolean; __size_bytes__?: number }): string | null {
+  if (!item || !item.__truncated__) return null
+  const n = item.__size_bytes__
+  return typeof n === 'number' && n > 0 ? `已截断 · 共 ${n} 字` : '已截断 · 展开取全文'
+}
+
+const topReasoningStubbed = computed(() => isExternalizedStub(props.message.reasoning_content))
+
+// F11/R1-C1：正文段未愈合（校验和守卫拒绝换文的降级态）必须显式取回全文——
+// 尤其最后一个回答（criterion #8）任何情况下不得停在截断预览。失败态由
+// payloadFetch → 可重试提示承接；watch 只随 displaySequence 变化触发，失败不循环。
+// 字段粒度：正文段住在 display_sequence ⊂ tool_results，只取回该字段。
+watch(
+  () => displaySequence.value,
+  (seq) => {
+    const unhealed = seq.some((i) => i && i.type === 'text' && (i as { __truncated__?: boolean }).__truncated__)
+    if (unhealed && props.message.conversation_id && payloadFetchByField.value.tool_results !== 'loading') {
+      void retryFetchFull('tool_results')
+    }
+  },
+  { immediate: true },
+)
 
 // Persisted tool items reuse the streaming ToolPartCard so a tool call looks
 // identical during streaming and after reload. Backend stores them as
@@ -1076,7 +1202,10 @@ function toToolPartItem(item: DisplaySequenceItem): DisplaySequenceItem {
     type: 'tool_call',
     status: item.status ?? 'completed',
     result: item.result ?? item.content,
-  }
+    // 评审 I5：ToolPartCard 展开截断项时按此取回 payload 全文
+    message_id: props.message.id,
+    conversation_id: props.message.conversation_id,
+  } as DisplaySequenceItem
 }
 
 const hasReasoningStep = computed(() => {
@@ -1341,11 +1470,21 @@ function formatTextWithCitations(content: string): string {
 
 const formattedReasoning = computed(() => {
   if (!props.message.reasoning_content) return ''
+  // P2-1 stub 容错：外置桩渲染 preview（全文由 onLazyToggle 拉回后此处自动更新）
+  if (isExternalizedStub(props.message.reasoning_content)) {
+    try {
+      const stub = JSON.parse(props.message.reasoning_content)
+      return renderMarkdownToHtml(stub.preview || '')
+    } catch { /* fall through */ }
+  }
   return renderMarkdownToHtml(props.message.reasoning_content)
 })
 
+// P0-1：只 watch formattedContent——watch 数组里放 formattedReasoning 会在挂载时
+// 强制求值（吃掉 3.4MB reasoning 的渲染成本）。折叠块的 mermaid/echarts 扫描
+// 由 onLazyToggle 首开时触发。
 watch(
-  [formattedContent, formattedReasoning],
+  [formattedContent],
   () => {
     nextTick(() => {
       renderMermaidBlocks(contentRef.value)
@@ -2987,5 +3126,56 @@ onMounted(() => {
 
 .alternating-content :deep(.math-edit-btn:active) {
   transform: scale(0.96);
+}
+
+/* ─── 正文截断 UX（2026-10-03）：截断徽标 / 取回状态 / 长文折叠 ─────────── */
+.trunc-badge {
+  display: inline-block;
+  margin-left: 0.5em;
+  padding: 0 0.45em;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  font-size: 0.72em;
+  font-weight: 400;
+  color: var(--color-text-light);
+  vertical-align: middle;
+}
+
+/* 渐进落库（2026-10-06）：中断残稿徽标——skin token 体系，禁硬编码色 */
+.interrupt-badge {
+  margin: 0 0 0.5em;
+  padding: 0.35em 0.6em;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-warning);
+  border-radius: 3px;
+  font-size: 0.78em;
+  color: var(--color-text-light);
+  background: var(--warning-tint, transparent);
+}
+
+.fetch-hint {
+  margin: 0.25em 0 0.5em;
+  font-size: 0.82em;
+  color: var(--color-text-light);
+}
+
+.fetch-hint.fetch-error {
+  color: var(--color-error);
+}
+
+.fetch-retry {
+  margin-left: 0.5em;
+  padding: 0.1em 0.5em;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  background: var(--color-white);
+  color: inherit;
+  font-size: 0.95em;
+  cursor: pointer;
+}
+
+.fetch-retry:hover {
+  background: var(--color-primary);
+  color: var(--color-white);
 }
 </style>

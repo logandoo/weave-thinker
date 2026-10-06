@@ -136,13 +136,14 @@ async def save_asr_hotwords(
     for item in request.hotwords:
         if not item.text or not item.text.strip():
             continue
+        weight = 50 if item.weight == 50 else max(1, min(5, item.weight))
         db.add(UserAsrHotword(
             user_id=current_user.id,
             text=item.text.strip(),
-            weight=max(1, min(5, item.weight)),
+            weight=weight,
             lang=item.lang,
         ))
-        inserted.append({"text": item.text.strip(), "weight": item.weight, "lang": item.lang})
+        inserted.append({"text": item.text.strip(), "weight": weight, "lang": item.lang})
 
     await db.commit()
 

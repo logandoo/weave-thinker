@@ -20,6 +20,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from app.services.playwright_thread import pw_ephemeral
+
 logger = logging.getLogger(__name__)
 
 # 可视交付物扩展名（确定性判定，无需 LLM）
@@ -43,9 +45,12 @@ async def _resolve_vlm(assistant_llm=None) -> Optional[object]:
     return ep
 
 
+@pw_ephemeral
 def _screenshot_html(file_path: str) -> Optional[bytes]:
     """Render an HTML/SVG file headless and return PNG bytes (sync — run via
-    asyncio.to_thread; 同步 Playwright 不能在 asyncio loop 跑)."""
+    asyncio.to_thread; 同步 Playwright 不能在 asyncio loop 跑).
+    2026-10-04：一次性线程隔离（自带 `with sync_playwright()` 会话；与池化
+    会话不得同线程——A4.9 wave2 Critical）。"""
     try:
         from pathlib import Path
         from playwright.sync_api import sync_playwright

@@ -97,6 +97,12 @@ class LLMService:
                      base_url, custom_model_name or self.config.model_name, self.is_custom_provider)
 
     def _build_params(self, messages: list, **kwargs) -> dict:
+        # P3/B4：工具结果图片信封 → 多模态 content parts（单点展开）。
+        try:
+            from app.services.tool_image_results import expand_tool_images
+            messages = expand_tool_images(messages)
+        except Exception:
+            pass
         model = kwargs.get("model") or self.custom_model_name or self.config.model_name or "gpt-3.5-turbo"
         # 模型网关：custom 端点的 toml params 作为每端点默认采样（kwargs 优先；
         # 非 custom 端点走下方 [defaults] 全局默认，行为与 legacy 一致）。

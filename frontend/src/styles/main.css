@@ -2,6 +2,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/* 会话侧栏共享 chrome：sidebar-panels.css 由各宿主 <style scoped src> 托管
+   （Sidebar / ZenHistoryDrawer / NotesPanelInline），不再全局 import——
+   避免 .modal-* 与 .menu-item 等通用类名对 NotesList/NotebooksList/AsrHotwordsDialog
+   等无关组件产生 unset 属性填充（A4.9 评审 Minor 全局 bleed 案）。 */
+
+/* 笔记编辑工具栏说明浮层（悬停 1s）：选择器全部锚定在
+   .editor-toolbar / .zen-note-toolbar / .find-replace-bar 之内，无通用类名 bleed 风险 */
+@import './editor-toolbar-tip.css';
+
 /* ==========================================================================
    设计令牌基线 = 默认皮肤「青野平面 (verdant-flat)」
    - 本块即注册表中的 verdant-flat：未设置 data-skin 时由此生效

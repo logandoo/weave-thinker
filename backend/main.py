@@ -17,7 +17,7 @@ logging.basicConfig(
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
 )
 
-from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api, user_settings, sync as sync_api, citations as citations_api
+from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api, user_settings, sync as sync_api, citations as citations_api, server_admin
 from app.db.database import init_db, AsyncSessionLocal
 from app.core.config import get_config, clear_config_cache
 from app.services.agent_scheduler import agent_scheduler
@@ -67,6 +67,9 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(conversation.router)
+app.include_router(server_admin.router)
+from app.api import message_payloads as message_payloads_api
+app.include_router(message_payloads_api.router)
 app.include_router(assistant.router)
 app.include_router(asr.router)
 app.include_router(admin.router)
@@ -119,6 +122,11 @@ async def startup_event():
     if not config.security_jwt_secret_key:
         raise RuntimeError("JWT secret key is not configured")
 
+    # conv-open 性能治理 P1-1（DESIGN_conv_open_performance）：所有 Message 写点
+    # 的超限 tool_results/reasoning_content/tool_calls 自动外置到 message_payloads。
+    from app.services.message_payload_service import install_message_payload_hook
+    install_message_payload_hook()
+
     def _on_sighup_reload_config(signum, frame):
         clear_config_cache()
         logger.info("Config cache cleared via SIGHUP")
@@ -141,6 +149,36 @@ async def startup_event():
     fonts_dir = os.path.join(os.path.dirname(__file__), "Fonts")
     os.makedirs(fonts_dir, exist_ok=True)
     await init_db()
+
+    # 部署排空令牌（2026-10-06，A4.9 r1 I5）：每启动生成随机令牌落盘
+    # backend/.drain_token（0600）——stop.sh 读取后经 X-Drain-Token 头调用
+    # drain 端点；令牌闸使本机恶意网页/反代拓扑无法打进 drain。
+    try:
+        from app.api import server_admin as _server_admin
+        _drain_tok = _server_admin.new_drain_token()
+        _server_admin.set_drain_token(_drain_tok)
+        _tok_path = os.path.join(os.path.dirname(__file__), ".drain_token")
+        # scoped 复审 Minor：写即 0600（os.open mode 原子生效），消除
+        # write-then-chmod 的权限窗口。
+        _fd = os.open(_tok_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(_fd, "w", encoding="utf-8") as _f:
+            _f.write(_drain_tok)
+    except Exception:
+        logger.exception("drain token bootstrap failed (fail-open; drain 端点将拒绝无令牌调用)")
+
+    # 渐进落库 sweep（2026-10-06，conv ae9aa092）：上次进程死亡（部署强杀/
+    # 崩溃/OOM）遗留的 streaming 在途行全部翻 interrupted——用户刷新后看到
+    # 部分正文+「已中断」徽标，而不是整段蒸发。fail-open 不阻塞启动。
+    try:
+        from app.api.chat import mark_interrupted_streams
+        from app.db.database import AsyncSessionLocal as _SweepSession
+        async with _SweepSession() as _sweep_db:
+            _swept = await mark_interrupted_streams(_sweep_db)
+            await _sweep_db.commit()
+        if _swept:
+            logger.warning("boot sweep: %d streaming message(s) marked interrupted", _swept)
+    except Exception:
+        logger.exception("boot sweep mark_interrupted_streams failed (fail-open)")
 
     # sync 波（2026-09-26 自 weave-thinker-client 上游）：注册 ORM 变更捕获；
     # [sync].enabled 在发射期逐事件读取（端点侧同配置请求期 404），SIGHUP 热改不脱钩。
@@ -247,6 +285,16 @@ async def startup_event():
     registry = ActiveAgentRegistry.get_instance()
     await registry.start_cleanup()
     await registry.recover_orphaned_tasks()
+    # vibeweaver 执法层 hook 安装（gate: tool.after + stop；幂等、fail-open）
+    try:
+        from app.services.vibeweaver_gate_service import install_hooks as _vw_install
+        _vw_summary = _vw_install()
+        logger.info("vibeweaver gate hooks: %s", _vw_summary)
+        from app.services.vibeweaver_audit_service import install_hooks as _vw_audit_install
+        _vw_audit_summary = _vw_audit_install()
+        logger.info("vibeweaver audit hooks: %s", _vw_audit_summary)
+    except Exception:
+        logger.exception("vibeweaver hook installation failed (fail-open)")
 
 
 @app.on_event("shutdown")

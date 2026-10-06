@@ -1015,6 +1015,21 @@ def _build_citation_mapping_view(state: "AgentLoopState", draft: str) -> str:
         + "\n".join(lines)
         + f"\n本轮检索结果台账共 {ledger.size} 条，合法引用编号范围 [1]-[{ledger.size}]。"
     )
+    # 2026-10-06（conv ae9aa092，用户红线）：直说草稿实际使用的有效编号——
+    # 确定性全文核对结论，不受任何展示窗口影响；杜绝审计员因引用落在
+    # 省略/未注意段落而睁眼说「没有引用」。
+    if report.cited:
+        _cited_sorted = sorted(report.cited)
+        _cited_view = "".join(f"[{n}]" for n in _cited_sorted[:30])
+        if len(_cited_sorted) > 30:
+            _cited_view += f" 等共 {len(_cited_sorted)} 个"
+        else:
+            _cited_view += f"（共 {len(_cited_sorted)} 个）"
+        block += (
+            f"\n草稿实际使用的有效引用编号：{_cited_view}"
+            "——此结论由确定性全文核对得出（不受草稿呈现方式影响），"
+            "严禁以「草稿没有引用/未标注引用」为由打回。"
+        )
     if report.unknown:
         _unknown_sorted = sorted(report.unknown)
         unknown = "、".join(f"[{n}]" for n in _unknown_sorted[:20])
@@ -2264,6 +2279,35 @@ def _rejected_append(loop: "AgentLoop", state: "AgentLoopState", content: str, r
         state.messages.append({"role": "assistant", "content": content, "_rejected": True})
 
 
+async def _emit_draft_rejected(loop, state, content, guidance, source, *, attempt_no: int | None = None) -> None:
+    """渐进落库（2026-10-06，conv ae9aa092，用户裁定「被拒草稿保留并标记」）：
+    审计打回发生时，把被拒草稿全文+裁决元数据交给持久化回调（chat.py 写
+    message_attempts 台账）。fail-open——回调失败只记日志，绝不炸 loop。
+
+    attempt_no：调用点显式传入（stash 时已递增的单调计数 state.draft_attempt_seq）
+    ——A4.9 r1 M4 修复：不得取 len(stash)（stash 有界 pop-oldest 后编号重复），
+    也不得在异步任务里惰性读 state（错位）。"""
+    cb = getattr(loop, "on_draft_rejected", None)
+    if cb is None:
+        return
+    try:
+        await cb(
+            content=content or "",
+            verdict=getattr(guidance, "verdict", "") or "",
+            problem=getattr(guidance, "problem", "") or "",
+            source=source,
+            attempt_no=int(attempt_no if attempt_no is not None
+                           else getattr(state, "draft_attempt_seq", 0)),
+        )
+    except Exception:
+        logger.warning("on_draft_rejected callback failed (fail-open)", exc_info=True)
+
+
+# advisory（同步上下文）emit 任务的强引用集（A4.9 r1 M4：fire-and-forget 的
+# create_task 只有弱引用，GC 可提前回收）。
+_DRAFT_EMIT_TASKS: set = set()
+
+
 def _stash_rejected_draft(state: "AgentLoopState", content: str, guidance: "AuditVerdict", source: str, reasoning: str = "") -> None:
     """Append an audit-rejected draft to the best-of stash (conv 7dc7a0d5).
 
@@ -2274,6 +2318,8 @@ def _stash_rejected_draft(state: "AgentLoopState", content: str, guidance: "Audi
     draft that spends the budget is a candidate too), on the draft path and
     the synthesis path alike. Pop-oldest at _AUDIT_STASH_LIMIT.
     """
+    # A4.9 r1 M4：单调打回计数器（stash 有界 pop-oldest 不影响编号）。
+    state.draft_attempt_seq = getattr(state, "draft_attempt_seq", 0) + 1
     state.audit_rejected_drafts.append({
         "content": content or "",
         # A2: reasoning excerpt (capped) so the last-resort selector sees the
@@ -2395,6 +2441,11 @@ class AgentLoopState:
     budget: Optional[IterationBudget] = None
     budget_grace_call: bool = False
     completed_normally: bool = False
+    # vibeweaver stop hook（P1/A3）：本 turn 已拦截收尾续跑次数（每轮预算
+    # 由 hook_service 复核；此处计数供钩子上下文与日志）。
+    stop_hook_blocks: int = 0
+    # vibeweaver loop-guard（P2/A5）：观察器请求的纠正指令（迭代边界消费）。
+    loop_guard_feedback: str = ""
     # Coordinator (LLM) judgments for this turn. ``turn_focus`` restates what
     # the user actually wants NOW (anti topic-anchoring); ``expects_tools`` is
     # the coordinator's judgment on whether answering requires tool calls —
@@ -2514,6 +2565,9 @@ class AgentLoopState:
     # but the stash survives so the last-resort selector can compare all
     # candidates with their rejection reasons. Bounded by _AUDIT_STASH_LIMIT.
     audit_rejected_drafts: List[dict] = field(default_factory=list)
+    # 单调打回计数器（2026-10-06）：message_attempts.attempt_no 的来源——
+    # stash 有界 pop-oldest 后 len() 会重复编号，必须用独立单调计数。
+    draft_attempt_seq: int = 0
     # Set when finish_reason=length truncates a tool-less answer: the next
     # iteration is the legitimate continuation tail, so the pre-send audit
     # (fabrication guard + LLM auditor) must skip exactly once — auditing the
@@ -3018,9 +3072,10 @@ def _is_audit_grounding(name: str) -> bool:
 _AUDIT_NON_EVIDENCE_RESERVE_TOKENS = 52000
 
 
-# 2026-09-20 审计完整性（verify/judge/auditor 复审）：草稿窗口改为 token 感知
-# （旧实现 >3000 字符即 head1500+tail1500，字符阈值且中段从不进入审计视野）。
-_AUDIT_DRAFT_WINDOW_TOKENS = 8000
+# 2026-10-06（conv ae9aa092，用户红线）：草稿窗口机制整体废除——审计 prompt
+# 中草稿永远逐字全文（截断审计 = 断章取义）；超巨型草稿走
+# `_chunked_full_audit` 分块全覆盖（零省略）。旧头+尾窗口函数（含 token
+# 真界收缩版）随之删除。
 
 
 # ── 分块声称清单（2026-09-20 SOTA wave）────────────────────────────────────
@@ -3231,43 +3286,19 @@ def _format_chunk_inventory(
     return "\n".join(lines)
 
 
-def _draft_audit_view(draft: str) -> Tuple[str, bool]:
-    """(view, truncated) for the auditor's draft window.
-
-    Token-aware: total head+tail ≈ _AUDIT_DRAFT_WINDOW_TOKENS, converted to
-    characters with the SAME CJK-aware estimator every other budget uses
-    (用户原则：禁止字符数拍脑袋阈值). The middle marker states that the
-    omitted range must not ground a verdict (template rule 8)."""
-    if not draft:
-        return draft, False
-    from app.services.context_compressor import estimate_text_tokens_rough
-    try:
-        _tk = estimate_text_tokens_rough(draft)
-    except Exception:
-        _tk = len(draft)
-    if _tk <= _AUDIT_DRAFT_WINDOW_TOKENS:
-        return draft, False
-    from app.services.context_compressor import estimate_text_tokens_rough as _est
-    _chars_per_token = max(1.0, len(draft) / max(1, _tk))
-    _half_chars = max(1500, int((_AUDIT_DRAFT_WINDOW_TOKENS / 2) * _chars_per_token))
-    if len(draft) <= 2 * _half_chars:
-        return draft, False
-    # A4.9 r5 Important-1：全局平均字符/token 会在 CJK 头部+ASCII 中段时严重
-    # 低估——必须按**实际切片**测量并收缩，直到被测 tokens 达标（真界而非估计）。
-    while _half_chars > 400 and (
-        _est(draft[:_half_chars]) + _est(draft[-_half_chars:])
-    ) > _AUDIT_DRAFT_WINDOW_TOKENS:
-        _half_chars = int(_half_chars * 0.8)
-    omitted = len(draft) - 2 * _half_chars
-    if omitted < 64:
-        # A4.9 r4 Minor：省略量小于标记本身时返回原文（避免"截断后更长"）
-        return draft, False
-    return (
-        draft[:_half_chars]
-        + f"\n…[中间省略 {omitted} 字符，未展示部分不得作为判定依据]…\n"
-        + draft[-_half_chars:],
-        True,
-    )
+def _parse_audit_json(raw: str) -> Optional[dict]:
+    """审计员输出的容错 JSON 提取（单次尝试）。返回 dict 或 None。"""
+    raw = (raw or "").strip()
+    json_start = raw.find("{")
+    json_end = raw.rfind("}") + 1
+    if json_start >= 0 and json_end > json_start:
+        try:
+            result = json.loads(raw[json_start:json_end])
+        except json.JSONDecodeError:
+            result = None
+        if isinstance(result, dict):
+            return result
+    return None
 
 
 def _audit_evidence_budget() -> int:
@@ -4246,6 +4277,9 @@ class AgentLoop:
         self._compressor = None
         self.delegation_depth = delegation_depth
         self.session_factory = session_factory
+        # 渐进落库回调（2026-10-06，conv ae9aa092）：chat.py 注入——审计打回时
+        # 把被拒草稿全文+裁决元数据写入 message_attempts 台账。None=未注入。
+        self.on_draft_rejected = None
         self._identity_context = (identity_context or "").strip()
         self._budget_config = BudgetConfig(
             max_result_size_chars=int(config.agent_tool_loop.get("max_result_size_chars", 100_000)),
@@ -5051,11 +5085,10 @@ class AgentLoop:
         "或与完整可见证据直接矛盾 → verdict=reject，按“凭空编造/无依据作答”处理；\n"
         "6. 声称的证据完全缺失且模型可补读（如文件从未读取、问题需要新信息）"
         "→ verdict=needs_evidence，problem 指明“立即调用工具补充证据后再回答”。\n\n"
-        "12. 草稿窗口截断纪律：若草稿正文标注“中间省略/未展示”，"
-        "不得对未展示的中段内容判 reject 或 needs_evidence——未展示 ≠ 不存在；"
-        "若本轮提供【分块声称清单】，中段声称以清单为准逐条核验；"
-        "清单覆盖率 <100% 或存在未提取声称的片段时，相关片段不得作为合格依据，"
-        "只能 unverifiable/needs_evidence；若未提供清单，仍按未展示纪律处理。\n\n"
+        "12. 草稿全文纪律（2026-10-06 用户红线）：草稿始终逐字全文呈现（超巨型时"
+        "按「第 i/N 块」分块全覆盖呈现，全稿零省略）——不存在“未展示的草稿内容”，"
+        "对草稿的任何判定都必须基于实际呈现的文字；分块呈现时只判定本块内可见问题，"
+        "跨块连贯性由合并阶段处理，不得因“未看到其他块”判 reject 或 needs_evidence。\n\n"
         "只输出JSON（不要输出任何其他内容；problem 不超过80字，unsupported_claims 最多3条、"
         "每条 claim 不超过40字——篇幅超限会被截断导致解析失败）：\n"
         '{"ok": true 或 false, '
@@ -5131,6 +5164,135 @@ class AgentLoop:
             logger.warning("evidence scout timed out — no-op (deterministic ranking remains)")
         except Exception:
             logger.warning("evidence scout failed", exc_info=True)
+
+    async def _chunked_full_audit(
+        self,
+        state: "AgentLoopState",
+        draft: str,
+        context_parts: List[str],
+        draft_idx: int,
+        prompt_budget: int,
+    ) -> Optional["AuditVerdict"]:
+        """分块全覆盖审计（2026-10-06 用户红线，conv ae9aa092）：草稿本身超巨型
+        （证据正文已收完仍超预算）时，把草稿分块、每块独立审计、保守合并——
+        全稿零省略，效率手段只允许分段，绝不允许截断。
+
+        - 每块 prompt = 共享上下文（用户消息/引用对照表/证据台账等）+ 草稿第 i/N 块；
+          块内文字完整可见，引用对照表为全稿口径（确定性全文 verify）。
+        - 合并优先级 reject > needs_evidence > unverifiable > accept；任一块
+          reject（带 problem）即打回（块内内容完整可见，判决有效）。无 problem
+          的判决与单调用契约一致按 accept 处理。
+        - 块调用/解析失败：显式置位 `audit_chunk_coverage_incomplete`；无 reject 时
+          整体 fail-open（None，低置信出货底线披露），绝不静默丢块冒充合格。
+        - 全 accept 时仍需过确定性零引用闸门（全文 verify）。
+        返回 None = accept 或 fail-open（与 `_audit_response` 契约一致：None=放行）；
+        异常内部消化不抛出。
+        """
+        from app.services.context_compressor import estimate_text_tokens_rough as _est
+        try:
+            _shared = list(context_parts)
+            _shared[draft_idx] = ""  # 草稿占位替换为分块
+            _shared_tokens = _est("\n\n".join(_shared))
+            _chunk_target = max(2000, prompt_budget - _shared_tokens - 1500)
+            _draft_tokens = _est(draft)
+            _max_chunks = max(4, min(64, int(_draft_tokens / max(1, _chunk_target)) + 2))
+            chunks, omitted = _split_audit_chunks(
+                draft, target_tokens=_chunk_target, max_chunks=_max_chunks)
+            if not chunks or omitted > 0:
+                state.audit_chunk_coverage_incomplete = True
+                logger.warning(
+                    "audit_metric outcome=fail_open reason=chunked_split_incomplete chunks=%d omitted=%d",
+                    len(chunks or []), omitted)
+                return None
+            _audit_llm = (
+                getattr(self, "audit_llm", None)
+                or getattr(self, "coordinator_llm", None)
+            )
+            _system = self._AUDITOR_SYSTEM_TEMPLATE.replace(
+                "__ASSISTANT_NAME__",
+                getattr(self, "_audit_assistant_name", None) or "AI助手")
+            sem = asyncio.Semaphore(
+                max(1, int(config.agent_audit_chunked_claim_max_concurrency)))
+            _total = len(chunks)
+
+            async def _one(idx: int, chunk: str) -> Optional[dict]:
+                _parts = list(_shared)
+                _parts[draft_idx] = (
+                    f"助手草稿回答（第 {idx + 1}/{_total} 块；全稿共 {_total} 块分块全覆盖呈现，"
+                    "零省略——其余块由并行审计分别核对。只判定本块内可见的问题；"
+                    "不得因「未看到全文/其他块」判 reject 或 needs_evidence；"
+                    "上方引用编号对照表为全稿口径，对本块同样适用）：\n" + chunk
+                )
+                msgs = [
+                    {"role": "system", "content": _system},
+                    {"role": "user", "content": "\n\n".join(_parts)},
+                ]
+                async with sem:
+                    try:
+                        raw = await self._complete_json(msgs, temperature=0.0, llm=_audit_llm)
+                    except Exception:
+                        logger.warning("chunked_full_audit block %d/%d failed", idx + 1, _total, exc_info=True)
+                        return None
+                return _parse_audit_json(raw)
+
+            results = await asyncio.gather(*(_one(i, ch) for i, ch in enumerate(chunks)))
+            failed = sum(1 for r in results if r is None)
+            if failed:
+                state.audit_chunk_coverage_incomplete = True
+            parsed = [r for r in results if r is not None]
+            logger.info(
+                "audit_metric outcome=chunked_full chunks=%d failed=%d draft_chars=%d",
+                _total, failed, len(draft))
+
+            def _verdict_of(r: dict) -> str:
+                ok_val = r.get("ok")
+                ok = ok_val if isinstance(ok_val, bool) else str(ok_val).strip().lower() in {"true", "yes", "1"}
+                v = str(r.get("verdict") or "").strip().lower()
+                if ok or v == "accept":
+                    return "accept"
+                if v not in ("reject", "unverifiable", "needs_evidence"):
+                    return "reject"
+                return v
+
+            by = {"reject": [], "needs_evidence": [], "unverifiable": [], "accept": []}
+            for r in parsed:
+                v = _verdict_of(r)
+                by[v if v in by else "accept"].append(r)
+            for rank in ("reject", "needs_evidence", "unverifiable"):
+                group = by[rank]
+                if not group:
+                    continue
+                _problems = [str(r.get("problem") or "").strip() for r in group]
+                _problems = [p for p in _problems if p]
+                if not _problems:
+                    # 无 problem 的判决不携带可执行修正——与单调用契约一致按 accept
+                    continue
+                _claims: List[dict] = []
+                for r in group:
+                    for c in (r.get("unsupported_claims") or []):
+                        if isinstance(c, dict) and len(_claims) < 3:
+                            _claims.append(c)
+                return AuditVerdict(
+                    verdict=rank,
+                    source="llm",
+                    problem=("【分块审计合并】" + "；".join(_problems))[:240],
+                    unsupported_claims=_claims,
+                    guidance="",  # 由调用方既有 soft-reject 机制包装修正指令
+                )
+            if failed:
+                # 覆盖缺口 + 其余块全 accept → fail-open（低置信底线）
+                return None
+            # 全 accept：过确定性零引用闸门（全文 verify）
+            _remand = _citation_remand_verdict(state, draft)
+            if _remand is not None:
+                return _remand
+            # 全覆盖 accept 哨兵（A4.9 r1 C1）：调用方据此直接放行——
+            # 不得落回超预算单调用（重复审计/flip-flop/错误未审计披露）。
+            return AuditVerdict(verdict="accept", source="chunked")
+        except Exception:
+            state.audit_chunk_coverage_incomplete = True
+            logger.warning("chunked_full_audit failed — coverage-incomplete floor", exc_info=True)
+            return None
 
     async def _chunked_claim_inventory(self, draft: str) -> "Tuple[List[dict], dict]":
         """map 阶段：逐块提取原子声称与局部风险（有界、并发、失败显式）。
@@ -5493,6 +5655,14 @@ class AgentLoop:
                 state, audit_target, guidance, source=source,
                 reasoning=reasoning_content,
             )
+            try:
+                _emit_task = asyncio.get_running_loop().create_task(
+                    _emit_draft_rejected(self, state, audit_target, guidance, source,
+                                         attempt_no=state.draft_attempt_seq))
+                _DRAFT_EMIT_TASKS.add(_emit_task)
+                _emit_task.add_done_callback(_DRAFT_EMIT_TASKS.discard)
+            except Exception:
+                pass
             logger.warning(
                 "Advisory audit (%s): one targeted repair (verdict=%s source=%s) — %s",
                 source,
@@ -5847,69 +6017,48 @@ class AgentLoop:
         _citation_map = _build_citation_mapping_view(state, draft)
         if _citation_map:
             context_parts.append(_citation_map)
-        # Draft window (2026-08-12 blind-spot wave): head+tail instead of
-        # head-only — a >3000-char draft can derail in the tail (repetition,
-        # topic drift, broken ending) and the head-only window made that
-        # invisible to the auditor.
-        _draft_view, _draft_cut = _draft_audit_view(draft)
+        # 草稿全文纪律（2026-10-06 用户红线，conv ae9aa092）：审计 prompt 中的
+        # 草稿永远逐字全文——头+尾省略中段 = 断章取义（引用落省略段时审计员
+        # 会睁眼误判「没有引用」）。效率手段只允许分块全覆盖审计
+        # （`_chunked_full_audit`，零省略），绝不允许截断。
         _draft_idx = len(context_parts)
-        if _draft_cut:
-            from app.services.context_compressor import estimate_text_tokens_rough as _est_tk
-            _draft_tokens = _est_tk(draft)
-            context_parts.append(
-                f"助手草稿回答（共 ~{_draft_tokens} tokens；窗口为头+尾，中段省略）：{_draft_view}"
-            )
-            # 2026-09-20 SOTA wave：不再靠加宽窗口覆盖中段——分块 map 全稿声称
-            # 清单 + 覆盖率；未覆盖（失败/超上限）→ 低置信出货底线。
-            if config.agent_audit_chunked_claim_audit_enabled:
-                try:
-                    _inv_claims, _inv_cov = await self._chunked_claim_inventory(draft)
-                    context_parts.append(
-                        _format_chunk_inventory(_inv_claims, _inv_cov, _evidence_full))
-                    _cov_done = int(_inv_cov.get("chunks_done") or 0)
-                    _cov_total = int(_inv_cov.get("chunks_total") or 0)
-                    _cov_omitted = int(_inv_cov.get("omitted_chunks") or 0)
-                    _cov_empty = int(_inv_cov.get("empty_claim_chunks") or 0)
-                    _cov_anom = int(_inv_cov.get("anomaly_claims") or 0)
-                    if (_cov_done < _cov_total or _cov_omitted > 0
-                            or _cov_empty > 0 or _cov_anom >= 3):
-                        state.audit_chunk_coverage_incomplete = True
-                        logger.warning(
-                            "chunked claim inventory incomplete: %d/%d chunks (+%d omitted) — low-confidence floor",
-                            _cov_done, _cov_total, _cov_omitted,
-                        )
-                except Exception:
-                    state.audit_chunk_coverage_incomplete = True
-                    logger.warning(
-                        "chunked claim inventory failed — coverage-incomplete floor", exc_info=True)
-        else:
-            context_parts.append(f"助手草稿回答：{_draft_view}")
+        context_parts.append(f"助手草稿回答（逐字全文）：{draft}")
         # A4.9 r5 Important-2：发送前硬守卫——预留金是估算，若组装后的审计提示
-        # 仍逼近上下文上限，按优先级显式降级（先缩草稿窗，再收起证据正文），
+        # 仍逼近上下文上限，按优先级显式降级（2026-10-06 起：先收起证据正文，
+        # 草稿永不缩；草稿本身超巨型 → 分块全覆盖审计），
         # 绝不把 400 → fail-open 未审计出货留给 provider。
         from app.services.context_compressor import estimate_text_tokens_rough as _est_guard
         if _est_guard("\n\n".join(context_parts)) > _audit_prompt_budget:
-            if _draft_cut:
-                _half = max(800, len(_draft_view) // 4)
-                _slim = (
-                    _draft_view[:_half]
-                    + "\n…[上下文上限：草稿窗口进一步缩小，中段与部分头尾未展示]…\n"
-                    + _draft_view[-_half:]
-                )
-                context_parts[_draft_idx] = f"助手草稿回答（上下文上限，窗口已进一步缩小）：{_slim}"
-            if (
-                _evidence_text_idx is not None
-                and _est_guard("\n\n".join(context_parts)) > _audit_prompt_budget
-            ):
+            _evidence_dropped = False
+            if _evidence_text_idx is not None:
                 context_parts[_evidence_text_idx] = (
                     "（证据正文因上下文上限未展开——证据台账仍完整列出各条目的"
                     "可见性/截断状态；对未展开证据只能判 unverifiable/needs_evidence，"
                     "严禁判 reject/编造。）"
                 )
+                _evidence_dropped = True
+            if _est_guard("\n\n".join(context_parts)) > _audit_prompt_budget:
+                # 草稿本身超巨型（证据已收完仍超预算）→ 分块全覆盖审计。
+                _chunked = await self._chunked_full_audit(
+                    state, draft, context_parts, _draft_idx, _audit_prompt_budget)
+                if _chunked is not None:
+                    # A4.9 r1 C1：分块全覆盖 accept（哨兵 verdict="accept"）=
+                    # 审计已判合格——直接放行（None），绝不落回超预算单调用
+                    # （重复审计/分块 accept 被单调用 reject 的 flip-flop）。
+                    if _chunked.verdict == "accept":
+                        return None
+                    return _chunked
+                if getattr(state, "audit_chunk_coverage_incomplete", False):
+                    # 分块覆盖未达成（块失败/解析失败）——低置信出货底线：
+                    # 不再重复单调用（必然再超预算），按 fail-open 契约放行。
+                    state.audit_budget_unaudited = True
+                    logger.warning(
+                        "audit_metric outcome=fail_open reason=chunked_coverage_incomplete — accepting draft")
+                    return None
             logger.warning(
-                "audit_prompt_guard: prompt tokens ~%d > budget %d — degraded (draft_cut=%s, evidence_text_dropped=%s)",
+                "audit_prompt_guard: prompt tokens ~%d > budget %d — degraded (evidence_text_dropped=%s, draft_never_cut=True)",
                 _est_guard("\n\n".join(context_parts)), _audit_prompt_budget,
-                _draft_cut, _evidence_text_idx is not None,
+                _evidence_dropped,
             )
         # F7（A4.9）：用户消息 headline 逐字全文后不再设上界——全部降级后仍超预算
         # 时，审计调用可能被 provider 拒绝并走 fail-open（未审计出货）。fail-open
@@ -6331,6 +6480,7 @@ class AgentLoop:
             # STRONGEST selection candidate (fresh generation from a
             # de-poisoned context) — stash it before chaining to the selector.
             _stash_rejected_draft(state, salvaged, guidance, source="salvage", reasoning="".join(_reason_parts))
+            await _emit_draft_rejected(self, state, salvaged, guidance, "salvage", attempt_no=state.draft_attempt_seq)
             logger.warning(
                 "Audit-budget salvage rejected by auditor: verdict=%s %s",
                 getattr(guidance, "verdict", "?"),
@@ -7280,6 +7430,11 @@ class AgentLoop:
             cancelled.set()
             state.cancelled = True
             keepalive_task.cancel()
+            try:
+                from app.services.vibeweaver_audit_service import unregister_run as _lg_unregister
+                _lg_unregister(str(getattr(conversation, "id", "") or ""))
+            except Exception:
+                pass
             if not producer_task.done():
                 producer_task.cancel()
             try:
@@ -7362,11 +7517,48 @@ class AgentLoop:
         # the loop must stay alive even at 0 budget: the consume() failure then
         # routes into the exhaustion handler below, which evaluates the goal and
         # resets the budget for the next turn instead of terminating the run.
+        assistant_content = ""
+        # vibeweaver loop-guard：注册活跃 run（观察器请求中断的落点）。
+        _lg_conv_id = str(getattr(conversation, "id", "") or "")
+        try:
+            from app.services.vibeweaver_audit_service import register_run as _lg_register
+            _lg_register(_lg_conv_id, state)
+        except Exception:
+            logger.debug("loop-guard register failed-open")
         while (await state.budget.get_remaining()) > 0 or state.budget_grace_call or self._skip_guardrails():
             # checkpoint 位于 consume 之前——budget.used
             # 仅代表「已完成」的迭代数，重放中断迭代时 consume 后回到同一 cursor，
             # 台账键跨重放稳定（write-before-invoke）。
             await self._maybe_checkpoint(state)
+            # ── vibeweaver loop-guard（A5）：迭代边界消费纠正指令 ──
+            # 观察器（文本退化 / noop-bash）请求的中断在下一迭代边界落地：
+            # 丢弃退化草稿、注入纠正指令继续（预算由观察器侧控制）。
+            if state.loop_guard_feedback:
+                _lg_feedback = state.loop_guard_feedback
+                state.loop_guard_feedback = ""
+                yield {
+                    "agent_step": {
+                        "name": "loop_guard",
+                        "title": "生成退化中断",
+                        "content": "检测到生成退化（重复/无意义序列或 echo 空转），已中断并注入纠正指令。",
+                        "step_type": "system",
+                    }
+                }
+                if assistant_content:
+                    # A4.9 I3：草稿若已被提交为 live assistant 消息（force-final
+                    # 等路径），不得再 _rejected_append 一份重复；仅未提交时走
+                    # 拒绝收编。segments 汇聚无论如何清空（避免外泄到终稿）。
+                    _already_committed = any(
+                        m.get("role") == "assistant" and m.get("content") == assistant_content
+                        for m in state.messages[-3:]
+                    )
+                    if not _already_committed:
+                        _prune_guardrail_pairs(state)
+                        _rejected_append(self, state, assistant_content, reasoning_content)
+                    state.turn_content_segments.clear()
+                    assistant_content = ""
+                _inject_directive(state, _lg_feedback, _ephemeral="loop_guard")
+                continue
             if state.budget_grace_call:
                 state.budget_grace_call = False
                 async for event in self._grace_call(state):
@@ -7805,6 +7997,20 @@ class AgentLoop:
                         assistant_raw_content += event_data
                         if content_text:
                             assistant_content += content_text
+                            # vibeweaver loop-guard 观察通道（A4）：文本增量
+                            # 发布（fire-and-forget；观察者 fail-open）。
+                            try:
+                                from app.services.agent_event_bus import (
+                                    AgentEvent as _AebEvent,
+                                    agent_event_bus as _aeb,
+                                )
+                                _aeb.publish_soon(_AebEvent(
+                                    type="message.delta",
+                                    session_id=_lg_conv_id,
+                                    data={"delta": content_text},
+                                ))
+                            except Exception:
+                                pass
                             # When reasoning is enabled, suppress all middle-iteration
                             # content; the single final answer is produced by
                             # _final_thinking after all tools finish (or directly when
@@ -8998,6 +9204,7 @@ class AgentLoop:
                             # budget branch — the budget-spending draft is a
                             # selection candidate too.
                             _stash_rejected_draft(state, _audit_target, guidance, source="draft", reasoning=reasoning_content)
+                            await _emit_draft_rejected(self, state, _audit_target, guidance, "draft", attempt_no=state.draft_attempt_seq)
                             # NPG no-progress 守卫（conv 3a216a51, 2026-09-02）：
                             # 连续两次 NPG enforce 打回且 flags 不降、期间无新
                             # 工具调用 → guidance 的两条自救路径（calculate
@@ -9220,6 +9427,7 @@ class AgentLoop:
                                 # Best-of stash (conv 7dc7a0d5): synthesis rejects
                                 # are selection candidates too (both branches).
                                 _stash_rejected_draft(state, _final_content, _synth_guidance, source="synthesis", reasoning=reasoning_content)
+                                await _emit_draft_rejected(self, state, _final_content, _synth_guidance, "synthesis", attempt_no=state.draft_attempt_seq)
                                 if (
                                     state.audit_rejections <= _audit_reject_budget_for(state)
                                     and state.audit_soft_rejections <= config.agent_audit_soft_reject_limit
@@ -9483,6 +9691,76 @@ class AgentLoop:
                     else:
                         yield {"done": True}
                         return
+
+                # ── vibeweaver stop hook（A3/D2）：turn 收敛门禁 ──
+                # 证据红 → 拦下收尾、注入纠正反馈续跑（预算内）；死亡磕模式
+                # 由自己的 judge 收尾，不重复设门。fail-open。
+                # A4.9 I4：迭代中途武装但未被消费的 loop_guard 纠正指令在此
+                # 同样生效（退化终稿不得静默收尾）。
+                if state.loop_guard_feedback and not self._skip_guardrails():
+                    _lg_feedback = state.loop_guard_feedback
+                    state.loop_guard_feedback = ""
+                    yield {
+                        "agent_step": {
+                            "name": "loop_guard",
+                            "title": "生成退化中断",
+                            "content": "检测到生成退化，收尾被中断并注入纠正指令。",
+                            "step_type": "system",
+                        }
+                    }
+                    _prune_guardrail_pairs(state)
+                    # A4.9 I4 残余：合成路径已把草稿提交为 live 消息时不得
+                    # 再 _rejected_append 重复（与 loop-top I3 守卫同款）。
+                    if not any(
+                        m.get("role") == "assistant" and m.get("content") == assistant_content
+                        for m in state.messages[-3:]
+                    ):
+                        _rejected_append(self, state, assistant_content, reasoning_content)
+                    state.turn_content_segments.clear()
+                    _inject_directive(state, _lg_feedback, _ephemeral="loop_guard")
+                    continue
+                if not self._skip_guardrails():
+                    try:
+                        from app.services import hook_service as _hs
+                        _stop_ctx = _hs.StopContext(
+                            session_id=str(getattr(state, "session_id", "") or ""),
+                            conversation_id=str(getattr(conversation, "id", "") or ""),
+                            user_id=str(getattr(user, "id", "") or ""),
+                            workspace_path=self.workspace_path or "",
+                            assistant_content=assistant_content or "",
+                            iterations=state.iterations,
+                            stop_hook_blocks_this_turn=state.stop_hook_blocks,
+                        )
+                        _stop_decision = await _hs.run_stop_hooks(_stop_ctx)
+                    except Exception:
+                        logger.exception("stop hook failed-open")
+                        _stop_decision = None
+                    if _stop_decision is not None and not _stop_decision.allow and _stop_decision.feedback:
+                        state.stop_hook_blocks += 1
+                        logger.info(
+                            "stop hook blocks completion (conv=%s turn_blocks=%d): %s",
+                            getattr(conversation, "id", ""), state.stop_hook_blocks,
+                            (_stop_decision.reason or "")[:120],
+                        )
+                        yield {
+                            "agent_step": {
+                                "name": "stop_hook",
+                                "title": "收尾门禁",
+                                "content": _stop_decision.reason or "验证证据未过收尾门禁，继续修复后重新收尾。",
+                                "step_type": "system",
+                            }
+                        }
+                        if assistant_content:
+                            _prune_guardrail_pairs(state)
+                            # A4.9 I4 残余：已提交草稿不重复拒绝（同 I3 守卫）
+                            if not any(
+                                m.get("role") == "assistant" and m.get("content") == assistant_content
+                                for m in state.messages[-3:]
+                            ):
+                                _rejected_append(self, state, assistant_content, reasoning_content)
+                            state.turn_content_segments.clear()
+                        _inject_directive(state, _stop_decision.feedback, _ephemeral="stop_hook")
+                        continue
 
                 state.completed_normally = True
                 break
@@ -10562,6 +10840,79 @@ class AgentLoop:
     })
 
     async def _execute_single_tool(
+        self,
+        call_id: str,
+        tool_name: str,
+        tool_args: dict,
+        session_factory: Any,
+        user: Any,
+        conversation: Any,
+        assistant: Any,
+        state: AgentLoopState,
+        current_turn_content: str = "",
+        current_turn_tool_results: str = "",
+    ) -> ToolCallResult:
+        """公共入口：tool.before / tool.after 钩子包壳（vibeweaver P1/A1-A2）。
+
+        before 返回 block → 本次调用直接回红错误（等价 execute.before throw）；
+        after 返回 block → 结果替换为红错误（GATE-BLOCKED），notes 追加到
+        结果文本尾部。钩子异常 fail-open，不影响工具执行。
+        """
+        from app.services import hook_service as _hs
+        try:
+            _hook_ctx = _hs.ToolHookContext(
+                tool_name=tool_name,
+                args=tool_args or {},
+                session_id=str(getattr(state, "session_id", "") or ""),
+                conversation_id=str(getattr(conversation, "id", "") or ""),
+                user_id=str(getattr(user, "id", "") or ""),
+                workspace_path=self.workspace_path or "",
+            )
+            _before = await _hs.run_tool_hooks("before", _hook_ctx)
+        except Exception:
+            logger.exception("tool.before hooks failed-open")
+            _before = None
+        if _before is not None and _before.block:
+            return ToolCallResult(
+                call_id=call_id,
+                name=tool_name,
+                arguments=tool_args,
+                result=json.dumps({"error": _before.block, "gate": "before-hook"}, ensure_ascii=False),
+                error=True,
+            )
+        result = await self._execute_single_tool_ledger(
+            call_id, tool_name, tool_args, session_factory, user, conversation,
+            assistant, state,
+            current_turn_content=current_turn_content,
+            current_turn_tool_results=current_turn_tool_results,
+        )
+        try:
+            _hook_ctx.result = result.result
+            _hook_ctx.is_error = bool(result.error)
+            _after = await _hs.run_tool_hooks("after", _hook_ctx)
+        except Exception:
+            logger.exception("tool.after hooks failed-open")
+            _after = None
+        if _after is not None:
+            if _after.block:
+                return ToolCallResult(
+                    call_id=call_id,
+                    name=tool_name,
+                    arguments=tool_args,
+                    result=json.dumps({"error": _after.block, "gate": "after-hook"}, ensure_ascii=False),
+                    error=True,
+                )
+            if _after.notes:
+                result = ToolCallResult(
+                    call_id=result.call_id,
+                    name=result.name,
+                    arguments=result.arguments,
+                    result=result.result + "\n" + "\n".join(_after.notes),
+                    error=result.error,
+                )
+        return result
+
+    async def _execute_single_tool_ledger(
         self,
         call_id: str,
         tool_name: str,

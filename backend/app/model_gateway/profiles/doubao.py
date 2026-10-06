@@ -7,7 +7,9 @@ Ark OpenAI 兼容端点（https://ark.cn-beijing.volces.com/api/v3）的豆包
 Seed 系列 wire（2026-09-15 真实 API 实测，doubao-seed-2-0-pro-260215）：
 - thinking{type: enabled|disabled}：开 → reasoning_content；关 → 无
   （auto 该模型不支持，实测 400 → 不下发）
-- 顶层 reasoning_effort ∈ {minimal, low, medium, high}（minimal=不思考）
+- 顶层 reasoning_effort ∈ {low, medium, high}（2026-10-04 起 minimal 档移除）
+- 遗留 "minimal" 值兜底映射 disable：Ark minimal=0 reasoning tokens ≡ 关闭，
+  菜单/wire 不再产出该档，但存量调用方不得被静默升级为默认深度思考
 - 无 thinking_budget 变量——所有 wire 路径剥除（模板静默忽略≠契约允许）
 """
 from typing import Any, Dict, Optional
@@ -17,11 +19,15 @@ from app.model_gateway.profiles.base import ThinkingProfile
 
 class DoubaoProfile(ThinkingProfile):
     name = "doubao"
-    efforts = ("high", "medium", "low", "minimal")
+    efforts = ("high", "medium", "low")
     preserve_thinking = False
 
     def enable(self, effort: Optional[str] = None, budget: Optional[int] = None,
                preserve: Optional[bool] = None) -> dict:
+        # minimal≡关闭（Ark 0 reasoning tokens）：档位已移除，遗留值走关思考。
+        # 大小写/空白容错——漏网值绝不能静默变成默认深度思考。
+        if isinstance(effort, str) and effort.strip().lower() == "minimal":
+            return self.disable()
         body: Dict[str, Any] = {"thinking": {"type": "enabled"}}
         if effort in self.efforts:
             body["reasoning_effort"] = effort

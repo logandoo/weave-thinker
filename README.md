@@ -154,7 +154,7 @@ cd ..
 
 **学术引用格式**：`[N]` 引用可按学科规范渲染为标准参考文献——内置 11 种样式（GB/T 7714 顺序编码制 / 作者-年份制 / 注释制、APA、MLA、Chicago 作者-年份制 / 注释制、Harvard、IEEE、Vancouver、AMA），保存笔记与导出 Word/PDF 含 `[N]` 引用时按样式生成参考文献节（默认 GB/T 7714 顺序编码制；助手设置优先，未设置回落全局默认）；文内引用覆盖编号括号、编号上标、作者-年份、作者-页码（MLA）、注释（首见全注、复见短注）五种形态，Word 导出角标为真上标对象；论文类长文在写作规划期锁定格式，完稿自动生成参考文献，不用手写；聊天回答保持 `[N]` 角标溯源，不追加参考文献节。
 
-**防幻觉体系**：发送前四态审计（accept / reject / unverifiable / needs_evidence）+ 拒绝预算与 salvage 重生成 + 遵循词 canary（长上下文防走神）+ 数值溯源闸门 NPG（关键数值须逐字溯源，默认记录、可配置强制拦截）。审计链路不静默截断：工具输出全量保留、超长自动存档并可回读核对；长回答按分块声称清单全稿核验，未覆盖片段显式标注并按低置信出货，绝不「看不到就当编造」。最新一条用户消息在意图判断、审计与守卫中逐字全文，长粘贴消息不会被截断误读；学术 / 研究类任务按研究语域组织（问题 → 假说 → 证据 → 结论），不混入工程流程话术。
+**防幻觉体系**：发送前四态审计（accept / reject / unverifiable / needs_evidence）+ 拒绝预算与 salvage 重生成 + 遵循词 canary（长上下文防走神）+ 数值溯源闸门 NPG（关键数值须逐字溯源，默认记录、可配置强制拦截）。审计链路不静默截断：工具输出全量保留、超长自动存档并可回读核对；被审草稿始终逐字全文送审（超长分块全覆盖审计，零省略），绝不「看不到就当编造」。最新一条用户消息在意图判断、审计与守卫中逐字全文，长粘贴消息不会被截断误读；学术 / 研究类任务按研究语域组织（问题 → 假说 → 证据 → 结论），不混入工程流程话术。
 
 **三层记忆**：每日摘要与 dream、文件记忆（AGENT.md / USER.md）、v2 概念/情节/潜意识管线并存。五段混合召回（BM25 + embedding → 关系扩展 → rerank → LLM 打分 → RRF 融合），支持复现晋升、休眠淡忘、梦境整理与成本治理降级，pgvector 可选。记忆面板可见来源与权重，支持修正、遗忘与一键擦除。
 
@@ -174,13 +174,15 @@ cd ..
 
 **可信计算**：`calculate` 是 AST 白名单安全计算器（无 eval），复杂计算走代码沙箱；模型口算的数字不作依据。
 
-**皮肤与技能**：3 套内置皮肤 × 明暗双模式（设计令牌体系，支持上传自定义皮肤，规范见 [docs/SKINS.md](docs/SKINS.md)）；10 项系统技能 + 用户技能，SKILL.md 即操作手册，捆绑脚本执行前做安全扫描。
+**中断保护**：回答生成途中服务重启/崩溃，已生成部分按中断时点保留并带「已中断」标记；被审计打回重写的草稿全文留痕可查；服务停止/升级前自动排空在途回答（默认最长 120 秒）。
+
+**皮肤与技能**：3 套内置皮肤 × 明暗双模式（设计令牌体系，支持上传自定义皮肤，规范见 [docs/SKINS.md](docs/SKINS.md)）；11 项系统技能 + 用户技能，SKILL.md 即操作手册，捆绑脚本执行前做安全扫描。
 
 **字体自托管**：Inter 与 Noto Sans SC（SIL OFL 1.1）全量存放在 `frontend/public/fonts/`，运行时零第三方 CDN 请求，离线与内网可用（许可与再分发义务见 [docs/license-compliance.md](docs/license-compliance.md) 第五节）。
 
 ## 内置工具与技能
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 50 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 10 项系统技能。
+后端 `app/tools/` 经 `registry.register()` 静态注册 50 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 11 项系统技能。
 
 <details>
 <summary>完整工具清单（50 个）</summary>
@@ -225,7 +227,7 @@ cd ..
 frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI · 3 皮肤令牌体系）
                      │  /api/*（JWT）
 backend/    FastAPI + async SQLAlchemy 2.0
-  ├─ app/api/        23 个路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/sync/…）
+  ├─ app/api/        26 个路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/sync/server-drain/…）
   ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出 · 联网同步
   ├─ app/tools/      工具体系（50 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）

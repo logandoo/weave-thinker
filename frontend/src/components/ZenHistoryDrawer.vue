@@ -4,7 +4,7 @@
 <template>
   <Teleport to="body">
     <div v-if="visible" class="zen-history-drawer-overlay" @click="$emit('close')"></div>
-    <div v-if="visible" class="zen-history-drawer" :class="{ 'zen-dragging': isDragging }">
+    <div v-if="visible" class="zen-history-drawer" :class="{ 'sidebar-dragging': isDragging }">
       <div class="drawer-header">
         <span class="drawer-title">Agent历史</span>
         <div class="drawer-actions">
@@ -31,9 +31,35 @@
       </div>
 
       <div class="drawer-body">
+        <!-- 助手切换（工作台 Agent 侧栏）：切换后会话/分组列表随所选助手刷新 -->
+        <div class="zen-asst-switcher">
+          <button class="zen-asst-trigger" @click.stop="asstMenuOpen = !asstMenuOpen" :title="currentAssistantName">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+            <span class="zen-asst-name">{{ currentAssistantName }}</span>
+            <svg class="zen-asst-chevron" :class="{ expanded: asstMenuOpen }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </button>
+          <div v-if="asstMenuOpen" class="zen-asst-menu" @click.stop>
+            <button
+              v-for="a in assistantStore.assistants"
+              :key="a.id"
+              class="zen-asst-item"
+              :class="{ active: a.id === assistantStore.currentAssistantId }"
+              @click="selectAssistantFromDrawer(a.id)"
+            >
+              {{ a.name }}
+            </button>
+            <div v-if="!assistantStore.assistants.length" class="zen-asst-empty">暂无助手</div>
+          </div>
+        </div>
+
         <!-- New Chat Button -->
-        <div class="zen-action-row">
-          <button class="zen-new-chat-btn" @click="handleNewChat">
+        <div class="action-buttons">
+          <button class="new-chat-btn" @click="handleNewChat">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M12 20h9"/>
               <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
@@ -43,9 +69,9 @@
         </div>
 
         <!-- Selection Bar -->
-        <div class="zen-selection-bar" v-if="selectionModeActive">
-          <div class="zen-selection-header">
-            <label class="zen-select-all" v-if="isExportMode">
+        <div class="selection-bar" v-if="selectionModeActive">
+          <div class="selection-bar-header">
+            <label class="select-all-label" v-if="isExportMode">
               <input
                 type="checkbox"
                 :checked="selectedConversationIds.size === chatStore.conversations.length && chatStore.conversations.length > 0"
@@ -53,7 +79,7 @@
               />
               全选
             </label>
-            <span class="zen-selected-count">
+            <span class="selected-count">
               <template v-if="isDeleteMode">
                 <template v-if="selectedConversationIds.size > 0 && selectedGroupIds.size > 0">
                   {{ selectedConversationIds.size }}个对话, {{ selectedGroupIds.size }}个分组
@@ -69,88 +95,88 @@
               <template v-else>{{ selectedConversationIds.size }} 已选</template>
             </span>
           </div>
-          <div class="zen-selection-actions">
+          <div class="selection-bar-actions">
             <button
-              class="zen-sel-confirm"
-              :class="{ export: isExportMode, delete: isDeleteMode }"
+              class="selection-confirm-btn"
+              :class="{ 'export-confirm-btn': isExportMode, 'delete-confirm-btn': isDeleteMode }"
               @click="handleSelectionConfirm"
               :disabled="!hasAnySelection || selectionPending"
             >
               {{ selectionPending ? (isExportMode ? '导出中...' : '删除中...') : (isExportMode ? '导出' : '删除') }}
             </button>
-            <button class="zen-sel-cancel" @click="exitSelectionMode">取消</button>
+            <button class="selection-cancel-btn" @click="exitSelectionMode">取消</button>
           </div>
-          <div class="zen-selection-progress" v-if="selectionProgress">{{ selectionProgress }}</div>
+          <div class="selection-progress" v-if="selectionProgress">{{ selectionProgress }}</div>
         </div>
 
         <!-- Conversation List -->
         <div
           
-          class="zen-conv-list"
+          class="conversation-list"
           ref="conversationListEl"
           @mousedown="onConversationListMouseDown"
         >
           <!-- Groups Directory -->
-          <div class="zen-groups-dir" v-if="groupStore.groups.length > 0">
-            <div class="zen-groups-dir-header" @click="toggleGroupsDirectory">
-              <svg class="zen-dir-chevron" :class="{ expanded: !groupsDirectoryCollapsed }" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <div class="groups-directory">
+            <div class="groups-directory-header" @click="toggleGroupsDirectory">
+              <svg class="directory-chevron" :class="{ expanded: !groupsDirectoryCollapsed }" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="9 6 15 12 9 18"/>
               </svg>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
               </svg>
-              <span class="zen-dir-name">分组对话</span>
-              <span class="zen-dir-count">{{ groupStore.groups.length }}</span>
+              <span class="directory-name">分组对话</span>
+              <span class="directory-count">{{ groupStore.groups.length }}</span>
             </div>
-            <div v-show="!groupsDirectoryCollapsed" class="zen-groups-dir-content">
+            <div v-show="!groupsDirectoryCollapsed" class="groups-directory-content">
               <SortableList
                 v-model="groupStore.groups"
                 :group="{ name: 'zen-groups', pull: false, put: false }"
                 item-key="id"
-                handle=".zen-group-header"
+                handle=".group-header"
                 :delay="100"
                 :disabled="selectionModeActive"
                 @start="onDragStart"
                 @end="onGroupDragEnd"
               >
                 <div v-for="group in groupStore.groups" :key="group.id"
-                     class="zen-conv-group"
+                     class="conversation-group"
                      :data-group-id="group.id"
                      :data-draggable="true"
                      :data-key="group.id"
                      :class="{ 'drag-hover': isDragging && dragExpandedGroupId === group.id }"
                 >
                   <div
-                    class="zen-group-header"
+                    class="group-header"
                     :class="{ 'group-selected': isDeleteMode && selectedGroupIds.has(group.id), 'group-focus': focusGroupId === group.id }"
                     @click="handleGroupHeaderClick(group.id)"
                   >
                     <input
                       v-if="isDeleteMode"
                       type="checkbox"
-                      class="zen-group-checkbox"
+                      class="group-checkbox"
                       :checked="selectedGroupIds.has(group.id)"
                       @click.stop
                       @change="toggleGroupSelect(group.id)"
                     />
                     <svg
-                      class="zen-group-chevron"
+                      class="group-chevron"
                       :class="{ expanded: !groupStore.isGroupCollapsed(group.id) || (isDragging && dragExpandedGroupId === group.id) }"
                       width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     >
                       <polyline points="9 6 15 12 9 18"/>
                     </svg>
-                    <span class="zen-group-dot" :style="{ backgroundColor: group.color }"></span>
-                    <span class="zen-group-name">{{ group.name }}</span>
-                    <span class="zen-group-count">{{ getGroupConvCount(group.id) }}</span>
-                    <div class="zen-group-actions" v-if="!isDeleteMode">
-                      <button class="zen-group-act-btn" @click.stop="openEditGroupDialog(group)" title="编辑分组">
+                    <span class="group-color-dot" :style="{ backgroundColor: group.color }"></span>
+                    <span class="group-name">{{ group.name }}</span>
+                    <span class="group-count">{{ getGroupConvCount(group.id) }}</span>
+                    <div class="group-actions" v-if="!isDeleteMode">
+                      <button class="group-action-btn" @click.stop="openEditGroupDialog(group)" title="编辑分组">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                           <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                           <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                         </svg>
                       </button>
-                      <button class="zen-group-act-btn delete" @click.stop="openDeleteGroupDialog(group)" title="删除分组">
+                      <button class="group-action-btn delete" @click.stop="openDeleteGroupDialog(group)" title="删除分组">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                           <polyline points="3 6 5 6 21 6"/>
                           <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -158,13 +184,19 @@
                       </button>
                     </div>
                   </div>
-                  <div class="zen-group-convs" :class="{ 'zen-group-convs-collapsed': groupStore.isGroupCollapsed(group.id) && (!isDragging || dragExpandedGroupId !== group.id) }">
+                  <div class="group-conversations" :class="{ 'group-convs-collapsed': groupStore.isGroupCollapsed(group.id) && (!isDragging || dragExpandedGroupId !== group.id) }">
                     <SortableList
-                      class="zen-group-conv-drag"
+                      class="group-conv-drag-list"
                       :list="dragLists[group.id] || []"
                       :group="convDragGroup"
                       item-key="id"
                       :sort-key="'group:' + group.id"
+
+                      :delay="100"
+
+                      :sort="false"
+
+                      :force-reinit="forceReinitCounter"
                       :disabled="selectionModeActive || editingTitleId !== null"
                       ghost-class="sortable-ghost"
                       @start="onDragStart"
@@ -177,19 +209,27 @@
                           :selection-mode-active="selectionModeActive"
                           :selected="selectedConversationIds.has(conv.id)"
                           :editing-title-id="editingTitleId"
+
+                          :editing-title="editingTitle"
                           :swiped-conversation-id="swipedConversationId"
                           :swipe-offset="swipeOffset"
+
+                          :is-swipe-dragging="isSwipeDragging"
                           :current-conversation-id="chatStore.currentConversationId"
                           @click="handleConversationClick"
                           @toggle-select="toggleSelect"
                           @start-edit="startEditTitle"
                           @save-title="saveTitle"
                           @cancel-edit="cancelEditTitle"
+
+                          @update-title="updateTitle"
                           @swipe-start="handleTouchStart"
                           @swipe-end="handleTouchEnd"
                           @swipe-move="handleTouchMove"
                           @swipe-export="handleSwipeExport"
                           @swipe-edit="handleSwipeEdit"
+
+                          @swipe-move-group="handleSwipeMoveGroup"
                           @swipe-save-note="handleSwipeSaveToNote"
                           @swipe-delete="handleSwipeDelete"
                           @toggle-menu="toggleMenu"
@@ -206,15 +246,21 @@
           <div
             v-for="category in ungroupedTimeCategories"
             :key="category.key"
-            class="zen-time-section"
+            class="time-category-section"
           >
-            <div class="zen-time-header">{{ category.label }}</div>
+            <div class="time-category-header">{{ category.label }}</div>
             <SortableList
-              class="zen-ungrouped-drag"
+              class="ungrouped-conv-drag-list"
               :list="dragLists[category.key] || []"
               :group="convDragGroup"
               item-key="id"
               :sort-key="'ungrouped:' + category.key"
+
+              :delay="100"
+
+              :sort="false"
+
+              :force-reinit="forceReinitCounter"
               :disabled="selectionModeActive || editingTitleId !== null"
               ghost-class="sortable-ghost"
               @start="onDragStart"
@@ -227,19 +273,27 @@
                   :selection-mode-active="selectionModeActive"
                   :selected="selectedConversationIds.has(conv.id)"
                   :editing-title-id="editingTitleId"
+
+                  :editing-title="editingTitle"
                   :swiped-conversation-id="swipedConversationId"
                   :swipe-offset="swipeOffset"
+
+                  :is-swipe-dragging="isSwipeDragging"
                   :current-conversation-id="chatStore.currentConversationId"
                   @click="handleConversationClick"
                   @toggle-select="toggleSelect"
                   @start-edit="startEditTitle"
                   @save-title="saveTitle"
                   @cancel-edit="cancelEditTitle"
+
+                  @update-title="updateTitle"
                   @swipe-start="handleTouchStart"
                   @swipe-end="handleTouchEnd"
                   @swipe-move="handleTouchMove"
                   @swipe-export="handleSwipeExport"
                   @swipe-edit="handleSwipeEdit"
+
+                  @swipe-move-group="handleSwipeMoveGroup"
                   @swipe-save-note="handleSwipeSaveToNote"
                   @swipe-delete="handleSwipeDelete"
                   @toggle-menu="toggleMenu"
@@ -251,15 +305,21 @@
           <!-- Empty ungrouped drop zone -->
           <div
             v-if="ungroupedTimeCategories.length === 0 && groupStore.groups.length > 0"
-            class="zen-ungrouped-drop"
+            class="ungrouped-drop-zone"
           >
-            <div class="zen-ungrouped-drop-label">未分组对话</div>
+            <div class="ungrouped-drop-zone-label">未分组对话</div>
             <SortableList
-              class="zen-ungrouped-drag zen-empty-drag"
+              class="ungrouped-conv-drag-list ungrouped-empty-drag-list"
               :list="emptyUngroupedList"
               :group="convDragGroup"
               item-key="id"
               sort-key="ungrouped:empty"
+
+              :delay="100"
+
+              :sort="false"
+
+              :force-reinit="forceReinitCounter"
               :disabled="selectionModeActive || editingTitleId !== null"
               ghost-class="sortable-ghost"
               @start="onDragStart"
@@ -271,31 +331,31 @@
             </SortableList>
           </div>
 
-          <div v-if="!loadingConversations && chatStore.conversations.length === 0 && groupStore.groups.length === 0" class="zen-list-empty">
+          <div v-if="!loadingConversations && chatStore.conversations.length === 0 && groupStore.groups.length === 0" class="list-empty">
             暂无对话
           </div>
-          <div v-if="loadingConversations" class="zen-list-empty">加载中...</div>
+          <div v-if="loadingConversations" class="list-empty">加载中...</div>
         </div>
 
         <!-- Marquee overlay -->
         <div
           v-show="isMarqueeSelecting && marqueeAnchor"
-          class="zen-marquee"
+          class="marquee-overlay"
           :style="marqueeStyle"
         ></div>
       </div>
 
       <!-- Context Menu -->
       <Teleport to="body">
-        <div v-if="activeMenuId" class="zen-conv-menu" :style="menuStyle" @click.stop>
-          <button class="zen-menu-item" @click="handleMenuEdit">
+        <div v-if="activeMenuId" class="conversation-menu" :style="menuStyle" @click.stop>
+          <button class="menu-item" @click="handleMenuEdit">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
             </svg>
             <span>修改名称</span>
           </button>
-          <button class="zen-menu-item" @click="handleMenuExport">
+          <button class="menu-item" @click="handleMenuExport">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
               <polyline points="7 10 12 15 17 10"/>
@@ -303,23 +363,23 @@
             </svg>
             <span>导出对话</span>
           </button>
-          <button class="zen-menu-item" @click="handleMenuSaveToNote">
+          <button class="menu-item" @click="handleMenuSaveToNote">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
             </svg>
             <span>添加到笔记</span>
           </button>
-          <button class="zen-menu-item delete" @click="handleMenuDelete">
+          <button class="menu-item delete" @click="handleMenuDelete">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="3 6 5 6 21 6"/>
               <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
             </svg>
             <span>删除对话</span>
           </button>
-          <div class="zen-menu-divider"></div>
+          <div class="menu-divider"></div>
           <button
             v-if="menuTargetConv?.group_id"
-            class="zen-menu-item"
+            class="menu-item"
             @click="removeConversationFromGroup(menuTargetConv.id)"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -327,7 +387,7 @@
             </svg>
             <span>移出分组</span>
           </button>
-          <button class="zen-menu-item" @click="openMoveToGroupMenu($event)">
+          <button class="menu-item" @click="openMoveToGroupMenu($event)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
               <line x1="12" y1="11" x2="12" y2="17"/>
@@ -340,19 +400,19 @@
 
       <!-- Move to Group Sub-menu -->
       <Teleport to="body">
-        <div v-if="showMoveToGroupMenu" class="zen-move-overlay" @mousedown.self="closeAllMenus"></div>
-        <div v-if="showMoveToGroupMenu" class="zen-conv-menu zen-move-menu" :style="moveMenuStyle" @click.stop>
-          <button class="zen-menu-item" @click="moveConversationToGroup(moveTargetConv!.id, null)">
+        <div v-if="showMoveToGroupMenu" class="move-group-overlay" @mousedown.self="closeAllMenus"></div>
+        <div v-if="showMoveToGroupMenu" class="conversation-menu move-group-menu" :style="moveMenuStyle" @click.stop>
+          <button class="menu-item" @click="moveConversationToGroup(moveTargetConv!.id, null)">
             <span>未分组</span>
           </button>
           <button
             v-for="group in groupStore.getGroupsForAssistant(assistantStore.currentAssistantId)"
             :key="group.id"
-            class="zen-menu-item"
+            class="menu-item"
             :class="{ active: moveTargetConv?.group_id === group.id }"
             @click="moveConversationToGroup(moveTargetConv!.id, group.id)"
           >
-            <span class="zen-group-dot" :style="{ backgroundColor: group.color }"></span>
+            <span class="group-color-dot" :style="{ backgroundColor: group.color }"></span>
             <span>{{ group.name }}</span>
           </button>
         </div>
@@ -360,21 +420,21 @@
 
       <!-- Group Dialog (Create/Edit) -->
       <Teleport to="body">
-        <div v-if="showGroupDialog" class="zen-modal-overlay" @mousedown.self="showGroupDialog = false">
-          <div class="zen-modal" @click.stop>
-            <h3 class="zen-modal-title">{{ editingGroup ? '编辑分组' : '新建分组' }}</h3>
-            <div class="zen-modal-body">
-              <div class="zen-form-group">
+        <div v-if="showGroupDialog" class="modal-overlay" @mousedown.self="showGroupDialog = false">
+          <div class="modal-content" @click.stop>
+            <h3 class="modal-title">{{ editingGroup ? '编辑分组' : '新建分组' }}</h3>
+            <div class="modal-body">
+              <div class="form-group">
                 <label>分组名称</label>
                 <input v-model="newGroupName" type="text" placeholder="输入分组名称" @keyup.enter="saveGroup" />
               </div>
-              <div class="zen-form-group">
+              <div class="form-group">
                 <label>标签颜色</label>
-                <div class="zen-color-picker">
+                <div class="color-picker">
                   <button
                     v-for="color in PRESET_COLORS"
                     :key="color"
-                    class="zen-color-opt"
+                    class="color-option"
                     :class="{ active: newGroupColor === color }"
                     :style="{ backgroundColor: color }"
                     @click="newGroupColor = color"
@@ -382,9 +442,9 @@
                 </div>
               </div>
             </div>
-            <div class="zen-modal-actions">
-              <button class="zen-modal-btn cancel" @click="showGroupDialog = false">取消</button>
-              <button class="zen-modal-btn confirm" @click="saveGroup">保存</button>
+            <div class="modal-actions">
+              <button class="modal-btn cancel" @click="showGroupDialog = false">取消</button>
+              <button class="modal-btn confirm" @click="saveGroup">保存</button>
             </div>
           </div>
         </div>
@@ -392,19 +452,19 @@
 
       <!-- Delete Group Confirmation -->
       <Teleport to="body">
-        <div v-if="showDeleteGroupDialog" class="zen-modal-overlay" @mousedown.self="showDeleteGroupDialog = false">
-          <div class="zen-modal" @click.stop>
-            <h3 class="zen-modal-title">删除分组</h3>
-            <div class="zen-modal-body">
+        <div v-if="showDeleteGroupDialog" class="modal-overlay" @mousedown.self="showDeleteGroupDialog = false">
+          <div class="modal-content" @click.stop>
+            <h3 class="modal-title">删除分组</h3>
+            <div class="modal-body">
               <p>确定要删除分组 "{{ deletingGroup?.name }}" 吗？</p>
-              <label class="zen-check-label">
+              <label class="checkbox-label">
                 <input type="checkbox" v-model="deleteGroupWithConversations" />
                 <span>同时删除分组中的全部对话</span>
               </label>
             </div>
-            <div class="zen-modal-actions">
-              <button class="zen-modal-btn cancel" @click="showDeleteGroupDialog = false">取消</button>
-              <button class="zen-modal-btn delete" @click="confirmDeleteGroup">删除</button>
+            <div class="modal-actions">
+              <button class="modal-btn cancel" @click="showDeleteGroupDialog = false">取消</button>
+              <button class="modal-btn delete" @click="confirmDeleteGroup">删除</button>
             </div>
           </div>
         </div>
@@ -412,19 +472,19 @@
 
       <!-- Bulk Delete Confirmation -->
       <Teleport to="body">
-        <div v-if="showBulkDeleteDialog" class="zen-modal-overlay" @click="showBulkDeleteDialog = false">
-          <div class="zen-modal" @click.stop>
-            <h3 class="zen-modal-title">确认删除</h3>
-            <div class="zen-modal-body">
+        <div v-if="showBulkDeleteDialog" class="modal-overlay" @click="showBulkDeleteDialog = false">
+          <div class="modal-content" @click.stop>
+            <h3 class="modal-title">确认删除</h3>
+            <div class="modal-body">
               <p>{{ bulkDeleteConfirmMessage }}</p>
-              <label v-if="selectedGroupIds.size > 0" class="zen-check-label">
+              <label v-if="selectedGroupIds.size > 0" class="checkbox-label">
                 <input type="checkbox" v-model="bulkDeleteWithConversations" />
                 <span>同时删除分组中的全部对话</span>
               </label>
             </div>
-            <div class="zen-modal-actions">
-              <button class="zen-modal-btn cancel" @click="showBulkDeleteDialog = false">取消</button>
-              <button class="zen-modal-btn delete" @click="confirmBulkDelete">删除</button>
+            <div class="modal-actions">
+              <button class="modal-btn cancel" @click="showBulkDeleteDialog = false">取消</button>
+              <button class="modal-btn delete" @click="confirmBulkDelete">删除</button>
             </div>
           </div>
         </div>
@@ -562,6 +622,7 @@ const { show: showToast } = useToast()
 const { confirm: showConfirm } = useConfirmDialog()
 
 const loadingConversations = ref(false)
+const forceReinitCounter = ref(0)
 const editingTitleId = ref<string | null>(null)
 const editingTitle = ref('')
 const titleInput = ref<HTMLInputElement | null>(null)
@@ -965,6 +1026,10 @@ watch(() => props.visible, async (v) => {
     if (!chatStore.conversations.length) {
       loadingConversations.value = true
       try {
+        // 助手列表每次抽屉打开都重载（Sidebar 模式下由 Sidebar 负责；工作台无 Sidebar）。
+        // 不可只在空列表时加载：陈旧列表会把已删除助手误判为有效（wave-2 C5 实证）。
+        await assistantStore.loadAssistants()
+        ensureCurrentAssistant()
         await Promise.all([
           chatStore.loadConversations(assistantStore.currentAssistantId),
           groupStore.loadGroups(assistantStore.currentAssistantId || undefined)
@@ -974,6 +1039,8 @@ watch(() => props.visible, async (v) => {
         loadingConversations.value = false
       }
     } else {
+      await assistantStore.loadAssistants()
+      ensureCurrentAssistant()
       syncDragLists()
     }
     // Re-apply a pending search-jump reveal: the drawer unmounts (v-if) on
@@ -1053,6 +1120,21 @@ async function saveTitle(id: string) {
   editingTitle.value = ''
 }
 
+function updateTitle(value: string) {
+  editingTitle.value = value
+}
+
+function handleSwipeMoveGroup(convId: string) {
+  const conv = chatStore.conversations.find(c => c.id === convId)
+  if (!conv) return
+  moveTargetConv.value = { id: conv.id, title: conv.title || '新对话', group_id: conv.group_id }
+  closeSwipeActions()
+  const MENU_WIDTH = 180
+  const left = Math.max(8, (window.innerWidth - MENU_WIDTH) / 2)
+  moveMenuStyle.value = { top: '40%', left: `${left}px` }
+  showMoveToGroupMenu.value = true
+}
+
 function cancelEditTitle() {
   editingTitleId.value = null
   editingTitle.value = ''
@@ -1075,7 +1157,7 @@ function toggleMenu(id: string, event: MouseEvent) {
   if (left + MENU_WIDTH > window.innerWidth - PADDING) left = window.innerWidth - MENU_WIDTH - PADDING
   menuStyle.value = { top: `${top}px`, left: `${left}px` }
   nextTick(() => {
-    const menuEl = document.querySelector('.zen-conv-menu') as HTMLElement
+    const menuEl = document.querySelector('.conversation-menu') as HTMLElement
     if (!menuEl) return
     const menuRect = menuEl.getBoundingClientRect()
     if (menuRect.height > window.innerHeight - rect.bottom - PADDING && rect.top > window.innerHeight - rect.bottom) {
@@ -1091,8 +1173,57 @@ function closeAllMenus() {
   menuTargetConv.value = null
   showMoveToGroupMenu.value = false
   moveTargetConv.value = null
+  asstMenuOpen.value = false
   closeSwipeActions()
 }
+
+// ===== 助手切换（工作台 Agent 侧栏）=====
+// 与 Sidebar.vue 选择助手同语义：selectAssistant 落 localStorage + 跨标签同步，
+// watch currentAssistantId 后刷新会话/分组列表（外部来源的切换同样生效）。
+const asstMenuOpen = ref(false)
+
+const currentAssistantName = computed(() => {
+  const a = assistantStore.assistants.find((x) => x.id === assistantStore.currentAssistantId)
+  return a ? a.name : '选择助手'
+})
+
+function selectAssistantFromDrawer(id: string) {
+  asstMenuOpen.value = false
+  if (id === assistantStore.currentAssistantId) return
+  assistantStore.selectAssistant(id)
+}
+
+/**
+ * 工作台模式没有 Sidebar 的 onMounted 默认选中逻辑：currentAssistantId 为空或失效时
+ * 补一次（优先「默认助手」）。仅补空缺，不覆盖用户已选 —— 抽屉重开不重置。
+ * 自身触发的切换经 asstWatchSuppressed 免掉 id-watch 的二次拉取（A4.9 M9）。
+ */
+let asstWatchSuppressed = false
+
+function ensureCurrentAssistant() {
+  const list = assistantStore.assistants
+  if (!list.length) return
+  const cur = assistantStore.currentAssistantId
+  if (cur && list.some((a) => a.id === cur)) return
+  const fallback = list.find((a) => a.name === '默认助手') || list[0]
+  asstWatchSuppressed = true
+  assistantStore.selectAssistant(fallback.id)
+  nextTick(() => { asstWatchSuppressed = false })
+}
+
+watch(() => assistantStore.currentAssistantId, async () => {
+  if (!props.visible || asstWatchSuppressed) return
+  loadingConversations.value = true
+  try {
+    await Promise.all([
+      chatStore.loadConversations(assistantStore.currentAssistantId),
+      groupStore.loadGroups(assistantStore.currentAssistantId || undefined),
+    ])
+    syncDragLists()
+  } finally {
+    loadingConversations.value = false
+  }
+})
 
 async function handleMenuEdit() {
   if (!menuTargetConv.value) return
@@ -1326,7 +1457,7 @@ function openMoveToGroupMenu(event: MouseEvent) {
   if (left + SUB_W > window.innerWidth - PAD) { left = rect.left - SUB_W - GAP; if (left < PAD) left = PAD }
   moveMenuStyle.value = { top: `${top}px`, left: `${left}px` }; showMoveToGroupMenu.value = true
   nextTick(() => {
-    const el = document.querySelector('.zen-move-menu') as HTMLElement; if (!el) return
+    const el = document.querySelector('.move-group-menu') as HTMLElement; if (!el) return
     if (el.getBoundingClientRect().bottom > window.innerHeight - PAD) {
       let newTop = window.innerHeight - el.getBoundingClientRect().height - PAD; if (newTop < PAD) newTop = PAD
       moveMenuStyle.value = { top: `${newTop}px`, left: `${left}px` }
@@ -1359,7 +1490,7 @@ const collapsedBeforeDrag = ref<Set<string>>(new Set())
 function onDragStart(event: any) {
   isDragging.value = true
   const fromEl = event?.from as HTMLElement | undefined
-  const isGroupDrag = fromEl?.classList?.contains('zen-groups-dir-content') || fromEl?.closest('.zen-groups-dir-content') !== null
+  const isGroupDrag = fromEl?.classList?.contains('groups-directory-content') || fromEl?.closest('.groups-directory-content') !== null
   if (isGroupDrag) {
     collapsedBeforeDrag.value = new Set(groupStore.collapsedGroups)
     for (const g of groupStore.groups) if (groupStore.isGroupCollapsed(g.id)) groupStore.expandGroup(g.id)
@@ -1383,7 +1514,7 @@ function onDragStart(event: any) {
 
 function onConversationDragEnd(event: any) {
   const toEl = event?.to as HTMLElement | undefined
-  const targetGroupEl = toEl?.closest('.zen-conv-group') as HTMLElement | null
+  const targetGroupEl = toEl?.closest('.conversation-group') as HTMLElement | null
   const targetGroupId = targetGroupEl?.getAttribute('data-group-id') || null
 
   nextTick(() => {
@@ -1425,17 +1556,17 @@ function deduplicateDragElements() {
 function reconcileDragState() {
   const groupIdByConvId = new Map<string, string | null>()
   for (const group of groupStore.groups) {
-    const container = document.querySelector(`[data-group-id="${group.id}"] .zen-group-conv-drag`)
+    const container = document.querySelector(`[data-group-id="${group.id}"] .group-conv-drag-list`)
     if (container) container.querySelectorAll('[data-draggable="true"][data-key]:not(.sortable-ghost):not(.sortable-fallback)').forEach(el => {
       const cid = el.getAttribute('data-key'); if (cid) groupIdByConvId.set(cid, group.id)
     })
   }
-  document.querySelectorAll('.zen-ungrouped-drag').forEach(container => {
+  document.querySelectorAll('.ungrouped-conv-drag-list').forEach(container => {
     container.querySelectorAll('[data-draggable="true"][data-key]:not(.sortable-ghost):not(.sortable-fallback)').forEach(el => {
       const cid = el.getAttribute('data-key'); if (cid && !groupIdByConvId.has(cid)) groupIdByConvId.set(cid, null)
     })
   })
-  const emptyZone = document.querySelector('.zen-empty-drag')
+  const emptyZone = document.querySelector('.ungrouped-empty-drag-list')
   if (emptyZone) emptyZone.querySelectorAll('[data-draggable="true"][data-key]:not(.sortable-ghost):not(.sortable-fallback)').forEach(el => {
     const cid = el.getAttribute('data-key'); if (cid) groupIdByConvId.set(cid, null)
   })
@@ -1487,11 +1618,11 @@ function handleDragMouseMove(e: MouseEvent | TouchEvent) {
   
   // First check group headers (always visible, even when collapsed)
   let foundGroupId: string | null = null
-  const groupHeaders = document.querySelectorAll('.zen-group-header')
+  const groupHeaders = document.querySelectorAll('.group-header')
   for (const header of groupHeaders) {
     const rect = header.getBoundingClientRect()
     if (cx >= rect.left && cx <= rect.right && cy >= rect.top && cy <= rect.bottom) {
-      const groupEl = header.closest('.zen-conv-group')
+      const groupEl = header.closest('.conversation-group')
       if (groupEl) {
         foundGroupId = groupEl.getAttribute('data-group-id')
       }
@@ -1503,7 +1634,7 @@ function handleDragMouseMove(e: MouseEvent | TouchEvent) {
   if (!foundGroupId && dragExpandedGroupId.value) {
     const expandedGroup = document.querySelector(`[data-group-id="${dragExpandedGroupId.value}"]`)
     if (expandedGroup) {
-      const conversationsEl = expandedGroup.querySelector('.zen-group-convs')
+      const conversationsEl = expandedGroup.querySelector('.group-conversations')
       if (conversationsEl) {
         const rect = conversationsEl.getBoundingClientRect()
         if (rect.height > 0 && cx >= rect.left && cx <= rect.right && cy >= rect.top && cy <= rect.bottom) {
@@ -1521,6 +1652,8 @@ function handleDragMouseMove(e: MouseEvent | TouchEvent) {
       zenDragHoverTimer = setTimeout(() => {
         if (zenDragHoverTargetGroupId === foundGroupId) {
           dragExpandedGroupId.value = foundGroupId
+          // 悬停展开折叠组：强制 SortableList 重初始化，使新展开的内层列表可接收拖放
+          forceReinitCounter.value++
         }
         zenDragHoverTimer = null
       }, 200)
@@ -1565,7 +1698,7 @@ function stopEdgeScroll() {
 function onConversationListMouseDown(e: MouseEvent) {
   if (!selectionModeActive.value || e.button !== 0) return
   const target = e.target as HTMLElement
-  if (target.closest('input[type="checkbox"]') || target.closest('button') || target.closest('.zen-group-header') || target.closest('.zen-conv-menu') || target.closest('.zen-time-header')) return
+  if (target.closest('input[type="checkbox"]') || target.closest('button') || target.closest('.group-header') || target.closest('.conversation-menu') || target.closest('.time-category-header')) return
   if (!conversationListEl.value) return
   const listRect = conversationListEl.value.getBoundingClientRect()
   if (e.clientX < listRect.left || e.clientX > listRect.right || e.clientY < listRect.top || e.clientY > listRect.bottom) return
@@ -1631,202 +1764,41 @@ onUnmounted(() => { document.removeEventListener('click', closeAllMenus); stopEd
 
 .drawer-body { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; position: relative; }
 
-.zen-action-row { padding: 8px 12px 0; flex-shrink: 0; }
-.zen-new-chat-btn {
-  display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px;
-  color: var(--color-text); font-size: 13px; border-radius: var(--radius-sm); transition: background-color var(--transition-fast);
-}
-.zen-new-chat-btn:hover { background-color: var(--color-hover); }
-
-.zen-search-bar { padding: 8px 12px; flex-shrink: 0; }
-.zen-search-input-wrapper { position: relative; display: flex; align-items: center; }
-.zen-search-icon { position: absolute; left: 10px; color: var(--color-text-light); pointer-events: none; }
-.zen-search-input {
-  width: 100%; padding: 7px 30px 7px 32px; font-size: 13px; border: 1px solid var(--color-border);
-  border-radius: var(--radius-md); background-color: var(--color-bg); color: var(--color-text); outline: none;
-  transition: border-color var(--transition-fast);
-}
-.zen-search-input:focus { border-color: var(--color-primary); }
-.zen-search-clear-btn { position: absolute; right: 6px; padding: 4px; color: var(--color-text-light); border-radius: var(--radius-sm); }
-.zen-search-clear-btn:hover { background-color: var(--color-hover); color: var(--color-text); }
-
-/* Selection bar */
-.zen-selection-bar { padding: 8px 12px; margin: 0 12px 8px; background-color: var(--color-hover); border-radius: var(--radius-md); }
-.zen-selection-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-.zen-select-all { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
-.zen-selected-count { font-size: 12px; color: var(--color-text-light); }
-.zen-selection-actions { display: flex; gap: 8px; }
-.zen-sel-confirm { flex: 1; padding: 8px 12px; color: white; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; }
-.zen-sel-confirm.export { background-color: var(--color-primary); }
-.zen-sel-confirm.delete { background-color: var(--color-error); }
-.zen-sel-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
-.zen-sel-cancel { padding: 8px 12px; background-color: var(--color-white); border: 1px solid var(--color-border); border-radius: var(--radius-sm); font-size: 13px; }
-.zen-selection-progress { margin-top: 8px; font-size: 12px; color: var(--color-primary); text-align: center; }
-
-/* Search results */
-.zen-search-results { padding: 4px 8px; overflow-y: auto; flex: 1; }
-.zen-search-item { padding: 8px 10px; border-radius: var(--radius-sm); cursor: pointer; transition: background-color var(--transition-fast); }
-.zen-search-item:hover { background-color: var(--color-hover); }
-.zen-search-item.active { background-color: color-mix(in srgb, var(--color-primary) 12%, transparent); }
-.zen-search-item-title { font-size: 13px; font-weight: 500; color: var(--color-text); margin-bottom: 4px; }
-.zen-search-snippet { font-size: 12px; color: var(--color-text-light); margin: 2px 0; }
-.zen-snippet-role { font-weight: 500; }
-
-/* Conversation list */
-.zen-conv-list { flex: 1; overflow-y: auto; padding: 8px; }
-
-/* Groups directory */
-.zen-groups-dir { margin-bottom: 4px; }
-.zen-groups-dir-header {
-  display: flex; align-items: center; gap: 6px; padding: 6px 8px; cursor: pointer;
-  border-radius: var(--radius-sm); transition: background-color var(--transition-fast);
-}
-.zen-groups-dir-header:hover { background-color: var(--color-hover); }
-.zen-dir-chevron { transition: transform 0.2s ease; color: var(--color-text-light); flex-shrink: 0; }
-.zen-dir-chevron.expanded { transform: rotate(90deg); }
-.zen-dir-name { flex: 1; font-size: 12px; font-weight: 600; color: var(--color-text-light); }
-.zen-dir-count { font-size: 11px; color: var(--color-text-light); background-color: var(--color-hover); padding: 1px 6px; border-radius: 10px; }
-.zen-groups-dir-content { padding-left: 4px; }
-
-/* Group */
-.zen-conv-group { border-radius: var(--radius-md); overflow: hidden; transition: background-color 0.2s ease, outline-color 0.2s ease; }
-.zen-group-header {
-  display: flex; align-items: center; gap: 6px; padding: 6px 8px; cursor: pointer;
-  border-radius: var(--radius-sm); transition: background-color var(--transition-fast);
-}
-.zen-group-header:hover { background-color: var(--color-hover); }
-.zen-group-header.group-selected { background-color: color-mix(in srgb, var(--color-error) 12%, transparent); }
-.zen-group-header.group-focus { background-color: color-mix(in srgb, var(--color-primary) 12%, transparent); padding-top: 4px; padding-bottom: 4px; }
-.zen-group-header.group-focus + .zen-group-convs:not(.zen-group-convs-collapsed) { margin-top: 2px; }
-.zen-group-header.group-focus .zen-group-name { color: var(--color-primary-dark); }
-.zen-group-checkbox { margin-right: 4px; cursor: pointer; flex-shrink: 0; }
-.zen-group-chevron { transition: transform 0.2s ease; color: var(--color-text-light); flex-shrink: 0; }
-.zen-group-chevron.expanded { transform: rotate(90deg); }
-.zen-group-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.zen-group-name { flex: 1; font-size: 13px; font-weight: 500; color: var(--color-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.zen-group-count { font-size: 11px; color: var(--color-text-light); background-color: var(--color-hover); padding: 1px 6px; border-radius: 10px; }
-.zen-group-actions { display: flex; gap: 2px; opacity: 0; transition: opacity var(--transition-fast); }
-.zen-group-header:hover .zen-group-actions { opacity: 1; }
-.zen-group-act-btn { padding: 3px; color: var(--color-text-light); border-radius: var(--radius-sm); }
-.zen-group-act-btn:hover { background-color: var(--color-hover); color: var(--color-text); }
-.zen-group-act-btn.delete:hover { color: var(--color-error); }
-.zen-group-convs {
-  padding-left: 16px;
-  display: grid;
-  grid-template-rows: 1fr;
-  opacity: 1;
-  transition: grid-template-rows 0.25s cubic-bezier(0.25, 1, 0.5, 1), opacity 0.2s ease;
-}
-.zen-group-convs-collapsed { grid-template-rows: 0fr; opacity: 0; overflow: hidden; padding: 0; margin: 0; border: none; }
-.zen-group-convs > * { min-height: 0; overflow: hidden; }
-
-/* Time sections */
-.zen-time-section { margin-bottom: 4px; }
-.zen-time-header { padding: 6px 10px; font-size: 11px; font-weight: 600; color: var(--color-text-light); text-transform: uppercase; letter-spacing: 0.5px; }
-
-/* Empty ungrouped drop */
-.zen-ungrouped-drop { margin-top: 4px; }
-.zen-ungrouped-drop-label { padding: 6px 10px; font-size: 11px; color: var(--color-text-light); }
-.zen-empty-drag { min-height: 48px; }
-
-.zen-list-empty { padding: 16px; font-size: 13px; color: var(--color-text-light); text-align: center; }
-
-/* Marquee */
-.zen-marquee { position: fixed; border: 1px solid var(--color-primary); background-color: color-mix(in srgb, var(--color-primary) 10%, transparent); pointer-events: none; z-index: 10; }
-
-/* Context menu */
-.zen-conv-menu {
-  position: fixed; background-color: var(--color-white); border: 1px solid var(--color-border);
-  border-radius: var(--radius-md); box-shadow: var(--shadow-lg); z-index: 1000; min-width: 140px; padding: 4px 0;
-}
-.zen-menu-item {
-  width: 100%; display: flex; align-items: center; gap: 8px; padding: 10px 14px;
-  color: var(--color-text); font-size: 13px; text-align: left; transition: background-color var(--transition-fast);
-}
-.zen-menu-item:hover { background-color: var(--color-hover); }
-.zen-menu-item.delete { color: var(--color-error); }
-.zen-menu-item.delete:hover { background-color: rgba(229, 62, 62, 0.08); }
-.zen-menu-item.active { background-color: color-mix(in srgb, var(--color-primary) 12%, transparent); color: var(--color-primary); }
-.zen-menu-divider { height: 1px; background-color: var(--color-border); margin: 4px 0; }
-.zen-move-overlay { position: fixed; inset: 0; z-index: 999; }
-
-/* Modals */
-.zen-modal-overlay { position: fixed; inset: 0; z-index: 998; background: rgba(0, 0, 0, 0.4); display: flex; align-items: center; justify-content: center; }
-.zen-modal { background: var(--color-white); border-radius: var(--radius-lg); padding: 24px; min-width: 280px; max-width: 90vw; box-shadow: 0 8px 32px rgba(90, 130, 60, 0.15); }
-.zen-modal-title { margin: 0 0 16px; font-size: 16px; font-weight: 600; color: var(--color-text); }
-.zen-modal-body { margin-bottom: 16px; }
-.zen-modal-body p { font-size: 14px; color: var(--color-text); margin-bottom: 8px; }
-.zen-form-group { margin-bottom: 12px; }
-.zen-form-group label { display: block; font-size: 13px; font-weight: 500; color: var(--color-text); margin-bottom: 4px; }
-.zen-form-group input {
-  width: 100%; padding: 8px 12px; font-size: 14px; border: 1px solid var(--color-border);
-  border-radius: var(--radius-md); color: var(--color-text); background-color: var(--color-bg); outline: none;
-}
-.zen-form-group input:focus { border-color: var(--color-primary); }
-.zen-color-picker { display: flex; flex-wrap: wrap; gap: 6px; }
-.zen-color-opt { width: 24px; height: 24px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
-.zen-color-opt.active { border-color: var(--color-text); }
-.zen-check-label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
-.zen-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.zen-modal-btn { padding: 8px 16px; border-radius: var(--radius-md); font-size: 13px; font-weight: 500; }
-.zen-modal-btn.cancel { background: none; border: 1px solid var(--color-border); color: var(--color-text-light); }
-.zen-modal-btn.cancel:hover { background-color: var(--color-hover); }
-.zen-modal-btn.confirm { background-color: var(--color-primary); color: white; border: none; }
-.zen-modal-btn.confirm:hover { background-color: var(--color-primary-dark); }
-.zen-modal-btn.delete { background-color: var(--color-error); color: white; border: none; }
-
 :deep(.sortable-ghost) { opacity: 0.35; background-color: var(--color-hover); border-radius: var(--radius-sm); transition: opacity 0.15s ease; }
 :deep(.sortable-chosen) { z-index: 10; }
 :deep(.sortable-drag) { opacity: 0.9; box-shadow: 0 4px 16px rgba(90, 130, 60, 0.12); border-radius: var(--radius-sm); }
 :deep(.sortable-fallback) { opacity: 0.8; box-shadow: 0 4px 16px rgba(90, 130, 60, 0.12); }
-.zen-dragging .zen-conv-group.drag-hover { outline: 2px solid var(--color-primary); border-radius: var(--radius-md); background-color: rgba(59, 130, 246, 0.1); transition: background-color 0.2s ease; }
-.zen-dragging .zen-group.drag-hover :deep(.zen-group-convs) { min-height: 48px; }
-
-/* Spotlight search (global) */
-.spotlight-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); backdrop-filter: blur(4px); z-index: 100000; display: flex; align-items: flex-start; justify-content: center; padding-top: 20vh; }
-.spotlight-modal { width: 560px; max-width: 90vw; background: var(--surface-panel,#fff); border-radius: 12px; box-shadow: 0 25px 60px rgba(0,0,0,0.3); overflow: hidden; animation: spotlightIn 0.15s ease-out; }
-@keyframes spotlightIn { from { opacity:0; transform: translateY(-10px) scale(0.97); } to { opacity:1; transform: translateY(0) scale(1); } }
-.spotlight-input-wrapper { display: flex; align-items: center; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--panel-border,#e5e7eb); }
-.spotlight-search-icon { flex-shrink: 0; color: var(--color-text-light); }
-.spotlight-input { flex: 1; border: none; outline: none; font-size: 16px; color: var(--color-text); background: transparent; }
-.spotlight-input::placeholder { color: var(--color-text-light); }
-.spotlight-results { max-height: 400px; overflow-y: auto; }
-.spotlight-status { padding: 24px 20px; text-align: center; color: var(--color-text-light); font-size: 14px; }
-.spotlight-result-item { padding: 12px 20px; cursor: pointer; border-bottom: 1px solid var(--panel-border,#e5e7eb); transition: background var(--transition-fast); }
-.spotlight-result-item:hover { background: var(--color-hover); }
-.spotlight-result-title { font-size: 14px; font-weight: 600; color: var(--color-text); margin-bottom: 4px; }
-.spotlight-result-snippet { font-size: 12px; color: var(--color-text-light); margin-top: 3px; }
-.spotlight-result-snippet--clickable { cursor: pointer; padding: 3px 4px; border-radius: 4px; transition: background-color 0.12s ease; }
-.spotlight-result-snippet--clickable:hover { background: var(--color-hover); }
-.spotlight-snippet-role { font-weight: 500; color: var(--color-text); margin-right: 4px; }
-.spotlight-snippet-text mark { background: var(--color-primary); color: #fff; padding: 0 2px; border-radius: 2px; }
-
-/* Batch popup (global) */
-.batch-popup-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100001; display: flex; align-items: center; justify-content: center; }
-.batch-popup { width: 480px; max-width: 90vw; max-height: 80vh; background: var(--surface-panel,#fff); border-radius: 12px; box-shadow: 0 20px 50px rgba(0,0,0,0.3); display: flex; flex-direction: column; overflow: hidden; animation: spotlightIn 0.15s ease-out; }
-.batch-popup-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--panel-border,#e5e7eb); }
-.batch-popup-header h2 { font-size: 16px; font-weight: 600; color: var(--color-text); margin: 0; }
-.batch-popup-close { color: var(--color-text-light); padding: 4px; border-radius: var(--radius-sm); }
-.batch-popup-close:hover { color: var(--color-text); background: var(--color-hover); }
-.batch-popup-body { flex: 1; overflow-y: auto; }
-.batch-popup-toolbar { padding: 10px 20px; border-bottom: 1px solid var(--panel-border,#e5e7eb); }
 .batch-select-all { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--color-text); cursor: pointer; }
-.batch-popup-list { padding: 4px 0; }
-.batch-popup-empty { padding: 32px 20px; text-align: center; color: var(--color-text-light); font-size: 14px; }
-.batch-popup-item { display: flex; align-items: center; gap: 12px; padding: 10px 20px; cursor: pointer; transition: background var(--transition-fast); border-bottom: 1px solid var(--panel-border,#e5e7eb); }
-.batch-popup-item:hover { background: var(--color-hover); }
-.batch-popup-item.selected { background: rgba(122,163,90,0.06); }
-.batch-popup-item-info { flex: 1; min-width: 0; }
-.batch-popup-item-title { font-size: 14px; font-weight: 500; color: var(--color-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.batch-popup-item-meta { font-size: 12px; color: var(--color-text-light); margin-top: 2px; }
-.batch-popup-footer { display: flex; align-items: center; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--panel-border,#e5e7eb); }
-.batch-popup-status { flex: 1; font-size: 13px; color: var(--color-primary); }
-.batch-popup-cancel { padding: 8px 16px; font-size: 13px; color: var(--color-text); background: var(--surface-panel-subtle); border: 1px solid var(--panel-border); border-radius: var(--radius-sm); }
-.batch-popup-cancel:hover { background: var(--color-hover); }
-.batch-popup-confirm { padding: 8px 20px; font-size: 13px; font-weight: 500; color: #fff; background: var(--color-primary); border-radius: var(--radius-sm); }
-.batch-popup-confirm:hover:not(:disabled) { opacity: 0.9; }
-.batch-popup-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
-.batch-popup-confirm.batch-popup-delete { background: var(--color-error); }
 
 .drawer-action-btn.danger:hover { color: var(--color-error); }
+
+/* ===== 助手切换（工作台 Agent 侧栏）===== */
+.zen-asst-switcher { position: relative; padding: 8px 12px; border-bottom: 1px solid var(--panel-border); flex-shrink: 0; }
+.zen-asst-trigger {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 10px;
+  border: 1px solid var(--panel-border); border-radius: var(--radius-md);
+  background-color: var(--surface-panel); color: var(--color-text);
+  font-size: 13px; cursor: pointer; transition: all var(--transition-fast);
+}
+.zen-asst-trigger:hover { background-color: var(--color-hover); border-color: var(--panel-border-strong); }
+.zen-asst-name { flex: 1; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zen-asst-chevron { transition: transform var(--transition-fast); color: var(--color-text-light); flex-shrink: 0; }
+.zen-asst-chevron.expanded { transform: rotate(180deg); }
+.zen-asst-menu {
+  position: absolute; top: calc(100% - 4px); left: 12px; right: 12px; z-index: 60;
+  background-color: var(--surface-panel-strong); border: 1px solid var(--panel-border-strong);
+  border-radius: var(--radius-md); box-shadow: var(--shadow-md);
+  max-height: 240px; overflow-y: auto; padding: 4px;
+}
+.zen-asst-item {
+  display: block; width: 100%; text-align: left; padding: 8px 12px;
+  border: none; background: transparent; color: var(--color-text);
+  font-size: 13px; border-radius: var(--radius-sm); cursor: pointer;
+  transition: background-color var(--transition-fast);
+}
+.zen-asst-item:hover { background-color: var(--color-hover); }
+.zen-asst-item.active { background-color: var(--color-hover); font-weight: 600; }
+.zen-asst-empty { padding: 10px 12px; font-size: 12px; color: var(--color-text-light); }
 </style>
+
+<style scoped src="../styles/sidebar-panels.css"></style>

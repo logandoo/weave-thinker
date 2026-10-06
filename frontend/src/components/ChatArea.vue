@@ -146,6 +146,8 @@
         </div>
       </div>
       <template v-else>
+        <!-- P2-2 上滚加载：顶部哨兵进入视口 → 拉取更早消息（保滚动位置） -->
+        <div v-if="chatStore.hasMoreMessages[chatStore.currentConversationId || '']" ref="olderSentinelRef" class="older-sentinel">加载更早消息…</div>
         <MessageBubble
           v-if="!useVirtualMessageList"
           v-for="msg in chatStore.currentMessages"
@@ -321,6 +323,15 @@
                 </div>
               </template>
             </template>
+          </div>
+        </div>
+
+        <!-- 插话队列（需求 4①）：回答生成中新发的 query 不进消息列表，而是作为
+             队列显示在**回答最下方**；上一答完毕后由终态冲刷继续作答。 -->
+        <div v-if="pendingInterjections.length" class="interjection-queue" role="status" aria-label="待回答队列">
+          <div v-for="p in pendingInterjections" :key="p.localId" class="interjection-queue-item">
+            <span class="interjection-queue-label">{{ p.committed ? '已接收' : '待回答' }}</span>
+            <span class="interjection-queue-text">{{ p.content }}</span>
           </div>
         </div>
 
@@ -763,6 +774,37 @@ function formatStepTitle(item: any): string {
 // P2 (2026-09-05)：formatter/tooltip 移入 useContextTokens 共享（移动端徽章复用）。
 const contextTokenTooltip = computed(() => contextTokenTooltipText(chatStore.currentContextInfo))
 const messageListRef = ref<HTMLElement | null>(null)
+// P2-2：顶部哨兵 → 上滚加载更早消息（IntersectionObserver 单触发守卫）
+const olderSentinelRef = ref<HTMLElement | null>(null)
+let olderObserver: IntersectionObserver | null = null
+let olderLoading = false
+async function loadOlderPreserveScroll(): Promise<void> {
+  const listEl = messageListRef.value
+  const convId = chatStore.currentConversationId
+  if (!convId || olderLoading) return
+  olderLoading = true
+  const prevHeight = listEl?.scrollHeight ?? 0
+  try {
+    await chatStore.loadOlderMessages(convId)
+    await nextTick()
+    // prepend 后保位：scrollHeight 增量补回 scrollTop（otto anchor-row 简化版）
+    if (listEl) {
+      const delta = listEl.scrollHeight - prevHeight
+      if (delta > 0) listEl.scrollTop += delta
+    }
+  } finally {
+    olderLoading = false
+  }
+}
+
+// 插话队列（需求 4①）：唯一数据源是 chat store 的 pendingInterjections ——
+// 不再混进 messages，因此渲染位置固定在回答最下方，与消息列表解耦。
+const pendingInterjections = computed(() => {
+  const convId = chatStore.currentConversationId
+  if (!convId) return [] as Array<{ localId: string; content: string; committed?: boolean }>
+  const list = (chatStore as any).pendingInterjections?.[convId]
+  return (Array.isArray(list) ? list : []) as Array<{ localId: string; content: string; committed?: boolean }>
+})
 
 // Virtual scrolling for the message list. Long conversations with heavy
 // Markdown/KaTeX/Mermaid payloads can render hundreds of DOM nodes; the
@@ -1025,6 +1067,8 @@ async function handleDownloadSingle() {
   showDownloadPopup.value = false
   showExportDialog()
   try {
+    // P2-1：导出需全文——stub 字段先取回（slim 载荷下 tool_results 可能是外置桩）
+    if (chatStore.currentConversationId) await chatStore.ensureFullPayloads(chatStore.currentConversationId)
     const selected = chatStore.currentMessages.filter(m => selectedMessageIds.value.has(m.id))
     const items = await Promise.all(selected.map(async (m) => ({
       title: m.role === 'user' ? '用户' : '助手',
@@ -1054,6 +1098,7 @@ async function handleDownloadBulk() {
   showDownloadPopup.value = false
   showExportDialog()
   try {
+    if (chatStore.currentConversationId) await chatStore.ensureFullPayloads(chatStore.currentConversationId)
     const selected = chatStore.currentMessages.filter(m => selectedMessageIds.value.has(m.id))
     const items = await Promise.all(selected.map(async (m, _idx) => ({
       title: m.role === 'user' ? '用户' : '助手',
@@ -1120,6 +1165,8 @@ function openNotebookPicker() {
 
 async function handleSaveToNotebook(notebookId: string) {
   showPicker.value = false
+  // P2-1：保存笔记需全文——stub 字段先取回
+  if (chatStore.currentConversationId) await chatStore.ensureFullPayloads(chatStore.currentConversationId)
   const selected = chatStore.currentMessages.filter(m => selectedMessageIds.value.has(m.id))
   if (selected.length === 0) return
   const parts: string[] = []
@@ -1251,6 +1298,13 @@ function onDocumentClick(e: MouseEvent) {
 }
 
 onMounted(() => {
+  olderObserver = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting)) void loadOlderPreserveScroll()
+  }, { root: messageListRef.value, rootMargin: '120px' })
+  watch(olderSentinelRef, (el) => {
+    olderObserver?.disconnect()
+    if (el) olderObserver?.observe(el)
+  }, { immediate: true })
   messageListRef.value?.addEventListener('scroll', onMessageListScroll)
   messageListRef.value?.addEventListener('wheel', onMessageListWheel, { passive: true })
   messageListRef.value?.addEventListener('touchstart', onMessageListTouchStart, { passive: true })
@@ -1268,6 +1322,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  olderObserver?.disconnect()
+  olderObserver = null
   messageListRef.value?.removeEventListener('scroll', onMessageListScroll)
   messageListRef.value?.removeEventListener('wheel', onMessageListWheel)
   messageListRef.value?.removeEventListener('touchstart', onMessageListTouchStart)
@@ -1774,6 +1830,43 @@ watch(
 @keyframes processing-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.85; }
+}
+
+/* 插话队列（需求 4①）—— 回答最下方的待回答区 */
+.interjection-queue {
+  margin: 8px 0 12px;
+  padding: 0 12px 0 52px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.interjection-queue-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm, 8px);
+  background: var(--color-bg-secondary, rgba(0, 0, 0, 0.02));
+  font-size: 13px;
+  line-height: 1.5;
+}
+.interjection-queue-label {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--color-primary);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.6;
+  opacity: 0.85;
+}
+.interjection-queue-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+  white-space: pre-wrap;
+  color: var(--color-text);
 }
 
 .error-message {

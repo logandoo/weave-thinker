@@ -99,10 +99,13 @@ async def _load_messages(db, conversation_id: str):
     from sqlalchemy import select
     from app.db.database import Message
     result = await db.execute(
-        select(Message).where(Message.conversation_id == conversation_id)
+        select(Message).where(Message.conversation_id == conversation_id,
+                              Message.delivery_status != "streaming")
         .order_by(Message.created_at)
     )
-    return result.scalars().all()
+    # 评审 I3：外置桩还原全文——否则 PDF 引用节读到 stub JSON 而非真实 tool_results
+    from app.services.message_payload_service import resolve_message_fields
+    return await resolve_message_fields(list(result.scalars()), db)
 
 
 async def _get_workspace_root(db, user: Any) -> str:

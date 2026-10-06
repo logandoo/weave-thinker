@@ -53,6 +53,10 @@
                     <path d="M12 2a7 7 0 0 0-7 7c0 2.4 1.2 4.5 3 5.7V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.3c1.8-1.2 3-3.3 3-5.7a7 7 0 0 0-7-7z"/>
                     <line x1="9" y1="22" x2="15" y2="22"/>
                   </template>
+                  <template v-else-if="tab.key === 'editor'">
+                    <path d="M12 20h9"/>
+                    <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+                  </template>
                   <template v-else-if="tab.key === 'skins'">
                     <circle cx="13.5" cy="6.5" r=".5"/>
                     <circle cx="17.5" cy="10.5" r=".5"/>
@@ -108,6 +112,30 @@
                 />
               </div>
 
+              <div v-else-if="activeTab === 'editor'" class="tab-panel">
+                <div class="editor-prefs-panel">
+                  <div class="editor-pref-row">
+                    <div class="editor-pref-text">
+                      <div class="editor-pref-title">尾注功能</div>
+                      <div class="editor-pref-desc">
+                        开启后，笔记与消息中的 [^1] 与 [^1]: 语法渲染为可跳转尾注
+                        （角标〔1〕↔ 文末注释双向跳转），工具栏出现「尾注」按钮；
+                        关闭时 [^1] 保持普通文字显示。
+                      </div>
+                    </div>
+                    <button
+                      class="editor-pref-toggle"
+                      :class="{ on: editorPrefs.endnoteEnabled }"
+                      role="switch"
+                      :aria-checked="editorPrefs.endnoteEnabled"
+                      @click="editorPrefs.setEndnote(!editorPrefs.endnoteEnabled)"
+                    >
+                      <span class="toggle-knob"></span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               <div v-else-if="activeTab === 'skins'" class="tab-panel">
                 <SkinPanel
                   embedded
@@ -124,6 +152,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
+import { useEditorPrefsStore } from '@/stores/editorPrefs'
 import AsrHotwordsPanel from './AsrHotwordsPanel.vue'
 import PermissionSettingsPanel from './PermissionSettingsPanel.vue'
 import SkillsPanel from './SkillsPanel.vue'
@@ -157,6 +186,7 @@ const emit = defineEmits<{
 }>()
 
 const activeTab = ref('hotwords')
+const editorPrefs = useEditorPrefsStore()
 const skillsPanelRef = ref<InstanceType<typeof SkillsPanel> | null>(null)
 
 const tabs = [
@@ -167,6 +197,7 @@ const tabs = [
   { key: 'skills', label: '技能管理' },
   { key: 'memory', label: '记忆管理' },
   { key: 'skins', label: '皮肤选择' },
+  { key: 'editor', label: '编辑器' },
 ]
 
 function close() {
@@ -187,6 +218,29 @@ function handleSkillsUpdated() {
 </script>
 
 <style scoped>
+/* 编辑器偏好（wave-2 B1）*/
+.editor-prefs-panel { padding: 8px 4px; }
+.editor-pref-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 16px; border: 1px solid var(--panel-border); border-radius: var(--radius-md);
+  background-color: var(--surface-panel);
+}
+.editor-pref-title { font-size: 14px; font-weight: 600; color: var(--color-text); margin-bottom: 4px; }
+.editor-pref-desc { font-size: 12px; color: var(--color-text-light); line-height: 1.6; max-width: 520px; }
+.editor-pref-toggle {
+  position: relative; width: 44px; height: 24px; flex-shrink: 0;
+  border: 1px solid var(--panel-border-strong); border-radius: 12px;
+  background-color: var(--color-hover); cursor: pointer;
+  transition: background-color var(--transition-fast);
+}
+.editor-pref-toggle.on { background-color: var(--color-primary, #2340b8); }
+.editor-pref-toggle .toggle-knob {
+  position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+  border-radius: 50%; background: var(--surface-panel-strong);
+  transition: transform var(--transition-fast);
+}
+.editor-pref-toggle.on .toggle-knob { transform: translateX(20px); }
+
 .system-settings-overlay {
   position: fixed;
   inset: 0;

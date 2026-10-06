@@ -129,11 +129,17 @@ class MessageResponse(BaseModel):
     tool_calls: Optional[str] = None
     tool_results: Optional[str] = None
     context_info: Optional[str] = None
+    # 渐进落库交付状态（2026-10-06）：final（默认）| interrupted（中断残稿，
+    # 前端「已中断」徽标）。streaming 在途行被列表接口过滤，永不下发。
+    delivery_status: str = "final"
     created_at: str
 
 
 class ConversationWithMessages(ConversationResponse):
     messages: List[MessageResponse] = []
+    # conv-open P2-2：message_limit 窗口语义（oldest→上滚加载游标）
+    has_more_messages: bool = False
+    oldest_message_id: Optional[str] = None
 
 
 class MatchedMessage(BaseModel):

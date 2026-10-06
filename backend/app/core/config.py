@@ -4,7 +4,7 @@
 import os
 import toml
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from functools import lru_cache
 
 
@@ -356,6 +356,14 @@ class Config:
     @property
     def asr_dashscope_model(self) -> str:
         return self.asr.get("dashscope_model", "qwen3-asr-flash-realtime-2026-02-10")
+
+    # [asr] 行为调参键（服务端 run-task parameters 直读 asr dict，无独立 property）：
+    # - max_sentence_silence: VAD 断句静音阈值 ms（语音面默认 800；服务端默认 1300）
+    # - vad_model: 仅 qwen-audio-3.1 系下发——near_meeting_16k（近场）/
+    #   far_field_meeting_16k（服务端默认）；空=不下发（2026-09-29 ASR 迁移波）
+    # - keep_dialect: 仅 qwen-audio-3.1 系下发——true=保留方言原文，
+    #   false/缺省=方言转写为普通话（显式 false 也下发）
+    # - ws_open_timeout/ws_ping_interval/ws_ping_timeout/ws_close_timeout: WS 透传参数
 
     @property
     def voice(self) -> dict:
@@ -1010,8 +1018,105 @@ class Config:
         return self.agent.get("name", "共享智能体")
 
     @property
+    def agent_skills(self) -> dict:
+        """[agent.skills] 段：技能装载行为（vibeweaver 集成 C2）。
+
+        force_inject：skill 名单，其 SKILL.md 全文直接注入 system prompt
+        （基准显示 available 自触发率常为 0，弱/中模型须强制注入）。
+        force_inject_max_chars：注入全文的字符预算（默认 60000）。
+        """
+        return self.agent.get("skills", {})
+
+    @property
+    def agent_skills_force_inject(self) -> List[str]:
+        raw = self.agent_skills.get("force_inject", [])
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if str(x).strip()]
+
+    @property
+    def agent_skills_force_inject_max_chars(self) -> int:
+        return int(self.agent_skills.get("force_inject_max_chars", 60000))
+
+    # ---- Hook 运行时 + vibeweaver 执法层（2026-10-01 集成波）----
+
+    @property
+    def hooks(self) -> dict:
+        """[hooks] 段：hook 运行时预算（app/services/hook_service.py）。"""
+        return self._config.get("hooks", {})
+
+    @property
+    def hooks_stop_max_per_turn(self) -> int:
+        return int(self.hooks.get("stop_hook_max_per_turn", 2))
+
+    @property
+    def hooks_stop_max_per_conversation(self) -> int:
+        return int(self.hooks.get("stop_hook_max_per_conversation", 3))
+
+    @property
+    def vibeweaver(self) -> dict:
+        """[vibeweaver] 段：执法层开关与预算。环境变量 VIBEWEAVER_GATE /
+        VIBEWEAVER_AUDIT / VIBEWEAVER_LOOPGUARD = "off" 时对应层强制关闭
+        （对齐 OpenCode 插件的同名逃生口）。"""
+        return self._config.get("vibeweaver", {})
+
+    @staticmethod
+    def _env_off(name: str) -> bool:
+        import os
+        return str(os.environ.get(name, "")).strip().lower() == "off"
+
+    @property
+    def vibeweaver_enabled(self) -> bool:
+        return bool(self.vibeweaver.get("enabled", True))
+
+    @property
+    def vibeweaver_gate_enabled(self) -> bool:
+        if self._env_off("VIBEWEAVER_GATE"):
+            return False
+        return bool(self.vibeweaver.get("gate_enabled", True))
+
+    @property
+    def vibeweaver_audit_enabled(self) -> bool:
+        if self._env_off("VIBEWEAVER_AUDIT"):
+            return False
+        return bool(self.vibeweaver.get("audit_enabled", True))
+
+    @property
+    def vibeweaver_loop_guard_enabled(self) -> bool:
+        if self._env_off("VIBEWEAVER_LOOPGUARD"):
+            return False
+        return bool(self.vibeweaver.get("loop_guard_enabled", True))
+
+    @property
+    def vibeweaver_audit_core_path(self) -> str:
+        import os
+        return str(os.environ.get("VIBEWEAVER_AUDIT_CORE", "") or self.vibeweaver.get("audit_core_path", ""))
+
+    @property
+    def vibeweaver_red_ttl_hours(self) -> float:
+        return float(self.vibeweaver.get("red_ttl_hours", 24))
+
+    @property
+    def agent_inline_tool_images(self) -> bool:
+        """工具结果图片内联（P3/B4）：True 时图像类读取回传 content part
+        （模型原生判图）；False 或上游不支持时降级 vision_interpret。"""
+        return bool(self.agent.get("inline_tool_images", True))
+
+    @property
     def agent_memory_max_items(self) -> int:
         return int(self.agent.get("memory_max_items", 12))
+
+    # ── conv-open 性能治理 P1-1（DESIGN_conv_open_performance）──
+    @property
+    def agent_payload_inline_max_chars(self) -> int:
+        """[agent] payload_inline_max_chars：消息字段内联上限（超限外置 message_payloads）。
+        默认 32768。"""
+        return int(self.agent.get("payload_inline_max_chars", 32768))
+
+    @property
+    def agent_payload_preview_chars(self) -> int:
+        """[agent] payload_preview_chars：外置桩内预览长度。默认 2000。"""
+        return int(self.agent.get("payload_preview_chars", 2000))
 
     @property
     def agent_note_context_limit(self) -> int:
@@ -1243,6 +1348,18 @@ class Config:
         return bool(self.sync.get("memory_enabled", True))
 
     @property
+    def sync_model_config_enabled(self) -> bool:
+        """模型池配置随同步（D-21；默认 true=自托管主形态）。多租户/开放注册部署
+        可在 [sync] model_config_enabled=false 关闭（防注册用户拿到部署级 key）。"""
+        return bool(self.sync.get("model_config_enabled", True))
+
+    @property
+    def sync_model_config_include_keys(self) -> bool:
+        """模型池载荷是否携带 api_key（默认 true=D-16 威胁模型：自托管+TLS）。
+        置 false → 只同步端点结构（url/model 名），key 由各端本地配置/用户覆写提供。"""
+        return bool(self.sync.get("model_config_include_keys", True))
+
+    @property
     def sync_blob_max_mb(self) -> int:
         return int(self.sync.get("blob_max_mb", 100))
 
@@ -1363,6 +1480,11 @@ class Config:
         return int(self.browser.get("max_pages", 5))
 
     @property
+    def browser_max_images_per_page(self) -> int:
+        """每页图片直址抽取上限（og:image 优先；图片能力缺口修复 2026-10-05）。"""
+        return int(self.browser.get("max_images_per_page", 12))
+
+    @property
     def browser_interaction(self) -> dict:
         return self.browser.get("interaction", {})
 
@@ -1398,6 +1520,30 @@ class Config:
     # 字符截断且无存档指针，审计回读无法恢复。输出现为全量返回 + 单流超
     # 阈值存档（tool_results/，无损可回读）+ 5MB OOM 硬顶显式标注。
     # 兼容：旧配置里的 [terminal] max_output_chars 被忽略，不影响启动。
+
+    # ---- Git tool（vibeweaver 集成 P0：受控 git 子命令 + 共享 git 定位）----
+
+    @property
+    def git_tool(self) -> dict:
+        return self._config.get("git_tool", {})
+
+    @property
+    def git_tool_enabled(self) -> bool:
+        return bool(self.git_tool.get("enabled", True))
+
+    @property
+    def git_tool_path(self) -> str:
+        # 含路径分隔符 → 必须是可执行文件；否则按名字 shutil.which。
+        # 回退顺序见 app/services/git_binary.resolve_git_path。
+        return str(self.git_tool.get("path", "git") or "git")
+
+    @property
+    def git_tool_timeout(self) -> float:
+        return float(self.git_tool.get("timeout_seconds", 30))
+
+    @property
+    def git_tool_max_output(self) -> int:
+        return int(self.git_tool.get("max_output_chars", 20000))
 
     # ---- Code execution skill ----
 
@@ -2659,7 +2805,15 @@ class Config:
         · concept_link_expansion_max（每轮并入上限，默认 3）·
         concept_link_expansion_units（unit 种子窗，默认 5）·
         concept_link_expansion_score（链接候选基础分，默认 0.45）——
-        unit→concept 拓扑召回 + concept→unit 源条目摘录并置。"""
+        unit→concept 拓扑召回 + concept→unit 源条目摘录并置。
+        P0-P2 键（2026-10-04，MLSys'26 论文评估落地）：
+        consistency_enabled（默认 true，P1-② 图-密集一致性加权——只作用
+        近期被采纳（verified）候选，增量落 calibrated_score；
+        bonus/damp/rank_gap 可配）·
+        strategy_route_enabled（**默认 false**，P2 配置级策略路由——显式开启
+        即授权 profile 参数覆盖同名 stage2 配置；各档可经
+        [memory.retrieval.strategy.<profile>] 覆盖，默认档
+        entity_dense（关键词密度≥0.4：关系扩展加深）/narrative（收紧））。"""
         return self.memory.get("retrieval", {})
 
     @property

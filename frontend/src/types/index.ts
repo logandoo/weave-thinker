@@ -11,6 +11,9 @@ export interface Message {
   tool_results?: string | null
   /** 本轮 token 用量快照（JSON 字符串，2026-09-05 P2 起持久化；跨设备播种徽章）。 */
   context_info?: string | null
+  /** 渐进落库交付状态（2026-10-06）：'final' 默认 | 'interrupted' 进程死亡/断连
+      中断的残稿（渲染「已中断」徽标）。streaming 在途行不下发。 */
+  delivery_status?: 'final' | 'interrupted'
   created_at: string
 }
 
@@ -96,6 +99,9 @@ export interface DisplaySequenceItem {
   subtask_id?: string
   subtask_name?: string
   reasoning_content?: string
+  // P2-1（评审 I5）：ToolPartCard 展开截断项时取回 payload 全文所需的定位
+  message_id?: string
+  conversation_id?: string
 }
 
 /** F1-1 part protocol events (SSE protocol version 2) */

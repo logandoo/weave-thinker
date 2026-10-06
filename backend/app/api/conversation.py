@@ -233,6 +233,30 @@ def _utc_iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() + 'Z'
 
 
+def _message_response_fields(m, slim: bool = False) -> dict:
+    """MessageResponse kwargs；slim=True 时肥字段换 stub（P2-1 瘦读）。
+
+    dict(...) kwarg 形式与 MessageResponse(...) 构造点同锚（test_message_context_info
+    的序列化契约 grep `context_info=m.context_info` 依赖此拼写）。
+    """
+    fields = dict(
+        id=m.id,
+        conversation_id=m.conversation_id,
+        role=m.role,
+        content=m.content,
+        reasoning_content=m.reasoning_content,
+        tool_calls=m.tool_calls,
+        tool_results=m.tool_results,
+        context_info=m.context_info,
+        delivery_status=getattr(m, "delivery_status", None) or "final",
+        created_at=_utc_iso(m.created_at),
+    )
+    if slim:
+        from app.api.message_payloads import slim_message_dict
+        fields = slim_message_dict(fields)
+    return fields
+
+
 def _conversation_response(
     conversation: Conversation, last_user_message_at: Optional[datetime] = None
 ) -> ConversationResponse:
@@ -479,7 +503,8 @@ async def search_conversations(
         matched_msgs_result = await db.execute(
             select(Message).where(
                 Message.conversation_id == conv.id,
-                Message.content.ilike(keyword)
+                Message.content.ilike(keyword),
+                Message.delivery_status != "streaming",
             ).order_by(Message.created_at).limit(3)
         )
         matched_msgs = matched_msgs_result.scalars().all()
@@ -493,6 +518,7 @@ async def search_conversations(
                     SELECT m.id, m.role, m.content, m.created_at
                     FROM messages m
                     WHERE m.conversation_id = :conv_id
+                      AND m.delivery_status != 'streaming'
                       AND m.search_vector @@ plainto_tsquery('simple', :q)
                     ORDER BY ts_rank_cd(m.search_vector, plainto_tsquery('simple', :q)) DESC
                     LIMIT 3
@@ -616,10 +642,16 @@ async def update_conversation_group(
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
 
+    touched = False
     if group_data.name is not None:
         group.name = group_data.name
+        touched = True
     if group_data.color is not None:
         group.color = group_data.color
+        touched = True
+    if touched:
+        # 同步发射侧契约（同 update_conversation）：有赋值必 bump。
+        group.updated_at = datetime.utcnow()
 
     await db.commit()
     await db.refresh(group)
@@ -668,6 +700,8 @@ async def move_conversation_group(
         raise HTTPException(status_code=404, detail="Assistant not found")
 
     group.assistant_id = move_data.assistant_id
+    # 同步发射侧契约：move 无条件赋值——必 bump（契约 §3.1）。
+    group.updated_at = datetime.utcnow()
     # Conversations inside the group move with it (groups are assistant-scoped).
     # sync 波上游：ORM 逐行更新以触发 sync_capture。
     moved_convs = (await db.execute(
@@ -675,6 +709,8 @@ async def move_conversation_group(
     )).scalars().all()
     for conv in moved_convs:
         conv.assistant_id = move_data.assistant_id
+        # 同步发射侧契约：同值移组亦照发事件跳 onupdate——逐行 bump。
+        conv.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(group)
 
@@ -837,6 +873,11 @@ async def reorder_conversations(
             continue
         conv.sort_order = item.sort_order
         conv.group_id = item.group_id
+        # 同步发射侧契约（2026-10-02 事故①）：SQLAlchemy 2.0.50 对同值赋值照发
+        # UPDATE+捕获事件但跳过 onupdate → 事件 payload 带旧 ts → 推送被 LWW
+        # 等值判 STALE（生产 24 条实证）。显式 bump 对齐 chat.py 先例；幂等
+        # 重试同样前进 ts，排序/分组语义本就是最后操作胜。
+        conv.updated_at = datetime.utcnow()
     await db.commit()
     return {"status": "ok"}
 
@@ -858,6 +899,9 @@ async def reorder_groups(
         if grp is None:
             continue
         grp.sort_order = item.sort_order
+        # 同步发射侧契约（同 reorder_conversations）：同值赋值跳 onupdate，
+        # 事件 payload 会带旧 ts → LWW 等值 STALE；显式 bump 保 ts 单调。
+        grp.updated_at = datetime.utcnow()
     await db.commit()
     return {"status": "ok"}
 
@@ -867,6 +911,8 @@ async def reorder_groups(
 @router.get("/{conversation_id}", response_model=ConversationWithMessages)
 async def get_conversation(
     conversation_id: str,
+    include: str = "full",
+    message_limit: int | None = None,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -882,10 +928,34 @@ async def get_conversation(
 
     await _reconcile_deathmatch_status(db, conversation)
 
-    msg_result = await db.execute(
-        select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
-    )
-    messages = msg_result.scalars().all()
+    # 渐进落库（2026-10-06）：streaming 在途行是崩溃恢复产物，不进列表
+    msg_stmt = select(Message).where(
+        Message.conversation_id == conversation_id,
+        Message.delivery_status != "streaming",
+    ).order_by(Message.created_at)
+    has_more_messages = False
+    oldest_message_id = None
+    if message_limit is not None and message_limit > 0:
+        # 最新 N 条（DESC 取窗再反转），has_more/oldest 供上滚加载（P2-2）
+        page_limit = min(int(message_limit), 500)
+        desc_rows = (await db.execute(
+            select(Message).where(
+                Message.conversation_id == conversation_id,
+                Message.delivery_status != "streaming",
+            )
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(page_limit + 1)
+        )).scalars().all()
+        has_more_messages = len(desc_rows) > page_limit
+        window = list(reversed(desc_rows[:page_limit]))
+        oldest_message_id = window[0].id if window else None
+        messages = window
+    else:
+        messages = (await db.execute(msg_stmt)).scalars().all()
+    if include != "slim":
+        # 评审 I6：slim 读不 resolve（桩即交付形态；resolve 全文再瘦=白拉白哈希）
+        from app.services.message_payload_service import resolve_message_fields
+        messages = await resolve_message_fields(messages, db)
 
     # last_user_message_at 与 list_conversations 同口径（MAX 全角色
     # created_at，2026-09-26 起含助手消息——重新生成也算最新操作），由已加载
@@ -920,18 +990,10 @@ async def get_conversation(
         deathmatch_compressed_context=conversation.deathmatch_compressed_context,
         deathmatch_plan=conversation.deathmatch_plan,
         deathmatch_plan_version=conversation.deathmatch_plan_version or 0,
+        has_more_messages=has_more_messages,
+        oldest_message_id=oldest_message_id,
         messages=[
-            MessageResponse(
-                id=m.id,
-                conversation_id=m.conversation_id,
-                role=m.role,
-                content=m.content,
-                reasoning_content=m.reasoning_content,
-                tool_calls=m.tool_calls,
-                tool_results=m.tool_results,
-                context_info=m.context_info,
-                created_at=_utc_iso(m.created_at)
-            )
+            MessageResponse(**_message_response_fields(m, slim=(include == "slim")))
             for m in messages
         ]
     )
@@ -983,10 +1045,17 @@ async def update_conversation(
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
+    touched = False
     if conversation_data.title is not None:
         conversation.title = conversation_data.title
+        touched = True
     if 'group_id' in conversation_data.model_fields_set:
         conversation.group_id = conversation_data.group_id
+        touched = True
+    if touched:
+        # 同步发射侧契约：同值赋值照发事件但跳 onupdate，payload 带旧 ts → LWW 等值
+        # STALE（事故①）；有赋值必显式 bump（契约 §3.1）。
+        conversation.updated_at = datetime.utcnow()
 
     await db.commit()
     await db.refresh(conversation)
@@ -1053,6 +1122,8 @@ async def move_conversation(
         conversation.assistant_id = move_data.assistant_id
 
     conversation.group_id = move_data.group_id
+    # 同步发射侧契约：move 无条件赋值（同值移组亦然）——必 bump（契约 §3.1）。
+    conversation.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(conversation)
     last_user_times = await _get_last_activity_times(db, [conversation.id])
@@ -1106,15 +1177,19 @@ async def get_messages(
         rows = (await db.execute(
             text(f"""
                 SELECT id, conversation_id, role, content, reasoning_content,
-                       tool_calls, tool_results, context_info, created_at
+                       tool_calls, tool_results, context_info, created_at,
+                       delivery_status
                 FROM messages
-                WHERE conversation_id = :cid {cursor_clause}
+                WHERE conversation_id = :cid
+                  AND delivery_status != 'streaming' {cursor_clause}
                 ORDER BY created_at DESC, id DESC
                 LIMIT :lim
             """),
             params,
         )).mappings().all()
         messages = list(reversed(rows))
+        from app.services.message_payload_service import resolve_dict_fields
+        messages = await resolve_dict_fields(messages, db)
         return [
             MessageResponse(
                 id=m["id"],
@@ -1125,15 +1200,23 @@ async def get_messages(
                 tool_calls=m["tool_calls"],
                 tool_results=m["tool_results"],
                 context_info=m["context_info"],
+                delivery_status=m["delivery_status"] or "final",
                 created_at=_utc_iso(m["created_at"])
             )
             for m in messages
         ]
 
     msg_result = await db.execute(
-        select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
+        # 渐进落库（2026-10-06）：streaming 在途行是崩溃恢复产物，不进默认列表
+        # （前端流式 bubble 走 SSE）；interrupted（中断残稿）正常展示带徽标。
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.delivery_status != "streaming",
+        ).order_by(Message.created_at)
     )
     messages = msg_result.scalars().all()
+    from app.services.message_payload_service import resolve_message_fields
+    messages = await resolve_message_fields(messages, db)
 
     return [
         MessageResponse(
@@ -1145,6 +1228,7 @@ async def get_messages(
             tool_calls=m.tool_calls,
             tool_results=m.tool_results,
             context_info=m.context_info,
+            delivery_status=m.delivery_status or "final",
             created_at=_utc_iso(m.created_at)
         )
         for m in messages

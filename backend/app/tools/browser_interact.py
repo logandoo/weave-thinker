@@ -553,3 +553,50 @@ registry.register(
     description="Take screenshot of interactive browser page",
     emoji="",
 )
+
+
+async def browser_video(args: dict, **kwargs) -> str:
+    """P3/B5：会话录像证据（Playwright 原生）。action=save 把活体 webm
+    拷贝到 output_files；status 报告录像状态。页内音频未采集（诚实降级
+    标记 UNVERIFIED-audio）。"""
+    action = str(args.get("action") or "save").strip().lower()
+    service = InteractiveBrowserService.get_instance()
+    conv_id = _get_conversation_id(kwargs)
+    session = await service.get_or_create_session(conv_id)
+    if not session:
+        return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
+
+    from app.services.interactive_browser_service import save_video, video_status
+    if action == "status":
+        result = await video_status(session)
+    else:
+        result = await save_video(session, note=str(args.get("note") or ""))
+    return json.dumps(result, ensure_ascii=False)
+
+
+registry.register(
+    name="browser_video",
+    toolset="web",
+    schema={
+        "name": "browser_video",
+        "description": (
+            "Save or inspect the interactive browser session's video recording as evidence. "
+            "action='save' copies the live Playwright webm to output_files and returns its path; "
+            "action='status' reports recording state. Recording starts automatically with the session. "
+            "In-page audio is NOT captured (returns an UNVERIFIED-audio mark) — use the APPENDIX §A1 "
+            "MediaRecorder template via browser_execute_js when audio evidence is required."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["save", "status"], "description": "save (default) or status"},
+                "note": {"type": "string", "description": "Optional evidence note stored with the save result."},
+            },
+        },
+    },
+    handler=browser_video,
+    check_fn=check_browser_interaction_requirements,
+    is_async=True,
+    description="Save/inspect browser session video evidence",
+    emoji="",
+)

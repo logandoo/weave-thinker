@@ -423,10 +423,14 @@ class AgentWorker:
                     async with AsyncSessionLocal() as hist_db:
                         result = await hist_db.execute(
                             select(Message)
-                            .where(Message.conversation_id == task.conversation_id)
+                            .where(Message.conversation_id == task.conversation_id,
+                                   Message.delivery_status != "streaming")
                             .order_by(Message.created_at)
                         )
                         hist_msgs = result.scalars().all()
+                        # 评审 I3：外置桩还原全文后再进后台任务上下文
+                        from app.services.message_payload_service import resolve_message_fields
+                        hist_msgs = await resolve_message_fields(list(hist_msgs), hist_db)
                         context_limit = config.agent_conversation_context_limit
                         recent = hist_msgs[-context_limit:] if len(hist_msgs) > context_limit else hist_msgs
                         for m in recent:

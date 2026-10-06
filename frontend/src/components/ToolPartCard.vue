@@ -5,12 +5,46 @@
 import { ref, computed } from 'vue'
 import StreamMarkdown from './StreamMarkdown.vue'
 import type { DisplaySequenceItem } from '@/types'
+import { isExternalizedStub } from '@/api/chat'
+import { useChatStore } from '@/stores/chat'
 
 const props = defineProps<{
   item: DisplaySequenceItem
 }>()
 
 const expanded = ref(false)
+const resultDomId = `tool-res-${Math.random().toString(36).slice(2, 9)}`
+// B3：取回全文的显式状态（失败可重试，绝不静默停在预览——conv 8c03ff8e 红线）
+const fetchState = ref<'idle' | 'loading' | 'error'>('idle')
+
+// P2-1（评审 I5）：展开截断工具结果时取回全文（stub 预览 → payload 原文）
+// 2026-10-05 字段粒度：工具卡只取回 tool_results——不再连带拉 reasoning_content
+// /tool_calls（一次点击不再加载全部字段；MB 级思考文本不被无意拖回）。
+async function fetchFullIfNeeded(): Promise<void> {
+  const item = props.item as Record<string, unknown>
+  const msgId = item.message_id as string | undefined
+  const convId = item.conversation_id as string | undefined
+  if (!msgId || !convId) return
+  const m = { tool_results: item.result, reasoning_content: item.content }
+  // 评审 R2 I5：__truncated__ 是项的同级键（非 result 子串）——必须显式计入，
+  // 否则徽标承诺的「展开取全文」永不可达
+  const anyStub = Object.values(m).some((v) => isExternalizedStub(v))
+    || item.__truncated__ === true
+    || (typeof item.result === 'string' && item.result.includes('__truncated__'))
+  if (anyStub) {
+    fetchState.value = 'loading'
+    const ok = await useChatStore().ensureMessageFull(convId, msgId, ['tool_results'])
+    fetchState.value = ok ? 'idle' : 'error'
+  }
+}
+
+// A3：截断徽标（slim 桩的 __truncated__/__size_bytes__ 同级标记）
+const truncBadgeText = computed(() => {
+  const it = props.item as Record<string, unknown>
+  if (!it.__truncated__) return null
+  const n = it.__size_bytes__
+  return typeof n === 'number' && n > 0 ? `已截断 · 共 ${n} 字` : '已截断 · 展开取全文'
+})
 
 const toolName = computed(() => props.item.title || formatToolName(props.item.name || ''))
 const statusIcon = computed(() => {
@@ -60,6 +94,7 @@ const argsSummary = computed(() => {
 })
 
 function toggle() {
+  if (!expanded.value) void fetchFullIfNeeded()
   expanded.value = !expanded.value
 }
 
@@ -113,13 +148,22 @@ function formatToolName(name: string): string {
       </span>
       <button
         v-if="hasResult"
+        type="button"
         class="tool-card-toggle"
+        :aria-expanded="expanded"
+        :aria-controls="resultDomId"
         @click.stop="toggle"
       >
         {{ expanded ? '收起结果' : '展开结果' }}
       </button>
+      <span v-if="truncBadgeText" class="trunc-badge">{{ truncBadgeText }}</span>
     </div>
-    <div v-if="expanded && item.result" class="tool-card-result">
+    <div v-if="expanded && item.result" :id="resultDomId" class="tool-card-result">
+      <div v-if="fetchState === 'loading'" class="fetch-hint" role="status">正在取回全文…</div>
+      <div v-else-if="fetchState === 'error'" class="fetch-hint fetch-error" role="status">
+        全文取回失败，当前为截断预览
+        <button type="button" class="fetch-retry" @click.stop="fetchFullIfNeeded">重试取回全文</button>
+      </div>
       <StreamMarkdown :content="displayResult" />
     </div>
   </div>
@@ -249,5 +293,42 @@ function formatToolName(name: string): string {
 
 .tool-pending .tool-card-header {
   opacity: 0.6;
+}
+
+/* 截断徽标 + 取回全文状态（conv 8c03ff8e 正文截断 UX 波） */
+.trunc-badge {
+  display: inline-block;
+  margin-left: 0.5em;
+  padding: 0 0.45em;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  font-size: 0.72em;
+  color: var(--color-text-light);
+  vertical-align: middle;
+}
+
+.fetch-hint {
+  margin: 0.25em 0 0.5em;
+  font-size: 0.82em;
+  color: var(--color-text-light);
+}
+
+.fetch-hint.fetch-error {
+  color: var(--color-error);
+}
+
+.fetch-retry {
+  margin-left: 0.5em;
+  padding: 0.1em 0.5em;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  background: var(--color-white);
+  color: inherit;
+  cursor: pointer;
+}
+
+.fetch-retry:hover {
+  background: var(--color-primary);
+  color: var(--color-white);
 }
 </style>

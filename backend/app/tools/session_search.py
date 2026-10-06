@@ -56,7 +56,8 @@ async def session_search(args: dict, **kwargs) -> str:
                     FROM messages m
                     JOIN conversations c ON m.conversation_id = c.id
                     WHERE c.user_id = :uid AND m.conversation_id = :cid
-                      AND m.role IN ('user', 'assistant') {clause}
+                      AND m.role IN ('user', 'assistant')
+                      AND m.delivery_status != 'streaming' {clause}
                     ORDER BY m.created_at {order}, m.id {order}
                     LIMIT :lim
                 """),
@@ -101,6 +102,7 @@ async def session_search(args: dict, **kwargs) -> str:
                 JOIN conversations c ON m.conversation_id = c.id
                 WHERE c.user_id = :uid
                   AND m.role IN ('user', 'assistant')
+                  AND m.delivery_status != 'streaming'
                   AND m.search_vector @@ to_tsquery('simple', :q)
                 ORDER BY rank DESC
                 LIMIT :lim
@@ -118,6 +120,7 @@ async def session_search(args: dict, **kwargs) -> str:
                     JOIN conversations c ON m.conversation_id = c.id
                     WHERE c.user_id = :uid
                       AND m.role IN ('user', 'assistant')
+                      AND m.delivery_status != 'streaming'
                       AND m.content ILIKE :pattern
                     ORDER BY m.created_at DESC
                     LIMIT :lim

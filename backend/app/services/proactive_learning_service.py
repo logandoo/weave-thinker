@@ -142,7 +142,7 @@ class ProactiveLearningService:
                 select(Message)
                 .where(Message.conversation_id.in_(
                     select(Message.conversation_id).limit(200)
-                ))
+                ), Message.delivery_status != "streaming")
                 .order_by(Message.created_at.desc())
                 .limit(100)
             )

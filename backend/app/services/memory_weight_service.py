@@ -150,6 +150,10 @@ async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_t
         "clarification_constraint": -0.05,
         "dreaming_contradiction": -0.10,
         "dreaming_confirmation": 0.05,
+        # P1-①（2026-10-04）：注入证据被最终回答引用（memory_adoption_service）。
+        # A4.9 wave2：0.04→0.02 + 每轮封顶 3 条——名字回显（模型复述注入名）会
+        # 高频触发，降半+限流防止系统性爬升到 trust cap。
+        "answer_cited": 0.02,
     }
     delta = signal_map.get(signal_type, 0)
     if delta == 0:
@@ -322,20 +326,19 @@ async def try_cold_resurrect(db: AsyncSession, user_message: str, user_id: str) 
             # 把刚复活的 weight 写回 floor（复活形同虚设）。
             # 注意：不得写 last_recalled_at——该列语义是"真实召回/注入"，
             # 复活仅是词法匹配，写它会污染 recency 融合与召回统计。
-            if status == "cold_forgotten":
-                weight = float(config.memory_concept.get("cold_resurrect_weight", 0.3))
-                res = await db.execute(
-                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight = :w, hot_forget_count = 0, weight_decayed_at = NOW(), updated_at = NOW() WHERE id = :id AND status = 'cold_forgotten'"),
-                    {"w": weight, "id": cid},
-                )
-            else:
-                res = await db.execute(
-                    text("UPDATE memory_concepts SET status = 'active', activation_strength = 1.0, weight_decayed_at = NOW(), updated_at = NOW() WHERE id = :id AND status = 'silent'"),
-                    {"id": cid},
-                )
-            # A4.9 Minor：条件 UPDATE 未命中（并发改状态）时不算复活
-            if not res.rowcount:
+            # 同步发射侧契约（复审 C I-1 重分类）：本路径用户召回内联可达、
+            # status 为同步内容列——ORM 化恢复捕获，显式 bump 保 ts 单调。
+            concept = await db.get(MemoryConcept, cid)
+            if not concept or concept.status != status or status not in ("cold_forgotten", "silent"):
                 continue
+            weight = float(config.memory_concept.get("cold_resurrect_weight", 0.3))
+            concept.status = "active"
+            concept.activation_strength = 1.0
+            concept.weight_decayed_at = datetime.utcnow()
+            concept.updated_at = datetime.utcnow()
+            if status == "cold_forgotten":
+                concept.weight = weight
+                concept.hot_forget_count = 0
             resurrected.append(cid)
             # §5.3.4：embedding 缺失/过期（NULL 或从未生成）时复活即重生成，
             # 否则复活后 Stage 3 embedding 检索仍不可达

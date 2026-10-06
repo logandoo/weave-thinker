@@ -3,13 +3,14 @@
 
 import json
 import logging
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_db
-from app.db.database import User, MemoryConcept
+from app.db.database import User, MemoryConcept, MemoryEpisode
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
 logger = logging.getLogger(__name__)
@@ -96,13 +97,13 @@ async def delete_concept(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        text("DELETE FROM memory_concepts WHERE id = :id AND user_id = :uid RETURNING id"),
-        {"id": concept_id, "uid": current_user.id},
-    )
-    deleted = result.fetchone()
-    if not deleted:
+    concept = await db.get(MemoryConcept, concept_id)
+    if not concept or concept.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Concept not found")
+    # 同步发射侧契约：ORM 删除触发 after_delete → capture 事件+tombstone
+    # （memory_concepts 属同步域；text() 物理删除零捕获是已修缺口）。
+    await db.delete(concept)
+    # 关联清理（junction 表非同步域，无捕获语义）。
     await db.execute(
         text("DELETE FROM concept_cluster_members WHERE concept_id = :id"),
         {"id": concept_id},
@@ -130,10 +131,15 @@ async def delete_all_memory(
         text("DELETE FROM concept_cluster_members WHERE concept_id IN (SELECT id FROM memory_concepts WHERE user_id = :uid)"),
         {"uid": uid},
     )
-    await db.execute(
-        text("DELETE FROM memory_concepts WHERE user_id = :uid"),
-        {"uid": uid},
-    )
+    # 同步域实体（memory_concepts/memory_episodes）走 ORM 逐行删除：
+    # after_delete → capture 事件+tombstone，客户端镜像擦除（text() 物理删除零捕获为已修缺口）。
+    # GDPR 罕见操作，行数=用户全部 concepts/episodes，可接受；先 flush 定界避免 UOW 表序歧义。
+    concepts = (await db.execute(
+        select(MemoryConcept).where(MemoryConcept.user_id == uid)
+    )).scalars().all()
+    for obj in concepts:
+        await db.delete(obj)
+    await db.flush()
     await db.execute(
         text("DELETE FROM memory_clusters WHERE user_id = :uid"),
         {"uid": uid},
@@ -142,10 +148,12 @@ async def delete_all_memory(
         text("DELETE FROM subconscious_log WHERE user_id = :uid"),
         {"uid": uid},
     )
-    await db.execute(
-        text("DELETE FROM memory_episodes WHERE user_id = :uid"),
-        {"uid": uid},
-    )
+    episodes = (await db.execute(
+        select(MemoryEpisode).where(MemoryEpisode.user_id == uid)
+    )).scalars().all()
+    for obj in episodes:
+        await db.delete(obj)
+    await db.flush()
     await db.execute(
         text("DELETE FROM memory_clarifications WHERE user_id = :uid"),
         {"uid": uid},
@@ -344,13 +352,15 @@ async def forget_concept(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        text("UPDATE memory_concepts SET valid_to = NOW(), weight = 0, status = 'forgotten', updated_at = NOW() WHERE id = :id AND user_id = :uid RETURNING id"),
-        {"id": concept_id, "uid": current_user.id},
-    )
-    updated = result.fetchone()
-    if not updated:
+    concept = await db.get(MemoryConcept, concept_id)
+    if not concept or concept.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Concept not found")
+    # 同步发射侧契约：ORM 变更触发捕获事件（memory_concepts 同步域）；
+    # status/weight/valid_to 为真实变更，显式 bump 保 ts 单调。
+    concept.valid_to = datetime.utcnow()
+    concept.weight = 0
+    concept.status = "forgotten"
+    concept.updated_at = datetime.utcnow()
     await db.commit()
     return {"forgotten": concept_id}
 

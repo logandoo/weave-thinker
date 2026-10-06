@@ -119,6 +119,46 @@ def _general_auth_headers(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
+DEFAULT_DASSCOPE_ASR_MODEL = "qwen3-asr-flash-realtime-2026-02-10"
+
+
+def _is_run_task_protocol_model(model: str) -> bool:
+    """run-task duplex WS 协议族判定。
+
+    Fun-ASR-Realtime / Paraformer-realtime / Qwen-Audio-3.x-ASR-Flash-Streaming
+    共用同一 run-task/finish-task 协议（百炼 Realtime API 概述）；Filetrans 系
+    非流式整文件转写（qwen-audio-*-filetrans），不入此族。"""
+    m = (model or "").lower()
+    return (
+        m.startswith("fun-asr")
+        or m.startswith("paraformer")
+        or (m.startswith("qwen-audio") and "asr" in m and m.endswith("streaming"))
+    )
+
+
+def _recognition_tuning_params(cfg: dict, model: str = "") -> dict:
+    """run-task 识别调参接线（Qwen-Audio-3.1 专属键经 [asr] 配置下发）。
+
+    - ``vad_model``: near_meeting_16k（近场）/ far_field_meeting_16k（服务端默认）
+    - ``keep_dialect``: true=保留方言原文，false/缺省=方言转写为普通话
+    未显式配置的键不下发，取服务端默认。**3.1 专属**：仅 qwen-audio-3.1 系
+    模型下发，fun-asr/paraformer 回退收不到不支持键（A4.9 R2-I1）。"""
+    out: dict = {}
+    if not (model or "").lower().startswith("qwen-audio-3.1"):
+        return out
+    if cfg.get("vad_model"):
+        out["vad_model"] = str(cfg["vad_model"])
+    if cfg.get("keep_dialect") is not None:
+        out["keep_dialect"] = bool(cfg["keep_dialect"])
+    return out
+
+
+def _supports_instant_vocabulary(model: str) -> bool:
+    """即时热词 ``vocabulary`` 仅 Qwen-Audio-3.x 族支持（百炼 improve-asr-accuracy）；
+    fun-asr/paraformer 走预编译 vocabulary_id，内联词不下发。"""
+    return (model or "").lower().startswith("qwen-audio")
+
+
 class ASRService:
     @property
     def _asr_config(self) -> dict:
@@ -195,8 +235,8 @@ class ASRService:
         ep = self._endpoint
         if ep is not None:
             # 单一模型名原则：顶层 model_name 即当前 provider 的模型
-            return str(ep.model_name or "") or str(ep.extra.get("dashscope_model", "") or "") or "qwen3-asr-flash-realtime-2026-02-10"
-        return self._asr_config.get("dashscope_model", "qwen3-asr-flash-realtime-2026-02-10")
+            return str(ep.model_name or "") or str(ep.extra.get("dashscope_model", "") or "") or DEFAULT_DASSCOPE_ASR_MODEL
+        return self._asr_config.get("dashscope_model", DEFAULT_DASSCOPE_ASR_MODEL)
 
     @property
     def is_mimo(self) -> bool:
@@ -463,8 +503,12 @@ class ASRService:
 
     @property
     def _is_funasr_model(self) -> bool:
-        model = self.dashscope_model.lower()
-        return model.startswith("fun-asr") or model.startswith("paraformer")
+        """run-task duplex WS 协议族判定（听写流式代理分派用）。
+
+        Fun-ASR-Realtime / Paraformer-realtime / Qwen-Audio-3.x-ASR-Flash-Streaming
+        共用同一 run-task/finish-task 协议（百炼 Realtime API 概述）；Filetrans
+        系非流式整文件转写，不入此族。"""
+        return _is_run_task_protocol_model(self.dashscope_model)
 
     async def transcribe_file(self, audio_data: bytes, filename: str = "audio.wav", language: str = "auto") -> dict:
         """一次性整段转写（agent 工具 asr_transcribe 入口，2026-08-31）。
@@ -510,6 +554,7 @@ class ASRService:
         try:
             async with upstream:
                 parameters: dict = {"sample_rate": 16000, "format": "pcm"}
+                parameters.update(_recognition_tuning_params(self._asr_config, self.dashscope_model))
                 if language and language != "auto":
                     parameters["language_hints"] = [language]
                 run_task = {
@@ -1105,21 +1150,22 @@ class ASRService:
             except Exception:
                 pass
 
-    def _format_funasr_hotwords(self, hotwords: Optional[list[dict]]) -> Optional[str]:
-        """DashScope hot words are now managed via the Vocabulary REST API.
-        This method is kept for backward compatibility with non-DashScope
-        FunASR deployments that accept an inline hotwords string."""
+    def _format_funasr_hotwords(self, hotwords: Optional[list[dict]]) -> Optional[dict]:
+        """即时热词 → 百炼标准 ``vocabulary`` 对象（dict[词]=权重）。
+
+        Qwen-Audio-3.x 族 run-task ``parameters.vocabulary`` 为官方即时热词
+        参数；权重 [1,5]（推荐 4）或 50（超级热词，账户≤50 个）；旧 ``hotwords``
+        JSON 串仅兼容自部署 FunASR，已弃用不再下发。"""
         if not hotwords:
             return None
-        valid = []
+        valid: dict = {}
         for item in hotwords:
             text = item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")
             weight = item.get("weight", 4) if isinstance(item, dict) else getattr(item, "weight", 4)
             if text and str(text).strip():
-                valid.append((str(text).strip(), max(1, min(5, int(weight)))))
-        if not valid:
-            return None
-        return json.dumps({text: weight for text, weight in valid}, ensure_ascii=False)
+                w = 50 if int(weight or 4) == 50 else max(1, min(5, int(weight or 4)))
+                valid[str(text).strip()] = w
+        return valid or None
 
     async def proxy_funasr_websocket_stream(
         self,
@@ -1191,6 +1237,9 @@ class ASRService:
                                 "sample_rate": 16000,
                                 "format": "pcm",
                             }
+                            parameters.update(
+                                _recognition_tuning_params(self._asr_config, self.dashscope_model)
+                            )
 
                             if language:
                                 parameters["language_hints"] = [language]
@@ -1198,22 +1247,16 @@ class ASRService:
                             if vocabulary_id:
                                 parameters["vocabulary_id"] = vocabulary_id
                                 logger.info("Fun-ASR vocabulary_id: %s", vocabulary_id)
+                                # Per-utterance hotwords still pass as instant
+                                # vocabulary when present (merged server-side).
+                                inline_items = msg.get("custom_hotwords")
                             else:
-                                # Fallback: inline hotwords when no DashScope vocabulary is synced
-                                custom_hotwords = msg.get("custom_hotwords") or default_hotwords
-                                hotwords_str = self._format_funasr_hotwords(custom_hotwords)
-                                if hotwords_str:
-                                    parameters["hotwords"] = hotwords_str
-                                    logger.info("Fun-ASR inline hotwords enabled, count=%d", len(custom_hotwords))
-
-                            # Per-utterance hotwords from the start message are also passed even when
-                            # a vocabulary_id is available, so callers can supply extra context.
-                            custom_hotwords = msg.get("custom_hotwords")
-                            if custom_hotwords:
-                                hotwords_str = self._format_funasr_hotwords(custom_hotwords)
-                                if hotwords_str:
-                                    parameters["hotwords"] = hotwords_str
-                                    logger.info("Fun-ASR per-utterance hotwords enabled, count=%d", len(custom_hotwords))
+                                # Instant vocabulary when no DashScope vocabulary is synced
+                                inline_items = msg.get("custom_hotwords") or default_hotwords
+                            vocabulary = self._format_funasr_hotwords(inline_items)
+                            if vocabulary and _supports_instant_vocabulary(self.dashscope_model):
+                                parameters["vocabulary"] = vocabulary
+                                logger.info("Fun-ASR inline vocabulary enabled, count=%d", len(vocabulary))
 
                             run_task_message = {
                                 "header": {

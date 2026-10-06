@@ -10,6 +10,16 @@ import { dispatchStreamPayload, type StreamHandlers, type ResumeHandlers, type S
 export { dispatchStreamPayload } from './streamDispatch'
 export type { StreamHandlers, ResumeHandlers, StreamStatusResult, ReplayPayload } from './streamDispatch'
 
+/** P2-1：外置桩检测（JSON 语义，键序无关——tool_results 桩以 display_sequence 开头）。 */
+export function isExternalizedStub(v: unknown): boolean {
+  if (typeof v !== 'string' || v.length < 2 || !v.startsWith('{')) return false
+  try {
+    return (JSON.parse(v) as { _externalized?: boolean })._externalized === true
+  } catch {
+    return false
+  }
+}
+
 function authHeaders(): Record<string, string> {
   const token = localStorage.getItem('chatllm_token')
   const headers: Record<string, string> = {
@@ -66,8 +76,16 @@ export const chatApi = {
     return data
   },
 
-  async getConversation(id: string): Promise<Conversation> {
-    const { data } = await api.get(`/conversations/${id}`)
+  async getConversation(id: string, opts?: { include?: 'slim' | 'full'; messageLimit?: number }): Promise<Conversation> {
+    const params: Record<string, string | number> = {}
+    if (opts?.include) params.include = opts.include
+    if (opts?.messageLimit) params.message_limit = opts.messageLimit
+    const { data } = await api.get(`/conversations/${id}`, { params })
+    return data
+  },
+
+  async getMessagePayload(messageId: string, field: string): Promise<{ message_id: string; field: string; content: string; size_bytes: number; externalized: boolean }> {
+    const { data } = await api.get(`/messages/${messageId}/payload/${field}`)
     return data
   },
 
@@ -90,6 +108,23 @@ export const chatApi = {
   async getMessages(conversationId: string): Promise<Message[]> {
     const { data } = await api.get(`/conversations/${conversationId}/messages`)
     return data
+  },
+
+  async getMessagesPaged(
+    conversationId: string,
+    beforeId: string,
+    limit: number,
+  ): Promise<{ messages: Message[]; has_more_messages: boolean; oldest_message_id: string | null }> {
+    // 游标分页：返回 [messages 升序 + has_more + oldest]（服务端 /messages?before_id 窗口）
+    const { data } = await api.get(`/conversations/${conversationId}/messages`, {
+      params: { before_id: beforeId, limit },
+    })
+    const messages: Message[] = Array.isArray(data) ? data : []
+    return {
+      messages,
+      has_more_messages: messages.length >= limit,
+      oldest_message_id: messages.length ? messages[0].id : null,
+    }
   },
 
   async searchConversations(query: string): Promise<ConversationSearchResult[]> {

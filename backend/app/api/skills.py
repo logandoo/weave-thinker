@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -371,12 +373,19 @@ async def update_skill(
             raise HTTPException(status_code=400, detail="Skill with this name already exists")
         skill.name = skill_data.name
 
+    touched = skill_data.name is not None
     if skill_data.description is not None:
         skill.description = skill_data.description
+        touched = True
     if skill_data.content is not None:
         skill.content = skill_data.content
+        touched = True
     if skill_data.is_active is not None:
         skill.is_active = skill_data.is_active
+        touched = True
+    if touched:
+        # 同步发射侧契约（同 update_note，I-1 清单）：有赋值必 bump。
+        skill.updated_at = datetime.utcnow()
 
     await db.commit()
     await db.refresh(skill)

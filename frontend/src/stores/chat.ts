@@ -12,11 +12,11 @@ import type {
   PartStartedEvent, PartDeltaEvent, PartUpdatedEvent,
   ContextInfo, ModelAlias,
 } from '@/types'
-import { chatApi } from '@/api/chat'
+import { chatApi, isExternalizedStub } from '@/api/chat'
 import { modelsApi } from '@/api/models'
 import { useAssistantStore } from '@/stores/assistant'
 import { useNotesStore } from '@/stores/notes'
-import { mergeReplayIntoSequence, pickStreamText, shouldApplyRefresh, dropDraftTextAfterLastTool } from '@/stores/streamReducer'
+import { mergeReplayIntoSequence, pickStreamText, shouldApplyRefresh, dropDraftTextAfterLastTool, keepLongerDisplayed, caughtUpAfterAnchor, recoveryCaughtUp, trimWindowAfterFullFetch, isSyntheticMessageId, type TurnAnchor } from '@/stores/streamReducer'
 import { abortPredecessor, isNoneReplayTransient } from '@/stores/streamConnection'
 import { compareConversationsBySidebarOrder, reconcilePendingPromotions, rollbackPendingPromotion, serverCaughtUp, serverLastUserMessageMs } from '@/stores/conversationOrder'
 import type { PendingPromotion } from '@/stores/conversationOrder'
@@ -111,12 +111,20 @@ export const useChatStore = defineStore('chat', () => {
   // reads the title from here so foreign-assistant opens keep their title.
   const conversationMeta = ref<Record<string, Conversation>>({})
   const messages = ref<Record<string, Message[]>>({})
+  // P0-2 深链去重：selectConversation 刚拉完的会话在 TTL 内跳过 refreshConversation
+  // 的重复全量 GET（实测双拉 33MB/16MB×2 的来源之一）。
+  const lastFullGetAt: Record<string, number> = {}
+  const LAST_FULL_GET_TTL_MS = 5000
   const streamStates: Record<string, StreamState> = reactive({})
   // 插话（2026-08-29，codex steer/deepseek-harness inbox 模式）：用户向运行中
   // run 提交的插话文本，先以乐观气泡上屏，等待后端 interjection_committed
   // commit-echo 确认；自然 done 时仍未确认 → 自动转普通发送（竞态兜底），
   // 用户主动 stop 时仍未确认 → 文本回填输入框（尊重停止意图）。
-  const pendingInterjections: Record<string, Array<{ localId: string; content: string }>> = reactive({})
+  // committed=true 表示后端已在迭代边界把它注入 run 上下文（commit-echo 已到），
+  // 由 run 自己作答；false 表示仍躺在队列里，终态冲刷时兜底重发。两类都只活在
+  // 这个队列里，不再作为乐观气泡写进 messages —— 显示位次因此恒为「回答最下方
+  // 的队列区」而不是流式回答之上的消息气泡（需求 4①）。
+  const pendingInterjections: Record<string, Array<{ localId: string; content: string; committed?: boolean; assistantId?: string | null }>> = reactive({})
   const interjectionRestoreText = ref('')
   // 本轮 run 的起始边界（turn 发起前最后一条服务器消息 id）：commit-dedup
   // 闸门只扫边界之后的消息（A4.9 R2 B1）。仅 sendMessage 发起新 turn 时设置；
@@ -133,6 +141,16 @@ export const useChatStore = defineStore('chat', () => {
     return !id.startsWith('temp-') && !id.startsWith('bg-') && !id.startsWith('resume-') &&
       !id.startsWith('interject-pending-') && !id.startsWith('interject-committed-')
   }
+  /** 项3 追平锚：严格持久化 id（local-abort- 等合成族一律排除——锚必须在
+   *  服务端快照里找得到，否则 caughtUpAfterAnchor 只能回 null 降级）。 */
+  function _newestPersistedId(list: readonly Message[]): string | null {
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const id = list[i]?.id
+      if (id && _isServerMessageId(id) && !isSyntheticMessageId(id)) return id
+    }
+    return null
+  }
+
   const currentError = ref<string | null>(null)
   const searchResults = ref<ConversationSearchResult[]>([])
   const searchQuery = ref('')
@@ -423,7 +441,7 @@ export const useChatStore = defineStore('chat', () => {
           // flight is an unrecoverable-by-anyone-else state (the UI shows a
           // blinking cursor forever). Drive it back through the standard
           // reconnect-or-sync recovery so it always terminates.
-          void tryReconnectOrSync(convId, (messages.value[convId] || []).length + 1, s)
+          void tryReconnectOrSync(convId, null, s)
         }
       }
     }, 5000)
@@ -523,12 +541,120 @@ export const useChatStore = defineStore('chat', () => {
 
   /** @returns true = 服务端快照已成功取得（追平判定可信）；false = 请求失败
    *  （调用方不得据此做盲回滚，见 busy-final 的 refresh→rollback 序列）。 */
-  async function refreshConversation(conversationId: string): Promise<boolean> {
+  // 在途去重：同一 (message, field 集合) 只发一次 payload GET
+  const _payloadInflight = new Map<string, Promise<boolean>>()
+  // P2-1 外置字段全集（读侧兼容历史 tool_calls 桩；写侧不外置 tool_calls）
+  const PAYLOAD_FIELDS = ['tool_results', 'reasoning_content', 'tool_calls'] as const
+  type PayloadField = typeof PAYLOAD_FIELDS[number]
+
+  /** P2-1：展开巨块前取回单字段全文（payload stub → 原文），写回本地消息。
+   *  @param fields 2026-10-05 起支持字段粒度：点击展开哪个块就只取回哪个字段
+   *    （工具卡→tool_results · 思考块→reasoning_content），缺省=全字段
+   *    （导出/正文愈合等需要整单全文的调用方不变）。
+   *  @returns true = 所请字段全部持有全文（取回成功或本就无需取回）；
+   *           false = 存在取回失败的桩字段——调用方须给出可重试的显式失败态
+   *           （红线：截断必须可感知，静默停在预览=不可接受）。
+   *  在途去重按 (msg, field) 粒度（minors 全清③：字段集序/重叠不再双取）。 */
+  async function ensureMessageFull(
+    conversationId: string,
+    messageId: string,
+    fields?: readonly PayloadField[],
+  ): Promise<boolean> {
+    const tasks = [...(fields ?? PAYLOAD_FIELDS)].map((field) => {
+      const key = `${conversationId}:${messageId}:${field}`
+      let task = _payloadInflight.get(key)
+      if (!task) {
+        task = _fetchFieldFull(conversationId, messageId, field).finally(() => {
+          _payloadInflight.delete(key)
+        })
+        _payloadInflight.set(key, task)
+      }
+      return task
+    })
+    return (await Promise.all(tasks)).every(Boolean)
+  }
+
+  async function _fetchFieldFull(
+    conversationId: string,
+    messageId: string,
+    field: PayloadField,
+  ): Promise<boolean> {
+    // 写回按 id 补丁（评审 R1：不用入口快照数组整体替换，避免与 loadOlder/refresh 竞态互毁）
+    const list = messages.value[conversationId] || []
+    const idx = list.findIndex((m) => m.id === messageId)
+    if (idx < 0) return true
+    const msg = list[idx]
+    if (!isExternalizedStub((msg as Record<string, unknown>)[field])) return true
+    try {
+      const payload = await chatApi.getMessagePayload(messageId, field)
+      const cur = messages.value[conversationId] || []
+      const curIdx = cur.findIndex((m) => m.id === messageId)
+      if (curIdx >= 0) {
+        const next = [...cur]
+        next[curIdx] = { ...next[curIdx], [field]: payload.content } as Message
+        messages.value[conversationId] = next
+      }
+      return true
+    } catch {
+      /* 保留 stub（preview）——false 上抛给调用方渲染可重试失败态 */
+      return false
+    }
+  }
+
+  /** P2-1：导出/保存笔记等需全文的路径前置——展开式批量取回 stub 字段。 */
+  async function ensureFullPayloads(conversationId: string): Promise<void> {
+    const list = messages.value[conversationId] || []
+    for (const m of list) {
+      const anyStub = ['tool_results', 'reasoning_content', 'tool_calls'].some((f) =>
+        isExternalizedStub((m as Record<string, unknown>)[f]))
+      if (anyStub) await ensureMessageFull(conversationId, m.id)
+    }
+  }
+
+  // P2-2 分页：打开路径默认最新 N 条，上滚加载更早（游标不重不漏）。
+  const MESSAGE_PAGE_SIZE = 50
+  const hasMoreMessages: Record<string, boolean> = reactive({})
+  const oldestMessageId: Record<string, string | null> = reactive({})
+
+  async function loadOlderMessages(conversationId: string): Promise<boolean> {
+    const before = oldestMessageId[conversationId]
+    if (!before || !hasMoreMessages[conversationId]) return false
+    try {
+      const older = await chatApi.getMessagesPaged(conversationId, before, MESSAGE_PAGE_SIZE)
+      const cur = messages.value[conversationId] || []
+      const existing = new Set(cur.map((m) => m.id))
+      const fresh = (older.messages || []).filter((m: Message) => !existing.has(m.id))
+      if (fresh.length) {
+        messages.value[conversationId] = [...fresh, ...cur]
+      }
+      oldestMessageId[conversationId] = older.oldest_message_id || null
+      hasMoreMessages[conversationId] = !!older.has_more_messages
+      return fresh.length > 0
+    } catch {
+      return false
+    }
+  }
+
+  async function refreshConversation(conversationId: string, opts?: { reuseFresh?: boolean; fullWindow?: boolean }): Promise<boolean> {
+    // P0-2 新鲜窗（评审 I2 修复：仅深链去重调用点显式开启）——默认语义=必拉，
+    // 否则发送/abort/流末的权威同步与回滚判定会拿到陈旧快照。
+    if (
+      opts?.reuseFresh
+      && messages.value[conversationId]
+      && Date.now() - (lastFullGetAt[conversationId] || 0) < LAST_FULL_GET_TTL_MS
+    ) {
+      return true
+    }
     const epochAtStart = messagesEpoch[conversationId] || 0
     const seqAtStart = (refreshSeqs[conversationId] || 0) + 1
     refreshSeqs[conversationId] = seqAtStart
     try {
-      const conversation = await chatApi.getConversation(conversationId)
+      // fullWindow（项3 锚降级）：锚被挤出分页窗时拉全量再判——一轮至多一次
+      const conversation = await chatApi.getConversation(conversationId,
+        opts?.fullWindow ? { include: 'slim' } : { include: 'slim', messageLimit: MESSAGE_PAGE_SIZE })
+      lastFullGetAt[conversationId] = Date.now()
+      hasMoreMessages[conversationId] = !!(conversation as unknown as { has_more_messages?: boolean }).has_more_messages
+      oldestMessageId[conversationId] = (conversation as unknown as { oldest_message_id?: string | null }).oldest_message_id ?? null
       conversationMeta.value[conversationId] = {
         ...conversationMeta.value[conversationId],
         id: conversationId,
@@ -573,13 +699,41 @@ export const useChatStore = defineStore('chat', () => {
           // disappearance. Once the server list catches up (same length),
           // apply cleanly so the synthetic is replaced by its real row and
           // never duplicates it.
+          // conv 4e159a79 shrink-guard: a server row that is a strict suffix
+          // of the displayed content lost its HEAD server-side — keep the
+          // longer displayed content for rendering (see keepLongerDisplayed).
+          const localById = new Map(localMessages.map(m => [m.id, m]))
+          const guardedServerMessages = serverMessages.map(m => {
+            const local = localById.get(m.id)
+            if (!local) return m
+            const content = keepLongerDisplayed(local.content, m.content)
+            return content && content !== m.content ? { ...m, content } : m
+          })
           const newestLocal = localMessages[localMessages.length - 1]
           const serverHasNewest = newestLocal && serverMessages.some(m => m.id === newestLocal.id)
-          const preserveSynthetic = newestLocal && !serverHasNewest
+          let preserveSynthetic = newestLocal && !serverHasNewest
             && serverMessages.length < localMessages.length
+          // 项3（2026-10-05）：窗口化刷新下 serverMessages.length 被 PAGE_SIZE
+          // 夹住，length 比较恒真 → 合成气泡会被永久保留成重复气泡。锚定等价
+          // 判定：服务端窗口在边界（本轮发起前最后一条服务器消息）之后已有同
+          // role+content 的持久化行 → 合成气泡已落库，不再保留（重复答案根治）。
+          if (preserveSynthetic && isSyntheticMessageId(newestLocal.id)) {
+            const boundaryId = _runBoundaryMessageIds[conversationId] ?? null
+            const bIdx = boundaryId ? serverMessages.findIndex(m => m.id === boundaryId) : -1
+            // A4.9 I1：边界缺席（本会话未发过新 turn / 已被挤出窗口）时不做等价
+            // 判重——扫整个窗口会把「同内容重发（继续/好）」的旧落库行误判为本次
+            // 合成气泡已落库，未 commit 的文本被提前丢弃。宁可暂留重复（下一
+            // 次干净刷新自愈），绝不丢用户正在看的气泡。
+            if (bIdx >= 0) {
+              const tail = serverMessages.slice(bIdx + 1)
+              const committed = tail.some(m => !isSyntheticMessageId(m.id)
+                && m.role === newestLocal.role && m.content === newestLocal.content)
+              if (committed) preserveSynthetic = false
+            }
+          }
           messages.value[conversationId] = preserveSynthetic
-            ? [...serverMessages, newestLocal]
-            : serverMessages
+            ? [...guardedServerMessages, newestLocal]
+            : guardedServerMessages
         }
         // P2：快照被采用（非陈旧）才播种（A4.9 R1 M1）。
         if (appliedRefresh) {
@@ -669,7 +823,8 @@ export const useChatStore = defineStore('chat', () => {
 
   async function syncAfterAbort(
     conversationId: string,
-    expectedMessageCount: number,
+    // null = 恢复模式（W3 项1 r2）：尾部形态判定 recoveryCaughtUp，无需锚。
+    turnAnchor: TurnAnchor | null,
     partialContent: string,
     partialReasoningContent: string,
     // P1（2026-09-05）：恢复路径（tryReconnectOrSync）传 true——setup 完成、
@@ -687,17 +842,69 @@ export const useChatStore = defineStore('chat', () => {
     // epoch guard already skips the stale in-flight assignment).
     const inheritedEpoch = messagesEpoch[conversationId] || 0
 
+    // 项3（2026-10-05）：分页感知追平判定。旧计数启发式（内存长度+1）在
+    // MESSAGE_PAGE_SIZE 窗口下永不满足（≥49 条历史会话）；锚定判定只看锚后
+    // 新增的持久化消息。锚被挤出窗口（null）→ 全量拉取一次再判（降级路径，
+    // 一轮至多一次；仍缺席 = 数据异常，按未追平继续走 Phase-2 兜底）。
+    let fullRefetchUsed = false
+    const caughtUp = async (): Promise<boolean> => {
+      const listNow = messages.value[conversationId] || []
+      if (!turnAnchor) return recoveryCaughtUp(listNow)
+      const r = caughtUpAfterAnchor(listNow, turnAnchor)
+      if (r !== null) return r
+      if (fullRefetchUsed) return false
+      // A4.9 M2：拉取失败不消耗一次性额度（refresh 内部捕获返回 false）
+      const ok = await refreshConversation(conversationId, { fullWindow: true })
+      if (!ok) return false
+      fullRefetchUsed = true
+      const verdict = caughtUpAfterAnchor(messages.value[conversationId] || [], turnAnchor) === true
+      // minor⑱：全量拉取后把整史收回分页窗——防 MB 级整史在 store 驻留整会话。
+      // W3 项3（2026-10-06）：仅 verdict=true 收窗——未追平时锚还在列表里，收窗
+      // 会逐出锚令后续永远不可判（Phase-2 陈旧轮破照旧叠 local-abort 气泡）。
+      // A4.9 B-m5：收窗前复查 epoch——await 期间新流接管时不得裁剪别人的列表。
+      if (stillOurs() && verdict) {
+        const before = messages.value[conversationId] || []
+        const after = trimWindowAfterFullFetch(before, true, MESSAGE_PAGE_SIZE)
+        if (after !== before) {
+          messages.value[conversationId] = after
+          hasMoreMessages[conversationId] = true
+          oldestMessageId[conversationId] = after[0]?.id ?? null
+        }
+      }
+      return verdict
+    }
+    // A4.9 B2：死磕 run 逐轮落库（mid-run 即有 assistant 行在锚后）——锚定判定
+    // 与旧计数同样会误判追平，沿用 Phase-2 的 dmActive 豁免：死磕活跃期不做
+    // 追平快判，交给流状态轮询（Phase-2 自带重挂）。
+    const dmActiveNow = (): boolean => {
+      const st = s.deathmatchVerdict?.status
+      return st === 'active' || st === 'grilling'
+    }
+    // A4.9 I2：caughtUp 内可能多跑一次 fullWindow RTT——收尾前复查 epoch，
+    // 防止 await 窗口期内新流接管后被旧循环 endStreaming 掐断。
+    const stillOurs = (): boolean =>
+      (messagesEpoch[conversationId] || 0) === inheritedEpoch
+
     // Phase 1: fast polls — covers the common case where the aborted stream
     // had already saved its final message before the abort landed.
     for (let attempt = 0; attempt < 8; attempt += 1) {
       await sleep(attempt === 0 ? 150 : 300)
       // Superseded by a newer flow on this conversation — stop touching state.
-      if ((messagesEpoch[conversationId] || 0) !== inheritedEpoch) return
-      await refreshConversation(conversationId)
+      if (!stillOurs()) return
+      // W3 项1（2026-10-06）：refresh 抛错/失败时当轮不做判定（recoveryCaughtUp
+      // 是尾部形态判定，对陈旧列表保守；此处门仍拒绝的是 refresh 异常路径）。
+      const refreshed = await refreshConversation(conversationId)
+      if (!refreshed) continue
 
-      if ((messages.value[conversationId] || []).length >= expectedMessageCount) {
+      if (!dmActiveNow() && await caughtUp()) {
+        if (!stillOurs()) return
+        // W3 项1：caughtUp 可能跑 fullWindow 补拉（多一次 RTT）——采信前要求在
+        // 其之后列表仍归本流（stillOurs 已查）且该补拉未失败（caughtUp 内保证）。
         currentError.value = null
         endStreaming(conversationId)
+        // 需求 4②：这是 syncAfterAbort 自述的**最常见**终态（abort 落地前回答已
+        // 存库）—— 挂着的插话必须继续作答，不得就此搁置。
+        void flushUnconfirmedInterjections(conversationId, 'auto-send')
         return
       }
     }
@@ -757,13 +964,14 @@ export const useChatStore = defineStore('chat', () => {
         // Skipped for deathmatch: its goal loop persists per-turn messages
         // mid-run, so the count check would false-positive and detach the
         // live stream long before the loop finishes.
-        const dmStatus = s.deathmatchVerdict?.status
-        const dmActive = dmStatus === 'active' || dmStatus === 'grilling'
-        if (!dmActive && poll > 0 && poll % 10 === 0) {
+        if (!dmActiveNow() && poll > 0 && poll % 10 === 0) {
           await refreshConversation(conversationId)
-          if ((messages.value[conversationId] || []).length >= expectedMessageCount) {
+          if (await caughtUp()) {
+            if (!stillOurs()) return
             currentError.value = null
             endStreaming(conversationId)
+            // 需求 4②：run 已收尾，挂着的插话必须继续作答，不得随刷新静默丢弃。
+            void flushUnconfirmedInterjections(conversationId, 'auto-send')
             return
           }
         }
@@ -773,13 +981,33 @@ export const useChatStore = defineStore('chat', () => {
       // Buffer complete / agent stopped / buffer expired: the final message
       // should now be in the DB (or about to be saved).
       await refreshConversation(conversationId)
-      if ((messages.value[conversationId] || []).length >= expectedMessageCount) {
+      if (!dmActiveNow() && await caughtUp()) {
+        if (!stillOurs()) return
         currentError.value = null
         endStreaming(conversationId)
+        // 需求 4②：同上 —— 终态冲刷队列。
+        void flushUnconfirmedInterjections(conversationId, 'auto-send')
         return
       }
       stalePolls += 1
       if (stalePolls >= 3) break
+    }
+
+    // W3 项3（2026-10-06）：Phase-2 陈旧轮破后的终局复核——收窗/整页新行退化
+    // 时序下锚可能已被逐出分页窗，叠局部气泡前重置一次性全量额度再判一次：
+    // 真追平（答案已落库）→ 干净收线不叠气泡；否则才落 local-abort 兜底。
+    if (partialContent.trim() || partialReasoningContent.trim()) {
+      fullRefetchUsed = false
+      if (!dmActiveNow() && await caughtUp()) {
+        if (!stillOurs()) return
+        currentError.value = null
+        endStreaming(conversationId)
+        void flushUnconfirmedInterjections(conversationId, 'auto-send')
+        return
+      }
+      // A4.9 Minor（评审 B）：复核窗口内可能已被新流接管——兜底叠气泡/收尾
+      // 前必须再查 epoch，绝不把 local-abort 挂到新流的列表上。
+      if (!stillOurs()) return
     }
 
     if (partialContent.trim()) {
@@ -798,14 +1026,26 @@ export const useChatStore = defineStore('chat', () => {
       ]
     }
 
+    if (!stillOurs()) return
     currentError.value = null
     endStreaming(conversationId)
+    // 需求 4②：轮询兜底也走到了终态 —— 挂着的插话继续作答，不得静默丢弃。
+    void flushUnconfirmedInterjections(conversationId, 'auto-send')
   }
 
   async function resumeActiveStream(conversationId: string): Promise<boolean> {
     if (_resumingSet.has(conversationId)) return false
     const s = getStream(conversationId)
     if (!s.streaming) {
+      return false
+    }
+    // 接管守卫（结构不变量）：resume 的语义是「重挂一条**已经断掉**的流」，
+    // 不是「替换任意活流」。本地已有一条未中止的健康连接时必须让路 —— 否则
+    // 下面的 abortPredecessor 会掐断插话兜底刚开启的下一 turn（实测：回答已
+    // 生成并落库、前端却收不到，chatllm.log "Client disconnected during tool
+    // loop" + "Final answer already persisted by producer" = 插话被静默丢弃）。
+    // 中止过的前任（watchdog abort / tab-switch abort）不拦，照常重挂。
+    if (s.abortController && !s.abortController.signal?.aborted) {
       return false
     }
     _resumingSet.add(conversationId)
@@ -859,6 +1099,11 @@ export const useChatStore = defineStore('chat', () => {
         if (conv) conv.title = title
       }
       endStreaming(conversationId)
+      // 需求 4②：resume 流的自然 done 同样必须冲刷队列。此前只有主发送流的
+      // onDone 冲刷，resume（切后台回来 / watchdog 重连 / busy-attach）收尾时
+      // 挂着的插话随 refresh 静默消失 —— 「回答完毕后插话被丢弃」的主要来源。
+      // 自然结束 = 队列该被继续作答，语义与主 onDone 一致取 auto-send。
+      void flushUnconfirmedInterjections(conversationId, 'auto-send')
       void refreshConversation(conversationId)
     }
 
@@ -984,6 +1229,8 @@ export const useChatStore = defineStore('chat', () => {
       if (replayStatus === 'complete') {
         if (replayDbMessageId) {
           await refreshConversation(conversationId)
+          // 需求 4②：resume 收到 complete（切后台回来时 run 已跑完）也是终态。
+          void flushUnconfirmedInterjections(conversationId, 'auto-send')
           const existing = messages.value[conversationId] || []
           if (!existing.find(m => m.id === replayDbMessageId)) {
             const assistantMessage: Message = {
@@ -1033,9 +1280,16 @@ export const useChatStore = defineStore('chat', () => {
 
   async function tryReconnectOrSync(
     conversationId: string,
-    expectedMessageCount: number,
+    // null = 恢复模式（W3 项1 r2）；流程内（send/regen/edit）传本 flow 的锚。
+    turnAnchor: TurnAnchor | null,
     s: StreamState,
   ) {
+    // 不是"恢复"的对象就别碰：已有一条**健康**活连接在跑时（例如插话兜底
+    // 刚开启的下一 turn）直接交还。否则走到底部的 syncAfterAbort 会用旧 turn
+    // 的追平锚去收尾新 turn —— Phase-1 锚定检查被旧 turn 的
+    // 完成满足，于是把新 turn endStreaming 掉（回答已生成、前端却收不到 = 插话
+    // 又被静默丢弃）。中止过的前任不算健康，照常恢复。
+    if (s.abortController && !s.abortController.signal?.aborted) return
     // Reentrancy guard: the watchdog safety net may fire while an earlier
     // recovery for the same conversation is between retry attempts.
     if (_recoveryInFlight.has(conversationId)) return
@@ -1065,7 +1319,7 @@ export const useChatStore = defineStore('chat', () => {
           await new Promise<void>(resolve => { window.setTimeout(() => resolve(), 1500) })
         }
       }
-      await syncAfterAbort(conversationId, expectedMessageCount, s.content, s.reasoning, true)
+      await syncAfterAbort(conversationId, turnAnchor, s.content, s.reasoning, true)
     } finally {
       _recoveryInFlight.delete(conversationId)
     }
@@ -1170,7 +1424,10 @@ export const useChatStore = defineStore('chat', () => {
     grillingQuestions.value = []
     grillingAnswers.value = {}
     try {
-      const conversation = await chatApi.getConversation(id)
+      const conversation = await chatApi.getConversation(id, { include: 'slim', messageLimit: MESSAGE_PAGE_SIZE })
+      lastFullGetAt[id] = Date.now()
+      hasMoreMessages[id] = !!(conversation as unknown as { has_more_messages?: boolean }).has_more_messages
+      oldestMessageId[id] = (conversation as unknown as { oldest_message_id?: string | null }).oldest_message_id ?? null
       // Cache the fetched conversation metadata independently of the sidebar
       // list: a deep-linked conversation from ANOTHER assistant is (correctly)
       // not injected into the current assistant's list (guard below), but the
@@ -1313,6 +1570,16 @@ export const useChatStore = defineStore('chat', () => {
 
     try {
       const status = await chatApi.getStreamStatus(id)
+      // 上面的存活检查发生在 await **之前**；await 期间本地可能已经有新流接管
+      // （最典型：插话兜底自动发送刚开启下一 turn）。此时 status 看到的正是那条
+      // 本地流的 buffer —— 继续走 resume 的话 abortPredecessor 会把它掐断，
+      // 于是回答生成并落库、前端却收不到（chatllm.log 实证："Client disconnected
+      // during tool loop" + "Final answer already persisted by producer"）= 用户的
+      // 插话被静默丢弃。接管前必须再确认一次。
+      const _liveAfterStatus = streamStates[id]
+      if (_liveAfterStatus?.streaming && _liveAfterStatus.abortController) {
+        return
+      }
       if (status.has_buffer && status.status === 'incomplete' && status.is_running) {
         beginStreaming(id)
         const resumed = await resumeActiveStream(id)
@@ -1321,7 +1588,7 @@ export const useChatStore = defineStore('chat', () => {
           // 干等 30s 看门狗——直接走有界恢复（重试 → 轮询 → 重挂）。
           const s = streamStates[id]
           if (s?.streaming && !s.abortController) {
-            void tryReconnectOrSync(id, (messages.value[id] || []).length + 1, s)
+            void tryReconnectOrSync(id, null, s)
           }
         }
       } else if (status.setup_in_progress) {
@@ -1332,7 +1599,7 @@ export const useChatStore = defineStore('chat', () => {
         // 出现后重挂直播。
         beginStreaming(id)
         const s = streamStates[id]
-        void tryReconnectOrSync(id, (messages.value[id] || []).length + 1, s)
+        void tryReconnectOrSync(id, null, s)
       } else if (status.has_buffer && status.status === 'complete' && status.db_message_id) {
         const existing = messages.value[id] || []
         if (!existing.find(m => m.id === status.db_message_id)) {
@@ -1344,6 +1611,10 @@ export const useChatStore = defineStore('chat', () => {
         if (!hasAssistant && status.content_length > 0) {
           beginStreaming(id)
           await resumeActiveStream(id)
+        } else {
+          // run 已 complete 且不需要重挂 —— 同样是终态，挂着的插话不得搁置
+          // （评审复审 New-2 / A3 残留）。
+          void flushUnconfirmedInterjections(id, 'auto-send')
         }
       }
     } catch {
@@ -1540,6 +1811,12 @@ export const useChatStore = defineStore('chat', () => {
       },
       onDone: (newConvId: string, messageId: string, title?: string, toolResults?: string | null, searchFailed?: boolean, taskSubmitted?: boolean) => {
         touch()
+        // 连接令牌（与 resume 的 onDoneCallback 同一不变量）：迟到的 done 绝不能
+        // 拆掉后继 turn 的流。插话兜底自动发送会立刻开启下一 turn，此时上一 run
+        // 的 done 才到达是常态 —— 无守卫的 endStreaming 会把新 turn 的
+        // abortController 置 null 并连带中止其 SSE（后台日志表现为
+        // "Client disconnected during tool loop"，回答已生成却没人收到 = 静默丢弃）。
+        if (s.abortController !== connection) return
         onFinalize(messageId, title, toolResults, searchFailed, taskSubmitted)
         endStreaming(conversationId)
         if (title) {
@@ -1552,6 +1829,8 @@ export const useChatStore = defineStore('chat', () => {
       },
       onError: (error: string) => {
         touch()
+        // 同上：连接令牌守卫，迟到的 error 不得拆掉后继 turn 的流。
+        if (s.abortController !== connection) return
         currentError.value = error
         endStreaming(conversationId)
         // 插话兜底（A4.9 I3）：run 错误终止时未确认插话绝不随 refresh 静默
@@ -1681,14 +1960,11 @@ export const useChatStore = defineStore('chat', () => {
         // 乐观气泡原地替换为服务器消息（id 来自落库行）。
         const pend = pendingInterjections[conversationId] || []
         const matchIdx = pend.findIndex(p => p.content === payload.content)
-        const head = matchIdx >= 0 ? pend.splice(matchIdx, 1)[0] : undefined
-        const arr = messages.value[conversationId] || []
-        const committed: Message = {
-          id: payload.id || `interject-committed-${Date.now()}`,
-          conversation_id: conversationId,
-          role: 'user',
-          content: payload.content,
-          created_at: payload.created_at || new Date().toISOString(),
+        // 确认后**留在队列里**并标记 committed —— 显示位次恒为「回答最下方的
+        // 队列区」，绝不在流式回答之上插入一条用户气泡（需求 4①）。出队统一
+        // 发生在回答终态的冲刷里。
+        if (matchIdx >= 0) {
+          pend[matchIdx] = { ...pend[matchIdx], committed: true }
         }
         // A4.9 R3 N1：echo 已确认的 commit 行登记入册，dedup 闸门排除之
         // （echo 丢失的行不在册，保持可匹配）。
@@ -1698,14 +1974,6 @@ export const useChatStore = defineStore('chat', () => {
           }
           _echoConfirmedCommittedIds[conversationId].add(payload.id)
         }
-        if (head) {
-          const idx = arr.findIndex(m => m.id === head.localId)
-          if (idx >= 0) {
-            arr.splice(idx, 1, committed)
-            return
-          }
-        }
-        if (!arr.some(m => m.id === committed.id)) arr.push(committed)
       },
       onContextInfo: (info: ContextInfo) => {
         touch()
@@ -2071,7 +2339,9 @@ export const useChatStore = defineStore('chat', () => {
     const abortController = new AbortController()
     const s = getStream(conversationId)
     s.abortController = abortController
-    const expectedMessageCount = messages.value[conversationId].length + 1
+    // 项3：锚定追平（分页感知）。锚=本轮最新持久化消息（严格谓词，合成族
+    // ——含 local-abort 残留气泡——一律跳过）；need=2（用户行+助手行）。
+    const turnAnchor: TurnAnchor = { id: _newestPersistedId(messages.value[conversationId] || []), need: 2 }
 
     const callbacks = wireStreamCallbacks(conversationId, (messageId, _title, toolResults, searchFailed, taskSubmitted) => {
       const finalContent = s.content
@@ -2149,6 +2419,10 @@ export const useChatStore = defineStore('chat', () => {
           if (arr.length && arr[arr.length - 1].id === userMessage.id) {
             messages.value[conversationId] = arr.slice(0, -1)
           }
+          // 请求已经结算（busy 拒绝），controller 却还挂着且未中止 —— 若不清掉，
+          // resume 的活连接接管守卫会把它当成"健康连接"而拒绝重挂（用户文本就
+          // 真的丢了）。这里显式宣告本 flow 的连接已死。
+          if (s.abortController === abortController) s.abortController = null
           const attached = await resumeActiveStream(conversationId)
           if (attached && _busyAttempts < 2) {
             // The attached run has now finished (resume resolves at done) —
@@ -2161,6 +2435,8 @@ export const useChatStore = defineStore('chat', () => {
             if (!attached) {
               currentError.value = '该会话已有正在进行的回答，请稍后重试。'
               endStreaming(conversationId)
+              // 终态：挂着的插话不得静默搁置（回填给用户，由其决定何时重发）。
+              void flushUnconfirmedInterjections(conversationId, 'restore')
             } else {
               // Attached but resend cap exhausted — never drop the user's
               // intent silently; surface it so they can resend manually.
@@ -2179,7 +2455,7 @@ export const useChatStore = defineStore('chat', () => {
       }
 
       if (s.streaming) {
-        await tryReconnectOrSync(conversationId, expectedMessageCount, s)
+        await tryReconnectOrSync(conversationId, turnAnchor, s)
         return
       }
       // Sync temp user-message IDs and any server-side state back into the store
@@ -2197,14 +2473,18 @@ export const useChatStore = defineStore('chat', () => {
         // Watchdog abort = the connection died silently. Prefer reconnecting
         // (resume replays the buffer and continues the live stream); fall back
         // to syncAfterAbort only when resume is impossible.
-        await tryReconnectOrSync(conversationId, expectedMessageCount, s)
+        // 本 flow 的请求已结算：显式清掉 controller，否则恢复链会把它当成
+        // "健康的活连接"而整体放弃（P3）。
+        if (s.abortController === abortController) s.abortController = null
+        await tryReconnectOrSync(conversationId, turnAnchor, s)
         return
       }
       // 非 AbortError（如 TypeError / 网络断连）：
       // 不要立即 endStreaming——visibilitychange handler 会
       // 在 tab 恢复时通过 resume 接管。此处只 fallback 到 sync。
       if (s.streaming) {
-        await tryReconnectOrSync(conversationId, expectedMessageCount, s)
+        if (s.abortController === abortController) s.abortController = null
+        await tryReconnectOrSync(conversationId, turnAnchor, s)
       } else {
         currentError.value = e.message || '发送失败'
         await refreshConversation(conversationId)
@@ -2236,7 +2516,12 @@ export const useChatStore = defineStore('chat', () => {
 
     const abortController = new AbortController()
     s.abortController = abortController
-    const expectedMessageCount = messages.value[convId].length + 1
+    // 项3：锚=截断后最新持久化消息；need=1（assistant-tail 把关：regenerate/编辑重发
+    // 中途旧助手行已删、编辑行原位紧随锚后——锚后助手行落库即追平）。
+    // A4.9 I1：同步 run 边界——preserveSynthetic 等价判重以锚后窗口为界。
+    const _anchorId = _newestPersistedId(messages.value[convId] || [])
+    _runBoundaryMessageIds[convId] = _anchorId
+    const turnAnchor: TurnAnchor = { id: _anchorId, need: 1 }
 
     const callbacks = wireStreamCallbacks(convId, (messageId, _title, toolResults, searchFailed) => {
       const assistantMessage: Message = {
@@ -2292,7 +2577,7 @@ export const useChatStore = defineStore('chat', () => {
         return
       }
       if (s.streaming) {
-        await tryReconnectOrSync(convId, expectedMessageCount, s)
+        await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
     } catch (e: any) {
@@ -2307,7 +2592,7 @@ export const useChatStore = defineStore('chat', () => {
         // Watchdog abort = the connection died silently. Prefer reconnecting
         // (resume replays the buffer and continues the live stream); fall back
         // to syncAfterAbort only when resume is impossible.
-        await tryReconnectOrSync(convId, expectedMessageCount, s)
+        await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
       currentError.value = e.message || '重新生成失败'
@@ -2342,7 +2627,12 @@ export const useChatStore = defineStore('chat', () => {
 
     const abortController = new AbortController()
     s.abortController = abortController
-    const expectedMessageCount = messages.value[convId].length + 1
+    // 项3：锚=截断后最新持久化消息；need=1（assistant-tail 把关：regenerate/编辑重发
+    // 中途旧助手行已删、编辑行原位紧随锚后——锚后助手行落库即追平）。
+    // A4.9 I1：同步 run 边界——preserveSynthetic 等价判重以锚后窗口为界。
+    const _anchorId = _newestPersistedId(messages.value[convId] || [])
+    _runBoundaryMessageIds[convId] = _anchorId
+    const turnAnchor: TurnAnchor = { id: _anchorId, need: 1 }
 
     const callbacks = wireStreamCallbacks(convId, (newMessageId, _title, toolResults) => {
       const assistantMessage: Message = {
@@ -2396,7 +2686,7 @@ export const useChatStore = defineStore('chat', () => {
         return
       }
       if (s.streaming) {
-        await tryReconnectOrSync(convId, expectedMessageCount, s)
+        await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
     } catch (e: any) {
@@ -2411,7 +2701,7 @@ export const useChatStore = defineStore('chat', () => {
         // Watchdog abort = the connection died silently. Prefer reconnecting
         // (resume replays the buffer and continues the live stream); fall back
         // to syncAfterAbort only when resume is impossible.
-        await tryReconnectOrSync(convId, expectedMessageCount, s)
+        await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
       currentError.value = e.message || '重新生成失败'
@@ -2492,7 +2782,12 @@ export const useChatStore = defineStore('chat', () => {
     beginStreaming(convId)
     const abortController = new AbortController()
     s.abortController = abortController
-    const expectedMessageCount = messages.value[convId].length + 1
+    // 项3：锚=截断后最新持久化消息；need=1（assistant-tail 把关：regenerate/编辑重发
+    // 中途旧助手行已删、编辑行原位紧随锚后——锚后助手行落库即追平）。
+    // A4.9 I1：同步 run 边界——preserveSynthetic 等价判重以锚后窗口为界。
+    const _anchorId = _newestPersistedId(messages.value[convId] || [])
+    _runBoundaryMessageIds[convId] = _anchorId
+    const turnAnchor: TurnAnchor = { id: _anchorId, need: 1 }
 
     const callbacks = wireStreamCallbacks(convId, (messageId, _title, toolResults, searchFailed) => {
       const assistantMessage: Message = {
@@ -2573,7 +2868,7 @@ export const useChatStore = defineStore('chat', () => {
         }
       }
       if (s.streaming) {
-        await tryReconnectOrSync(convId, expectedMessageCount, s)
+        await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
     } catch (e: any) {
@@ -2588,7 +2883,7 @@ export const useChatStore = defineStore('chat', () => {
         // Watchdog abort = the connection died silently. Prefer reconnecting
         // (resume replays the buffer and continues the live stream); fall back
         // to syncAfterAbort only when resume is impossible.
-        await tryReconnectOrSync(convId, expectedMessageCount, s)
+        await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
       currentError.value = e.message || '编辑失败'
@@ -2600,23 +2895,20 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   // ── 插话（interjection）───────────────────────────────────────────────
-  /** 移除一条待确认插话及其乐观气泡；返回是否真的移除了（已被 done/stop
-   *  兜底排走的条目返回 false —— 调用方据此避免重复发送，A4.9 I2）。
-   *  移除同时回滚乐观 token 增量（deferred #5）：走此函数的路径都是「消息
-   *  未进入任何 run 上下文」（回退/rate_limited/restore/兜底重发前移除）；
-   *  commit-confirm 路径走 onInterjectionCommitted 的 shift，不经过这里，
-   *  增量正确保留。 */
+  /** 移除一条待确认插话队列条目；返回是否真的移除了（已被 done/stop 兜底
+   *  排走的条目返回 false —— 调用方据此避免重复发送，A4.9 I2）。
+   *  插话不再作为乐观气泡写进 messages（显示位次固定在回答最下方的队列区），
+   *  因此这里只做队列出队。未确认条目顺带回滚乐观 token 增量；已 commit 的
+   *  文本已进 run 上下文，增量是真实的，不回滚。 */
   function _removePendingInterjection(convId: string, localId: string): boolean {
     const pend = pendingInterjections[convId] || []
     const entry = pend.find(p => p.localId === localId)
     const had = !!entry
     if (had) {
       pendingInterjections[convId] = pend.filter(p => p.localId !== localId)
-      removeContextTokenDelta(convId, entry.content)
+      // 已 commit 的文本已经进入 run 上下文，token 增量是真实的，不回滚。
+      if (!entry.committed) removeContextTokenDelta(convId, entry.content)
     }
-    const arr = messages.value[convId] || []
-    const idx = arr.findIndex(m => m.id === localId)
-    if (idx >= 0) arr.splice(idx, 1)
     return had
   }
 
@@ -2624,9 +2916,17 @@ export const useChatStore = defineStore('chat', () => {
   function _drainUnconfirmedInterjections(convId: string): string[] {
     const pend = pendingInterjections[convId] || []
     if (!pend.length) return []
-    const texts = pend.map(p => p.content)
+    // 未确认的才返回给调用方兜底；已 commit 的只出队（run 自己作答，回填或
+    // 重发都会造成重复提问）。
+    const texts = pend.filter(p => !p.committed).map(p => p.content)
     for (const p of [...pend]) _removePendingInterjection(convId, p.localId)
     return texts
+  }
+
+  /** 未确认条目对应的助手绑定（与 _drainUnconfirmedInterjections 同序）。 */
+  function _drainUnconfirmedAssistantIds(convId: string): Array<string | null> {
+    const pend = pendingInterjections[convId] || []
+    return pend.filter(p => !p.committed).map(p => p.assistantId ?? null)
   }
 
   /** 该文本是否已在本轮 run 中 commit（echo 丢失的 resume 场景，A4.9 I4）——
@@ -2653,7 +2953,15 @@ export const useChatStore = defineStore('chat', () => {
       if (tailIdx > boundaryIdx) upperIdx = tailIdx
       // tailIdx 丢失（被刷新重排等）→ 保持全量扫描的旧语义（宁发不丢）
     }
+    // 边界后的**首条 user 行**是本轮自己的 query（sendMessage 的乐观气泡，
+    // 中途 refresh 会换成真实服务器 id）。它不是被 commit 的插话 —— 同文时
+    // 绝不能据此跳过兜底重发，否则用户那句话被静默吞掉（需求 4② 的丢弃源）。
+    let turnQueryIdx = -1
+    for (let i = boundaryIdx + 1; i <= upperIdx; i++) {
+      if (arr[i].role === 'user') { turnQueryIdx = i; break }
+    }
     for (let i = upperIdx; i > boundaryIdx; i--) {
+      if (i === turnQueryIdx) continue
       const m = arr[i]
       if (m.role === 'user' && m.content === text && _isServerMessageId(m.id) &&
           !excludeIds.has(m.id) && !echoConfirmed.has(m.id)) {
@@ -2672,15 +2980,9 @@ export const useChatStore = defineStore('chat', () => {
     if (!convId || !text) return
     const localId = `interject-pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     if (!pendingInterjections[convId]) pendingInterjections[convId] = []
-    pendingInterjections[convId].push({ localId, content: text })
-    if (!messages.value[convId]) messages.value[convId] = []
-    messages.value[convId].push({
-      id: localId,
-      conversation_id: convId,
-      role: 'user',
-      content: text,
-      created_at: new Date().toISOString(),
-    })
+    // assistantId 一并挂在条目上：兜底重发时透传，避免丢助手绑定
+    // （此前只是把硬编码 null 换成一个从未被传入的形参 —— 是死管道）。
+    pendingInterjections[convId].push({ localId, content: text, assistantId: assistantId ?? null })
     addContextTokenDelta(convId, text)
     const res = await chatApi.interjectStream(convId, text)
     if (res.status === 'steered') return
@@ -2705,7 +3007,12 @@ export const useChatStore = defineStore('chat', () => {
   /** done/stop/error 兜底：auto-send = 自然结束竞态，未确认插话自动转为新消息
    *  （已 commit 但 echo 丢失的文本跳过——A4.9 I4 防重复）；restore = 用户主动
    *  停止，文本回填输入框。 */
-  async function flushUnconfirmedInterjections(convId: string, mode: 'auto-send' | 'restore') {
+  async function flushUnconfirmedInterjections(convId: string, mode: 'auto-send' | 'restore', assistantId?: string | null) {
+    const pendAll = pendingInterjections[convId] || []
+    if (!pendAll.length) return
+    // 已 commit 的条目已进 run 上下文并由 chat.py 落库，由 run 自己作答；
+    // 只有未确认的才需要兜底重发 / 回填。两类都出队 —— 队列不得滞留。
+    const assistantIds = _drainUnconfirmedAssistantIds(convId)
     const texts = _drainUnconfirmedInterjections(convId)
     if (!texts.length) return
     if (mode === 'restore') {
@@ -2722,13 +3029,15 @@ export const useChatStore = defineStore('chat', () => {
     const drainTailSnapshot = [...(messages.value[convId] || [])]
       .reverse().find(m => _isServerMessageId(m.id))?.id ?? null
     const matchedIds = new Set<string>()
-    for (const text of texts) {
+    for (let i = 0; i < texts.length; i += 1) {
+      const text = texts[i]
       const hit = _findCommittedInterjection(convId, text, boundarySnapshot, drainTailSnapshot, echoSnapshot, matchedIds)
       if (hit) {
         matchedIds.add(hit)
         continue
       }
-      await sendMessage(text, null, 0, convId)
+      // 显式优先条目上记的助手绑定，其次才是调用方传入的兜底值。
+      await sendMessage(text, assistantIds[i] ?? assistantId ?? null, 0, convId)
     }
   }
 
@@ -2749,15 +3058,39 @@ export const useChatStore = defineStore('chat', () => {
     endStreaming(convId)
     currentError.value = null
     // 停止时仍未确认的插话：run 已被取消，队列不再被消费 —— 文本回填输入框，
-    // 绝不在用户明确停止后隐式开启新 turn。先于 expectedMessageCount 计算
-    // （A4.9 M1：气泡移除会缩短列表，先算会虚高目标计数拖慢 syncAfterAbort）。
+    // 绝不在用户明确停止后隐式开启新 turn。先于锚计算
+    // （A4.9 M1：气泡移除会改变列表，先取锚会被合成气泡干扰）。
     await flushUnconfirmedInterjections(convId, 'restore')
-    const expectedMessageCount = (messages.value[convId] || []).length + 1
+    // minor㉑（A4.9 第四波）：零部分回答（首 token 前停止）时后端 cancel 处理器
+    // 不落库空回答（chat.py 空内容守卫）——syncAfterAbort 的追平目标永不出现，
+    // 白轮询 Phase-1+Phase-2 约 14s。此形态一次 refresh 直收即可。
+    if (!partialContent.trim() && !partialReasoning.trim()) {
+      await refreshConversation(convId)
+      // A4.9 I-A（minors 波评审）：客户端零内容 ≠ 服务端零落库——工具阶段停止时
+      // 服务端 tool_results 累积非空仍会落库（chat.py:3590 谓词含 _stop_tool_results），
+      // 且媒体本地化可超 2s 看守使 commit 晚于本次 refresh。3s 后补一次复查刷新
+      // （epoch/流态守卫：新流接管则不碰）。
+      const epochAtStop = messagesEpoch[convId] || 0
+      window.setTimeout(() => {
+        if ((messagesEpoch[convId] || 0) !== epochAtStop) return
+        if (streamStates[convId]?.streaming) return
+        void refreshConversation(convId)
+      }, 3000)
+      return
+    }
+    // 项3：锚=当前最新服务器消息（被停轮的用户行通常已落库或被合成）；need=1
+    // （cancel 处理器落库的部分回答）。若本轮用户气泡仍是合成 id，锚会自动
+    // 回退到上一条服务器消息——锚后需出现 U'+A' 两条，need=1 依旧正确
+    // （尾部持久化须为 assistant）。
+    const turnAnchor: TurnAnchor = {
+      id: _newestPersistedId(messages.value[convId] || []),
+      need: 1,
+    }
     // The backend persists the partial reply in the cancel handler — poll the
     // conversation so the partial assistant bubble appears without a manual
     // reload (the deliberate stop does not go through the onError recovery
     // path that normally triggers syncAfterAbort).
-    await syncAfterAbort(convId, expectedMessageCount, partialContent, partialReasoning)
+    await syncAfterAbort(convId, turnAnchor, partialContent, partialReasoning)
   }
 
   function resetState() {
@@ -2842,7 +3175,7 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     try {
-      const conversation = await chatApi.getConversation(convId)
+      const conversation = await chatApi.getConversation(convId, { include: 'slim' })
       conv.deathmatch_mode = conversation.deathmatch_mode
       conv.deathmatch_status = conversation.deathmatch_status
       conv.deathmatch_goal = conversation.deathmatch_goal
@@ -2932,6 +3265,7 @@ export const useChatStore = defineStore('chat', () => {
     streamingTaskProgress,
     isStreaming,
     activeStreamingConversationIds,
+    pendingInterjections,
     interjectionRestoreText,
     currentError,
     currentMessages,
@@ -2976,6 +3310,10 @@ export const useChatStore = defineStore('chat', () => {
     loadConversations,
     createConversation,
     selectConversation,
+    ensureMessageFull,
+    ensureFullPayloads,
+    loadOlderMessages,
+    hasMoreMessages,
     deleteConversation,
     removeConversationFromList,
     bulkDeleteConversations,

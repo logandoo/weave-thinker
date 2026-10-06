@@ -1,0 +1,58 @@
+/* Copyright (c) 2026 Weave Thinker Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* 笔记编辑工具栏说明浮层 —— 笔记模式（.editor-toolbar）与工作台模式（.zen-note-toolbar）
+ * 共用。悬停 1s 后显示（用户指定间隔），移开即隐。
+ *
+ * 取代原生 title 提示：原生延时由浏览器决定不可配置。title 已在工具栏按钮上换为
+ * data-tip + aria-label（无障碍保留）。
+ *
+ * 定位：fixed + CSS 变量（useToolbarTip 注入 --tip-x/--tip-y）—— 滚动工具栏
+ * （overflow-x:auto）内 absolute 会被裁剪，浮层不可见（A4.9 H2 实测）。
+ */
+.editor-toolbar button[data-tip],
+.zen-note-toolbar button[data-tip],
+.find-replace-bar button[data-tip] {
+  position: relative;
+}
+
+.editor-toolbar button[data-tip]::after,
+.zen-note-toolbar button[data-tip]::after,
+.find-replace-bar button[data-tip]::after {
+  content: attr(data-tip);
+  position: fixed;
+  left: var(--tip-x, 0px);
+  top: var(--tip-y, 0px);
+  transform: translateX(-50%);
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(30, 30, 30, 0.92);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease, visibility 0.12s ease;
+  transition-delay: 0s;
+  z-index: 10050;
+}
+
+.editor-toolbar button[data-tip]:hover::after,
+.zen-note-toolbar button[data-tip]:hover::after,
+.find-replace-bar button[data-tip]:hover::after {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 1s; /* 用户指定：悬停 1s 后展示说明 */
+}
+
+/* 键盘聚焦同样给出说明（无障碍） */
+.editor-toolbar button[data-tip]:focus-visible::after,
+.zen-note-toolbar button[data-tip]:focus-visible::after,
+.find-replace-bar button[data-tip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 1s;
+}

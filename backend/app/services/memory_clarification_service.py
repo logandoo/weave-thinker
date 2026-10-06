@@ -151,10 +151,13 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
 
     if ctype == "negate":
         for cid in affected_ids:
-            await db.execute(
-                text("UPDATE memory_concepts SET valid_to = NOW(), weight = 0, updated_at = NOW() WHERE id = :id AND user_id = :uid"),
-                {"id": cid, "uid": user_id},
-            )
+            concept = await db.get(MemoryConcept, cid)
+            if not concept or concept.user_id != user_id:
+                continue
+            # 同步发射侧契约：ORM 变更触发捕获（text() UPDATE 零事件为已修缺口）。
+            concept.valid_to = datetime.utcnow()
+            concept.weight = 0
+            concept.updated_at = datetime.utcnow()
 
     elif ctype == "refine":
         new_desc = parsed.get("new_description", "")
@@ -195,7 +198,8 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
                 continue
             await db.execute(text("DELETE FROM concept_cluster_members WHERE concept_id = :id"), {"id": cid})
             await db.execute(text("DELETE FROM concept_relations WHERE source_id = :id OR target_id = :id"), {"id": cid})
-            await db.execute(text("DELETE FROM memory_concepts WHERE id = :id AND user_id = :uid"), {"id": cid, "uid": user_id})
+            # 同步发射侧契约：同步域表 ORM 删除（事件+tombstone）；junction 表 text() 保持。
+            await db.delete(concept)
 
 
 async def get_recent_clarifications(db: AsyncSession, user_id: str, days: int = 3) -> list[dict]:

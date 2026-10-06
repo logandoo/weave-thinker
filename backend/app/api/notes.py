@@ -4,6 +4,7 @@
 import asyncio
 import csv
 import io
+import html as html_lib
 import re
 import os
 import mimetypes
@@ -14,6 +15,8 @@ import base64
 from pathlib import Path
 from urllib.parse import quote, urlparse, unquote
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +24,7 @@ from sqlalchemy import select, desc, func
 from typing import List
 
 from app.db.database import get_db, User, Notebook, Note
+from app.services.playwright_thread import pw_ephemeral, pw_thread
 from app.services.workspace_service import ensure_user_workspace
 from app.schemas.notes import (
     NotebookCreate,
@@ -54,6 +58,125 @@ logger = logging.getLogger(__name__)
 # flattens nested lists with 3-space indentation (GFM/CommonMark standard),
 # while markdown-it-py handles them correctly – matching the frontend (marked.js).
 _md_it = _MarkdownIt("commonmark", {"html": True}).enable("table")
+
+# ===== 尾注（endnote）导出渲染（wave-2 A3）=====
+# 前端尾注语法 [^id] / [^id]: 在导出面同样渲染为角标〔N〕+ 文末定义段，
+# 口径与 frontend/src/composables/useMarkdown.ts preprocessEndnoteSyntax 对齐：
+# 定义行抽取（围栏内除外）· 引用首次出现序编号 · 正文行内渲染保格式（禁 textContent）。
+_ENDNOTE_REF_RE = re.compile(r"\[\^([^\]\s]+)\]")
+_ENDNOTE_DEF_LINE_RE = re.compile(r"^\[\^([^\]\s]+)\]:[ \t]?(.*)$")
+_ENDNOTE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _extract_endnotes(md: str) -> tuple[str, list[tuple[str, int, str]]]:
+    """抽取 [^id]: 定义行，把 [^id] 引用换成角标 HTML。返回 (markdown, [(id, num, body)])。"""
+    defs: list[tuple[str, str]] = []
+    kept: list[str] = []
+    in_fence = False
+    for line in md.split("\n"):
+        if _ENDNOTE_FENCE_RE.match(line):
+            in_fence = not in_fence
+        if not in_fence:
+            m = _ENDNOTE_DEF_LINE_RE.match(line)
+            if m:
+                defs.append((m.group(1), m.group(2)))
+                continue
+        kept.append(line)
+    text = "\n".join(kept)
+
+    # 围栏掩码：代码块内的字面 [^id] 不是引用（与前端同口径）
+    masks: list[str] = []
+
+    def _mask(seg: str) -> str:
+        masks.append(seg)
+        return f"\u0000EN{len(masks) - 1}\u0000"
+
+    # 以行为粒度整体掩码围栏段（含未闭合流式中途态）
+    text_lines = text.split("\n")
+    out_lines: list[str] = []
+    buf: list[str] = []
+    fence_open: str | None = None
+    for line in text_lines:
+        fm = _ENDNOTE_FENCE_RE.match(line)
+        if fence_open is None and fm:
+            fence_open = fm.group(1)
+            buf.append(line)
+        elif fence_open is not None:
+            buf.append(line)
+            if fm and fm.group(1) == fence_open:
+                out_lines.append(_mask("\n".join(buf)))
+                buf = []
+                fence_open = None
+        else:
+            out_lines.append(line)
+    if buf:
+        out_lines.append(_mask("\n".join(buf)))
+    text = "\n".join(out_lines)
+
+    order: list[str] = []
+    for m in _ENDNOTE_REF_RE.finditer(text):
+        if m.group(1) not in order:
+            order.append(m.group(1))
+    # 嵌套引用（定义正文内的 [^x]）参与编号——与前端 preprocessEndnoteSyntax 同口径（wave-3 #4）
+    for _did, body in defs:
+        for m in _ENDNOTE_REF_RE.finditer(body):
+            if m.group(1) not in order:
+                order.append(m.group(1))
+    for did, _body in defs:
+        if did not in order:
+            order.append(did)
+    num_by_id = {k: i + 1 for i, k in enumerate(order)}
+
+    seen_ref_ids: set[str] = set()
+
+    def _ref_sub(m: re.Match) -> str:
+        i = m.group(1)
+        e = html_lib.escape(i, quote=True)
+        n = num_by_id.get(i, 0)
+        # 首次出现的引用带 id（回跳锚目标）；重复引用不重复 id（复审 A#2/A#13）
+        id_attr = ""
+        if i not in seen_ref_ids:
+            seen_ref_ids.add(i)
+            id_attr = f' id="note-endnote-ref-{e}"'
+        return (
+            f'<sup class="note-endnote-ref"{id_attr} data-endnote-id="{e}" data-endnote-num="{n}">'
+            f'<a href="#note-endnote-def-{e}">〔{n}〕</a></sup>'
+        )
+
+    text = _ENDNOTE_REF_RE.sub(_ref_sub, text)
+    text = re.sub(r"\u0000EN(\d+)\u0000", lambda m: masks[int(m.group(1))], text)
+    return text, [(d, num_by_id[d], b) for d, b in defs]
+
+
+def _render_endnote_defs(defs: list[tuple[str, int, str]], num_by_id: dict[str, int] | None = None) -> str:
+    """文末定义段 HTML —— 正文走行内渲染保格式。"""
+    parts: list[str] = []
+    seen_def_ids: set[str] = set()
+    for did, n, body in defs:
+        # 正文内嵌套 [^x] 转角标（与前端同构，wave-3 #4）
+        def _nested_ref(m: re.Match) -> str:
+            i = m.group(1)
+            e = html_lib.escape(i, quote=True)
+            n = (num_by_id or {}).get(i, 0)
+            return (
+                f'<sup class="note-endnote-ref" data-endnote-id="{e}"'
+                f' data-endnote-num="{n}">〔{n or "?"}〕</sup>'
+            )
+        body = _ENDNOTE_REF_RE.sub(_nested_ref, body)
+        body_html = _md_it.renderInline(body).strip() if body.strip() else ""
+        e = html_lib.escape(did, quote=True)
+        id_attr = ""
+        if did not in seen_def_ids:
+            seen_def_ids.add(did)
+            id_attr = f' id="note-endnote-def-{e}"'
+        parts.append(
+            f'<p class="note-endnote-def"{id_attr} data-endnote-id="{e}"'
+            f' data-endnote-num="{n}">'
+            f'<a class="note-endnote-back" href="#note-endnote-ref-{e}">〔{n}〕</a>'
+            f'{" " + body_html if body_html else ""}</p>'
+        )
+    return "\n".join(parts)
+
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
 
@@ -1113,6 +1236,7 @@ def _normalize_echarts_option(raw: str) -> str:
         return raw
 
 
+@pw_thread
 def _batch_render_echarts_svg(
     entries: list[tuple[str, str]],
 ) -> dict[str, str]:
@@ -1233,6 +1357,7 @@ MathJax = {
 """
 
 
+@pw_thread
 def _batch_render_mermaid_and_math(
     mermaid_entries: list[tuple[str, str]],
     math_entries: list[tuple[str, str, bool]],
@@ -1658,9 +1783,36 @@ def _clean_mathjax_svg(svg: str) -> str:
     return s
 
 
+def _decode_math_pua(latex: str) -> str:
+    """还原前端 serializeMathDelimited 的数学闭符编码（2026-10-04 往返波）。
+
+    编码=闭合标签制：\uE0FF + tag（0=字面 \uE0FF · 1=\\) · 2=\\] · 3=行首 ] ·
+    4=\n · 5=\r），转义先行故任意输入恒等（与前端 decodeMathClosers 同表同法）。
+    导出层读原始 markdown，必须同点解码，否则 MathJax 收到的源与前端 KaTeX 不同。
+    """
+    mapping = {
+        '0': '\uE0FF', '1': '\\)', '2': '\\]', '3': ']', '4': '\n', '5': '\r',
+    }
+    out = []
+    i = 0
+    while i < len(latex):
+        if latex[i] == '\uE0FF' and i + 1 < len(latex):
+            rep = mapping.get(latex[i + 1])
+            if rep is not None:
+                out.append(rep)
+                i += 2
+                continue
+        out.append(latex[i])
+        i += 1
+    return ''.join(out)
+
+
+@pw_ephemeral
 def _render_math_with_mathjax(latex: str, display: bool) -> str | None:
     """Render LaTeX via Playwright + MathJax CDN (SVG output).
-    Returns self-contained SVG string or None."""
+    Returns self-contained SVG string or None.
+    A4.9 wave2：自带 `with sync_playwright()` 会话 → 一次性线程（与池化会话
+    不得同线程，见 playwright_thread.run_ephemeral）。"""
     latex = _preprocess_latex_for_mathjax(latex)
     html_path = None
     try:
@@ -1731,6 +1883,7 @@ try {{
                 pass
 
 
+@pw_thread
 def _batch_render_math_with_mathjax(
     formulas: list[tuple[str, str, bool]]
 ) -> dict[str, str]:
@@ -1839,7 +1992,7 @@ renderAll();
 
 
 
-def _markdown_to_html_with_mermaid(content: str) -> str:
+def _markdown_to_html_with_mermaid(content: str, endnote_enabled: bool = True) -> str:
     """Convert Markdown to HTML with Mermaid diagrams + LaTeX math.
 
     Strategy: replace Mermaid code fences, fenced code blocks, inline code
@@ -1897,11 +2050,13 @@ def _markdown_to_html_with_mermaid(content: str) -> str:
     # parser unchanged and are restored as valid HTML afterwards.
 
     def replace_code_fence(match: re.Match) -> str:
-        body = match.group(0)
-        # Strip the leading ```lang and trailing ```
-        m = re.match(r'```(\w+)?\n?([\s\S]*?)```\s*$', body)
-        lang = (m.group(1) if m else "") or ""
-        code = (m.group(2) if m else body) or ""
+        # 围栏长度感知（2026-10-03）：前端 buildCodeFence 对内嵌 ``` 的代码发
+        # 4+ 反引号围栏（GFM）；此处以 backreference 等长闭合，content=围栏行
+        # 之间各行以 \n 连接（与 marked 往返语义一致，首尾空行保真）。
+        # info 串取首 token（与 marked 一致；"```js title=x" → lang=js）
+        _info = (match.group(2) or "").strip()
+        lang = _info.split()[0] if _info else ""
+        code = match.group(3) or ""
         lang_attr = f' class="language-{_html_escape(lang)}"' if lang else ""
         html_block = (
             f'<pre><code{lang_attr}>{_html_escape(code)}</code></pre>'
@@ -1912,7 +2067,7 @@ def _markdown_to_html_with_mermaid(content: str) -> str:
         # placeholder as a block-level element rather than wrapping it in <p>.
         return f"\n\n{key}\n\n"
 
-    content = re.sub(r'```[\s\S]*?```', replace_code_fence, content)
+    content = re.sub(r'(`{3,})([^`\n]*)\n([\s\S]*?)\n\1', replace_code_fence, content)
 
     def replace_inline_code(match: re.Match) -> str:
         body = match.group(0)[1:-1]  # strip surrounding backticks
@@ -1934,6 +2089,8 @@ def _markdown_to_html_with_mermaid(content: str) -> str:
     mathjax_batch: list[tuple[str, str, bool]] = []
 
     def _try_math_render(latex: str, display: bool, key: str) -> None:
+        # PUA 解码单点（fallback 与 batch 两路共用此漏斗；解码幂等性不成立故只此一处）
+        latex = _decode_math_pua(latex)
         mathjax_batch.append((key, latex, display))
         placeholders[key] = _render_math_fallback_html(latex, display=display)
 
@@ -2005,6 +2162,8 @@ def _markdown_to_html_with_mermaid(content: str) -> str:
     # 2. Convert the (now placeholder-only) Markdown to HTML.
     # Use markdown-it-py (CommonMark) which handles nested lists with
     # 3-space indentation correctly – matching the frontend (marked.js).
+    # 尾注（wave-2 A3）：[^id]/[^id]: 抽取为角标 + 文末定义段（同前端口径）。
+    content, _endnote_defs = _extract_endnotes(content) if endnote_enabled else (content, [])
     html = _md_it.render(content)
 
     # 3. Restore the rendered SVG / code in place of each placeholder. Strip
@@ -2013,6 +2172,15 @@ def _markdown_to_html_with_mermaid(content: str) -> str:
     for key, rendered in placeholders.items():
         html = html.replace(f"<p>{key}</p>", rendered)
         html = html.replace(key, rendered)
+
+    if _endnote_defs:
+        _endnote_num_map = {d[0]: d[1] for d in _endnote_defs}
+        defs_html = _render_endnote_defs(_endnote_defs, _endnote_num_map)
+        # 定义段同样过占位符还原（复审 A#1）：正文含行内代码/数学时
+        # 不得把 ZZZPDFPLACEHOLDER… 原样漏进导出
+        for key, rendered in placeholders.items():
+            defs_html = defs_html.replace(f"<p>{key}</p>", rendered).replace(key, rendered)
+        html += defs_html
 
     return html
 
@@ -2151,7 +2319,7 @@ def _build_note_md(note, workspace_root: str | None = None) -> str:
     return "\n".join(parts)
 
 
-def _render_note_pdf(note, workspace_root: str | None = None) -> bytes:
+def _render_note_pdf(note, workspace_root: str | None = None, endnote_enabled: bool = True) -> bytes:
     """Render a single note to PDF bytes via Markdown → HTML (with Mermaid) → WeasyPrint."""
     from weasyprint import HTML, CSS
     from app.services.pdf_fonts import get_font_config_and_css
@@ -2161,7 +2329,7 @@ def _render_note_pdf(note, workspace_root: str | None = None) -> bytes:
     content = _strip_media_tags(content)
     if workspace_root:
         content = _materialize_note_images(content, workspace_root)
-    html_body = _markdown_to_html_with_mermaid(content)
+    html_body = _markdown_to_html_with_mermaid(content, endnote_enabled=endnote_enabled)
     html_body = _ensure_heading_ids(html_body)
     title_html = (
         f'<h1 id="_note_title">{note.title}</h1>' if note.title else ""
@@ -2404,6 +2572,8 @@ async def update_notebook(
         raise HTTPException(status_code=404, detail="Notebook not found")
 
     notebook.name = notebook_data.name
+    # 同步发射侧契约：无条件赋值（同值重存亦照发事件跳 onupdate）——必 bump（I-1）。
+    notebook.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(notebook)
 
@@ -2432,6 +2602,9 @@ async def set_default_notebook(
         current_default.is_default = False
 
     notebook.is_default = True
+    # 同步发射侧契约：目标已是默认时全程净零变更仍照发事件跳 onupdate（复审 A/B
+    # 合并裁定）——必 bump；被降级的其余默认行走净变更 onupdate，无需处理。
+    notebook.updated_at = datetime.utcnow()
 
     await db.commit()
     await db.refresh(notebook)
@@ -2443,6 +2616,7 @@ async def set_default_notebook(
 @router.get("/notebooks/{notebook_id}/export")
 async def export_notebook(
     notebook_id: str,
+    endnote_enabled: bool = True,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -2572,7 +2746,7 @@ async def bulk_export_notes(
             items.append((safe_name, "md", content.encode("utf-8")))
         else:
             try:
-                pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root)
+                pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root, endnote_enabled)
             except Exception:
                 logger.exception("PDF rendering failed for note %s", note.id)
                 pdf_bytes = b""
@@ -2599,6 +2773,7 @@ async def bulk_export_notes(
 async def export_note(
     note_id: str,
     format: str = "md",
+    endnote_enabled: bool = True,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -2634,7 +2809,7 @@ async def export_note(
         )
     else:
         try:
-            pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root)
+            pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root, endnote_enabled)
         except Exception:
             logger.exception("PDF rendering failed")
             raise HTTPException(status_code=500, detail="PDF rendering failed")
@@ -2751,10 +2926,17 @@ async def update_note(
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
+    touched = False
     if note_data.title is not None:
         note.title = note_data.title
+        touched = True
     if note_data.content is not None:
         note.content = note_data.content
+        touched = True
+    if touched:
+        # 同步发射侧契约：同值赋值照发事件但跳 onupdate，payload 带旧 ts → LWW 等值
+        # STALE（事故①，复审 I-1 清单）；有赋值必显式 bump。
+        note.updated_at = datetime.utcnow()
 
     await db.commit()
     await db.refresh(note)
@@ -2889,6 +3071,8 @@ async def move_note(
         raise HTTPException(status_code=404, detail="Target notebook not found")
 
     note.notebook_id = target_notebook.id
+    # 同步发射侧契约：move 无条件赋值——必 bump（I-1）。
+    note.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(note)
 
@@ -2929,6 +3113,8 @@ async def bulk_move_notes(
 
     for note in notes:
         note.notebook_id = target_notebook.id
+        # 同步发射侧契约：同值移动亦照发事件跳 onupdate——逐行 bump（I-1）。
+        note.updated_at = datetime.utcnow()
 
     await db.commit()
     return BulkMoveResponse(status="ok", moved_count=len(notes))

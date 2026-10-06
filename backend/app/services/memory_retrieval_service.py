@@ -167,6 +167,14 @@ async def _retrieve_with_meta_inner(
             return ctx, [], 0.0
     candidates = await _stage1_bm25_search(db, user_id, stage0, cold_start)
 
+    # P2 策略路由（entity_dense/narrative）：Stage2 关系扩展参数按档覆盖
+    _profile = select_retrieval_profile(query_text, stage0, config.memory_retrieval)
+    _profile_params = strategy_profile_params(_profile, config.memory_retrieval) if _profile != "default" else {}
+
+    # P1-② 两模态排名快照（lex=Stage1 序，dense=Stage3 序；一致性加权只吃快照）
+    for _i, _c in enumerate(candidates):
+        _c.metadata["lex_rank"] = _i
+
     concept_candidates = [c for c in candidates if c.tier == "concept"]
     epi_candidates = [c for c in candidates if c.tier == "episodic"]
     sub_candidates = [c for c in candidates if c.tier == "subconscious"]
@@ -174,6 +182,7 @@ async def _retrieve_with_meta_inner(
     if concept_candidates:
         concept_candidates = await _stage2_description_expansion(
             db, user_id, concept_candidates, stage0, query_text,
+            param_overrides=_profile_params,
         )
 
     # WFM（2609.18182）残余闭环：unit→concept 链接召回（file 记忆条目沿
@@ -186,6 +195,10 @@ async def _retrieve_with_meta_inner(
         candidates = await _stage3_embedding_rerank(
             db, user_id, query_text, concept_candidates, epi_candidates, sub_candidates, stage0,
         )
+        # P1-② dense 排名快照（Stage3 成功序=向量侧序；失败降级路径不快照——
+        # 拼接序不是向量序，A4.9 wave2 Minor）
+        for _i, _c in enumerate(candidates):
+            _c.metadata["dense_rank"] = _i
     except Exception:
         logger.exception("Stage 3 failed, falling back to BM25")
         candidates = concept_candidates + epi_candidates + sub_candidates
@@ -194,6 +207,15 @@ async def _retrieve_with_meta_inner(
         candidates = await _stage4_rerank(candidates, query_text, user_id=user_id, db=db, cold_start=cold_start)
     except Exception:
         logger.exception("Stage 4 failed")
+
+    # P1-②（MLSys'26 §3.2）：只对验证过证据（近期被采纳概念）做图-密集一致性加权
+    if config.memory_retrieval.get("consistency_enabled", True):
+        try:
+            from app.services.memory_adoption_service import adopted_concepts_recent
+            apply_cross_modal_consistency(
+                candidates, verified_ids=adopted_concepts_recent())
+        except Exception:
+            logger.debug("cross-modal consistency failed (fail-open)", exc_info=True)
 
     final_candidates = _composite_score_by_tier(candidates, stage0)
     # D2（默认关）：文本路径跨轮去重（上一轮注入 id 本轮不重复）
@@ -981,14 +1003,16 @@ async def _get_subconscious_detail(db: AsyncSession, unit_id: str) -> dict | Non
 
 async def _stage2_description_expansion(
     db: AsyncSession, user_id: str, candidates: list[RetrievalCandidate],
-    stage0: Stage0Result, query_text: str,
+    stage0: Stage0Result, query_text: str, param_overrides: dict | None = None,
 ) -> list[RetrievalCandidate]:
     from app.services.memory_bm25 import get_desc_index
     from app.services.memory_cluster_service import (
         get_clusters_for_concepts, get_neighbors, edge_read_whitelist,
     )
 
-    ret_cfg = config.memory_retrieval
+    # P2 策略路由：profile 参数覆盖（entity_dense/narrative，见 select_retrieval_profile）
+    ret_cfg = dict(config.memory_retrieval or {})
+    ret_cfg.update(param_overrides or {})
     query_str = " ".join(stage0.keywords)
 
     try:
@@ -1504,6 +1528,107 @@ def _cand_abs_score(c) -> float:
     if cal is not None:
         return float(cal)
     return float(c.score) if c.score <= 1.0 else 0.5
+
+
+def _cand_field(c, key, default=None):
+    """候选字段取值（RetrievalCandidate 对象或 dict 双形态——纯函数单测用 dict）。"""
+    if isinstance(c, dict):
+        return c.get(key, default)
+    return getattr(c, key, default)
+
+
+def apply_cross_modal_consistency(
+    candidates, *, verified_ids, bonus: float = 0.05, damp: float = 0.03,
+    rank_gap: int = 4,
+) -> None:
+    """P1-② Graph×Dense 一致性加权（MLSys'26 §3.2 落地，2026-10-04）。
+
+    论文核心约束：只对**验证过**（历史被引用/采纳）的证据做两模态对齐，全量对齐
+    成本违例且易放大噪声。此处以 Stage1（lex_rank，词法/BM25 序）与 Stage3
+    （dense_rank，向量重排序）的排名快照为两模态信号：
+    - 两模态都靠前（各 ≤3）→ 一致 → +bonus；
+    - 排名悬殊（|差| ≥ rank_gap）→ 分歧 → −damp（下限 0）；
+    - 其余（含无排名快照、非 verified）→ 零改动。
+
+    A4.9 wave2 Critical 修正：增量**镜像进 metadata["calibrated_score"]**——
+    `_composite_score_by_tier` 以 calibrated_score 重算终分（对 c.score 的改动
+    会被覆盖=死代码），calibrated 才是终分的真实输入（gate 的 max(sim,cal)
+    同步受益/受抑，与论文"对齐调整置信"一致）。
+    """
+    if not verified_ids:
+        return
+    for c in candidates:
+        if _cand_field(c, "id") not in verified_ids:
+            continue
+        meta = _cand_field(c, "metadata") or {}
+        lex = meta.get("lex_rank")
+        dense = meta.get("dense_rank")
+        if lex is None or dense is None:
+            continue
+        old_score = float(_cand_field(c, "score", 0.0))
+        if lex <= 3 and dense <= 3:
+            new_score = old_score + bonus
+        elif abs(int(lex) - int(dense)) >= rank_gap:
+            new_score = max(0.0, old_score - damp)
+        else:
+            continue
+        delta = new_score - old_score
+        if isinstance(c, dict):
+            c["score"] = new_score
+        else:
+            c.score = new_score
+        cal = meta.get("calibrated_score")
+        if cal is not None:
+            try:
+                meta["calibrated_score"] = min(1.0, max(0.0, float(cal) + delta))
+            except (TypeError, ValueError):
+                pass
+
+
+def select_retrieval_profile(query_text: str, stage0, cfg: dict) -> str:
+    """P2 配置级策略路由（MLSys'26 §3.4 降级方案，2026-10-04）。
+
+    按查询特征档切换检索参数（先 if 规则，bandit 缓议——评估文档 §3.4）：
+    - `"entity_dense"`：关键词密度高（≥0.4）→ 关系扩展加深（预算/衰减抬）；
+    - `"narrative"`：叙事/稀疏关键词 → 关系扩展收紧、词法权重抬；
+    - `"default"`：`strategy_route_enabled` 未开（**默认关**，house style，
+      ADR D-q8）→ 零行为变化。显式开启=授权 profile 参数覆盖同名 stage2 配置
+      （可用 `[memory.retrieval.strategy.<profile>]` 自定义各档）。
+    """
+    if not (cfg or {}).get("strategy_route_enabled", False):
+        return "default"
+    try:
+        import jieba  # type: ignore
+        tokens = [t for t in jieba.lcut(query_text or "") if t.strip()]
+    except Exception:
+        tokens = re.findall(r"[\u4e00-\u9fff]|[a-zA-Z0-9]+", query_text or "")
+    approx = max(1, len(tokens))
+    keywords = list(getattr(stage0, "keywords", None) or [])
+    density = len(keywords) / approx
+    return "entity_dense" if density >= 0.4 else "narrative"
+
+
+STRATEGY_PROFILE_DEFAULTS: dict = {
+    # rho/AGPR 维持 opt-in（不动热路径既有行为）；两档差在关系扩展预算与衰减
+    # （entity_dense 深于代码默认=narrative 收紧），路由开启即覆盖同名 stage2 配置。
+    "entity_dense": {
+        "stage2_relation_max_new": 12,
+        "stage2_relation_score_decay": 0.65,
+    },
+    "narrative": {
+        "stage2_relation_max_new": 5,
+        "stage2_relation_score_decay": 0.4,
+    },
+}
+
+
+def strategy_profile_params(profile: str, cfg: dict) -> dict:
+    """profile → 参数覆盖（cfg `[memory.retrieval.strategy.<profile>]` 覆盖内置）。"""
+    base = dict(STRATEGY_PROFILE_DEFAULTS.get(profile, {}))
+    user = ((cfg or {}).get("strategy") or {}).get(profile)
+    if isinstance(user, dict):
+        base.update(user)
+    return base
 
 
 def _cand_gate_score(c) -> float:

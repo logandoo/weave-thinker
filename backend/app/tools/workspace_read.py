@@ -141,6 +141,25 @@ async def workspace_read(args: Dict[str, Any], **kwargs) -> str:
     except (ValueError, TypeError):
         limit = _DEFAULT_LIMIT_LINES
 
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+        # P3/B4：图像内联回传（模型原生判图 / mm_probe 通路）。
+        from app.services.tool_image_results import (
+            build_image_envelope_from_file,
+            inline_images_enabled,
+        )
+        if inline_images_enabled():
+            envelope = build_image_envelope_from_file(
+                resolved, f"[workspace_read] 图像 {name}（{ext}）已内联返回，可直接判读。",
+            )
+            if envelope is not None:
+                return envelope
+        return json.dumps(
+            {"name": name, "path": resolved, "type": ext, "success": True,
+             "note": "图像未内联（超过内联上限或 inline_tool_images 关闭）。"
+                     "如需判读请使用 vision_interpret 工具。"},
+            ensure_ascii=False,
+        )
+
     if ext in (".docx", ".doc"):
         result = _read_docx_file(resolved)
     else:

@@ -654,6 +654,77 @@ $$"""),
     ("conversations_deathmatch_no_progress_replans", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_no_progress_replans INTEGER DEFAULT 0"),
     # AEWM 借鉴波（2026-09-25）：证伪台账（anti task-state contamination）
     ("conversations_deathmatch_retracted_claims", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_retracted_claims JSONB"),
+    # conv-open 性能治理 P1-1（2026-10-03）：超限 tool_results/reasoning_content/
+    # tool_calls 全文外置（DESIGN_conv_open_performance.md），行内留显式 stub。
+    ("message_payloads_v1", (
+        "CREATE TABLE IF NOT EXISTS message_payloads ("
+        "id VARCHAR(36) PRIMARY KEY, "
+        "message_id VARCHAR(36) NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
+        "field VARCHAR(32) NOT NULL, "
+        "content TEXT NOT NULL, "
+        "size_bytes INTEGER NOT NULL DEFAULT 0, "
+        "sha256 VARCHAR(64) NOT NULL, "
+        "created_at TIMESTAMP WITHOUT TIME ZONE)"
+    )),
+    ("idx_message_payloads_message", "CREATE INDEX IF NOT EXISTS idx_message_payloads_message ON message_payloads(message_id, field)"),
+    # 评审 C1 修复（2026-10-03）：per-(message_id,field) 归属唯一，弃 sha 全局去重
+    # （共享行 + CASCADE = 删一消息毁他消息的静默数据丢失）。
+    ("idx_message_payloads_sha", "CREATE INDEX IF NOT EXISTS idx_message_payloads_sha ON message_payloads(sha256)"),
+    ("message_payloads_v2_uniq", (
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='message_payloads_sha256_key') THEN "
+        "ALTER TABLE message_payloads DROP CONSTRAINT message_payloads_sha256_key; END IF; "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='uq_message_payloads_msg_field') THEN "
+        "ALTER TABLE message_payloads ADD CONSTRAINT uq_message_payloads_msg_field UNIQUE (message_id, field); END IF; "
+        "END $$"
+    )),
+    # v3（2026-10-05）：v2 只卸了 CONSTRAINT 形态；v1 窗口期由 create_all 建的库
+    # 携带的是 UNIQUE INDEX 形态 ix_message_payloads_sha256——残留会导致两条字节
+    # 相同的肥字段外置时 IntegrityError（写路径 500）。卸唯一索引并按模型
+    # index=True 语义重建为普通索引（asyncpg 单语句限制：两条迁移分开执行）。
+    ("message_payloads_v3_sha_idx_drop", (
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='ix_message_payloads_sha256' "
+        "AND indexdef ILIKE 'CREATE UNIQUE%') THEN "
+        "DROP INDEX ix_message_payloads_sha256; END IF; END $$"
+    )),
+    ("message_payloads_v3_sha_idx_recreate",
+     "CREATE INDEX IF NOT EXISTS ix_message_payloads_sha256 ON message_payloads(sha256)"),
+    # 渐进落库（2026-10-06，conv ae9aa092）：run 开始即建 assistant 行
+    # （delivery_status='streaming'），周期刷写正文；进程死亡 → 启动 sweep 翻
+    # 'interrupted'；正常 finalize/用户 stop → 'final'。
+    ("messages_delivery_status",
+     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(16) NOT NULL DEFAULT 'final'"),
+    ("idx_messages_delivery_status",
+     "CREATE INDEX IF NOT EXISTS idx_messages_delivery_status ON messages(delivery_status)"),
+    # 被拒/中断草稿台账：审计打回的草稿全文+裁决元数据保留并标记（用户裁定）。
+    ("message_attempts_v1", (
+        "CREATE TABLE IF NOT EXISTS message_attempts ("
+        "id VARCHAR(36) PRIMARY KEY, "
+        "message_id VARCHAR(36) NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
+        "conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, "
+        "attempt_no INTEGER NOT NULL DEFAULT 1, "
+        "status VARCHAR(16) NOT NULL DEFAULT 'rejected', "
+        "content TEXT NOT NULL DEFAULT '', "
+        "verdict_json TEXT, "
+        "created_at TIMESTAMP WITHOUT TIME ZONE)"
+    )),
+    ("idx_message_attempts_message",
+     "CREATE INDEX IF NOT EXISTS idx_message_attempts_message ON message_attempts(message_id, attempt_no)"),
+    # A4.9 r1 M3：message_id 可空 + ON DELETE SET NULL——空终态清理删行时台账
+    # 不随 CASCADE 消失（「被拒草稿保留并标记」用户裁定）。幂等：约束存在才换。
+    ("message_attempts_v2_setnull", (
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='message_attempts_message_id_fkey') THEN "
+        "ALTER TABLE message_attempts DROP CONSTRAINT message_attempts_message_id_fkey; END IF; "
+        "END $$"
+    )),
+    ("message_attempts_v2_setnull_col",
+     "ALTER TABLE message_attempts ALTER COLUMN message_id DROP NOT NULL"),
+    ("message_attempts_v2_setnull_fk", (
+        "ALTER TABLE message_attempts ADD CONSTRAINT message_attempts_message_id_fkey "
+        "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL"
+    )),
 ]
 
 

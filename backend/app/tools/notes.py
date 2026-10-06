@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.tools.registry import registry
@@ -395,10 +396,17 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
             note = result.scalar_one_or_none()
             if not note:
                 return json.dumps({"error": f"Note '{note_id}' not found"}, ensure_ascii=False)
+            touched = False
             if "title" in args:
                 note.title = args["title"] or note.title
+                touched = True
             if "content" in args:
                 note.content = await asyncio.to_thread(_maybe_render_note_citations, args["content"], kwargs)
+                touched = True
+            if touched:
+                # 同步发射侧契约：同值/自赋值照发事件跳 onupdate（复审 B I-2）——
+                # 有键命中才 bump；两键皆缺零事件零 bump。
+                note.updated_at = datetime.utcnow()
             await db.commit()
             await db.refresh(note)
             return json.dumps(

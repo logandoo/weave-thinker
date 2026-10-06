@@ -259,9 +259,62 @@ class Message(Base):
     # 本轮上下文 token 用量（context_info 事件的最新值，JSON 字符串）——
     # 持久化后跨设备可见（手机端发出的轮次在电脑端打开也能看到本轮 tokens）。
     context_info = Column(Text, nullable=True)
+    # 2026-10-06（conv ae9aa092）：渐进落库交付状态。
+    # streaming=在途（run 开始即建行、周期刷写；默认列表/同步过滤，不展示）；
+    # final=正常完成（含用户主动 stop 的部分保存）；interrupted=进程死亡/
+    # 断连等非预期中断（前端「已中断」徽标）。
+    delivery_status = Column(String(16), nullable=False, default="final", index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")
+
+
+class MessagePayload(Base):
+    """外置的超限消息字段全文（tool_results / reasoning_content / tool_calls）。
+
+    行内 columns 只留显式 stub（payload_ref + size + preview），全文在此表按
+    (message_id, field) 归属唯一存一行（随本消息 CASCADE）；sha256 仅作完整性
+    元数据，不作寻址。DESIGN_conv_open_performance §2 P1-1。
+    """
+
+    __tablename__ = "message_payloads"
+
+    # 评审 C1/C2 修复：payload 行按 (message_id, field) 唯一、归属单条消息——
+    # 不跨消息共享（旧 sha 全局去重 + message_id CASCADE 会在删除任一消息时
+    # 连带销毁他消息的共享行=静默数据丢失）；sha256 仅作完整性元数据不作寻址。
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    message_id = Column(String(36), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    field = Column(String(32), nullable=False)
+    content = Column(Text, nullable=False)
+    size_bytes = Column(Integer, nullable=False, default=0)
+    sha256 = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("message_id", "field", name="uq_message_payloads_msg_field"),)
+
+
+class MessageAttempt(Base):
+    """被拒/中断的草稿尝试全文台账（2026-10-06，conv ae9aa092，用户裁定：
+    被打回重写的回答保留并标记）。
+
+    每次审计打回（remand/reject/needs_evidence 触发的重写）落一行：
+    草稿全文 + 裁决元数据（verdict/problem/source）。status:
+    rejected=审计打回；interrupted=进程死亡时仍未完成的在途草稿；
+    accepted=（预留）最终被接受的草稿。只读审计面，不进渲染契约/同步。
+    """
+
+    __tablename__ = "message_attempts"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # A4.9 r1 M3：message_id 可空 + SET NULL——空终态清理删除 streaming 空行时，
+    # 该轮的被打回草稿台账不随行的 CASCADE 消失（用户裁定「保留并标记」）。
+    message_id = Column(String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True)
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    attempt_no = Column(Integer, nullable=False, default=1)
+    status = Column(String(16), nullable=False, default="rejected")
+    content = Column(Text, nullable=False, default="")
+    verdict_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class UserSession(Base):

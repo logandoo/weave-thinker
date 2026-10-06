@@ -88,7 +88,7 @@ if (typeof window !== 'undefined' && !_visibilityChangeHandler) {
             store.currentError = null
             const resumed = await store.resumeActiveStream(convId)
             if (!resumed && s.streaming && !s.abortController) {
-              void store.tryReconnectOrSync(convId, (store.messages[convId] || []).length + 1, s)
+              void store.tryReconnectOrSync(convId, null, s)
             }
             return
           }
@@ -106,7 +106,7 @@ if (typeof window !== 'undefined' && !_visibilityChangeHandler) {
       // 不能停在 streaming=true 无人驱动的状态。
       const resumed = await store.resumeActiveStream(convId)
       if (!resumed && s.streaming && !s.abortController) {
-        void store.tryReconnectOrSync(convId, (store.messages[convId] || []).length + 1, s)
+        void store.tryReconnectOrSync(convId, null, s)
       }
     }
 

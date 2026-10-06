@@ -349,7 +349,18 @@ async def terminal(args: dict, **kwargs) -> str:
         if _ws_venv.exists():
             _workspace_venv_bin = str(_ws_venv)
     _node_paths = "/usr/local/bin"
-    _path_parts = [p for p in (_workspace_venv_bin, venv_bin, _node_paths, "/usr/bin", "/bin") if p]
+    _bundled_bin = ""
+    _bundled_git_env = {}
+    try:
+        from app.services.git_binary import bundled_bin_dir
+        _bundled_bin = bundled_bin_dir()
+        if _bundled_bin:
+            from app.services.git_binary import _bundled_git_env as _bge
+            _bundled_git_env = _bge() or {}
+    except Exception:
+        _bundled_bin = ""
+        _bundled_git_env = {}
+    _path_parts = [p for p in (_workspace_venv_bin, venv_bin, _bundled_bin, _node_paths, "/usr/bin", "/bin") if p]
     _terminal_path = ":".join(_path_parts)
 
     try:
@@ -366,6 +377,7 @@ async def terminal(args: dict, **kwargs) -> str:
                 "TERM": "dumb",
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "TZ": "Asia/Shanghai",
+                **_bundled_git_env,
             },
         )
 

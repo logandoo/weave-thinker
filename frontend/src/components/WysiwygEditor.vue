@@ -3,7 +3,7 @@
 
 <template>
   <div class="wysiwyg-editor-wrap" :class="tableCursorClass" style="position:relative;flex:1;overflow:hidden;display:flex;flex-direction:column">
-    <div class="wysiwyg-editor" ref="editorRef" contenteditable="true" @input="onInput" @paste="onPaste" @click="onClick" @contextmenu="onContextMenu" @mousedown="handleMouseDown" v-html="renderedContent"></div>
+    <div class="wysiwyg-editor" ref="editorRef" contenteditable="true" @beforeinput="onBeforeInput" @input="onInput" @paste="onPaste" @click="onClick" @contextmenu="onContextMenu" @mousedown="handleMouseDown" v-html="renderedContent"></div>
   </div>
   <Teleport to="body">
     <div v-show="tableEdgeButton.visible" class="table-edge-btn" :style="{ top: tableEdgeButton.y + 'px', left: tableEdgeButton.x + 'px' }" @mousedown.stop.prevent="handleTableEdgeInsert" @mouseleave="hideTableEdgeButton">+</div>
@@ -68,7 +68,9 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { renderMarkdownToHtml, addCitationSuperscripts, htmlToMarkdown, renderMermaidBlocks, renderEchartsBlocks, attachMathEditListeners } from '@/composables/useMarkdown'
+import { renderMarkdownToHtml, addCitationSuperscripts, htmlToMarkdown, renderMermaidBlocks, renderEchartsBlocks, attachMathEditListeners, renderMathSafe, buildEndnoteRefHtml, buildEndnoteDefHtml, endnoteEnabled } from '@/composables/useMarkdown'
+import { buildCodeBlockHtml } from '@/composables/snippetInsert'
+import { normalizeHeadingTypography, normalizeHeadingBlocksAround, shouldNormalizeHeadingAfterInput, isHeadingTag } from '@/composables/headingTypography'
 
 const props = defineProps<{
   modelValue: string
@@ -93,10 +95,11 @@ const isMultiSelectMode = ref(false)
 let multiSelectCounter = 0
 
 // Undo/Redo state
+// 选区以「全文文本偏移」持久化 —— 旧实现存 DOM 子节点路径，而快照 HTML 是
+// 剥标记+重解析后的树（文本节点合并/拆分），路径必然漂移（查找高亮可见期
+// undo 丢光标根因，wave-2 A1）。文本偏移与 span 结构无关，天然抗漂移。
 interface SavedSelection {
-  startPath: number[]
   startOffset: number
-  endPath: number[]
   endOffset: number
 }
 
@@ -111,39 +114,27 @@ let isUndoing = false
 let isExternalContentUpdate = false
 let inputDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
-function getNodePath(node: Node, root: Node): number[] {
-  const path: number[] = []
-  let current: Node | null = node
-  while (current && current !== root) {
-    const parent = current.parentNode
-    if (!parent) break
-    const index = Array.from(parent.childNodes).indexOf(current as ChildNode)
-    path.unshift(index)
-    current = parent
+/** 点位全文文本偏移：root 内 (node, offset) 之前的文本长度。 */
+function textOffsetOf(root: HTMLElement, node: Node, offset: number): number {
+  const r = document.createRange()
+  r.selectNodeContents(root)
+  try {
+    r.setEnd(node, offset)
+  } catch {
+    return 0
   }
-  return path
-}
-
-function getNodeFromPath(path: number[], root: Node): Node | null {
-  let current: Node = root
-  for (const idx of path) {
-    const children = current.childNodes
-    if (idx < 0 || idx >= children.length) return null
-    current = children[idx]
-  }
-  return current
+  return r.toString().length
 }
 
 function saveSelection(root: HTMLElement): SavedSelection | null {
   const sel = window.getSelection()
   if (!sel || sel.rangeCount === 0) return null
   const range = sel.getRangeAt(0)
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null
   try {
     return {
-      startPath: getNodePath(range.startContainer, root),
-      startOffset: range.startOffset,
-      endPath: getNodePath(range.endContainer, root),
-      endOffset: range.endOffset,
+      startOffset: textOffsetOf(root, range.startContainer, range.startOffset),
+      endOffset: textOffsetOf(root, range.endContainer, range.endOffset),
     }
   } catch {
     return null
@@ -152,17 +143,8 @@ function saveSelection(root: HTMLElement): SavedSelection | null {
 
 function restoreSelection(root: HTMLElement, saved: SavedSelection | null): boolean {
   if (!saved) return false
-  const startNode = getNodeFromPath(saved.startPath, root)
-  const endNode = getNodeFromPath(saved.endPath, root)
-  if (!startNode || !endNode) return false
   try {
-    const range = document.createRange()
-    range.setStart(startNode, Math.min(saved.startOffset, startNode.textContent?.length || 0))
-    range.setEnd(endNode, Math.min(saved.endOffset, endNode.textContent?.length || 0))
-    const sel = window.getSelection()
-    sel?.removeAllRanges()
-    sel?.addRange(range)
-    return true
+    return setSelectionByTextOffset(saved.startOffset, saved.endOffset)
   } catch {
     return false
   }
@@ -197,14 +179,40 @@ function restoreEditorSelection() {
   savedEditorSelection = null
 }
 
+/**
+ * 快照用 HTML：先剥掉 [data-find-match] 搜索高亮标记再入栈。
+ * 不剥则 undo/redo 会把陈旧搜索高亮复活进正文（用户须手动去除的根因）。
+ */
+function captureSnapshotHtml(): string {
+  if (!editorRef.value) return ''
+  const clone = editorRef.value.cloneNode(true) as HTMLElement
+  clone.querySelectorAll('[data-find-match="true"]').forEach(mark => {
+    const parent = mark.parentNode
+    if (!parent) return
+    while (mark.firstChild) parent.insertBefore(mark.firstChild, mark)
+    parent.removeChild(mark)
+  })
+  stripFindStyleSpans(clone)
+  return clone.innerHTML
+}
+
 function pushUndoState(force = false) {
   if (isUndoing || !editorRef.value) return
   const state: EditorState = {
-    html: editorRef.value.innerHTML,
+    html: captureSnapshotHtml(),
     selection: saveSelection(editorRef.value),
   }
   const last = undoStack.value[undoStack.value.length - 1]
-  if (force || !last || last.html !== state.html) {
+  if (force) {
+    undoStack.value.push(state)
+    if (undoStack.value.length > 100) undoStack.value.shift()
+    redoStack.value = []
+  } else if (last && last.html === state.html) {
+    // 同内容只合并选区（wave-2 A1）：否则 pre-change 快照会被同 html 顶条目
+    // 去重吞掉，顶条目遗留陈旧/空选区，撤销落点漂移
+    last.selection = state.selection
+    redoStack.value = []
+  } else if (!last || last.html !== state.html) {
     undoStack.value.push(state)
     if (undoStack.value.length > 100) undoStack.value.shift()
     redoStack.value = []
@@ -214,11 +222,13 @@ function pushUndoState(force = false) {
 function pushCurrentState() {
   if (isUndoing || !editorRef.value) return
   const state: EditorState = {
-    html: editorRef.value.innerHTML,
+    html: captureSnapshotHtml(),
     selection: saveSelection(editorRef.value),
   }
   const last = undoStack.value[undoStack.value.length - 1]
-  if (!last || last.html !== state.html) {
+  if (last && last.html === state.html) {
+    last.selection = state.selection
+  } else if (!last || last.html !== state.html) {
     undoStack.value.push(state)
     if (undoStack.value.length > 100) undoStack.value.shift()
     redoStack.value = []
@@ -246,6 +256,12 @@ function resetUndoStack() {
 }
 
 function undo() {
+  // 去抖窗口内先落盘在途状态（wave-2 复审 B#2）：否则一次撤销回退两步
+  if (inputDebounceTimer) {
+    clearTimeout(inputDebounceTimer)
+    inputDebounceTimer = null
+    pushCurrentState()
+  }
   if (editorRef.value) {
     editorRef.value.dataset.undoAttempted = 'true'
     editorRef.value.dataset.undoStackSize = String(undoStack.value.length)
@@ -261,6 +277,11 @@ function undo() {
 }
 
 function redo() {
+  if (inputDebounceTimer) {
+    clearTimeout(inputDebounceTimer)
+    inputDebounceTimer = null
+    pushCurrentState()
+  }
   if (redoStack.value.length === 0 || !editorRef.value) return
   const state = redoStack.value.pop()!
   undoStack.value.push(state)
@@ -441,6 +462,7 @@ function saveCleanUndoState() {
 }
 
 function applyToListSelections(listType: 'ol' | 'ul') {
+  if (isComposing) return // IME 护栏（wave-3 #1）
   const el = editorRef.value
   if (!el || multiSelections.value.size === 0) return
   
@@ -526,6 +548,7 @@ function applyToListSelections(listType: 'ol' | 'ul') {
 }
 
 function applyBlockquoteToSelections() {
+  if (isComposing) return // IME 护栏（wave-3 #1）
   const el = editorRef.value
   if (!el || multiSelections.value.size === 0) return
   
@@ -661,7 +684,140 @@ function collectTextNodesInRange(range: Range, root: HTMLElement): Text[] {
   return textNodes
 }
 
+/**
+ * 逐 text-node 包裹选区（ProseMirror mark 纪律）。
+ * 绝不用 extractContents 整块包裹 —— 那会把块级元素（p/li/h*）拖进 inline span，
+ * 产生 span>p 非法结构，浏览器修复/序列化回灌即「自动换行」与字号失效的根因。
+ * 每个文本节点的选中片段各自包一个 span，块结构一概不动。
+ */
+function wrapRangePerTextNode(
+  range: Range,
+  root: HTMLElement,
+  makeSpan: () => HTMLElement,
+): HTMLElement[] {
+  const created: HTMLElement[] = []
+  const textNodes = collectTextNodesInRange(range, root)
+  const startContainer = range.startContainer
+  const endContainer = range.endContainer
+  const startOffset = range.startOffset
+  const endOffset = range.endOffset
+
+  for (const textNode of textNodes) {
+    if (!textNode.textContent) continue
+    // 跳过不可编辑部件（mermaid/echarts/复制钮）内部文本与纯空白节点：
+    // 包裹会破坏部件 DOM / 给空格加无意义 span（A4.9 N14）
+    const parentEl = textNode.parentElement
+    if (parentEl && parentEl.closest('[contenteditable="false"]')) continue
+    if (!textNode.textContent.trim()) continue
+    const nodeRange = document.createRange()
+    if (textNode === startContainer) {
+      nodeRange.setStart(textNode, startOffset)
+    } else {
+      nodeRange.setStart(textNode, 0)
+    }
+    if (textNode === endContainer) {
+      nodeRange.setEnd(textNode, endOffset)
+    } else {
+      nodeRange.setEnd(textNode, textNode.length)
+    }
+    if (nodeRange.collapsed) continue
+    // 边界防过包：intersectsNode 含「仅触边」的节点；把子区间夹回外层 range，
+    // 夹完为空（只触边）就跳过 —— 选 "hello " 不得连带包掉  里的 world
+    try {
+      if (range.comparePoint(nodeRange.startContainer, nodeRange.startOffset) < 0) {
+        nodeRange.setStart(range.startContainer, range.startOffset)
+      }
+      if (range.comparePoint(nodeRange.endContainer, nodeRange.endOffset) > 0) {
+        nodeRange.setEnd(range.endContainer, range.endOffset)
+      }
+    } catch { /* 跨树比较失败则维持原区间 */ }
+    if (nodeRange.collapsed) continue
+    const span = makeSpan()
+    try {
+      nodeRange.surroundContents(span)
+      created.push(span)
+    } catch {
+      // 单文本节点内的 range 不应失败；失败则跳过该节点，绝不整块 extract
+      continue
+    }
+  }
+  return created
+}
+
+function applyFontSizeToSelection(size: string) {
+  if (isComposing) return // IME 组合期不做格式变更（wave-2 A5）
+  pushUndoState(true)
+  const selection = window.getSelection()
+  if (!selection || selection.rangeCount === 0) return
+  const root = editorRef.value
+  if (!root) return
+
+  const ranges = Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i))
+  for (const range of ranges) {
+    if (range.collapsed) continue
+    // 先用「未变形」的 range 采样待清理的既有字号 span（wrap 之后 range 会失效），
+    // 再包裹、最后统一清理 —— 多次改字号只换值不叠层（A4.9 I4）。
+    const toClear: HTMLElement[] = []
+    for (const textNode of collectTextNodesInRange(range, root)) {
+      let n: Node | null = textNode.parentNode
+      while (n && n !== root) {
+        if (n.nodeType === Node.ELEMENT_NODE) {
+          const el = n as HTMLElement
+          if (el.tagName === 'SPAN' && el.style.fontSize && isElementFullyInRange(el, range)) {
+            toClear.push(el)
+          }
+        }
+        n = n.parentNode
+      }
+    }
+    if (size) {
+      // 逐文本节点包 span（px 绝对值，内层永远压过外层）。绝不 extractContents：
+      // 块结构一概不动（span>p 非法结构=换行/字号失效根因）。
+      wrapRangePerTextNode(range, root, () => {
+        const span = document.createElement('span')
+        span.style.fontSize = size
+        return span
+      })
+    }
+    for (const el of toClear) {
+      if (!el.isConnected) continue
+      el.style.removeProperty('font-size')
+      if (!el.getAttribute('style')) unwrapElementKeepText(el)
+    }
+  }
+  // 保留用户选区（wave-2 复审 #2）：格式化不应清空选区/挪动视口
+  onInput()
+  nextTick(() => pushCurrentState())
+}
+
+function isElementFullyInRange(el: HTMLElement, range: Range): boolean {
+  // 以元素的首/末文本端点判覆盖 —— selectNodeContents 的元素锚点边界与
+  // 常见的文本锚点选区（双击/拖选）比较会恒 false（A4.9 C2）。
+  try {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    const texts: Text[] = []
+    while (walker.nextNode()) texts.push(walker.currentNode as Text)
+    if (texts.length === 0) {
+      const elRange = document.createRange()
+      elRange.selectNodeContents(el)
+      return (
+        range.compareBoundaryPoints(Range.START_TO_START, elRange) <= 0 &&
+        range.compareBoundaryPoints(Range.END_TO_END, elRange) >= 0
+      )
+    }
+    const first = texts[0]
+    const last = texts[texts.length - 1]
+    const a = range.comparePoint(first, 0)
+    const b = range.comparePoint(last, last.length)
+    // 首端在 range 前（-1）= 元素左侧溢出；末端在 range 后（1）= 右侧溢出
+    return a !== -1 && b !== 1
+  } catch {
+    return false
+  }
+}
+
 function applyHighlightToSelection(color: string = '#ffff00') {
+  if (isComposing) return // IME 组合期不做格式变更（wave-2 A5）
   pushUndoState(true)
   const selection = window.getSelection()
   if (!selection || selection.rangeCount === 0) return
@@ -705,15 +861,26 @@ function applyHighlightToSelection(color: string = '#ffff00') {
     }
 
     if (isRemoveMode) {
-      // Remove highlights from all highlighted text nodes in range,
-      // even if not every text node is highlighted (partial selection)
+      // 先收集再统一解包：解包时 normalize() 会合并相邻文本节点，
+      // 边遍历边解包会让后续节点引用失效 ——「只取消最先匹配一段」的根因。
+      // 收集整条祖先链（不只最近层）：嵌套旧高亮一次全清（A4.9 I5）。
+      const toUnwrap = new Set<HTMLElement>()
       for (const textNode of textNodes) {
         const txt = textNode.textContent || ''
         if (!txt.trim()) continue
-        const ancestor = findAncestorHighlight(root, textNode)
-        if (ancestor) {
-          unwrapElementKeepText(ancestor)
+        let n: Node | null = textNode.parentNode
+        while (n && n !== root) {
+          if (n.nodeType === Node.ELEMENT_NODE) {
+            const el = n as HTMLElement
+            if ((el.tagName === 'SPAN' && el.style.backgroundColor) || el.tagName === 'MARK') {
+              toUnwrap.add(el)
+            }
+          }
+          n = n.parentNode
         }
+      }
+      for (const ancestor of toUnwrap) {
+        unwrapElementKeepText(ancestor)
       }
       continue
     }
@@ -725,16 +892,40 @@ function applyHighlightToSelection(color: string = '#ffff00') {
       continue
     }
 
-    const contents = range.extractContents()
-    stripStylePropertyInFragment(contents, 'background-color')
-    const span = document.createElement('span')
-    span.style.backgroundColor = color
-    span.style.borderRadius = '2px'
-    span.appendChild(contents)
-    range.insertNode(span)
+    // 采样「被选区完全覆盖的外层旧高亮」—— 必须在 wrap 使 range 失效之前（A4.9 I3）
+    const toStrip: HTMLElement[] = []
+    for (const textNode of textNodes) {
+      let n: Node | null = textNode.parentNode
+      while (n && n !== root) {
+        if (n.nodeType === Node.ELEMENT_NODE) {
+          const el = n as HTMLElement
+          if (
+            el.tagName === 'SPAN' && el.style.backgroundColor &&
+            isElementFullyInRange(el, range)
+          ) {
+            toStrip.push(el)
+          }
+        }
+        n = n.parentNode
+      }
+    }
+
+    // 逐文本节点包高亮 span —— 跨段选区绝不 extractContents（span>p 非法结构
+    // 即换行/序列化回灌根因）。
+    wrapRangePerTextNode(range, root, () => {
+      const span = document.createElement('span')
+      span.style.backgroundColor = color
+      span.style.borderRadius = '2px'
+      return span
+    })
+    for (const el of toStrip) {
+      if (!el.isConnected) continue
+      el.style.removeProperty('background-color')
+      if (!el.getAttribute('style')) unwrapElementKeepText(el)
+    }
   }
 
-  selection.removeAllRanges()
+  // 保留用户选区（wave-2 复审 #2）：格式化不应清空选区/挪动视口
   onInput()
   nextTick(() => pushCurrentState())
 }
@@ -813,28 +1004,47 @@ function stripStylePropertyInFragment(fragment: DocumentFragment, prop: 'color' 
 }
 
 function applyFontColor(color: string) {
+  if (isComposing) return // IME 组合期不做格式变更（wave-2 A5）
   pushUndoState(true)
   const selection = window.getSelection()
   if (!selection || selection.rangeCount === 0) return
+  const root = editorRef.value
+  if (!root) return
 
   const ranges = Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i))
 
   for (const range of ranges) {
     if (range.collapsed) continue
 
-    // extractContents clones boundary ancestors into the fragment, so
-    // stripping color inside the fragment only affects the selected text —
-    // this guarantees the NEW color wins instead of being overridden by a
-    // nested old color span.
-    const contents = range.extractContents()
-    stripStylePropertyInFragment(contents, 'color')
+    // 采样待清理的外层旧色 span（wrap 前，range 未变形）—— A4.9 I3
+    const toStrip: HTMLElement[] = []
+    for (const textNode of collectTextNodesInRange(range, root)) {
+      let n: Node | null = textNode.parentNode
+      while (n && n !== root) {
+        if (n.nodeType === Node.ELEMENT_NODE) {
+          const el = n as HTMLElement
+          if (el.tagName === 'SPAN' && el.style.color && isElementFullyInRange(el, range)) {
+            toStrip.push(el)
+          }
+        }
+        n = n.parentNode
+      }
+    }
 
-    const span = document.createElement('span')
-    span.style.color = color
-    span.appendChild(contents)
-    range.insertNode(span)
+    // 逐文本节点包颜色 span —— 同 applyFontSizeToSelection，绝不 extractContents
+    // 整块包裹（span>p 非法结构根因）。内层新色 span 压过外层旧色。
+    wrapRangePerTextNode(range, root, () => {
+      const span = document.createElement('span')
+      span.style.color = color
+      return span
+    })
+    for (const el of toStrip) {
+      if (!el.isConnected) continue
+      el.style.removeProperty('color')
+      if (!el.getAttribute('style')) unwrapElementKeepText(el)
+    }
   }
-  selection.removeAllRanges()
+  // 保留用户选区（wave-2 复审 #2）：格式化不应清空选区/挪动视口
   onInput()
   nextTick(() => pushCurrentState())
 }
@@ -860,7 +1070,112 @@ function unwrapElement(el: HTMLElement, range: Range) {
   parent.normalize()
 }
 
+/**
+ * 尾注（endnote）：在光标/选区末尾插入自动编号角标，文末生成对应定义段，
+ * 光标移入定义段供用户即刻输入说明。点击角标/点击定义编号的双向跳转由
+ * onClick 的锚点分支（a[href^="#"]）承担，本函数只负责建对。
+ */
+/**
+ * 尾注全局重编号：引用首次出现序 = 显示编号（与渲染侧 preprocessEndnoteSyntax
+ * 同口径），无引用的定义排其后。角标/回跳标签〔N〕同步改写（wave-2 A4/B2）。
+ */
+function updateEndnoteNumbering(root: HTMLElement) {
+  const numById = new Map<string, number>()
+  let next = 1
+  root.querySelectorAll<HTMLElement>('.note-endnote-ref').forEach((el) => {
+    const id = el.getAttribute('data-endnote-id') || ''
+    if (id && !numById.has(id)) numById.set(id, next++)
+  })
+  root.querySelectorAll<HTMLElement>('.note-endnote-def').forEach((el) => {
+    const id = el.getAttribute('data-endnote-id') || ''
+    if (id && !numById.has(id)) numById.set(id, next++)
+  })
+  const apply = (el: HTMLElement, sel: string | null) => {
+    const id = el.getAttribute('data-endnote-id') || ''
+    const n = numById.get(id)
+    if (n === undefined) return
+    el.setAttribute('data-endnote-num', String(n))
+    const a = (sel ? el.querySelector(sel) : el.querySelector('a')) as HTMLElement | null
+    if (!a) return
+    // 标签是纯 chrome（渲染器/编号器重建 find 标记）：replaceChildren 一次性
+    // 归一，拆分文本节点场景（find 标记嵌入标签）不再写坏（复审 A#5）
+    a.replaceChildren(document.createTextNode(`〔${n}〕`))
+  }
+  root.querySelectorAll<HTMLElement>('.note-endnote-ref').forEach((el) => apply(el, 'a'))
+  root.querySelectorAll<HTMLElement>('.note-endnote-def').forEach((el) => apply(el, 'a.note-endnote-back'))
+}
+
+function insertEndnote() {
+  if (isComposing) return // IME 组合期不做格式变更（wave-2 A5）
+  const root = editorRef.value
+  if (!root) return
+  pushUndoState(true)
+
+  // 自动编号 = 现有最大 endnote id + 1（编号计算不落库）
+  let maxId = 0
+  root.querySelectorAll<HTMLElement>('[data-endnote-id]').forEach((el) => {
+    const n = parseInt(el.getAttribute('data-endnote-id') || '0', 10)
+    if (!isNaN(n) && n > maxId) maxId = n
+  })
+  const id = maxId + 1
+
+  const tmp = document.createElement('div')
+  tmp.innerHTML = buildEndnoteRefHtml(String(id), id)
+  const refEl = tmp.firstElementChild as HTMLElement
+
+  const sel = window.getSelection()
+  let inserted = false
+  if (sel && sel.rangeCount > 0 && root.contains(sel.anchorNode)) {
+    const anchorEl = (sel.anchorNode.nodeType === Node.TEXT_NODE
+      ? (sel.anchorNode as Text).parentElement
+      : (sel.anchorNode as Element)) as HTMLElement | null
+    // 不可编辑部件（mermaid/echarts/复制钮）内禁插 —— insertNode 会破坏部件 DOM
+    if (!anchorEl || !anchorEl.closest('[contenteditable="false"]')) {
+      const range = sel.getRangeAt(0)
+      // Word 式：选中文字保留，角标插在选区末尾
+      range.collapse(false)
+      // 光标落在旧角标文本内（文本偏移恢复的常态落点）时整体外移：
+      // 新角标绝不能嵌套进旧角标/锚点内部（A4 排障实锤）
+      const hostRef = (range.startContainer.nodeType === Node.TEXT_NODE
+        ? (range.startContainer as Text).parentElement
+        : (range.startContainer as Element))?.closest?.('.note-endnote-ref, a.note-endnote-back')
+      if (hostRef) {
+        range.setStartAfter(hostRef)
+        range.collapse(true)
+      }
+      range.insertNode(refEl)
+      inserted = true
+    }
+  }
+  if (!inserted) {
+    root.appendChild(refEl)
+  }
+
+  const tmpDef = document.createElement('div')
+  tmpDef.innerHTML = buildEndnoteDefHtml(String(id), id, '')
+  const defEl = tmpDef.firstElementChild as HTMLElement
+  root.appendChild(defEl)
+
+  // 显示编号 = 文档序出现位；插入后全部角标/定义就地重排（wave-2 A4：
+  // 新旧并存时旧角标不同步会出现重复编号）
+  updateEndnoteNumbering(root)
+
+  // 光标移入定义段（回跳编号之后），用户即刻输入说明文字
+  const defRange = document.createRange()
+  defRange.setStart(defEl, defEl.childNodes.length)
+  defRange.collapse(true)
+  if (sel) {
+    sel.removeAllRanges()
+    sel.addRange(defRange)
+  }
+  defEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
+
+  onInput()
+  nextTick(() => pushCurrentState())
+}
+
 function applySuperscript() {
+  if (isComposing) return // IME 护栏（wave-3 #1）
   pushUndoState(true)
   const selection = window.getSelection()
   if (!selection || selection.rangeCount === 0) return
@@ -917,12 +1232,13 @@ function applySuperscript() {
     }
   }
 
-  selection.removeAllRanges()
+  // 保留用户选区（wave-2 复审 #2）：格式化不应清空选区/挪动视口
   onInput()
   nextTick(() => pushCurrentState())
 }
 
 function applySubscript() {
+  if (isComposing) return // IME 护栏（wave-3 #1）
   pushUndoState(true)
   const selection = window.getSelection()
   if (!selection || selection.rangeCount === 0) return
@@ -979,7 +1295,7 @@ function applySubscript() {
     }
   }
 
-  selection.removeAllRanges()
+  // 保留用户选区（wave-2 复审 #2）：格式化不应清空选区/挪动视口
   onInput()
   nextTick(() => pushCurrentState())
 }
@@ -1714,6 +2030,144 @@ function insertMedia(kind: 'audio' | 'video', src: string, name = '') {
   })
 }
 
+/** 块级插入候选标签（block-in-inline 防护的切块范围；LI 不切=保列表结构）。 */
+const BLOCK_INSERT_TAGS = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'PRE'])
+
+/**
+ * 块级片段插入前把光标所在块级元素切开（遗留项 A：块级公式/代码块插进段落中
+ * 会产生 div-in-p 的 block-in-inline DOM）。切开后插入点位于两块之间。
+ */
+function splitBlockForBlockInsert(range: Range) {
+  const editor = editorRef.value
+  if (!editor) return
+  // F3: 光标落在行内公式内时把切点吸附到公式边界——extractContents 深拷贝
+  // 半选 .math-editable 会产生两份 data-tex（公式重复）。
+  const startEl = range.startContainer.nodeType === Node.ELEMENT_NODE
+    ? (range.startContainer as HTMLElement)
+    : (range.startContainer.parentElement || null)
+  const mathAncestor = startEl && startEl.closest ? startEl.closest('.math-editable') : null
+  if (mathAncestor && editor.contains(mathAncestor)) {
+    range.setStartAfter(mathAncestor)
+    range.collapse(true)
+  }
+  let node: Node | null = range.startContainer
+  let block: HTMLElement | null = null
+  while (node && node !== editor) {
+    if (node.nodeType === Node.ELEMENT_NODE && BLOCK_INSERT_TAGS.has((node as HTMLElement).tagName)) {
+      block = node as HTMLElement
+      break
+    }
+    node = node.parentNode
+  }
+  if (!block) return
+  const after = document.createRange()
+  after.setStart(range.startContainer, range.startOffset)
+  if (block.lastChild) after.setEndAfter(block.lastChild)
+  else after.setEnd(block, block.childNodes.length)
+  const frag = after.extractContents()
+  // F4: 可见内容判空（extractContents 常留空文本节点，childNodes.length 会骗人）
+  const hasVisible = (root: Node): boolean => {
+    const w = document.createTreeWalker(root, NodeFilter.SHOW_ALL)
+    let n: Node | null = w.currentNode
+    while (n) {
+      if (n.nodeType === Node.ELEMENT_NODE) {
+        const tag = (n as HTMLElement).tagName
+        if (tag === 'IMG' || tag === 'BR' || tag === 'TABLE' || tag === 'SVG' || tag === 'MATH') return true
+      }
+      if (n.nodeType === Node.TEXT_NODE && (n.textContent || '').replace(/\u200b/g, '').length) return true
+      n = w.nextNode()
+    }
+    return false
+  }
+  const fragVisible = hasVisible(frag)
+  const blockVisible = hasVisible(block)
+  if (!fragVisible && !blockVisible) return
+  if (!fragVisible) {
+    // 光标在块尾/块内容已尽——无需新块，插入点即块后
+    range.setStartAfter(block)
+    range.collapse(true)
+    return
+  }
+  const newBlock = block.cloneNode(false) as HTMLElement
+  newBlock.removeAttribute('id')  // F5: 拷贝块不得复制 id（渲染锚点分裂）
+  newBlock.removeAttribute('name')
+  newBlock.appendChild(frag)
+  block.parentNode!.insertBefore(newBlock, block.nextSibling)
+  if (!blockVisible) {
+    // 光标在块首——左半已空：去掉空壳，插入点即原位置（不留 <p></p> 残渣）
+    block.parentNode!.removeChild(block)
+    range.setStartBefore(newBlock)
+  } else {
+    range.setStartAfter(block)
+  }
+  range.collapse(true)
+}
+
+/** 通用片段插入（恢复已保存选区 → 光标处插入 html → 序列化）。blockLevel=块级形态（先切块）。 */
+function insertSnippetHtml(html: string, blockLevel = false) {
+  if (!editorRef.value) return
+  pushUndoState(true)
+  let inserted = false
+  if (savedEditorSelection) {
+    restoreEditorSelection()
+  }
+  const sel = window.getSelection()
+  if (sel && sel.rangeCount > 0 && editorRef.value.contains(sel.anchorNode)) {
+    const range = sel.getRangeAt(0)
+    // F6: 先删选区（替换语义）再切块——切块会把 range 折叠到块边界
+    range.deleteContents()
+    // 光标在 pre/code 内时吸出到块后：widget 进代码块会被 textContent 泄漏成字面
+    const startEl2 = range.startContainer.nodeType === Node.ELEMENT_NODE
+      ? (range.startContainer as HTMLElement)
+      : (range.startContainer.parentElement || null)
+    const preAncestor = startEl2 && startEl2.closest ? startEl2.closest('pre') : null
+    if (preAncestor && editorRef.value!.contains(preAncestor)) {
+      range.setStartAfter(preAncestor)
+      range.collapse(true)
+    }
+    if (blockLevel) splitBlockForBlockInsert(range)
+    const tmp = document.createElement('div')
+    tmp.innerHTML = html
+    const frag = document.createDocumentFragment()
+    let lastNode: Node | null = null
+    while (tmp.firstChild) {
+      lastNode = frag.appendChild(tmp.firstChild)
+    }
+    range.insertNode(frag)
+    if (lastNode) {
+      range.setStartAfter(lastNode)
+      range.collapse(true)
+      sel.removeAllRanges()
+      sel.addRange(range)
+    }
+    inserted = true
+  }
+  if (!inserted) {
+    editorRef.value.focus()
+    const tmp = document.createElement('div')
+    tmp.innerHTML = html
+    while (tmp.firstChild) {
+      editorRef.value.appendChild(tmp.firstChild)
+    }
+  }
+  onInput()
+  nextTick(() => {
+    pushCurrentState()
+    attachMathEditListeners(editorRef.value!)
+  })
+}
+
+/** 插入 LaTeX 公式（行内 $…$ / 块级 $$…$$ 由 displayMode 决定）；data-tex 保原文可再编辑。 */
+function insertMath(tex: string, displayMode: boolean) {
+  // 块级公式（displayMode）插前切块；行内保持原位
+  insertSnippetHtml(renderMathSafe(tex, displayMode), displayMode)
+}
+
+/** 插入代码块（pre>code，序列化为 ```lang 围栏；无渲染壳 chrome 防泄漏）。 */
+function insertCodeBlock(code: string, lang: string) {
+  insertSnippetHtml(buildCodeBlockHtml(code, lang), true)
+}
+
 function insertImage(src: string, alt = '') {
   if (!editorRef.value) return
   pushUndoState(true)
@@ -1880,7 +2334,7 @@ function onImageResizeMouseUp() {
   nextTick(() => pushCurrentState())
 }
 
-watch(() => props.modelValue, async (newValue) => {
+watch([() => props.modelValue, endnoteEnabled], async ([newValue]) => {
   if (skipNextModelRender) {
     return
   }
@@ -1949,6 +2403,7 @@ onMounted(async () => {
     el.__getUndoStackSize = () => undoStack.value.length
     el.__pushUndoState = pushUndoState
     el.__applyHighlight = applyHighlightToSelection
+    el.__applyFontSize = applyFontSizeToSelection
   }
 })
 
@@ -1996,6 +2451,24 @@ function onClick(ev: MouseEvent) {
 
   // Handle anchor link clicks (#hash)
   const anchor = target.closest?.('a[href^="#"]') as HTMLAnchorElement | null
+  // 尾注角标/定义整宿主可点（wave-2 C3）：移动端上标 `<a>` 命中盒极小，
+  // 点击常落在 sup/p 上 —— 按 data-endnote-id 直接解析对端目标。
+  const endnoteHost = target.closest?.('.note-endnote-ref, .note-endnote-def') as HTMLElement | null
+  if (!anchor && endnoteHost && root.contains(endnoteHost)) {
+    const eid = endnoteHost.getAttribute('data-endnote-id') || ''
+    const isRef = endnoteHost.classList.contains('note-endnote-ref')
+    const targetEl = eid
+      ? (root.querySelector(isRef ? `#note-endnote-def-${CSS.escape(eid)}` : `#note-endnote-ref-${CSS.escape(eid)}`) as HTMLElement | null)
+      : null
+    if (targetEl) {
+      ev.preventDefault()
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      targetEl.classList.remove('note-endnote-flash')
+      void targetEl.offsetWidth
+      targetEl.classList.add('note-endnote-flash')
+    }
+    return
+  }
   if (anchor && root.contains(anchor)) {
     const hash = anchor.getAttribute('href') || ''
     const id = hash.replace(/^#/, '')
@@ -2005,7 +2478,16 @@ function onClick(ev: MouseEvent) {
         const el = root.querySelector(`#${CSS.escape(decoded)}`) as HTMLElement | null
         if (el) {
           ev.preventDefault()
-          scrollPreviewToElement(root, el)
+          // scrollIntoView 自适应真实滚动容器（编辑器内滚 vs 移动端整页滚），
+          // scrollPreviewToElement 只滚编辑器自身 —— 移动端跳转失效根因（wave-2 C3）
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          // 尾注双向跳转：到达目标后闪烁提示（角标↔定义互跳的视觉闭环）
+          if (el.classList.contains('note-endnote-ref') || el.classList.contains('note-endnote-def')) {
+            el.classList.remove('note-endnote-flash')
+            // 触发 reflow 以便重复点击也能重放动画
+            void el.offsetWidth
+            el.classList.add('note-endnote-flash')
+          }
           try { history.replaceState(null, '', `#${decoded}`) } catch { /* ignore */ }
           return
         }
@@ -2050,6 +2532,7 @@ function getCleanHtml(): string {
     parent.removeChild(mark)
     if (parent.normalize) parent.normalize()
   })
+  stripFindStyleSpans(clone)
   return clone.innerHTML
 }
 
@@ -2094,14 +2577,38 @@ async function flushPendingSerialization(): Promise<void> {
   }
 }
 
-function onInput(force = false) {
+/**
+ * pre-change 快照（wave-2 A1）：新一轮输入开始前（beforeinput，浏览器尚未改树）
+ * 压入变更前 DOM+选区 —— 撤销链才是「回到键入前」而不是「回到上一拍之后」。
+ * 突发判定 = 无待决去抖（inputDebounceTimer 为空 = 新一轮编辑）。
+ */
+function onBeforeInput() {
+  if (isUndoing || isExternalContentUpdate || isComposing) return
+  if (inputDebounceTimer) return
+  pushUndoState()
+}
+
+function onInput(force: boolean | Event = false) {
   if (!editorRef.value || suppressInputDepth.value > 0) return
+
+  // 需求 3：Enter 切块 / 块边界处 Backspace 合块会在标题内留下浏览器样式伪影
+  // （<span style="font-size:…">，见 composables/headingTypography.ts）。
+  // 双重门槛：inputType ∈ 切块/合块集合 **且** onKeydown 判定确实切/合了块。
+  // 后者不可省 —— deleteContentBackward 也覆盖"块中间删一个字符"，那里的字号
+  // 可能是用户用字号按钮显式设置的，不该被抹掉（评审 A4）。
+  const nativeEvent = typeof force === 'object' && force !== null ? force as InputEvent : null
+  if (nativeEvent) {
+    // 任何 native input 都消费掉标记（匹配与否都要清）—— 标记的寿命就是
+    // 「keydown 之后的那一次 input」，绝不跨事件存活（评审复审 New-1）。
+    const shouldNormalize = shouldNormalizeHeadingAfterInput(nativeEvent.inputType) && pendingHeadingNormalize
+    pendingHeadingNormalize = false
+    if (shouldNormalize) normalizeHeadingBlocksAroundCaret()
+  }
 
   // DOM-derived undo snapshots and find highlights stay synchronous; only the
   // serialization is deferred.
-  if (!isUndoing && !isExternalContentUpdate && undoStack.value.length === 0) {
-    pushUndoState()
-  }
+  // pre-change 基线由 onBeforeInput 在突变前压入（wave-2 A1）；
+  // 此处不再补「空栈首拍」事后快照（那会把基线锚在变更后且常无选区）。
   if (!isUndoing && !isExternalContentUpdate) {
     scheduleInputUndo()
   }
@@ -2109,14 +2616,70 @@ function onInput(force = false) {
   // Update highlights to reflect any content changes while find bar is active
   if (props.findActive && props.findQuery) {
     updateFindHighlights()
+  } else if (editorRef.value?.querySelector('[data-find-match="true"]')) {
+    // 查找未激活（或无查询词）却残留搜索高亮标记 —— 无条件清除。
+    // 不用存在位旗标：粘贴/innerHTML 引入的标记不经 updateFindHighlights，
+    // 旗标漏报会让污染永驻（wave-3 C1-8 实证后回退，正确性优先）。
+    removeFindHighlights()
   }
 
   scheduleSerialize(!!force)
 }
 
+/** 切块/合块之后：归一化光标块与前一兄弟里的标题（Backspace 合并目标）。 */
+let pendingHeadingNormalize = false
+
+/** 光标是否位于当前块的文本首/尾（只有这里删字符才会真正合块）。 */
+function isCaretAtBlockEdge(edge: 'start' | 'end'): boolean {
+  const sel = window.getSelection()
+  if (!sel || sel.rangeCount === 0) return false
+  const range = sel.getRangeAt(0)
+  if (!range.collapsed) return false
+  const root = editorRef.value
+  if (!root) return false
+  const block = getCurrentBlockElement()
+  if (!block) return false
+  const probe = document.createRange()
+  probe.selectNodeContents(block)
+  if (edge === 'start') {
+    probe.setEnd(range.startContainer, range.startOffset)
+    return probe.toString().length === 0
+  }
+  probe.setStart(range.endContainer, range.endOffset)
+  return probe.toString().length === 0
+}
+
+function normalizeHeadingBlocksAroundCaret() {
+  const root = editorRef.value
+  if (!root) return
+  const block = getCurrentBlockElement()
+  if (!block) return
+  const prev = block.previousElementSibling as HTMLElement | null
+  normalizeHeadingBlocksAround(block as HTMLElement, prev)
+}
+
 // Find/replace highlight functions
+// find 配色（与 .find-match / .find-match-current 的 CSS 值一致）——搜索期瞬态样式，
+// 不属于内容。Chrome 的 typingStyle 会把刚拆掉的标记计算样式以**内联**形式续给
+// 随后键入的无关文字（wave-2 复现实证：键入首字符即出现 rgba(255,140,0,0.7) span），
+// 只认 [data-find-match] 的清理器永远漏掉它。凡清理/出快照一律剥掉。
+const FIND_PALETTE_COLORS = ['rgba(255, 200, 0, 0.4)', 'rgba(255, 140, 0, 0.7)']
+// find 标记存在位（wave-2 性能）：onInput 每键不再 querySelector 全树
+let findMarksPresent = false
+
+function stripFindStyleSpans(root: HTMLElement) {
+  root.querySelectorAll<HTMLElement>('span[style]').forEach(span => {
+    const bg = (span.style.backgroundColor || '').replace(/\s+/g, '')
+    const hit = FIND_PALETTE_COLORS.some(c => bg === c.replace(/\s+/g, ''))
+    if (!hit) return
+    span.style.removeProperty('background-color')
+    span.style.removeProperty('border-radius')
+    if (!span.getAttribute('style')) unwrapElementKeepText(span)
+  })
+}
+
 function removeFindHighlights() {
-  if (!editorRef.value) return
+  if (!editorRef.value || isComposing) return // IME 组合期不动树（wave-3 #1）
   suppressInputDepth.value++
   try {
     const marks = editorRef.value.querySelectorAll('[data-find-match="true"]')
@@ -2129,12 +2692,15 @@ function removeFindHighlights() {
       parent.removeChild(mark)
       if (parent.normalize) parent.normalize()
     })
+    stripFindStyleSpans(editorRef.value)
+    findMarksPresent = false
   } finally {
     suppressInputDepth.value--
   }
 }
 
 function updateFindHighlights() {
+  if (!editorRef.value || isComposing) return // IME 组合期不动树（wave-3 #1）
   if (!editorRef.value || !props.findActive || !props.findQuery) {
     removeFindHighlights()
     return
@@ -2176,6 +2742,7 @@ function updateFindHighlights() {
 
       try {
         range.surroundContents(mark)
+        findMarksPresent = true
       } catch {
         // Skip if can't surround (crosses element boundary)
       }
@@ -2209,6 +2776,9 @@ function setSelectionByTextOffset(startOffset: number, endOffset: number) {
   while (walker.nextNode()) {
     const node = walker.currentNode
     const len = node.textContent?.length || 0
+    // 空文本节点贡献 0 长度却会「吞掉」偏移 0 的归属（落进空节点后选区
+    // 语义全错：字号读数/格式命令找错祖先）—— 解析一律跳过（wave-2 B3a 排障实锤）
+    if (len === 0) continue
 
     if (!startNode && currentOffset + len >= startOffset) {
       startNode = node
@@ -2229,17 +2799,14 @@ function setSelectionByTextOffset(startOffset: number, endOffset: number) {
     const sel = window.getSelection()
     sel?.removeAllRanges()
     sel?.addRange(range)
-    // Scroll into view
-    const rect = range.getBoundingClientRect()
-    const editorRect = editorRef.value.getBoundingClientRect()
-    if (rect.top < editorRect.top || rect.bottom > editorRect.bottom) {
-      const scrollTop = editorRef.value.scrollTop + (rect.top - editorRect.top) - editorRect.height / 2
-      editorRef.value.scrollTo({ top: Math.max(0, scrollTop), behavior: 'smooth' })
-    }
+    // 不做滚动（wave-2 复审 #2）：restoreSelection 供 undo/格式恢复等静默路径使用，
+    // 自带滚动会把视口拽到选区处 —— 用户感知为「格式化后跳到选中文字首部」。
+    // 查找导航的滚动由 find-match-current 的 scrollIntoView 单独负责。
   }
 }
 
 function replaceTextRange(startOffset: number, endOffset: number, replacement: string) {
+  if (isComposing) return false // IME 护栏（wave-3 #1）
   if (!editorRef.value) return false
   pushUndoState(true)
   setSelectionByTextOffset(startOffset, endOffset)
@@ -2749,6 +3316,25 @@ function onKeydown(e: KeyboardEvent) {
     return
   }
 
+  // 切/合块标记（需求 3）：Enter 恒切块；Backspace/Delete 只有在块边界或
+  // 跨块选区时才合块 —— 其余删字符不动标题排版（保护用户显式设置的字号）。
+  // 触发键之外的任何按键一律清掉陈旧标记：列表项的自定义 Backspace 会
+  // preventDefault（无对应 input）、IME Enter 不切块 —— 若不清，标记会活到
+  // 下一次无关 input 上被误用（评审复审 New-1）。
+  if (e.key !== 'Enter' && e.key !== 'Backspace' && e.key !== 'Delete') {
+    pendingHeadingNormalize = false
+  }
+  if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    pendingHeadingNormalize = true
+  } else if (e.key === 'Backspace' || e.key === 'Delete') {
+    const sel = window.getSelection()
+    if (sel && sel.rangeCount > 0) {
+      const collapsed = sel.isCollapsed
+      pendingHeadingNormalize = !collapsed ||
+        isCaretAtBlockEdge(e.key === 'Backspace' ? 'start' : 'end')
+    }
+  }
+
   if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
     const li = findCurrentListItem()
     if (li) {
@@ -2932,6 +3518,7 @@ function onKeydown(e: KeyboardEvent) {
 
 // Handle paste events - convert markdown to rendered HTML
 function onPaste(e: ClipboardEvent) {
+  if (isComposing) return // IME 护栏（wave-3 #1）
   const imageFiles = e.clipboardData?.files
     ? Array.from(e.clipboardData.files).filter(f => f.type.startsWith('image/'))
     : []
@@ -3154,6 +3741,7 @@ function focus() {
 
 // Execute formatting command
 function execCommand(command: string, value?: string) {
+  if (isComposing) return // IME 护栏（wave-3 #1）
   pushUndoState(true)
 
   if (command === 'formatBlock' && value === 'blockquote') {
@@ -3187,6 +3775,8 @@ function execCommand(command: string, value?: string) {
 
 // Update math element with new TeX content
 async function updateMathElement(element: HTMLElement, newHtml: string) {
+  if (isComposing) return // IME 护栏（wave-3 #1）
+  pushUndoState(true) // 数学编辑可撤销（复审 B#10）
   element.outerHTML = newHtml
   await nextTick()
   if (editorRef.value) {
@@ -3221,31 +3811,17 @@ function getCurrentHeadingLevel(): string | null {
   return null
 }
 
-const HEADING_TYPO_PROPS = ['font-size', 'font-family', 'font-weight', 'line-height', 'letter-spacing'] as const
-
-// After formatBlock promotes a block to a heading, any inline typography
-// (font-size/font-family/font-weight/line-height) carried over from the
-// original text would make this heading render differently from other
-// headings of the same level. Strip those properties (recursively) so all
-// headings of a level share identical typography. Color/background are kept.
-function normalizeHeadingTypography(h: HTMLElement) {
-  const strip = (el: HTMLElement) => {
-    HEADING_TYPO_PROPS.forEach(p => el.style.removeProperty(p))
-    if (!el.getAttribute('style')) el.removeAttribute('style')
-  }
-  strip(h)
-  h.querySelectorAll<HTMLElement>('*').forEach(strip)
-  // <font> tags carry face/size via attributes invisible to CSS — unwrap.
-  Array.from(h.querySelectorAll('font')).forEach(f => unwrapElementKeepText(f as HTMLElement))
-}
-
 function applyHeadingCommand(heading: string) {
   pushUndoState(true)
   const root = editorRef.value
   const before = new Set(root ? Array.from(root.querySelectorAll('h1, h2, h3, h4, h5, h6')) : [])
   const currentLevel = getCurrentHeadingLevel()
-  if (currentLevel === heading) {
-    document.execCommand('formatBlock', false, '<p>')
+  // 'p' = 「正文」：取消标题格式（与同级再点一次的既有语义一致 —— 逐字保留
+  // 内容，不碰用户显式设置的字号/颜色，只换块级标签）。
+  if (heading === 'p' || currentLevel === heading) {
+    if (currentLevel) {
+      document.execCommand('formatBlock', false, '<p>')
+    }
   } else {
     document.execCommand('formatBlock', false, `<${heading}>`)
     if (root) {
@@ -3390,6 +3966,8 @@ defineExpose({
   updateMathElement,
   applyHighlightToSelection,
   applyFontColor,
+  applyFontSizeToSelection,
+  insertEndnote,
   applySuperscript,
   applySubscript,
   applyToListSelections,
@@ -3406,6 +3984,8 @@ defineExpose({
   applyHeadingCommand,
   saveEditorSelection,
   restoreEditorSelection,
+  insertMath,
+  insertCodeBlock,
   insertTable,
   tableSelection,
   deleteSelectedTableRowsOrCols,
@@ -3444,7 +4024,7 @@ defineExpose({
   height: 100%;
   padding: 12px 24px 24px; /* wave-8 用户点名：首行与工具栏间距减半（24→12） */
   padding-bottom: var(--note-editor-padding-bottom, 24px);
-  font-size: 15px;
+  font-size: 14px;
   line-height: 1.6;
   color: var(--color-text);
   background-color: var(--color-bg);
@@ -3880,6 +4460,38 @@ defineExpose({
 .wysiwyg-editor :deep(.find-match-current) {
   background-color: rgba(255, 140, 0, 0.7);
   border-radius: 2px;
+}
+
+/* 尾注：角标上标化 + 可点击；与引用角标 [N] 视觉区分（wave-2 B2）：
+   〔N〕括形 + 主色；定义段文末；双向跳转到达时闪烁 */
+.wysiwyg-editor :deep(.note-endnote-ref) {
+  vertical-align: super;
+  font-size: 0.75em;
+  cursor: pointer;
+  color: var(--color-primary, #2340b8);
+  font-weight: 600;
+}
+
+.wysiwyg-editor :deep(.note-endnote-ref a),
+.wysiwyg-editor :deep(.note-endnote-back) {
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.wysiwyg-editor :deep(.note-endnote-def) {
+  font-size: 0.9em;
+  color: inherit;
+  opacity: 0.95;
+}
+
+.wysiwyg-editor :deep(.note-endnote-flash) {
+  animation: note-endnote-flash 1.2s ease;
+}
+
+@keyframes note-endnote-flash {
+  0% { background-color: rgba(255, 200, 0, 0.55); }
+  100% { background-color: transparent; }
 }
 </style>
 

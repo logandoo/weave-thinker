@@ -38,6 +38,10 @@ DEFAULT_AGENT_PERMISSIONS = {
     # 拒绝（会覆盖工作区当前状态，需用户显式授权）。
     "workspace_write": True,
     "workspace_restore": False,
+    # vibeweaver 集成 P0（2026-10-01）：工作区内受控 git 变更（add/commit/
+    # stash/init）默认允许——提交是可回滚的本地动作；restore 仍走
+    # workspace_restore（覆盖文件需显式授权）。
+    "git_execution": True,
     "note_create": True,
     "note_edit": True,
     "note_delete": False,
@@ -82,6 +86,7 @@ def permission_description(key: str) -> str:
         "terminal_execution": "终端命令执行（高风险操作）",
         "workspace_write": "工作区文件写入/编辑",
         "workspace_restore": "恢复工作区快照（会覆盖当前文件内容）",
+        "git_execution": "工作区 git 变更操作（add/commit/stash/init）",
         "note_create": "新增笔记",
         "note_edit": "编辑笔记",
         "note_delete": "删除笔记",
@@ -100,6 +105,13 @@ def permission_key_for_tool_request(tool_name: str, details: Optional[Dict[str, 
         action = (details.get("action") or "").lower()
         if action in ("start", "write", "kill"):
             return "terminal_execution"
+        return None
+    if tool_name == "git":
+        sub = str(details.get("action") or details.get("subcommand") or "").lower()
+        if sub == "restore":
+            return "workspace_restore"
+        if sub in ("add", "commit", "stash", "init"):
+            return "git_execution"
         return None
     if tool_name == "notes":
         action = (details.get("action") or "").lower()

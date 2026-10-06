@@ -218,7 +218,9 @@ onMounted(async () => {
   const convId = route.query.conv as string | undefined
   if (convId) {
     await chatStore.selectConversation(convId)
-    await chatStore.refreshConversation(convId)
+    // P0-2 去串行 + 去重：不阻塞首屏；reuseFresh 跳过 selectConversation 刚拉过的
+    // 重复全量 GET（评审 I2：TTL 仅此调用点开启，其余调用者语义不变）。
+    void chatStore.refreshConversation(convId, { reuseFresh: true })
   }
 
   // Ensure the active conversation ID is always reflected in the URL so that

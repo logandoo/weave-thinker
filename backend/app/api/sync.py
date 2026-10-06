@@ -674,7 +674,8 @@ async def resync(
             q = (
                 select(Message)
                 .join(Conversation, Message.conversation_id == Conversation.id)
-                .where(Conversation.user_id == current_user.id)
+                .where(Conversation.user_id == current_user.id,
+                       Message.delivery_status != "streaming")
             )
         elif entity_type == "skill_files":
             # 全量保真波：skill_files 经父 user_skills 归属（此前 else=messages 会错套）
@@ -689,7 +690,8 @@ async def resync(
             q = (
                 select(Message)
                 .join(Conversation, Message.conversation_id == Conversation.id)
-                .where(Conversation.user_id == current_user.id)
+                .where(Conversation.user_id == current_user.id,
+                       Message.delivery_status != "streaming")
             )
         rows = (await db.execute(q)).scalars().all()
         entities[entity_type] = [row_snapshot(r) for r in rows]
@@ -700,5 +702,19 @@ async def resync(
     entities["user_profile"] = [
         {k: snap.get(k) for k in (*PROFILE_COLS, "updated_at", "id")}
     ]
+    # 模型池配置（2026-09-29 波，D-21/D-22）：服务端合并配置的模型段随 resync
+    # 下行——客户端白名单落盘 config_model.toml + 热重载 → 全端模型列表一致（D-16）。
+    # 方向单向（服务端→客户端）；[sync] model_config_enabled=false 整体关闭
+    # （多租户/开放注册部署）；model_config_include_keys=false 剥离 api_key。
+    from app.services.model_config_sync import build_model_config_payload
+
+    if config.sync_model_config_enabled:
+        mc_payload = build_model_config_payload(
+            getattr(config, "_config", {}) or {},
+            include_keys=config.sync_model_config_include_keys,
+        )
+        if mc_payload:
+            mc_payload["id"] = "model_config"
+            entities["model_config"] = [mc_payload]
     max_seq = (await db.execute(select(func.max(SyncEvent.seq)))).scalar() or 0
     return ResyncResponse(entities=entities, cursor=max_seq)

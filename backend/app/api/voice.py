@@ -81,7 +81,8 @@ async def get_voice_session_messages(
     if not conv:
         raise HTTPException(status_code=404, detail="\u4f1a\u8bdd\u4e0d\u5b58\u5728")
     msg_result = await db.execute(
-        select(Message).where(Message.conversation_id == session_id)
+        select(Message).where(Message.conversation_id == session_id,
+                              Message.delivery_status != "streaming")
         .order_by(Message.created_at)
     )
     messages = msg_result.scalars().all()

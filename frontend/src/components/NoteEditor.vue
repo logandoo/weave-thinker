@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 <template>
-  <div class="note-editor-page">
+  <div class="note-editor-page" @pointerover="onTipPointer" @focusin="onTipPointer">
     <div class="editor-header">
       <button class="back-btn" @click="goBack">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -36,13 +36,13 @@
     </div>
 
     <div class="editor-toolbar">
-      <button class="toolbar-btn" :class="{ active: isBold }" @mousedown.prevent @click="execCommand('bold')" title="粗体">
+      <button class="toolbar-btn" :class="{ active: isBold }" @mousedown.prevent @click="execCommand('bold')" data-tip="粗体" aria-label="粗体">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/>
           <path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/>
         </svg>
       </button>
-      <button class="toolbar-btn" :class="{ active: isItalic }" @mousedown.prevent @click="execCommand('italic')" title="斜体">
+      <button class="toolbar-btn" :class="{ active: isItalic }" @mousedown.prevent @click="execCommand('italic')" data-tip="斜体" aria-label="斜体">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="19" y1="4" x2="10" y2="4"/>
           <line x1="14" y1="20" x2="5" y2="20"/>
@@ -56,7 +56,7 @@
           ref="headingBtnRef"
           @mousedown.prevent
           @click="toggleHeadingMenu"
-          :title="currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '标题'"
+          :aria-label="currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '标题'" :data-tip="currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '标题'"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M4 12h8"/>
@@ -65,7 +65,7 @@
           </svg>
         </button>
       </div>
-      <button class="toolbar-btn" :class="{ active: isQuote }" @mousedown.prevent @click="handleBlockquoteCommand" title="引用">
+      <button class="toolbar-btn" :class="{ active: isQuote }" @mousedown.prevent @click="handleBlockquoteCommand" data-tip="引用" aria-label="引用">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="3" y1="10" x2="3" y2="14"/>
           <line x1="7" y1="6" x2="21" y2="6"/>
@@ -73,7 +73,7 @@
           <line x1="7" y1="18" x2="21" y2="18"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="handleListCommand('insertUnorderedList')" title="项目符号列表">
+      <button class="toolbar-btn" @mousedown.prevent @click="handleListCommand('insertUnorderedList')" data-tip="项目符号列表" aria-label="项目符号列表">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="9" y1="6" x2="21" y2="6"/>
           <line x1="9" y1="12" x2="21" y2="12"/>
@@ -83,7 +83,7 @@
           <circle cx="4.5" cy="18" r="1.5" fill="currentColor" stroke="none"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="handleListCommand('insertOrderedList')" title="编号列表">
+      <button class="toolbar-btn" @mousedown.prevent @click="handleListCommand('insertOrderedList')" data-tip="编号列表" aria-label="编号列表">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="10" y1="6" x2="21" y2="6"/>
           <line x1="10" y1="12" x2="21" y2="12"/>
@@ -93,30 +93,30 @@
           <path d="M4 19h3"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef.value?.saveEditorSelection()" @click="handleRestartNumbering()" title="重新编号">
+      <button class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="handleRestartNumbering()" data-tip="重新编号" aria-label="重新编号">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M1 4v6h6"/>
           <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
           <text x="12" y="16" font-size="8" fill="currentColor" stroke="none" text-anchor="middle" font-weight="bold">1</text>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('left')" title="左对齐">
+      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('left')" data-tip="左对齐" aria-label="左对齐">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="3" y1="6" x2="21" y2="6"/><rect x="3" y="9" width="10" height="6" rx="1"/><line x1="3" y1="18" x2="21" y2="18"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('center')" title="居中">
+      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('center')" data-tip="居中" aria-label="居中">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="3" y1="6" x2="21" y2="6"/><rect x="7" y="9" width="10" height="6" rx="1"/><line x1="3" y1="18" x2="21" y2="18"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('right')" title="右对齐">
+      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('right')" data-tip="右对齐" aria-label="右对齐">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="3" y1="6" x2="21" y2="6"/><rect x="11" y="9" width="10" height="6" rx="1"/><line x1="3" y1="18" x2="21" y2="18"/>
         </svg>
       </button>
       <div class="table-picker-wrap">
-        <button class="toolbar-btn" ref="tableBtnRef" @mousedown.prevent @click="toggleTablePicker" title="插入表格">
+        <button class="toolbar-btn" ref="tableBtnRef" @mousedown.prevent @click="toggleTablePicker" data-tip="插入表格" aria-label="插入表格">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <rect x="3" y="3" width="18" height="18" rx="2"/>
             <line x1="3" y1="9" x2="21" y2="9"/>
@@ -126,9 +126,23 @@
           </svg>
         </button>
       </div>
+      <button class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="openMathInsertDialog" data-tip="插入公式" aria-label="插入公式">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M5 20c2-8 4-12 7-16"/>
+          <path d="M9 12h6"/>
+          <text x="14" y="18" font-size="9" fill="currentColor" stroke="none" text-anchor="middle" font-style="italic">x²</text>
+        </svg>
+      </button>
+      <button class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="openCodeInsertDialog" data-tip="插入代码块" aria-label="插入代码块">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="8 6 3 12 8 18"/>
+          <polyline points="16 6 21 12 16 18"/>
+          <line x1="14" y1="4" x2="10" y2="20"/>
+        </svg>
+      </button>
       <div class="toolbar-divider"></div>
       <div class="color-picker-wrap">
-        <button class="toolbar-btn highlight-btn" ref="highlightBtnRef" @mousedown.prevent @click="toggleHighlightColorPicker" title="高亮">
+        <button class="toolbar-btn highlight-btn" ref="highlightBtnRef" @mousedown.prevent @click="toggleHighlightColorPicker" data-tip="高亮" aria-label="高亮">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 20h9"/>
             <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
@@ -136,24 +150,27 @@
         </button>
       </div>
       <div class="color-picker-wrap">
-        <button class="toolbar-btn font-color-btn" ref="fontColorBtnRef" @mousedown.prevent @click="toggleFontColorPicker" title="字体">
+        <button class="toolbar-btn font-color-btn" ref="fontColorBtnRef" @mousedown.prevent @click="toggleFontColorPicker" data-tip="字体" aria-label="字体">
           <span class="font-color-text">A</span>
         </button>
       </div>
-      <button class="toolbar-btn" :class="{ active: isSup }" @mousedown.prevent @click="applySuperscript" title="上标">
+      <button class="toolbar-btn" :class="{ active: isSup }" @mousedown.prevent @click="applySuperscript" data-tip="上标" aria-label="上标">
         <span class="script-btn-text">A<sup>2</sup></span>
       </button>
-      <button class="toolbar-btn" :class="{ active: isSub }" @mousedown.prevent @click="applySubscript" title="下标">
+      <button class="toolbar-btn" :class="{ active: isSub }" @mousedown.prevent @click="applySubscript" data-tip="下标" aria-label="下标">
         <span class="script-btn-text">A<sub>2</sub></span>
       </button>
+      <button v-if="editorPrefs.endnoteEnabled" class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="insertEndnote" data-tip="尾注" aria-label="尾注">
+        <span class="script-btn-text">注<sup>1</sup></span>
+      </button>
       <div class="toolbar-divider"></div>
-      <button class="toolbar-btn" @click="openFindBar(false)" title="查找">
+      <button class="toolbar-btn" @click="openFindBar(false)" data-tip="查找" aria-label="查找">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="11" cy="11" r="8"/>
           <line x1="21" y1="21" x2="16.65" y2="16.65"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @click="openFindBar(true)" title="查找替换">
+      <button class="toolbar-btn" @click="openFindBar(true)" data-tip="查找替换" aria-label="查找替换">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M17 1l4 4-4 4"/>
           <path d="M3 11V9a4 4 0 0 1 4-4h14"/>
@@ -162,7 +179,7 @@
         </svg>
       </button>
       <div class="toolbar-divider"></div>
-      <button class="toolbar-btn" :class="{ active: showToc }" @click="showToc = !showToc" title="目录">
+      <button class="toolbar-btn" :class="{ active: showToc }" @click="showToc = !showToc" data-tip="目录" aria-label="目录">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
           <polyline points="14 2 14 8 20 8"/>
@@ -170,7 +187,7 @@
           <line x1="8" y1="17" x2="13" y2="17"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @click="startVoiceNote" :disabled="isProcessing" title="语音输入">
+      <button class="toolbar-btn" @click="startVoiceNote" :disabled="isProcessing" data-tip="语音输入" aria-label="语音输入">
         <svg v-if="!isRecording" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
           <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
@@ -182,21 +199,21 @@
         </svg>
       </button>
       <div class="toolbar-divider"></div>
-      <button class="toolbar-btn" @mousedown.prevent @click="triggerImageUpload" title="插入图片">
+      <button class="toolbar-btn" @mousedown.prevent @click="triggerImageUpload" data-tip="插入图片" aria-label="插入图片">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
           <circle cx="8.5" cy="8.5" r="1.5"/>
           <polyline points="21 15 16 10 5 21"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="triggerAudioUpload" title="插入音频">
+      <button class="toolbar-btn" @mousedown.prevent @click="triggerAudioUpload" data-tip="插入音频" aria-label="插入音频">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M9 18V5l12-2v13"/>
           <circle cx="6" cy="18" r="3"/>
           <circle cx="18" cy="16" r="3"/>
         </svg>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="triggerVideoUpload" title="插入视频">
+      <button class="toolbar-btn" @mousedown.prevent @click="triggerVideoUpload" data-tip="插入视频" aria-label="插入视频">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"/>
           <polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
@@ -217,13 +234,13 @@
           @keydown="onFindKeydown"
         />
         <span v-if="findQuery" class="find-count">{{ matchPositions.length === 0 ? '无结果' : `${currentMatchIndex + 1}/${matchPositions.length}` }}</span>
-        <button class="find-nav-btn" :disabled="matchPositions.length === 0" @click="findPrev" title="上一个">
+        <button class="find-nav-btn" :disabled="matchPositions.length === 0" @click="findPrev" data-tip="上一个" aria-label="上一个">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg>
         </button>
-        <button class="find-nav-btn" :disabled="matchPositions.length === 0" @click="findNext" title="下一个">
+        <button class="find-nav-btn" :disabled="matchPositions.length === 0" @click="findNext" data-tip="下一个" aria-label="下一个">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
         </button>
-        <button class="find-close-btn" @click="closeFindBar" title="关闭">
+        <button class="find-close-btn" @click="closeFindBar" data-tip="关闭" aria-label="关闭">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
@@ -234,8 +251,8 @@
           placeholder="替换为..."
           @keydown="onReplaceKeydown"
         />
-        <button class="find-action-btn" :disabled="matchPositions.length === 0" @click="replaceCurrent" title="替换">替换</button>
-        <button class="find-action-btn" :disabled="matchPositions.length === 0" @click="replaceAll" title="全部替换">全部</button>
+        <button class="find-action-btn" :disabled="matchPositions.length === 0" @click="replaceCurrent" data-tip="替换" aria-label="替换">替换</button>
+        <button class="find-action-btn" :disabled="matchPositions.length === 0" @click="replaceAll" data-tip="全部替换" aria-label="全部替换">全部</button>
       </div>
     </div>
 
@@ -394,6 +411,7 @@
     </Teleport>
     <Teleport to="body">
       <div v-if="showHeadingMenu" class="heading-dropdown-teleport" :style="headingMenuStyle" @click.stop>
+        <button class="heading-dropdown-item" :class="{ 'heading-active': !currentHeadingLevel }" @click="applyHeading('p')"><span class="heading-icon">正文</span></button>
         <button class="heading-dropdown-item" :class="{ 'heading-active': currentHeadingLevel === 'h1' }" @click="applyHeading('h1')"><span class="heading-icon">H1</span></button>
         <button class="heading-dropdown-item" :class="{ 'heading-active': currentHeadingLevel === 'h2' }" @click="applyHeading('h2')"><span class="heading-icon">H2</span></button>
         <button class="heading-dropdown-item" :class="{ 'heading-active': currentHeadingLevel === 'h3' }" @click="applyHeading('h3')"><span class="heading-icon">H3</span></button>
@@ -484,7 +502,7 @@
       <div v-if="showMathEditDialog" class="math-dialog-overlay" @click="closeMathEditDialog">
         <div class="math-dialog" @click.stop>
           <div class="math-dialog-header">
-            <h3>编辑数学公式</h3>
+            <h3>{{ mathDialogMode === 'insert' ? '插入数学公式' : '编辑数学公式' }}</h3>
             <button class="math-dialog-close" @click="closeMathEditDialog">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="18" y1="6" x2="6" y2="18"/>
@@ -493,6 +511,18 @@
             </button>
           </div>
           <div class="math-dialog-content">
+            <div class="math-mode-toggle">
+              <button
+                class="math-mode-btn"
+                :class="{ active: !mathEditDisplayMode }"
+                @click="mathEditDisplayMode = false"
+              >行内</button>
+              <button
+                class="math-mode-btn"
+                :class="{ active: mathEditDisplayMode }"
+                @click="mathEditDisplayMode = true"
+              >块级</button>
+            </div>
             <textarea
               v-model="mathEditTex"
               class="math-edit-textarea"
@@ -503,7 +533,38 @@
           </div>
           <div class="math-dialog-footer">
             <button class="math-dialog-cancel" @click="closeMathEditDialog">取消</button>
-            <button class="math-dialog-save" @click="saveMathEdit">保存</button>
+            <button class="math-dialog-save" @click="saveMathEdit">{{ mathDialogMode === 'insert' ? '插入' : '保存' }}</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+    <Teleport to="body">
+      <div v-if="showCodeInsertDialog" class="math-dialog-overlay" @click="showCodeInsertDialog = false">
+        <div class="math-dialog" @click.stop>
+          <div class="math-dialog-header">
+            <h3>插入代码块</h3>
+            <button class="math-dialog-close" @click="showCodeInsertDialog = false">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+          <div class="math-dialog-content">
+            <input
+              v-model="codeInsertLang"
+              class="code-lang-input"
+              placeholder="语言（可选，如 python / js / sh）"
+            />
+            <textarea
+              v-model="codeInsertText"
+              class="math-edit-textarea code-insert-textarea"
+              placeholder="粘贴或输入代码..."
+            ></textarea>
+          </div>
+          <div class="math-dialog-footer">
+            <button class="math-dialog-cancel" @click="showCodeInsertDialog = false">取消</button>
+            <button class="math-dialog-save" @click="confirmCodeInsert">插入</button>
           </div>
         </div>
       </div>
@@ -512,15 +573,21 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick, type CSSProperties } from 'vue'
 import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router'
 import { useNotesStore } from '@/stores/notes'
 import { useAsrStreaming } from '@/composables/useAsrStreaming'
 import { useAsrHotwords } from '@/composables/useAsrHotwords'
 import { useToast } from '@/composables/useToast'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
+import { useAnchoredPickerStyle } from '@/composables/pickerAnchoring'
+import { useToolbarTip } from '@/composables/toolbarTip'
+import { useEditorPrefsStore } from '@/stores/editorPrefs'
+import { readSelectionFontSize } from '@/composables/editorFontSize'
+import { useFindReplace } from '@/composables/useFindReplace'
+
 import { navigateWithMobileHistory } from '@/composables/useMobileNavigation'
-import { renderMarkdownToHtml, renderMermaidBlocks, renderSingleMermaidBlock, fixLostMermaidBlocks, renderEchartsBlocks, fixLostEchartsBlocks, attachMathEditListeners, katexModule } from '@/composables/useMarkdown'
+import { renderMarkdownToHtml, renderMermaidBlocks, renderSingleMermaidBlock, fixLostMermaidBlocks, renderEchartsBlocks, fixLostEchartsBlocks, attachMathEditListeners, katexModule, renderMathSafe } from '@/composables/useMarkdown'
 import ExportProgressDialog from './ExportProgressDialog.vue'
 import WysiwygEditor from './WysiwygEditor.vue'
 import WordCountButton from './WordCountButton.vue'
@@ -664,8 +731,6 @@ function onObjectAlign(align: 'left' | 'center' | 'right') {
   }
 }
 
-const showFindBar = ref(false)
-const showReplaceBar = ref(false)
 const showHeadingMenu = ref(false)
 const currentHeadingLevel = ref<string | null>(null)
 const showToc = ref(false)
@@ -730,41 +795,43 @@ function updateZoomSvgScale() {
 const mathEditTex = ref('')
 const mathEditDisplayMode = ref(false)
 const mathEditElement = ref<HTMLElement | null>(null)
-const headingMenuStyle = computed(() => {
-  const btn = headingBtnRef.value
-  if (!btn) return {}
-  const rect = btn.getBoundingClientRect()
-  return {
-    position: 'fixed' as const,
-    top: `${rect.bottom + 4}px`,
-    left: `${rect.left}px`,
-    zIndex: 9999,
-  }
-})
+const mathDialogMode = ref<'edit' | 'insert'>('edit')
+const showCodeInsertDialog = ref(false)
+const codeInsertLang = ref('')
+const codeInsertText = ref('')
+// 标题菜单定位：**打开瞬间**测量按钮矩形。旧实现是 computed —— 唯一响应式
+// 依赖是模板 ref（挂载时赋值一次、之后不变），getBoundingClientRect 又不是
+// 响应式的，于是首次求值的矩形被永久缓存：面板拖宽/窗口改比例后按钮已经移位，
+// 菜单仍开在按钮的旧位置（16:9 上恰好没移过所以看着是对的）。
+const headingMenuStyle = ref<CSSProperties>({})
 
-const fontColorPickerStyle = computed(() => {
-  const btn = fontColorBtnRef.value
+function measureMenuStyle(btn: HTMLElement | null): CSSProperties {
   if (!btn) return {}
   const rect = btn.getBoundingClientRect()
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - 280 - 8))
+  const top = Math.min(rect.bottom + 4, Math.max(8, window.innerHeight - 80))
   return {
-    position: 'fixed' as const,
-    top: `${rect.bottom + 4}px`,
-    left: `${rect.left}px`,
+    position: 'fixed',
+    top: `${top}px`,
+    left: `${left}px`,
     zIndex: 9999,
   }
-})
+}
 
-const highlightColorPickerStyle = computed(() => {
-  const btn = highlightBtnRef.value
-  if (!btn) return {}
-  const rect = btn.getBoundingClientRect()
-  return {
-    position: 'fixed' as const,
-    top: `${rect.bottom + 4}px`,
-    left: `${rect.left}px`,
-    zIndex: 9999,
-  }
-})
+function refreshHeadingMenuStyle() {
+  if (!showHeadingMenu.value) return
+  headingMenuStyle.value = measureMenuStyle(headingBtnRef.value)
+}
+
+// 字体/高亮拾取器定位：共用 useAnchoredPickerStyle（打开瞬间测量 + 视口钳制）。
+// 旧实现是 computed 包 getBoundingClientRect（矩形被永久缓存 + 右侧工具栏浮层
+// 溢出视口）—— 与 ZenNotePanel 同步替换。
+const { pickerStyle: fontColorPickerStyle, refreshPickerStyle: refreshFontColorPickerStyle } =
+  useAnchoredPickerStyle(fontColorBtnRef)
+const { onTipPointer } = useToolbarTip()
+const editorPrefs = useEditorPrefsStore()
+const { pickerStyle: highlightColorPickerStyle, refreshPickerStyle: refreshHighlightColorPickerStyle } =
+  useAnchoredPickerStyle(highlightBtnRef)
 
 const fontColors = [
   '#000000', '#e60000', '#ff9900', '#ffff00', '#008a00', '#0066cc',
@@ -807,11 +874,12 @@ function closeAllToolbarMenus() {
 function toggleHeadingMenu() {
   if (showHeadingMenu.value) {
     showHeadingMenu.value = false
-  } else {
-    closeAllToolbarMenus()
-    updateHeadingButtonState()
-    showHeadingMenu.value = true
+    return
   }
+  closeAllToolbarMenus()
+  updateHeadingButtonState()
+  headingMenuStyle.value = measureMenuStyle(headingBtnRef.value)
+  showHeadingMenu.value = true
 }
 
 const isBold = ref(false)
@@ -870,6 +938,7 @@ function toggleHighlightColorPicker() {
     showHighlightColorPicker.value = false
   } else {
     closeAllToolbarMenus()
+    refreshHighlightColorPickerStyle()
     showHighlightColorPicker.value = true
   }
 }
@@ -906,17 +975,8 @@ function removeHighlight() {
   }
 }
 
-const tablePickerStyle = computed(() => {
-  const btn = tableBtnRef.value
-  if (!btn) return {}
-  const rect = btn.getBoundingClientRect()
-  return {
-    position: 'fixed' as const,
-    top: `${rect.bottom + 4}px`,
-    left: `${rect.left}px`,
-    zIndex: 10000,
-  }
-})
+const { pickerStyle: tablePickerStyle, refreshPickerStyle: refreshTablePickerStyle } =
+  useAnchoredPickerStyle(tableBtnRef)
 
 function toggleTablePicker() {
   const editor = wysiwygEditorRef.value
@@ -927,6 +987,7 @@ function toggleTablePicker() {
     showTablePicker.value = false
   } else {
     closeAllToolbarMenus()
+    refreshTablePickerStyle()
     showTablePicker.value = true
   }
   tablePickerHoverRow.value = 0
@@ -952,10 +1013,6 @@ function confirmTablePicker() {
   }
 }
 
-const findQuery = ref('')
-const replaceQuery = ref('')
-const matchPositions = ref<number[]>([])
-const currentMatchIndex = ref(-1)
 
 let pinchStartDistance = 0
 let pinchStartScale = 100
@@ -1652,145 +1709,15 @@ function onEditorKeydown(e: KeyboardEvent) {
   }
 }
 
-function computeMatches() {
-  const text = wysiwygEditorRef.value?.getTextContent() || ''
-  const query = findQuery.value
-  if (!query) {
-    matchPositions.value = []
-    currentMatchIndex.value = -1
-    return
-  }
-  const positions: number[] = []
-  let idx = 0
-  const lowerText = text.toLowerCase()
-  const lowerQuery = query.toLowerCase()
-  while (idx < lowerText.length) {
-    const found = lowerText.indexOf(lowerQuery, idx)
-    if (found === -1) break
-    positions.push(found)
-    idx = found + 1
-  }
-  matchPositions.value = positions
-  if (positions.length === 0) {
-    currentMatchIndex.value = -1
-  } else if (currentMatchIndex.value >= positions.length) {
-    currentMatchIndex.value = 0
-  }
-}
-
-function highlightCurrentMatch() {
-  if (matchPositions.value.length === 0 || currentMatchIndex.value < 0) return
-  // Do NOT select text in editor - the highlight CSS already visually marks which match is current.
-  // Selecting text would cause Enter key to replace the matched keyword with a newline.
-  const editorEl = wysiwygEditorRef.value?.editorRef
-  if (!editorEl) return
-  const currentMark = editorEl.querySelector('.find-match-current') as HTMLElement | null
-  if (currentMark) {
-    currentMark.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  }
-}
-
-function onFindInput() {
-  computeMatches()
-  if (matchPositions.value.length > 0) {
-    currentMatchIndex.value = 0
-    nextTick(() => highlightCurrentMatch())
-  }
-}
-
-function findNext() {
-  if (matchPositions.value.length === 0) return
-  currentMatchIndex.value = (currentMatchIndex.value + 1) % matchPositions.value.length
-  nextTick(() => highlightCurrentMatch())
-}
-
-function findPrev() {
-  if (matchPositions.value.length === 0) return
-  currentMatchIndex.value = (currentMatchIndex.value - 1 + matchPositions.value.length) % matchPositions.value.length
-  nextTick(() => highlightCurrentMatch())
-}
-
-function onFindKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter') {
-    e.preventDefault()
-    if (e.shiftKey) {
-      findPrev()
-    } else {
-      findNext()
-    }
-  } else if (e.key === 'Escape') {
-    e.preventDefault()
-    closeFindBar()
-  }
-}
-
-function onReplaceKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape') {
-    e.preventDefault()
-    closeFindBar()
-  }
-}
-
-function replaceCurrent() {
-  const editor = wysiwygEditorRef.value
-  if (!editor || matchPositions.value.length === 0 || currentMatchIndex.value < 0) return
-  const pos = matchPositions.value[currentMatchIndex.value]
-  const queryLen = findQuery.value.length
-  const success = editor.replaceTextRange?.(pos, pos + queryLen, replaceQuery.value)
-  if (success) {
-    hasChanges.value = true
-    computeMatches()
-    if (matchPositions.value.length === 0) {
-      currentMatchIndex.value = -1
-    } else if (currentMatchIndex.value >= matchPositions.value.length) {
-      currentMatchIndex.value = 0
-    }
-    nextTick(() => highlightCurrentMatch())
-  }
-}
-
-function replaceAll() {
-  const query = findQuery.value
-  if (!query || matchPositions.value.length === 0) return
-  const editor = wysiwygEditorRef.value
-  if (!editor) return
-
-  // Replace from last match to first to avoid index shifts
-  for (let i = matchPositions.value.length - 1; i >= 0; i--) {
-    const pos = matchPositions.value[i]
-    editor.replaceTextRange?.(pos, pos + query.length, replaceQuery.value)
-  }
-  hasChanges.value = true
-  computeMatches()
-  currentMatchIndex.value = matchPositions.value.length > 0 ? 0 : -1
-  nextTick(() => highlightCurrentMatch())
-}
-
-function openFindBar(withReplace: boolean) {
-  if (showFindBar.value && showReplaceBar.value === withReplace) {
-    closeFindBar()
-    return
-  }
-  showFindBar.value = true
-  showReplaceBar.value = withReplace
-  nextTick(() => {
-    findInputRef.value?.focus()
-    if (findQuery.value) {
-      computeMatches()
-      if (matchPositions.value.length > 0) {
-        currentMatchIndex.value = 0
-        nextTick(() => highlightCurrentMatch())
-      }
-    }
-  })
-}
-
-function closeFindBar() {
-  showFindBar.value = false
-  showReplaceBar.value = false
-  matchPositions.value = []
-  currentMatchIndex.value = -1
-}
+const {
+  showFindBar, showReplaceBar, findQuery, replaceQuery, matchPositions, currentMatchIndex,
+  computeMatches, highlightCurrentMatch, onFindInput, findNext, findPrev,
+  onFindKeydown, onReplaceKeydown, replaceCurrent, replaceAll, openFindBar, closeFindBar,
+} = useFindReplace({
+  getEditor: () => wysiwygEditorRef.value,
+  findInputRef,
+  onMutate: () => { hasChanges.value = true },
+})
 
 // Apply a one-shot search highlight (set when navigating from a note search
 // result). Waits for the editor to finish rendering the note content, then
@@ -1907,66 +1834,11 @@ function applyHighlight() {
 }
 
 function getSelectionFontSize() {
+  // wave-2 C2：共享 readSelectionFontSize（按选区真实覆盖段取字号，边界不失真）
   const editorEl = wysiwygEditorRef.value?.editorRef
-  if (!editorEl) { selectedFontSize.value = ''; return }
-  const sel = window.getSelection()
-  if (!sel || sel.rangeCount === 0 || !editorEl.contains(sel.anchorNode)) {
-    selectedFontSize.value = ''
-    return
-  }
-  const fontSizeOptions = ['12px', '14px', '16px', '18px', '20px', '24px', '28px', '32px', '36px']
-
-  function normalizeSize(raw: string): string {
-    if (!raw) return ''
-    if (fontSizeOptions.includes(raw)) return raw
-    const px = parseFloat(raw)
-    if (isNaN(px)) return ''
-    // Snap to nearest available option
-    let closest = ''
-    let minDiff = Infinity
-    for (const opt of fontSizeOptions) {
-      const optPx = parseFloat(opt)
-      const diff = Math.abs(px - optPx)
-      if (diff < minDiff) {
-        minDiff = diff
-        closest = opt
-      }
-    }
-    return closest
-  }
-
-  function findSizeFromNode(start: Node | null): string {
-    let n = start
-    let firstElement: HTMLElement | null = null
-    while (n && n !== editorEl) {
-      if (n.nodeType === Node.ELEMENT_NODE) {
-        const el = n as HTMLElement
-        if (!firstElement) firstElement = el
-        const fs = el.style?.fontSize
-        if (fs) {
-          const norm = normalizeSize(fs)
-          if (norm) return norm
-        }
-      }
-      n = n.parentNode
-    }
-    // Fallback: use computed style from the nearest element
-    if (firstElement) {
-      const computed = getComputedStyle(firstElement).fontSize
-      const norm = normalizeSize(computed)
-      if (norm) return norm
-    }
-    return ''
-  }
-
-  const anchorSize = findSizeFromNode(sel.anchorNode)
-  if (sel.isCollapsed || sel.anchorNode === sel.focusNode) {
-    selectedFontSize.value = anchorSize
-    return
-  }
-  const focusSize = findSizeFromNode(sel.focusNode)
-  selectedFontSize.value = (anchorSize && focusSize && anchorSize === focusSize) ? anchorSize : ''
+  selectedFontSize.value = readSelectionFontSize(editorEl) // 共享默认字号表（wave-3 #9 去重）
 }
+
 
 function toggleFontColorPicker() {
   const editor = wysiwygEditorRef.value
@@ -1984,6 +1856,7 @@ function toggleFontColorPicker() {
       editor.saveEditorSelection()
     }
     closeAllToolbarMenus()
+    refreshFontColorPickerStyle()
     showFontColorPicker.value = true
   }
 }
@@ -2011,27 +1884,18 @@ function applyFontSize() {
   if (editor.restoreEditorSelection) {
     editor.restoreEditorSelection()
   }
-  const selection = window.getSelection()
-  if (!selection || selection.rangeCount === 0) return
-  const range = selection.getRangeAt(0)
-  if (range.collapsed) return
-  const contents = range.extractContents()
-  const span = document.createElement('span')
-  if (size) {
-    span.style.fontSize = size
+  // 唯一实现走引擎 applyFontSizeToSelection（逐 text-node 包裹，绝不 extractContents
+  // 整块包裹 —— 跨块选区 span>p 非法结构即换行/字号失效根因）。
+  if (editor.applyFontSizeToSelection) {
+    editor.applyFontSizeToSelection(size)
   }
-  span.appendChild(contents)
-  range.insertNode(span)
-  if (size) {
-    const allInner = span.querySelectorAll('*') as NodeListOf<HTMLElement>
-    allInner.forEach(el => { el.style.fontSize = '' })
-  }
-  selection.removeAllRanges()
+  // 不清选区：格式化后停留原位（wave-2 复审 #2）
   showFontColorPicker.value = false
-  const editorEl = editor.editorRef
-  if (editorEl) {
-    editorEl.dispatchEvent(new Event('input', { bubbles: true }))
-  }
+}
+
+function selectionCleanup() {
+  const sel = window.getSelection()
+  if (sel) sel.removeAllRanges()
 }
 
 function applySuperscript() {
@@ -2049,6 +1913,16 @@ function applySubscript() {
     editor.applySubscript()
   } else {
     execCommand('subscript')
+  }
+}
+
+function insertEndnote() {
+  const editor = wysiwygEditorRef.value
+  if (editor && editor.insertEndnote) {
+    if (editor.restoreEditorSelection) {
+      editor.restoreEditorSelection()
+    }
+    editor.insertEndnote()
   }
 }
 
@@ -2265,10 +2139,37 @@ function editMermaidFromZoom() {
 }
 
 function handleMathEdit(payload: { tex: string; displayMode: boolean; element: HTMLElement }) {
+  mathDialogMode.value = 'edit'
   mathEditTex.value = payload.tex
   mathEditDisplayMode.value = payload.displayMode
   mathEditElement.value = payload.element
   showMathEditDialog.value = true
+}
+
+function openMathInsertDialog() {
+  wysiwygEditorRef.value?.saveEditorSelection()
+  mathDialogMode.value = 'insert'
+  mathEditTex.value = ''
+  mathEditDisplayMode.value = false
+  mathEditElement.value = null
+  showMathEditDialog.value = true
+}
+
+function openCodeInsertDialog() {
+  wysiwygEditorRef.value?.saveEditorSelection()
+  codeInsertLang.value = ''
+  codeInsertText.value = ''
+  showCodeInsertDialog.value = true
+}
+
+function confirmCodeInsert() {
+  if (!codeInsertText.value.trim()) {
+    showCodeInsertDialog.value = false
+    return
+  }
+  wysiwygEditorRef.value?.insertCodeBlock(codeInsertText.value, codeInsertLang.value)
+  showCodeInsertDialog.value = false
+  wysiwygEditorRef.value?.focus()
 }
 
 const mathPreviewHtml = computed(() => {
@@ -2281,11 +2182,22 @@ const mathPreviewHtml = computed(() => {
       strict: 'ignore',
     })
   } catch {
-    return `<span style="color: var(--color-text-light)">${mathEditTex.value}</span>`
+    const esc = (mathEditTex.value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    return `<span style="color: var(--color-text-light)">${esc}</span>`
   }
 })
 
 function saveMathEdit() {
+  if (mathDialogMode.value === 'insert') {
+    if (!mathEditTex.value.trim()) {
+      showMathEditDialog.value = false
+      return
+    }
+    wysiwygEditorRef.value?.insertMath(mathEditTex.value, mathEditDisplayMode.value)
+    showMathEditDialog.value = false
+    wysiwygEditorRef.value?.focus()
+    return
+  }
   const el = mathEditElement.value
   if (!el) {
     showMathEditDialog.value = false
@@ -2293,22 +2205,11 @@ function saveMathEdit() {
   }
   const newTex = mathEditTex.value
   const displayMode = mathEditDisplayMode.value
-  const escaped = newTex.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  // 唯一构造器 renderMathSafe（Hub 契约：math-editable 形状/data-tex/escapeMathPercent 单点收口）
   const wrapper = document.createElement('div')
-  const tag = displayMode ? 'div' : 'span'
-  wrapper.innerHTML = `<${tag} class="math-editable" data-tex="${escaped}" data-display-mode="${displayMode}"></${tag}>`
+  wrapper.innerHTML = renderMathSafe(newTex, displayMode)
   const newEl = wrapper.firstElementChild as HTMLElement
   if (newEl) {
-    try {
-      const innerHtml = katexModule.renderToString(newTex, {
-        displayMode,
-        throwOnError: false,
-        output: 'html',
-        strict: 'ignore',
-      })
-      const innerTag = displayMode ? 'div' : 'span'
-      newEl.innerHTML = `<${innerTag} class="math-rendered-content">${innerHtml}</${innerTag}><span class="math-controls"><button class="math-edit-btn" title="编辑公式"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button></span>`
-    } catch { /* ignore */ }
     el.replaceWith(newEl)
     nextTick(() => {
       const container = wysiwygEditorRef.value?.editorRef || previewRef.value
@@ -2328,7 +2229,7 @@ function onDocumentClick(e: MouseEvent) {
   if (!showHeadingMenu.value && !showFontColorPicker.value && !showHighlightColorPicker.value && !showTablePicker.value) return
   const target = e.target as HTMLElement
   // Don't close menus when clicking TOC button (TOC is not mutually exclusive)
-  if (target.closest('button[title="目录"]')) return
+  if (target.closest('button[data-tip="目录"]')) return
   if (showHeadingMenu.value) {
     if (target.closest('.heading-dropdown-teleport') || target.closest('.heading-dropdown-wrap')) return
     showHeadingMenu.value = false
@@ -2352,7 +2253,18 @@ function onSelectionChange() {
 }
 
 function onGlobalKeydown(e: KeyboardEvent) {
-  // Global keyboard shortcuts
+  // Esc：关闭插入/编辑对话框（公式/代码块）
+  if (e.key === 'Escape') {
+    if (showMathEditDialog.value) {
+      closeMathEditDialog()
+      e.preventDefault()
+      wysiwygEditorRef.value?.focus()
+    } else if (showCodeInsertDialog.value) {
+      showCodeInsertDialog.value = false
+      e.preventDefault()
+      wysiwygEditorRef.value?.focus()
+    }
+  }
 }
 
 function onMermaidEdit(e: Event) {
@@ -2392,6 +2304,7 @@ onMounted(() => {
   document.addEventListener('mermaid-edit', onMermaidEdit)
   document.addEventListener('mermaid-zoom', onMermaidZoom)
   document.addEventListener('math-edit', onMathEdit)
+  window.addEventListener('resize', refreshHeadingMenuStyle)
   autoSaveTimer = setInterval(async () => {
     if (hasChanges.value && noteId.value && !saving.value) {
       saving.value = true
@@ -2421,6 +2334,7 @@ onUnmounted(() => {
   document.removeEventListener('mermaid-edit', onMermaidEdit)
   document.removeEventListener('mermaid-zoom', onMermaidZoom)
   document.removeEventListener('math-edit', onMathEdit)
+  window.removeEventListener('resize', refreshHeadingMenuStyle)
   if (autoSaveTimer) {
     clearInterval(autoSaveTimer)
     autoSaveTimer = null
@@ -3704,6 +3618,50 @@ async function stopRecording() {
 .math-edit-textarea:focus {
   outline: none;
   border-color: var(--color-primary);
+}
+
+.math-mode-toggle {
+  display: flex;
+  gap: 0;
+  margin-bottom: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  width: fit-content;
+}
+
+.math-mode-btn {
+  padding: 5px 14px;
+  font-size: 12px;
+  color: var(--color-text-light);
+  background-color: var(--color-bg);
+  transition: all var(--transition-fast);
+}
+
+.math-mode-btn.active {
+  color: var(--color-white);
+  background-color: var(--color-primary);
+}
+
+.code-lang-input {
+  width: 100%;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-text);
+  background-color: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.code-lang-input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.code-insert-textarea {
+  min-height: 180px;
 }
 
 .math-preview-label {

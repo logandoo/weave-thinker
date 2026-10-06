@@ -8,7 +8,15 @@
 sync_events（delete 时附带 sync_tombstones）。事件在 flush 内逐对象触发，
 与本仓全 ORM 写路径同覆盖；bulk DML（update()/delete() 语句）不触发 mapper
 事件——实测同步域（conversations/messages/notes/notebooks/assistants）无 bulk
-写路径（唯一 bulk 点 asr.py UserAsrHotword 非同步域），故无缺口。
+写路径（唯一 bulk 点 asr.py UserAsrHotword 已随全量保真波入同步域
+SYNC_ENTITIES（user_asr_hotwords）且其写路径为逐行 ORM + delete+create，
+无 bulk update 缺口），故 mapper 覆盖面无缺口。
+⚠ 已知捕获缺口（后续项，非 mapper 面）：memory 域**后台维护批处理**仍走
+Core-SQL/text() 写同步列（scheduler 驱动的 weight_decay/consolidation/dreaming/
+backfill/migration/embedding 刷新，~30 点清单见 sync 收口波记录）——零事件零
+墓碑；用户可达路径（memory.py forget/delete/delete_all、clarification
+negate/forget、召回内联 try_cold_resurrect）已 ORM 化恢复捕获（余留清零波
+2026-10-02）。本 docstring 的「无缺口」断言仅限 mapper 覆盖面。
 
 origin 回显抑制：push 端点应用客户端变更前经 `set_origin_device()` 置
 ContextVar，捕获写入 sync_events.origin_device；delta 携带 device_id 时过滤
@@ -82,6 +90,7 @@ _origin_device: contextvars.ContextVar = contextvars.ContextVar(
 )
 
 _registered = False
+_LISTENERS: list = []  # (model, event_name, fn) 引用表——M1 升级：支持测试反注册
 
 
 def set_origin_device(device_id):
@@ -162,6 +171,18 @@ def _emit(connection, entity_type: str, op: str, target) -> None:
     config = get_config()
     if not config.sync_enabled:
         return
+    # 渐进落库（2026-10-06）：streaming 在途行不参与同步下发（周期刷写会造成
+    # LWW 噪音风暴）；翻 terminal（final/interrupted）后由当次提交正常发射。
+    if entity_type == "messages":
+        if getattr(target, "delivery_status", "final") == "streaming":
+            return
+        if op == "update":
+            # A4.9 r1 B#1 + scoped 复审 Critical：streaming 期 create 被跳过，
+            # 终态翻转的 update 对端无行可命中（update-without-create = 跨设备
+            # 丢失）。op 词表是 create/update/delete（sync_apply 对 append-only
+            # messages 只认 create，其余 SKIPPED）——终态翻转必须按 "create"
+            # 发射（对端无行→幂等插入；有行→SKIPPED，正是 append-only 语义）。
+            op = "create"
     # 记忆域独立开关（S5）：默认捕获（全量保真波口径），[sync] memory_enabled=false 可关
     if entity_type in MEMORY_SYNC_ENTITIES and not config.sync_memory_enabled:
         return
@@ -213,6 +234,12 @@ def register_sync_capture() -> None:
     global _registered
     if _registered:
         return
+    # 监听器引用登记（M1 升级）：支持 unregister_sync_capture 测试隔离——
+    # 内联 lambda 无法被 event.remove 定位，故统一经 _add_listener 收集。
+    def _add_listener(target, name: str, fn) -> None:
+        event.listen(target, name, fn)
+        _LISTENERS.append((target, name, fn))
+
     # user_profile：users 自行仅四列净变更才发事件（last_login 等不触发）
     def _user_after_update(mapper, connection, target):
         state = sa_inspect(target)
@@ -222,20 +249,20 @@ def register_sync_capture() -> None:
             return
         _emit(connection, "user_profile", "update", target)
 
-    event.listen(User, "after_update", _user_after_update)
+    _add_listener(User, "after_update", _user_after_update)
     # 记忆域监听一并注册（发射期按 [sync] memory_enabled 逐事件门控，SIGHUP 安全）
     for entity_type, model in {**SYNC_ENTITIES, **MEMORY_SYNC_ENTITIES}.items():
-        event.listen(
+        _add_listener(
             model,
             "after_insert",
             lambda m, c, t, et=entity_type: _emit(c, et, "create", t),
         )
-        event.listen(
+        _add_listener(
             model,
             "after_update",
             lambda m, c, t, et=entity_type: _emit(c, et, "update", t),
         )
-        event.listen(
+        _add_listener(
             model,
             "after_delete",
             lambda m, c, t, et=entity_type: _emit(c, et, "delete", t),
@@ -245,3 +272,15 @@ def register_sync_capture() -> None:
         "sync_capture registered for %d entity types (+%d memory-gated)",
         len(SYNC_ENTITIES), len(MEMORY_SYNC_ENTITIES),
     )
+
+
+def unregister_sync_capture() -> None:
+    """整体摘除监听器并复位幂等标志（测试隔离专用，生产不调用）。
+
+    M1 升级：监听器经 _LISTENERS 持引用，event.remove 可精确定位；
+    反注册后 re-register 幂等标志复位，可重新注册。"""
+    global _registered
+    for target, name, fn in _LISTENERS:
+        event.remove(target, name, fn)
+    _LISTENERS.clear()
+    _registered = False

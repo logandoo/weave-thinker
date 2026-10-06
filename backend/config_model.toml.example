@@ -74,7 +74,8 @@ is_custom = true
 provider_type = "qwen3.8_vllm"
 
 # Doubao（火山方舟 Ark，OpenAI 兼容）：thinking{type} + 顶层 reasoning_effort
-# （high/medium/low/minimal）；无 thinking_budget。模型需先在方舟控制台开通。
+# （high/medium/low；minimal≡关闭已并入「关闭」开关，2026-10-04）；无 thinking_budget。
+# 模型需先在方舟控制台开通。
 [endpoints.doubao]
 kind = "llm"
 base_url = "https://ark.cn-beijing.volces.com/api/v3"
@@ -102,7 +103,7 @@ kind = "asr"
 provider_type = "dashscope"
 base_url = ""
 api_key = ""              # ← 填入 DashScope key
-model_name = "fun-asr-realtime"
+model_name = "qwen-audio-3.1-asr-flash-streaming"   # 或 fun-asr-realtime（同 run-task 协议族）
 is_custom = true
 
 [endpoints.asr.extra]
@@ -203,7 +204,7 @@ desc = "轻量快速推理"
 
 [endpoints.doubao.capabilities]
 supports_reasoning = true
-reasoning_efforts = [ "high", "medium", "low", "minimal",]
+reasoning_efforts = [ "high", "medium", "low",]
 
 [endpoints.doubao.capabilities.effort_meta.high]
 label = "high"
@@ -217,10 +218,6 @@ default = true
 [endpoints.doubao.capabilities.effort_meta.low]
 label = "low"
 desc = "轻量思考，侧重快速响应"
-
-[endpoints.doubao.capabilities.effort_meta.minimal]
-label = "minimal"
-desc = "关闭思考，直接回答"
 
 [endpoints.deepseek.capabilities]
 supports_reasoning = true

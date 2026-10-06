@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { marked } from 'marked'
+import { buildCodeFence, collapseExtraBlankLines, encodeMathClosers, escapePuaMarkers, decodeMathClosers, stripMathFraming, mathLiteralHtml } from './snippetInsert'
+import { stableRenderCacheKey } from './stringCacheKey'
 import hljs from 'highlight.js'
 import mermaid from 'mermaid'
 import * as echarts from 'echarts'
@@ -54,13 +56,26 @@ const liveEchartsInstances = new Set<echarts.ECharts>()
 const RENDER_CACHE_MAX = 128
 const renderCache = new Map<string, string>()
 
+// ===== 尾注总开关（wave-2 B1，默认关）=====
+// 关 = [^id]/[^id]: 保持字面（历史行为，历史笔记/LLM 输出不受语义变更影响）；
+// 开 = 尾注渲染 + 编辑器「尾注」按钮可用。切换必须清渲染缓存（同一内容两态渲染不同）。
+import { ref } from 'vue'
+
+// 响应式：WysiwygEditor 监听其变化即时重渲染（wave-3 #2）
+export const endnoteEnabled = ref(false)
+export function setEndnoteEnabled(v: boolean): void {
+  if (endnoteEnabled.value === v) return
+  endnoteEnabled.value = v
+  clearRenderCache()
+}
+
+export function clearRenderCache(): void {
+  renderCache.clear()
+}
+
 function getRenderCacheKey(content: string): string {
-  // Fast stable key: length + a few boundary samples to avoid full hashing.
-  const len = content.length
-  if (len <= 8) return content
-  const head = content.slice(0, 4)
-  const tail = content.slice(-4)
-  return `${len}:${head}:${tail}`
+  // 全串散列键 —— 旧 len+head4+tail4 会同长同头尾碰撞串稿（wave-2 C6）。
+  return stableRenderCacheKey(content) + (endnoteEnabled.value ? '|e1' : '|e0')
 }
 
 function getCachedRender(content: string): string | undefined {
@@ -210,7 +225,7 @@ function escapeHtml(s: string): string {
  * <body> (e.g. the note preview popup).
  */
 function wrapCodeBlock(lang: string, highlighted: string): string {
-  const safeLang = (lang || '').replace(/[^A-Za-z0-9_+.-]/g, '')
+  const safeLang = (lang || '').replace(/[^A-Za-z0-9_+#.-]/g, '')
   const label = escapeHtml(lang || 'text')
   return (
     '<div class="code-block">' +
@@ -337,7 +352,37 @@ function escapeMathPercent(tex: string): string {
   return tex.replace(/(?<!\\)%/g, '\\%')
 }
 
-function renderMathSafe(tex: string, displayMode: boolean): string {
+/**
+ * 数学片段序列化定界（htmlToMarkdown 反向路径）：tex 含 `$` 时用 \(...\)/\[...\]
+ * 定界，防 `$…$` 二次解析误切分（tokenizer 四族定界全支持，round-trip 恒等）。
+ * compact=行内紧凑形态（无换行，供纯文本抽取路径用）。
+ */
+function serializeMathDelimited(decoded: string, display: boolean, compact = false): string {
+  // 发射矩阵（round-trip 恒等；round4 复审两 Critical 收口）：
+  // - 块形态 $$…$$ 只用于「无 $ 无 \r 且过 isRealDisplayMath」——导出层 [^$] 正则
+  //   不吃 $、money-guard 对 99 = $5/99 元 类首行拒收、CR 归一化会重切首行（三回旋镖）。
+  // - 其余一律括号/方括号 + 全编码（闭符/换行/CR 全 tag 化：无空行劈段、无早闭、
+  //   导出层 \[…\] 正则 [\s\S]*? 可吃任意内容）。
+  // - 美元行内 $…$ 只用于「无 $ 无 \r\n 非空白缘」（tokenizer [^$\n]+? + flanks）。
+  if (display) {
+    // CR 必须排除：marked 会把 \r 归一成 \n，parse 侧首行被重切后 money-guard
+    // 可能反水拒收（99 元\rx^2 类=二次保存毁）；含 \r 一律方括号形态（tag5 编码）
+    const blockSafe = !decoded.includes('$') && !/[\r]/.test(decoded) && isRealDisplayMath(decoded)
+    if (blockSafe) {
+      const body = escapePuaMarkers(decoded)
+      return compact ? ('$$' + body + '$$') : ('\n$$\n' + body + '\n$$\n')
+    }
+    const enc = encodeMathClosers(decoded, true)
+    return compact ? ('\\[' + enc + '\\]') : ('\n\\[\n' + enc + '\n\\]\n')
+  }
+  const dollarSafe = !decoded.includes('$') && !/[\r\n]/.test(decoded) && !/^\s|\s$/.test(decoded)
+  if (dollarSafe) {
+    return '$' + escapePuaMarkers(decoded) + '$'
+  }
+  return '\\(' + encodeMathClosers(decoded, false) + '\\)'
+}
+
+export function renderMathSafe(tex: string, displayMode: boolean): string {
   try {
     const html = katex.renderToString(escapeMathPercent(tex), {
       displayMode,
@@ -350,9 +395,10 @@ function renderMathSafe(tex: string, displayMode: boolean): string {
     const innerTag = displayMode ? 'div' : 'span'
     return `<${tag} class="math-editable" data-tex="${escaped}" data-display-mode="${displayMode}"><${innerTag} class="math-rendered-content">${html}</${innerTag}><span class="math-controls"><button class="math-edit-btn" title="编辑公式"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button></span></${tag}>`
   } catch {
-    const escaped = tex.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    const escaped = tex.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
     const tag = displayMode ? 'div' : 'span'
-    return `<${tag} class="katex-error">${escaped}</${tag}>`
+    // katex 抛错也保留 math-editable + data-tex：公式源不因渲染失败而丢失（可再编辑/序列化）
+    return `<${tag} class="math-editable" data-tex="${escaped}" data-display-mode="${displayMode}"><${tag} class="katex-error">${escaped}</${tag}></${tag}>`
   }
 }
 
@@ -456,7 +502,7 @@ function createMathExtension() {
           const m = src.match(/^\$(?!\$)(?!\s)([^$\n]+?)(?<!\s)\$(?![\d$])/)
           if (!m) return undefined
           if (!isMathishInner(m[1])) return undefined
-          return { type: 'mathInlineDollar', raw: m[0], text: m[1] }
+          return { type: 'mathInlineDollar', raw: m[0], text: decodeMathClosers(m[1]) }
         },
         renderer(token: { text: string }): string {
           return renderMathSafe(token.text, false)
@@ -472,7 +518,7 @@ function createMathExtension() {
         tokenizer(src: string) {
           const m = src.match(/^\\\(([\s\S]+?)\\\)/)
           if (!m) return undefined
-          return { type: 'mathInlineParen', raw: m[0], text: m[1] }
+          return { type: 'mathInlineParen', raw: m[0], text: decodeMathClosers(m[1]) }
         },
         renderer(token: { text: string }): string {
           return renderMathSafe(token.text, false)
@@ -488,7 +534,7 @@ function createMathExtension() {
         tokenizer(src: string) {
           const m = src.match(/^\\\[([\s\S]+?)(?:\\\]|\n[ \t]*\][ \t]*(?=\n|$))/)
           if (!m) return undefined
-          return { type: 'mathDisplayBracket', raw: m[0], text: m[1].trim() }
+          return { type: 'mathDisplayBracket', raw: m[0], text: stripMathFraming(decodeMathClosers(m[1])) }
         },
         renderer(token: { text: string }): string {
           return renderMathSafe(token.text, true)
@@ -505,7 +551,7 @@ function createMathExtension() {
           const m = src.match(/^\$\$(?!\$)([^$\n]+?)\$\$(?![\d$])/)
           if (!m) return undefined
           if (!isMathishInner(m[1])) return undefined
-          return { type: 'mathDisplayDollarInline', raw: m[0], text: m[1] }
+          return { type: 'mathDisplayDollarInline', raw: m[0], text: decodeMathClosers(m[1]) }
         },
         renderer(token: { text: string }): string {
           return renderMathSafe(token.text, true)
@@ -522,7 +568,7 @@ function createMathExtension() {
           const m = src.match(/^[ \t]*\$\$([\s\S]+?)\$\$[ \t]*(?=\n|$)/)
           if (!m) return undefined
           if (!isRealDisplayMath(m[1])) return undefined
-          return { type: 'mathBlockDollar', raw: m[0], text: m[1].trim() }
+          return { type: 'mathBlockDollar', raw: m[0], text: decodeMathClosers(stripMathFraming(m[1])) }
         },
         renderer(token: { text: string }): string {
           return renderMathSafe(token.text, true)
@@ -797,7 +843,7 @@ function cleanupEmbeddedMermaidHtml(content: string): string {
 
       const src = el.getAttribute('data-mermaid-source') || ''
       const decoded = decodeMermaidSource(src)
-      const replacement = document.createTextNode('\n```mermaid\n' + decoded + '\n```\n')
+      const replacement = document.createTextNode(buildCodeFence('mermaid', decoded))
       el.parentNode?.replaceChild(replacement, el)
       return true
     }
@@ -1056,6 +1102,142 @@ function canonicalImageSrc(src: string): string {
   return src
 }
 
+// ===== 尾注（endnote）—— CommonMark 脚注语法 =====
+// 正文引用 [^id] · 文末定义 [^id]: 正文（定义行独立成行）。
+// 渲染：[^id] → <sup class="note-endnote-ref" …><a href="#note-endnote-def-id">[n]</a></sup>
+//       定义 → 文末 <p class="note-endnote-def" …><a class="note-endnote-back">[n]</a> 正文</p>
+// 编号 n 按引用首次出现序计算、不落库（Tiptap Pages endnotes / buttondown
+// tiptap-footnotes 同构）。点击角标 ↔ 点击文末编号双向跳转（WysiwygEditor 托管）。
+// 尾注正文必须整体走行内渲染（marked.parseInline），绝不能 textContent ——
+// 那会剥掉正文里的加粗/链接等格式（tiptap-footnotes 序列化事故同款教训）。
+const ENDNOTE_REF_RE = /\[\^([^\]\s]+)\]/g
+const ENDNOTE_DEF_LINE_RE = /^\[\^([^\]\s]+)\]:[ \t]?(.*)$/
+
+/** id 会进 HTML 属性（id/href/data-*）——必须属性转义，防 markdown 侧注入（A4.9 C1）。 */
+function escapeHtmlAttr(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/'/g, '&#39;')
+}
+
+interface EndnoteDef {
+  id: string
+  body: string
+  num: number
+}
+
+export function buildEndnoteRefHtml(id: string, num: number, withId = true): string {
+  const e = escapeHtmlAttr(id)
+  const idAttr = withId ? ` id="note-endnote-ref-${e}"` : ''
+  return `<sup class="note-endnote-ref"${idAttr} data-endnote-id="${e}" data-endnote-num="${num}"><a href="#note-endnote-def-${e}">〔${num}〕</a></sup>`
+}
+
+export function buildEndnoteDefHtml(id: string, num: number, bodyHtml: string, withId = true): string {
+  const e = escapeHtmlAttr(id)
+  const idAttr = withId ? ` id="note-endnote-def-${e}"` : ''
+  return `<p class="note-endnote-def"${idAttr} data-endnote-id="${e}" data-endnote-num="${num}"><a class="note-endnote-back" href="#note-endnote-ref-${e}">〔${num}〕</a>${bodyHtml ? ' ' + bodyHtml : ''}</p>`
+}
+
+/**
+ * 渲染前预处理：抽取 [^id]: 定义行（围栏代码块内除外）、把行内 [^id] 换成
+ * 角标 HTML（行内代码/围栏内的字面 [^id] 先掩码保护）。编号按首次出现序。
+ */
+function preprocessEndnoteSyntax(md: string): { text: string; defs: EndnoteDef[] } {
+  const defs: Array<{ id: string; body: string }> = []
+  const lines = md.split('\n')
+  const kept: string[] = []
+  let inFence = false
+  for (const line of lines) {
+    const fenceMatch = line.match(/^\s*(```|~~~)/)
+    if (fenceMatch) inFence = !inFence
+    if (!inFence) {
+      const m = line.match(ENDNOTE_DEF_LINE_RE)
+      if (m) {
+        defs.push({ id: m[1], body: m[2] })
+        continue
+      }
+    }
+    kept.push(line)
+  }
+  let text = kept.join('\n')
+
+  // 掩码保护：围栏代码块（```/~~~，含未闭合的流式中途态）与行内代码里的
+  // 字面 [^id] 不是尾注引用
+  const masks: string[] = []
+  const mask = (s: string) => {
+    masks.push(s)
+    return `\u0000EN${masks.length - 1}\u0000`
+  }
+  {
+    const lines = text.split('\n')
+    const out: string[] = []
+    let fence: string | null = null
+    let buf: string[] = []
+    for (const line of lines) {
+      const m = line.match(/^\s*(```|~~~)/)
+      if (fence === null && m) {
+        fence = m[1]
+        buf.push(line)
+      } else if (fence !== null) {
+        buf.push(line)
+        if (m && m[1] === fence) {
+          out.push(mask(buf.join('\n')))
+          buf = []
+          fence = null
+        }
+      } else {
+        out.push(line)
+      }
+    }
+    if (buf.length) out.push(mask(buf.join('\n')))
+    text = out.join('\n')
+  }
+  text = text.replace(/`[^`\n]*`/g, (m) => mask(m))
+  // 缩进代码块（4 空格/Tab 行）、链接 URL、原始 HTML 标签内的 [^id] 不是引用（wave-3 #4）
+  text = text.replace(/^(?: {4}|\t).*$/gm, (m) => mask(m))
+  text = text.replace(/\]\([^)]*\)/g, (m) => mask(m))
+  text = text.replace(/<[^>]+>/g, (m) => mask(m))
+
+  // 编号：引用首次出现序（正文行 + 尾注正文内的嵌套引用一起计）；未被引用的定义排在其后
+  const order: string[] = []
+  text.replace(ENDNOTE_REF_RE, (_m, id: string) => {
+    if (!order.includes(id)) order.push(id)
+    return _m
+  })
+  for (const d of defs) {
+    d.body.replace(ENDNOTE_REF_RE, (_m, id: string) => {
+      if (!order.includes(id)) order.push(id)
+      return _m
+    })
+    if (!order.includes(d.id)) order.push(d.id)
+  }
+  const numById = new Map(order.map((id, i) => [id, i + 1]))
+
+  // 同一 id 的重复引用只在首次出现处保留 DOM id（重复 id 会使锚点跳转/查询失效）
+  const seenRefId = new Set<string>()
+  text = text.replace(ENDNOTE_REF_RE, (_m, id: string) => {
+    const first = !seenRefId.has(id)
+    seenRefId.add(id)
+    return buildEndnoteRefHtml(id, numById.get(id)!, first)
+  })
+  text = text.replace(/\u0000EN(\d+)\u0000/g, (_m, i: string) => masks[parseInt(i, 10)])
+
+  return {
+    text,
+    defs: defs.map((d) => ({
+      ...d,
+      num: numById.get(d.id)!,
+      // 尾注正文里的嵌套 [^x] 同样替换为角标（否则下一轮渲染退化为字面文本）
+      body: d.body.replace(ENDNOTE_REF_RE, (_m, id: string) =>
+        buildEndnoteRefHtml(id, numById.get(id)!, false)
+      ),
+    })),
+  }
+}
+
 export function renderMarkdownToHtml(content: string): string {
   if (!content) return ''
   const cached = getCachedRender(content)
@@ -1068,7 +1250,12 @@ export function renderMarkdownToHtml(content: string): string {
     // wired at module init) — no placeholder extraction/restore needed here.
     const { text: iframeText, placeholders: iframePlaceholders } = extractSafeIframes(cleaned)
     const normalized = normalizeMarkdownSpacing(iframeText)
-    const html = marked.parse(normalized, { async: false }) as string
+    // 尾注预处理：[^id]: 定义行抽取 + 行内 [^id] → 角标 HTML（编号按首次出现序）。
+    // 总开关关闭时跳过 —— [^id] 保持字面（wave-2 B1）
+    const { text: endnoteText, defs: endnoteDefs } = endnoteEnabled.value
+      ? preprocessEndnoteSyntax(normalized)
+      : { text: normalized, defs: [] as EndnoteDef[] }
+    const html = marked.parse(endnoteText, { async: false }) as string
     const processed = splitOlContainingHeadings(html)
     const sanitized = DOMPurify.sanitize(processed, {
       ALLOW_DATA_ATTR: true,
@@ -1078,8 +1265,31 @@ export function renderMarkdownToHtml(content: string): string {
     const withIframes = restoreSafeIframes(sanitized, iframePlaceholders)
     const rewritten = rewriteImageUrls(withIframes)
     const mediaRewritten = rewriteMediaUrls(rewritten)
-    setCachedRender(content, mediaRewritten)
-    return mediaRewritten
+    // 尾注定义段追加到文末：正文走 marked.parseInline 保格式（禁 textContent）。
+    // 整体再过一次 DOMPurify（id/href 属性已转义，这里是纵深防御——A4.9 C1）。
+    let endnoteHtml = ''
+    const seenDefIds = new Set<string>()
+    for (const d of endnoteDefs) {
+      // 重复定义行只在首个保留 DOM id（复审 A#13）
+      const firstDef = !seenDefIds.has(d.id)
+      seenDefIds.add(d.id)
+      const bodyHtml = d.body.trim()
+        ? DOMPurify.sanitize(marked.parseInline(d.body, { async: false }) as string, {
+            ALLOW_DATA_ATTR: true,
+            ADD_ATTR: ['target', 'rel', 'style'],
+          })
+        : ''
+      endnoteHtml += buildEndnoteDefHtml(d.id, d.num, bodyHtml, firstDef)
+    }
+    const withEndnotes = endnoteHtml
+      ? mediaRewritten +
+        DOMPurify.sanitize(endnoteHtml, {
+          ALLOW_DATA_ATTR: true,
+          ADD_ATTR: ['target', 'rel', 'style'],
+        })
+      : mediaRewritten
+    setCachedRender(content, withEndnotes)
+    return withEndnotes
   } catch {
     return content
   }
@@ -1611,6 +1821,23 @@ export function htmlToMarkdown(html: string): string {
   // by the mathDisplayBracket tokenizer, and marked does not honor "\~" for
   // strikethrough.
   function escapeMdText(s: string): string {
+    // 尾注开关开启时 [^id] 是活语法：不转义其括号（wave-2 B1），
+    // 掩码保护后照常转义其余 [ ]，往返仍守恒。
+    {
+      // [^id] 恒为活语法：关态也保留原样（关态渲染为字面、开态即激活）——
+      // 旧「关态实体化」使开启后无法复活（wave-3 #5）
+      const keep: string[] = []
+      s = stripZeroWidth(s).replace(/\[\^[^\]\s]+\]/g, (m) => {
+        keep.push(m)
+        return `\u0000FN${keep.length - 1}\u0000`
+      })
+      const escaped = escapeMdTextBody(s)
+      return escaped.replace(/\u0000FN(\d+)\u0000/g, (_m, i: string) => keep[parseInt(i, 10)])
+    }
+    return escapeMdTextBody(s)
+  }
+
+  function escapeMdTextBody(s: string): string {
     return stripZeroWidth(s)
       .replace(/&/g, '&amp;')
       .replace(/[\\`*_<>|#]/g, (ch) => '\\' + ch)
@@ -1634,6 +1861,28 @@ export function htmlToMarkdown(html: string): string {
     const text = (el.textContent || '').trim()
     const num = /^\d{1,3}$/.test(idx) ? idx : text.replace(/^\[|\]$/g, '')
     return '[' + num + ']'
+  }
+
+  // 尾注角标（renderMarkdownToHtml 生成的 <sup class="note-endnote-ref" data-endnote-id="id">）
+  // 序列化还原为 CommonMark 脚注引用 [^id]，保证往返守恒。
+  function endnoteRefPlainText(el: HTMLElement): string | null {
+    if (!el.classList.contains('note-endnote-ref')) return null
+    const id = (el.getAttribute('data-endnote-id') || '').trim()
+    return id ? '[^' + id + ']' : null
+  }
+
+  // 尾注定义段（<p class="note-endnote-def" data-endnote-id="id">）序列化为
+  // [^id]: 正文 —— 去掉回跳编号链接（渲染时按文档序重建），正文整体走行内
+  // 序列化保格式。克隆上操作，不碰活 DOM。
+  function endnoteDefMarkdown(el: HTMLElement): string | null {
+    if (!el.classList.contains('note-endnote-def')) return null
+    const id = (el.getAttribute('data-endnote-id') || '').trim()
+    if (!id) return null
+    const clone = el.cloneNode(true) as HTMLElement
+    clone.querySelectorAll('a.note-endnote-back').forEach((a) => a.remove())
+    // 正文压平换行：[^id]: 定义行是单行语法，多行 body 会在下一轮解析时被腰斩
+    const body = processChildren(clone).trim().replace(/\s*\n+\s*/g, ' ')
+    return body ? '[^' + id + ']: ' + body + '\n\n' : '[^' + id + ']: \n\n'
   }
 
   // CommonMark flanking rules (simplified): if a `**`/`*` delimiter run
@@ -1953,10 +2202,18 @@ export function htmlToMarkdown(html: string): string {
     let out = ''
     const walk = (node: Node): void => {
       if (node.nodeType === Node.TEXT_NODE) {
+        // $ 与 \ 也实体化：raw-HTML 块内文本对 markdown/导出数学提取正则保持
+        // 不可见（mathLiteralHtml 的 &#36;/&#92; 提示经浏览器解码后重序列化
+        // 不得退化成真定界符——A4.9 round5 评审定位的一次性衰变缺陷）
         out += stripZeroWidth(node.textContent || '')
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;')
+          .replace(/\$/g, '&#36;')
+          .replace(/\\/g, '&#92;')
+          // 字面 [^…] 实体化：raw-HTML 路径文本不经 markdown 转义，
+          // 否则下一轮渲染被 preprocessEndnoteSyntax 误转为活尾注引用
+          .replace(/\[\^/g, '&#91;^')
         return
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return
@@ -1969,6 +2226,12 @@ export function htmlToMarkdown(html: string): string {
         const inner = out
         out = saved
         return inner
+      }
+      // 尾注定义段整块保真（wave-2 A2）：容器内的定义段走 raw-HTML 路径时
+      // 不得被丢弃/降级 —— outerHTML 保留类名与锚点，回到顶层时仍可识别。
+      if (el.classList && el.classList.contains('note-endnote-def')) {
+        out += el.outerHTML
+        return
       }
       switch (tag) {
         case 'strong':
@@ -2003,6 +2266,13 @@ export function htmlToMarkdown(html: string): string {
           break
         }
         case 'sup': {
+          const en = endnoteRefPlainText(el)
+          if (en !== null) {
+            // 尾注角标在 raw-HTML 路径同样还原 [^id]（outerHTML 会冻结 data-endnote-num
+            // 且重复 id——两 walker 口径必须一致）
+            out += en
+            break
+          }
           const cite = citationRefPlainText(el)
           out += cite !== null ? cite : '<sup>' + kids() + '</sup>'
           break
@@ -2098,15 +2368,17 @@ export function htmlToMarkdown(html: string): string {
           out += styleParts.length > 0 ? '<span style="' + styleParts.join(';') + '">' + inner + '</span>' : inner
           break
         }
-        case 'span': {
+        case 'span':
+        case 'div': {
           if (el.classList.contains('math-editable')) {
             // Math inside raw-HTML blocks cannot be re-rendered by the
-            // markdown pipeline; keep the TeX source as literal text
-            // (same behavior as before this fix — no regression).
+            // markdown pipeline; keep the TeX source as literal text.
+            // 定界美元走 HTML 实体（mathLiteralHtml）：导出提取正则见不到真 $，
+            // 前端实体渲染出 $ —— 双侧字面一致（旧真定界符提示会被导出 typeset）。
             const tex = el.getAttribute('data-tex') || ''
             const display = el.getAttribute('data-display-mode') === 'true'
             const decoded = htmlDecode(tex)
-            out += display ? ('$$' + decoded + '$$') : ('$' + decoded + '$')
+            out += mathLiteralHtml(decoded, display)
             break
           }
           const inner = kids()
@@ -2139,6 +2411,14 @@ export function htmlToMarkdown(html: string): string {
     if (node.nodeType !== Node.ELEMENT_NODE) return ''
 
     const el = node as HTMLElement
+    // 代码块渲染壳 chrome（.code-block-header 语言标签 + 复制按钮）是展示层，
+    // 序列化时整体跳过——否则语言标签会泄漏成正文段落（基线实证："python"
+    // 段落粘在 ```python 围栏前，每次保存累加一行）。
+    if (el.classList && (el.classList.contains('code-block-header') ||
+        el.classList.contains('code-block-copy-btn') ||
+        el.classList.contains('code-block-lang'))) {
+      return ''
+    }
     const tag = el.tagName.toLowerCase()
     let result = ''
 
@@ -2163,6 +2443,15 @@ export function htmlToMarkdown(html: string): string {
         break
       }
       case 'p': {
+        const endnoteDef = endnoteDefMarkdown(el)
+        if (endnoteDef !== null) {
+          // 顶层才用 [^id]: 语法；li/表格等容器内语法行会被前缀破坏 ——
+          // raw HTML 整块保真（wave-3 #4：列表内定义不退化）
+          const parent = el.parentElement
+          const topLevel = !parent || parent === container || parent.tagName === 'BODY'
+          result = topLevel ? endnoteDef : el.outerHTML + '\n\n'
+          break
+        }
         const ml = el.style.marginLeft
         const mlVal = ml ? parseInt(ml, 10) : 0
         const ta = el.style.textAlign || (el.getAttribute('align') || '')
@@ -2175,7 +2464,11 @@ export function htmlToMarkdown(html: string): string {
         const isEmpty = !inner.trim() && !el.querySelector('img, table, pre, .math-editable')
         const parentTag = el.parentElement ? el.parentElement.tagName : ''
         if (styleParts.length > 0) {
-          result = '<p style="' + styleParts.join(';') + '">' + (isEmpty ? '<br>' : blockEmphasisWrap(el, serializeChildrenAsHtml(el), true, ctx)) + '</p>\n\n'
+          const wrapped = '<p style="' + styleParts.join(';') + '">' + (isEmpty ? '<br>' : blockEmphasisWrap(el, serializeChildrenAsHtml(el), true, ctx)) + '</p>\n\n'
+          // 容器内嵌套尾注定义段提出到块后（防 <p><p> 结构漂移，wave-3 #4）
+          const defRe = /<p class="note-endnote-def"[\s\S]*?<\/p>/g
+          const hoistedDefs: string[] = []
+          result = wrapped.replace(defRe, (m2) => { hoistedDefs.push(m2); return '' }) + hoistedDefs.join('\n\n')
         } else if (isEmpty) {
           // Keep empty paragraphs as explicit raw HTML so blank lines the
           // user typed survive the markdown round-trip instead of collapsing.
@@ -2208,6 +2501,27 @@ export function htmlToMarkdown(html: string): string {
       case 'hr': result = '---\n\n'; break
       case 'blockquote': {
         const ta = el.style.textAlign || (el.getAttribute('align') || '')
+        // 尾注定义段不进引用前缀（wave-2 A2）：`> [^id]:` 下轮无法识别为定义行，
+        // 定义退化丢失 —— 提升到引用块之后（尾注语义本就归文末）。
+        const defEls = Array.from(el.children).filter(
+          (c) => (c as HTMLElement).classList?.contains('note-endnote-def')
+        )
+        if (defEls.length > 0) {
+          const clone = el.cloneNode(true) as HTMLElement
+          clone.querySelectorAll('.note-endnote-def').forEach((d) => d.remove())
+          let inner: string
+          if (ta && ta !== 'left' && ta !== 'start') {
+            inner = '<blockquote style="text-align:' + ta + '">' + serializeChildrenAsHtml(clone) + '</blockquote>\n\n'
+          } else {
+            inner = '> ' + processChildren(clone).split('\n').join('\n> ') + '\n\n'
+          }
+          let hoisted = ''
+          for (const d of defEls) {
+            hoisted += endnoteDefMarkdown(d as HTMLElement) || ''
+          }
+          result = inner + hoisted
+          break
+        }
         if (ta && ta !== 'left' && ta !== 'start') {
           result = '<blockquote style="text-align:' + ta + '">' + serializeChildrenAsHtml(el) + '</blockquote>\n\n'
         } else {
@@ -2361,12 +2675,13 @@ export function htmlToMarkdown(html: string): string {
         if (codeEl) {
           const langClass = codeEl.className.match(/language-(\S+)/)
           const lang = langClass ? langClass[1] : ''
-          const text = stripZeroWidth((codeEl.textContent || '').trim())
+          const text = stripZeroWidth(codeEl.textContent || '')
           if (el.classList.contains('mermaid-block')) {
             const src = el.getAttribute('data-mermaid-source') || ''
-            result = '\n```mermaid\n' + htmlDecode(src) + '\n```\n'
+            result = buildCodeFence('mermaid', htmlDecode(src))
           } else {
-            result = '\n```' + lang + '\n' + text + '\n```\n\n'
+            // buildCodeFence：围栏长度化（内嵌 ``` 不截断）+ 首尾空行保真（不 trim）
+            result = buildCodeFence(lang, text)
           }
         }
         break
@@ -2399,15 +2714,15 @@ export function htmlToMarkdown(html: string): string {
       case 'div': {
         if (el.classList.contains('mermaid-block')) {
           const src = el.getAttribute('data-mermaid-source') || ''
-          result = '\n```mermaid\n' + htmlDecode(src) + '\n```\n'
+          result = buildCodeFence('mermaid', htmlDecode(src))
         } else if (el.classList.contains('echarts-block')) {
           const src = el.getAttribute('data-echarts-source') || ''
-          result = '\n```echarts\n' + htmlDecode(src) + '\n```\n'
+          result = buildCodeFence('echarts', htmlDecode(src))
         } else if (el.classList.contains('math-editable')) {
           const tex = el.getAttribute('data-tex') || ''
           const display = el.getAttribute('data-display-mode') === 'true'
           const decoded = htmlDecode(tex)
-          result = display ? ('\n$$\n' + decoded + '\n$$\n') : ('$' + decoded + '$')
+          result = serializeMathDelimited(decoded, display)
         } else {
           const inner = processChildren(el)
         const isEmpty = !inner.trim() && !el.querySelector('img, audio, video, iframe, table, pre, .math-editable')
@@ -2434,7 +2749,7 @@ export function htmlToMarkdown(html: string): string {
           const tex = el.getAttribute('data-tex') || ''
           const display = el.getAttribute('data-display-mode') === 'true'
           const decoded = htmlDecode(tex)
-          result = display ? ('\n$$\n' + decoded + '\n$$\n') : ('$' + decoded + '$')
+          result = serializeMathDelimited(decoded, display)
           break
         }
         result = serializeStyledInline(el, ctx)
@@ -2467,6 +2782,8 @@ export function htmlToMarkdown(html: string): string {
         result = '<mark>' + processChildren(el) + '</mark>'; break
       }
       case 'sup': {
+        const en = endnoteRefPlainText(el)
+        if (en !== null) { result = en; break }
         const cite = citationRefPlainText(el)
         result = cite !== null ? cite : '<sup>' + processChildren(el) + '</sup>'
         break
@@ -2555,7 +2872,7 @@ export function htmlToMarkdown(html: string): string {
 
   markdown = processChildren(container)
 
-  markdown = markdown.replace(/\n{3,}/g, '\n\n')
+  markdown = collapseExtraBlankLines(markdown)
   markdown = markdown.replace(/\n+$/, '')
 
   return markdown

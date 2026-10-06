@@ -3,7 +3,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select, update as sa_update
 from sse_starlette.sse import EventSourceResponse
 import asyncio
 import json
@@ -14,7 +14,7 @@ from datetime import datetime
 
 import re as _re
 
-from app.db.database import get_db, Message, Conversation, User, Assistant, ChatSession
+from app.db.database import get_db, Message, MessageAttempt, Conversation, User, Assistant, ChatSession
 from app.db.database import AsyncSessionLocal
 from app.schemas.chat import ChatRequest
 from app.services.agent_service import AgentService, should_use_custom_model, _load_identity_memory_context
@@ -646,6 +646,165 @@ def _transform_tool_loop_results(
     return json.dumps(payload, ensure_ascii=False)
 
 
+class ProgressiveFlusher:
+    """在途 assistant 行的周期刷写器（2026-10-06，conv ae9aa092 渐进落库）。
+
+    run 开始即建 delivery_status='streaming' 的 assistant 行；本类按阈值把
+    当前已流式正文刷进该行——进程被杀死（部署/崩溃）时用户刷新仍能看到
+    部分正文（启动 sweep 翻 interrupted 后带徽标展示），而不是整段蒸发。
+
+    - 触发：距上次刷写累计新增 ≥ min_chars，或距上次 ≥ min_seconds 且有增长；
+    - 单 flight：在途写未完成时跳过（下一 tick 再试），绝不并发写同一行；
+    - fail-open：写失败只记日志（流式主路径不受影响）。
+    """
+
+    def __init__(self, writer, *, clock=time.monotonic, min_chars: int = 2000,
+                 min_seconds: float = 5.0):
+        self._writer = writer
+        self._clock = clock
+        self._min_chars = min_chars
+        self._min_seconds = min_seconds
+        self._last_flush_at = clock()
+        self._last_len = 0
+        self._pending: "asyncio.Task | None" = None
+
+    def feed(self, text: str) -> None:
+        cur = len(text or "")
+        if cur <= self._last_len:
+            return
+        grew = cur - self._last_len
+        elapsed = self._clock() - self._last_flush_at
+        if grew < self._min_chars and not (elapsed >= self._min_seconds and grew > 0):
+            return
+        if self._pending is not None and not self._pending.done():
+            return  # 单 flight：在途写未完成，下个 tick 再刷
+        self._last_len = cur
+        self._last_flush_at = self._clock()
+        snapshot = text
+        try:
+            self._pending = asyncio.get_running_loop().create_task(self._writer(snapshot))
+        except Exception:
+            logger.debug("progressive flush schedule failed (fail-open)", exc_info=True)
+
+    def reset(self) -> None:
+        """打回边界（audit_reset）：被拒草稿不进在途行（它已入 message_attempts
+        台账）——累加基线归零，让下一稿的增量刷写正常工作。"""
+        self._last_len = 0
+
+    async def revert_to(self, text: str) -> None:
+        """打回撤回（A4.9 r1 M1）：被拒草稿可能已被周期刷进在途行——先等在途
+        写落地（保序），再把行内容撤回到本稿开始前基线，绝不让 SIGKILL 窗口里
+        的 interrupted 残稿展示被审计否决的文字。"""
+        self._last_len = len(text or "")
+        if self._pending is not None and not self._pending.done():
+            try:
+                # scoped 复审 Minor：有界等待——在途写卡死不得拖住打回路径
+                await asyncio.wait_for(asyncio.shield(self._pending), timeout=5.0)
+            except Exception:
+                pass
+        try:
+            await self._writer(text)
+        except Exception:
+            logger.debug("progressive revert failed (fail-open)", exc_info=True)
+
+
+async def _save_assistant_terminal(
+    db,
+    *,
+    conversation_id: str,
+    content: str,
+    reasoning: str | None,
+    tool_results: str | None,
+    tool_calls: str | None,
+    context_info,
+    status: str = "final",
+) -> Message:
+    """终态落库（2026-10-06 渐进落库）：本会话若存在 delivery_status='streaming'
+    的在途行则 update-in-place（翻 status），否则插入新行（旧行为兜底——
+    死磕按轮落库等未建 streaming 行的路径）。
+
+    返回落库行（调用方负责 commit/refresh，与既有路径一致）。
+    """
+    row = (await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation_id,
+               Message.delivery_status == "streaming")
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )).scalars().first()
+    if row is None:
+        row = Message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content=content,
+            reasoning_content=reasoning or None,
+            tool_results=tool_results,
+            tool_calls=tool_calls,
+            context_info=context_info,
+            delivery_status=status,
+        )
+        db.add(row)
+        return row
+    row.content = content
+    row.reasoning_content = reasoning or None
+    row.tool_results = tool_results
+    row.tool_calls = tool_calls
+    if context_info is not None:
+        row.context_info = context_info
+    row.delivery_status = status
+    return row
+
+
+async def mark_interrupted_streams(db) -> int:
+    """启动 sweep（B）：进程死亡遗留的 streaming 行——
+    有正文的翻 interrupted（部分正文+徽标展示）；空壳（内容为零——杀在工具
+    阶段/首 token 前）直接删除（空 bubble 无信息，展示即噪音）。
+    返回翻 interrupted 的行数。
+
+    部署约束（A4.9 r1 I1）：本 sweep 无实例归属——**同一数据库只支持单实例
+    运行本服务**（多实例共库时 A 实例重启会把 B 实例的在途行翻 interrupted）。
+    同库多副本（如 weave_blah 旧版）不建 streaming 行，不受影响。
+    """
+
+    await db.execute(
+        sa_delete(Message).where(
+            Message.delivery_status == "streaming",
+            (Message.content == "") | (Message.content.is_(None)),
+        )
+    )
+    result = await db.execute(
+        sa_update(Message)
+        .where(Message.delivery_status == "streaming")
+        .values(delivery_status="interrupted")
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def _drop_unshown_pre_tool_prose(assistant_content: str, gate) -> str:
+    """工具调用边界只丢弃「从未推送给客户端」的预工具散文。
+
+    gate.held 里停着的是被 hold、从未经 SSE 送达用户的文本——按契约丢弃
+    （conv 149ce886 的占位/复述散文）。已流式送达用户的文本一律保留：
+    - gate 未武装的直发流（coordinator 预判无工具、模型自发调 calculate）；
+    - hold-cap 释放后的后续直发（on_tool_call()/_clear() 会把 cap_released
+      复位，旧判定在第二个工具边界把已保留散文整段抹掉）；
+    - iteration_done(0) 释放的截断 head（_clear() 同样复位 cap_released）。
+
+    conv 4e159a79（2026-10-01）：截断续写轮的前半场（一~六块正文）在续写
+    轮调用 calculate 时被整段清空，落库只剩尾段「的## 七、势力组织（续）
+    …」，done 刷新后用户已见的 1-6 块被替换删除。旧判定
+    `if not _pre_tool_gate.cap_released: assistant_content = ""` 即根因。
+
+    held 恒为 assistant_content 的未展示后缀（两处累加同一 _clean_content）；
+    endswith 失配（理论上不可达）时保守保留全部文本——宁可多存不丢。"""
+    unshown = getattr(gate, "held", "") or ""
+    if not unshown:
+        return assistant_content
+    if assistant_content.endswith(unshown):
+        return assistant_content[: len(assistant_content) - len(unshown)]
+    return assistant_content
+
+
 def _display_sequence_keep_evidence(seq):
     """压缩/重答时 display_sequence 的取舍——与客户端 dropDraftTextAfterLastTool
     **镜像对称**（A4.9 R1 Important-3）：保留 reasoning/tool 与最后一张工具卡之前
@@ -892,18 +1051,30 @@ async def _load_conversation_messages(db: AsyncSession, conversation_id: str, li
     slice cannot recover messages the query already dropped — the newest
     window must be taken here, at the SQL boundary.
     """
+    # 渐进落库（2026-10-06，A4.9 r1 I2）：streaming 在途/僵尸行绝不进模型
+    # 上下文（UI 不可见的半稿会污染下一轮）；interrupted 残稿正常进——
+    # 让模型看到「该问题已被部分回答」，减轻重复回答（conv ae9aa092 Q3）。
     if limit is not None:
         stmt = (
             select(Message)
-            .where(Message.conversation_id == conversation_id)
+            .where(Message.conversation_id == conversation_id,
+                   Message.delivery_status != "streaming")
             .order_by(Message.created_at.desc())
             .limit(limit)
         )
         result = await db.execute(stmt)
-        return list(reversed(result.scalars().all()))
-    stmt = select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
-    result = await db.execute(stmt)
-    return result.scalars().all()
+        rows = list(reversed(result.scalars().all()))
+    else:
+        stmt = select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.delivery_status != "streaming",
+        ).order_by(Message.created_at)
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+    # conv-open P1-1：外置字段（payload stub）必须还原全文后再进 LLM 上下文/
+    # regenerate/导出 —— 语义与落库前逐字节一致（DESIGN_conv_open_performance §4）。
+    from app.services.message_payload_service import resolve_message_fields
+    return await resolve_message_fields(rows, db)
 
 
 async def _trim_messages_for_regeneration(
@@ -924,10 +1095,30 @@ async def _trim_messages_for_regeneration(
     if target_message.role != "assistant":
         raise HTTPException(status_code=400, detail="只能重新生成助手消息")
 
-    for message in reversed(conversation_messages[target_index:]):
-        await db.delete(message)
-    await db.commit()
+    await _delete_message_slice(db, conversation_messages[target_index:])
     return conversation_messages[:target_index]
+
+
+async def _delete_message_slice(db: AsyncSession, slice_rows) -> None:
+    """按 id 批量删除消息切片——不碰 ORM 实例、不自带 commit。
+
+    2026-10-04 conv 4e159a79 编辑重发 500：conv-open 波后 `_load_conversation_messages`
+    经 resolve_message_fields 对外置 stub 行返回 SimpleNamespace 拷贝，`db.delete(拷贝)`
+    抛 UnmappedInstanceError→500。改为 id 批量 DELETE（payload 行随 messages FK
+    ON DELETE CASCADE 清理）。
+
+    事务边界：**编辑路径**由调用方与新用户消息插入同一次 commit（其间失败回滚即
+    完整恢复，见 test_trim_edit_defers_commit_atomic_replace）；**regenerate 路径**
+    的删除随调用方 sort_order 提交点落库——替代的助手回复由 agent 循环在流中晚于
+    提交生成，生成失败时旧答案不恢复（删先于建为该架构固有时序，旧实现同序且更早
+    提交，本波不改，见 tests/decisions.md D-q6）。
+    """
+    ids = [row.id for row in slice_rows if getattr(row, "id", None)]
+    if not ids:
+        return
+    # 分块 IN：超长会话编辑头消息时单语句参数量撞 PG 绑定上限（65535）。
+    for i in range(0, len(ids), 500):
+        await db.execute(sa_delete(Message).where(Message.id.in_(ids[i:i + 500])))
 
 
 async def _trim_messages_for_edit(
@@ -936,7 +1127,9 @@ async def _trim_messages_for_edit(
     conversation_id: str,
     edit_message_id: str,
 ):
-    """Delete the target user message and all subsequent messages for edit-and-resend."""
+    """Delete the target user message and all subsequent messages for edit-and-resend.
+
+    删除不自带 commit（见 _delete_message_slice）：与新用户消息的插入同事务落库。"""
     conversation_messages = await _load_conversation_messages(db, conversation_id)
     target_index = next(
         (index for index, message in enumerate(conversation_messages) if message.id == edit_message_id),
@@ -949,9 +1142,7 @@ async def _trim_messages_for_edit(
     if target_message.role != "user":
         raise HTTPException(status_code=400, detail="只能编辑用户消息")
 
-    for message in reversed(conversation_messages[target_index:]):
-        await db.delete(message)
-    await db.commit()
+    await _delete_message_slice(db, conversation_messages[target_index:])
     return conversation_messages[:target_index]
 
 
@@ -964,6 +1155,16 @@ async def chat_stream(
 ):
     conversation_id = request.conversation_id
     assistant_id = request.assistant_id
+
+    # 部署排空（2026-10-06，conv ae9aa092 P2）：drain 中的进程拒收新 run——
+    # stop.sh 排空窗口内的新请求打给新进程/稍后重试。必须在任何写库（会话
+    # 创建/用户消息落库/chat_session）之前：503 不得留下半拉子持久化状态。
+    if _agent_registry.is_draining:
+        raise HTTPException(
+            status_code=503,
+            detail="server is draining for restart — please retry in a few seconds",
+            headers={"Retry-After": "5"},
+        )
 
     # Capture user identity scalars UP FRONT: later code paths (media
     # localization in self-save / interrupted-save) run after the request
@@ -1078,39 +1279,74 @@ async def chat_stream(
 
     user_message = None  # 仅「新用户消息」轮（普通/编辑）绑定；regenerate 不产生新消息
     if request.regenerate_from_message_id:
-        conversation_messages = await _trim_messages_for_regeneration(
-            db,
-            conversation_id=conversation_id,
-            regenerate_from_message_id=request.regenerate_from_message_id,
-        )
-        # 重新生成 = 该会话的最新操作（2026-09-26 用户指令）：解除拖拽钉住
-        # （sort_order 置 0），使其在 (sort_order asc, 最近活动 desc) 排序下回到
-        # 所在分组/时间分类最上方；活动时间键随新助手消息落库后的
-        # MAX(messages.created_at)（全角色口径，conversation.py）推进。
-        # updated_at 由 onupdate 自动推进，不在这里显式写（A4.9 R1 M-5：排序
-        # 不变式不允许 updated_at 显式驱动）。
-        conversation.sort_order = 0
-        await db.commit()
+        try:
+            conversation_messages = await _trim_messages_for_regeneration(
+                db,
+                conversation_id=conversation_id,
+                regenerate_from_message_id=request.regenerate_from_message_id,
+            )
+            # 重新生成 = 该会话的最新操作（2026-09-26 用户指令）：解除拖拽钉住
+            # （sort_order 置 0），使其在 (sort_order asc, 最近活动 desc) 排序下回到
+            # 所在分组/时间分类最上方；活动时间键随新助手消息落库后的
+            # MAX(messages.created_at)（全角色口径，conversation.py）推进。
+            # updated_at 由 onupdate 自动推进，不在这里显式写（A4.9 R1 M-5：排序
+            # 不变式不允许 updated_at 显式驱动）。
+            # 值守卫（余留清零波）：sort_order 已为 0 时跳过赋值——同值照发
+            # 事件但跳 onupdate，会产生带旧 ts 的幻影事件被 LWW 等值判 STALE（§3.1）。
+            if conversation.sort_order:
+                conversation.sort_order = 0
+            await db.commit()
+        except BaseException:
+            # 同编辑路径：setup 失败不占会话槽位（shield 防二次取消复漏）。
+            if _reserved_agent_state is not None:
+                try:
+                    await asyncio.shield(_agent_registry.release_reservation(
+                        conversation_id, _reserved_agent_state))
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                _reserved_agent_state = None
+            raise
     elif request.edit_message_id:
-        conversation_messages = await _trim_messages_for_edit(
-            db,
-            conversation_id=conversation_id,
-            edit_message_id=request.edit_message_id,
-        )
-        # Save the new user message
-        user_message = Message(
-            conversation_id=conversation_id,
-            role="user",
-            content=request.messages[-1].content
-        )
-        conversation.updated_at = datetime.utcnow()
-        # 继续旧会话后置顶（2026-09-15）：新用户消息 = 会话成为「最新活动」。
-        # sort_order 置 0 使其在 (sort_order asc, 最近用户消息 desc) 排序下跳到
-        # 所在分组/时间分类最上方（前端乐观置顶 + 刷新后由本写入保持一致）。
-        conversation.sort_order = 0
-        db.add(user_message)
-        await db.commit()
-        conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
+        try:
+            conversation_messages = await _trim_messages_for_edit(
+                db,
+                conversation_id=conversation_id,
+                edit_message_id=request.edit_message_id,
+            )
+            # Save the new user message
+            user_message = Message(
+                conversation_id=conversation_id,
+                role="user",
+                content=request.messages[-1].content
+            )
+            conversation.updated_at = datetime.utcnow()
+            # 继续旧会话后置顶（2026-09-15）：新用户消息 = 会话成为「最新活动」。
+            # sort_order 置 0 使其在 (sort_order asc, 最近用户消息 desc) 排序下跳到
+            # 所在分组/时间分类最上方（前端乐观置顶 + 刷新后由本写入保持一致）。
+            # 值守卫（对齐 regenerate 分支 §3.1）：已为 0 跳过赋值，免幻影 STALE 事件。
+            if conversation.sort_order:
+                conversation.sort_order = 0
+            db.add(user_message)
+            await db.commit()
+            # reload 也在保护圈内：此前若失败（DB 抖动/取消），删+建已落库、
+            # 槽位必须释放，否则 180s provisional TTL 内重试被 conversation_busy 挡。
+            conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
+        except BaseException:
+            # 编辑 setup 失败（404/400 校验、DB 异常、取消）不占会话槽位：
+            # identity-checked 释放，不碰共享态；shield 防二次取消在释放途中
+            # 再抛 CancelledError 复漏槽位（同 _release_setup_slot_safely 口径）。
+            if _reserved_agent_state is not None:
+                try:
+                    await asyncio.shield(_agent_registry.release_reservation(
+                        conversation_id, _reserved_agent_state))
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                _reserved_agent_state = None
+            raise
     else:
         user_message = Message(
             conversation_id=conversation_id,
@@ -1395,6 +1631,9 @@ async def chat_stream(
 
     search_query, note_context_for_search = extract_search_query_and_note_context(latest_user_query)
     message_count = 1
+    # P1-①（2026-10-04）：本轮注入的记忆 id（_memory_ctx 回填；终局步据此判采纳回写）
+    _injected_mem_ids: list[str] = []
+    _adoption_tasks: set = set()
 
     async def _ensure_title(refreshed_conversation, full_response: str) -> str | None:
         """Generate a title for a brand-new conversation and persist it.
@@ -1462,6 +1701,18 @@ async def chat_stream(
             refreshed = conversation
 
         final_title = await _ensure_title(refreshed, final_content)
+
+        # P1-① 采纳反馈闭环（fire-and-forget，fail-open）：最终回答引用了本轮
+        # 注入的记忆证据（名/别名命中）→ 权重/边权回写（memory_adoption_service）。
+        if _injected_mem_ids and (final_content or "").strip():
+            try:
+                from app.services.memory_adoption_service import spawn_answer_adoption
+                _task = spawn_answer_adoption(
+                    current_user.id, list(_injected_mem_ids), final_content)
+                _adoption_tasks.add(_task)
+                _task.add_done_callback(_adoption_tasks.discard)
+            except Exception:
+                logger.debug("adoption scheduling failed (fail-open)", exc_info=True)
 
         # Compress tool_results for the SSE done event. The full payload is
         # already persisted in the DB; a huge string (> 30 KB with browser
@@ -1563,15 +1814,18 @@ async def chat_stream(
                                 interrupted_content, _cap_tool_results,
                                 _user_id_local, _username_local,
                             )
-                            msg = Message(
+                            # 渐进落库：断连中断=非预期中断——streaming 在途行
+                            # 原地更新并标 interrupted（前端「已中断」徽标）。
+                            msg = await _save_assistant_terminal(
+                                bg_db,
                                 conversation_id=_cap_conv_id,
-                                role="assistant",
                                 content=_loc_content,
-                                reasoning_content=_cap_reasoning if _cap_reasoning else None,
+                                reasoning=_cap_reasoning if _cap_reasoning else None,
                                 tool_results=_loc_tr,
                                 tool_calls=_cap_tool_calls,
+                                context_info=None,
+                                status="interrupted",
                             )
-                            bg_db.add(msg)
                             conv_row.updated_at = datetime.utcnow()
                             await bg_db.commit()
                             await bg_db.refresh(msg)
@@ -1639,16 +1893,20 @@ async def chat_stream(
 
             async def _memory_ctx() -> str | None:
                 """§5.2 工程要求 1：召回管线与 coordinator/准备工作并发（取 max 非 sum）。
-                独立 DB 会话（AsyncSession 不可并发共用）；失败回退 None 走旧方案。"""
+                独立 DB 会话（AsyncSession 不可并发共用）；失败回退 None 走旧方案。
+                2026-10-04：改 retrieve_with_meta 收本轮注入 id（P1-① 采纳回写输入）。"""
+                nonlocal _injected_mem_ids
                 from app.services.memory_runtime_state import memory_runtime_enabled as _mem_rt
                 if not (_mem_rt(_cfg) and _cfg.memory.get("retrieval_enabled")):
                     return None
                 try:
                     from app.services import memory_retrieval_service
                     async with _AsyncSessionLocal() as mem_db:
-                        return await memory_retrieval_service.retrieve_and_build_context(
+                        _ctx, _ids, _top = await memory_retrieval_service.retrieve_with_meta(
                             mem_db, current_user.id, conversation_messages,
                             conversation_id=conversation_id)
+                        _injected_mem_ids = list(_ids or [])
+                        return _ctx
                 except Exception:
                     logger.exception("New memory retrieval failed, falling back")
                     return None
@@ -1849,6 +2107,37 @@ async def chat_stream(
                     if n not in ("browser", "pdf_export", "web_search")
                 ],
             )
+
+            # 渐进落库（2026-10-06，conv ae9aa092）：审计打回时被拒草稿全文+
+            # 裁决元数据写入 message_attempts 台账（用户裁定：保留并标记）。
+            # 台账挂到本轮 streaming 在途行下；无在途行（死磕等路径）则跳过。
+            async def _on_draft_rejected(*, content, verdict, problem, source, attempt_no):
+                try:
+                    async with AsyncSessionLocal() as _att_db:
+                        _att_row = (await _att_db.execute(
+                            select(Message)
+                            .where(Message.conversation_id == conversation_id,
+                                   Message.delivery_status == "streaming")
+                            .order_by(Message.created_at.desc())
+                            .limit(1)
+                        )).scalars().first()
+                        if _att_row is None:
+                            return
+                        _att_db.add(MessageAttempt(
+                            message_id=_att_row.id,
+                            conversation_id=conversation_id,
+                            attempt_no=attempt_no,
+                            status="rejected",
+                            content=content or "",
+                            verdict_json=json.dumps({
+                                "verdict": verdict, "problem": problem, "source": source,
+                            }, ensure_ascii=False),
+                        ))
+                        await _att_db.commit()
+                except Exception:
+                    logger.warning("message_attempts write failed (fail-open)", exc_info=True)
+
+            agent_loop.on_draft_rejected = _on_draft_rejected
 
             # §5.2 工程要求 1：coordinator 与召回管线/工作区准备/skills 组装真并发
             # （合并等待取 max 非 sum）。coordinator 只读 user/assistant 消息，
@@ -2180,6 +2469,54 @@ async def chat_stream(
                         pass
                     return
 
+                # 渐进落库（2026-10-06，conv ae9aa092）：run 开始即建
+                # delivery_status='streaming' 的 assistant 行 + 周期刷写器——
+                # 进程被杀死（部署/崩溃/OOM）时已流式正文存活于 DB，启动 sweep
+                # 翻 interrupted 后带徽标展示，不再整段蒸发。死磕按轮落库
+                # 不在此路径（其逐轮保存已有独立契约）。
+                _streaming_row_id: str | None = None
+                if _deathmatch_mgr is None:
+                    try:
+                        async with AsyncSessionLocal() as _pf_db:
+                            _pf_row = Message(
+                                conversation_id=_cap_conversation_id,
+                                role="assistant",
+                                content="",
+                                delivery_status="streaming",
+                            )
+                            _pf_db.add(_pf_row)
+                            await _pf_db.commit()
+                            await _pf_db.refresh(_pf_row)
+                            _streaming_row_id = str(_pf_row.id)
+                            # 行 id 挂到 buffer（A4.9 r1 M2）：detach/relay/消费端
+                            # 的空行清理按行 id 精确删除，不跨 run 误删下一 run 的新行。
+                            try:
+                                _stream_buf.streaming_message_id = _streaming_row_id
+                            except Exception:
+                                pass
+                    except Exception:
+                        logger.warning(
+                            "streaming row creation failed (fail-open)", exc_info=True)
+
+                async def _pf_write(text: str) -> None:
+                    if not _streaming_row_id:
+                        return
+                    try:
+                        async with AsyncSessionLocal() as _pf_db:
+                            # Core 级 UPDATE：不触发 ORM/sync 事件（streaming
+                            # 行本就不下发同步）；仅当行仍在途时刷写。
+                            await _pf_db.execute(
+                                sa_update(Message)
+                                .where(Message.id == _streaming_row_id,
+                                       Message.delivery_status == "streaming")
+                                .values(content=text)
+                            )
+                            await _pf_db.commit()
+                    except Exception:
+                        logger.debug("progressive flush failed (fail-open)", exc_info=True)
+
+                _pf = ProgressiveFlusher(_pf_write)
+
                 # F1-1: per-stream part translator. Legacy events keep flowing
                 # unchanged; each translated event additionally emits
                 # part_started/part_delta/part_updated so v2 clients can drive
@@ -2265,18 +2602,20 @@ async def chat_stream(
                             )).scalar_one_or_none()
                             if conv_row is None:
                                 return None
-                            msg = Message(
+                            # 渐进落库（2026-10-06）：有 streaming 在途行则原地
+                            # 更新翻 final，不插入重复行。
+                            msg = await _save_assistant_terminal(
+                                db,
                                 conversation_id=conv_id,
-                                role="assistant",
                                 content=content,
-                                reasoning_content=reasoning or None,
+                                reasoning=reasoning or None,
                                 tool_results=tr_json_str,
                                 tool_calls=tc_json,
                                 context_info=(
                                     json.dumps(ctx_info, ensure_ascii=False) if ctx_info else None
                                 ),
+                                status="final",
                             )
-                            db.add(msg)
                             conv_row.updated_at = datetime.utcnow()
                             await db.commit()
                     except Exception:
@@ -2498,6 +2837,7 @@ async def chat_stream(
                                 )
                                 _clean_content = _strip_dsml_all(_clean_content)
                                 assistant_content += _clean_content
+                                _pf.feed(assistant_content)
                                 if _clean_content:
                                     _gate_stream = _pre_tool_gate.on_content(
                                         _clean_content, time.monotonic()
@@ -2521,21 +2861,15 @@ async def chat_stream(
                                 # When the assistant emits tool calls, the content
                                 # produced so far is a transient pre-tool
                                 # utterance (often a duplicate or placeholder).
-                                # Do not persist it as part of the final message;
-                                # only the answer produced after the tool results
-                                # should be saved.
+                                # Only the part the client NEVER saw (still in
+                                # the gate hold) is dropped; anything already
+                                # streamed must persist — A4.9 I2 contract
+                                # generalized (conv 4e159a79, see helper doc).
                                 display_sequence.append({"type": "tool_placeholder"})
-                                if not _pre_tool_gate.cap_released:
-                                    # Pre-tool text on a tool-requiring turn was
-                                    # held back (gating) — drop it silently; the
-                                    # answer after the tool results is
-                                    # authoritative. EXCEPTION: when the hold
-                                    # cap already released the prose (it was
-                                    # streamed to the user), keep it in the
-                                    # persisted answer — the user saw it and it
-                                    # must not vanish on refresh (A4.9 I2).
-                                    assistant_content = ""
-                                else:
+                                assistant_content = _drop_unshown_pre_tool_prose(
+                                    assistant_content, _pre_tool_gate
+                                )
+                                if assistant_content:
                                     # A4.9 R2 N1：快照已释放的预工具散文——压缩时
                                     # 只保留它，其后（工具后）的草稿仍按契约丢弃，
                                     # 否则「散文+旧稿+重答」三段拼接落库。
@@ -2543,6 +2877,13 @@ async def chat_stream(
                                 # Held canary tails belong to the discarded
                                 # pre-tool draft — reset so no stale partial
                                 # marker is prepended to post-tool content.
+                                # Lossless for prose: the held tail is by
+                                # construction a pure `[遵循词…` marker-prefix
+                                # fragment (CANARY_PREFIX_RE; see
+                                # tests/test_canary_tail_invariant.py) — never
+                                # answer text, so dropping it on a KEPT draft
+                                # loses nothing (a flush would leak marker
+                                # fragments into the answer instead).
                                 _canary_tail = ""
                                 _reasoning_canary_tail = ""
                                 _reasoning_meta_tail = ""
@@ -2639,9 +2980,14 @@ async def chat_stream(
                                 # tool iteration means the held text is stale
                                 # pre-tool prose — drop it (also covers a
                                 # tool_call event lost to subscriber-queue
-                                # overflow, which would otherwise keep the
-                                # gate armed for the whole turn).
+                                # overflow). Same tool-boundary contract as
+                                # the tool_call branch: only the never-shown
+                                # hold is droppable (conv 4e159a79).
                                 _id_info = event["iteration_done"] or {}
+                                if bool(_id_info.get("tool_calls")):
+                                    assistant_content = _drop_unshown_pre_tool_prose(
+                                        assistant_content, _pre_tool_gate
+                                    )
                                 _gate_flush = _pre_tool_gate.on_iteration_done(
                                     bool(_id_info.get("tool_calls")),
                                     time.monotonic(),
@@ -2778,6 +3124,9 @@ async def chat_stream(
                                 #     appended every agent_step AFTER the final
                                 #     text (tools-at-bottom symptom).
                                 assistant_content = ""
+                                # A4.9 r1 M1：被拒草稿可能已被刷进在途行——
+                                # 撤回到本稿前基线（空），残稿永不含被拒文字。
+                                await _pf.revert_to("")
                                 reason_seg = current_reasoning_segment.strip()
                                 if reason_seg:
                                     # Thinking accrued since the last tool
@@ -3381,6 +3730,26 @@ async def chat_stream(
                                 "skipping self-save (terminal status already persisted or nothing to save)"
                             )
                             try:
+                                # 空终态：清掉渐进落库的空 streaming 行
+                                try:
+                                    async with AsyncSessionLocal() as _clean_db:
+                                        _clean_q = sa_delete(Message).where(
+                                            Message.delivery_status == "streaming",
+                                            (Message.content == "") | (Message.content.is_(None)),
+                                        )
+                                        # A4.9 r1 M2：行 id 精确删除（buffer 携带），
+                                        # 避免跨 run 误删下一 run 的新建行。
+                                        # scoped 复审 Minor：本作用域无 _bg_buf（NameError
+                                        # 会被 except 吞成死代码）——只用 _stream_buf。
+                                        _clean_row_id = getattr(_stream_buf, "streaming_message_id", None)
+                                        if _clean_row_id:
+                                            _clean_q = _clean_q.where(Message.id == _clean_row_id)
+                                        else:
+                                            _clean_q = _clean_q.where(Message.conversation_id == _cap_conversation_id)
+                                        await _clean_db.execute(_clean_q)
+                                        await _clean_db.commit()
+                                except Exception:
+                                    logger.debug("empty streaming row cleanup failed", exc_info=True)
                                 await _stream_buf.mark_complete(None)
                             except Exception:
                                 pass
@@ -3395,15 +3764,17 @@ async def chat_stream(
                                         )).scalar_one_or_none()
                                         if conv_row is None:
                                             break
-                                        msg = Message(
+                                        # 渐进落库：streaming 在途行原地更新翻 final
+                                        msg = await _save_assistant_terminal(
+                                            bg_db,
                                             conversation_id=_cap_conversation_id,
-                                            role="assistant",
                                             content=_cap_content,
-                                            reasoning_content=full_reasoning_local if full_reasoning_local else None,
+                                            reasoning=full_reasoning_local if full_reasoning_local else None,
                                             tool_results=tr_json,
                                             tool_calls=tool_calls_json_local,
+                                            context_info=None,
+                                            status="final",
                                         )
-                                        bg_db.add(msg)
                                         conv_row.updated_at = datetime.utcnow()
                                         await bg_db.commit()
                                         await bg_db.refresh(msg)
@@ -3492,20 +3863,23 @@ async def chat_stream(
                                         )
                                     )).scalar_one_or_none()
                                     if _stop_conv is not None:
-                                        _stop_msg = Message(
+                                        # 渐进落库：streaming 在途行原地更新。
+                                        # 用户主动 stop = 刻意截断（用户知情且
+                                        # 见证），按既有语义落 'final'；进程
+                                        # 死亡类非预期中断才标 'interrupted'。
+                                        _stop_msg = await _save_assistant_terminal(
+                                            _stop_db,
                                             conversation_id=_cap_conversation_id,
-                                            role="assistant",
                                             content=_stop_content,
-                                            reasoning_content=_stop_reasoning,
+                                            reasoning=_stop_reasoning,
                                             tool_results=_stop_tool_results,
-                                            # P2 (A4.9 R1 M4): 停止保存路径
-                                            # 同样落账 token 快照（常规可见路径）。
+                                            tool_calls=None,
                                             context_info=(
                                                 json.dumps(_stream_buf.context_info, ensure_ascii=False)
                                                 if getattr(_stream_buf, "context_info", None) else None
                                             ),
+                                            status="final",
                                         )
-                                        _stop_db.add(_stop_msg)
                                         _stop_conv.updated_at = datetime.utcnow()
                                         await _stop_db.commit()
                                         await _stop_db.refresh(_stop_msg)
@@ -3735,6 +4109,23 @@ async def chat_stream(
                                 # (mirrors the self-save guard above).
                                 if not (_cap_content or "").strip() and not _cap_tool_results and not _cap_tool_calls:
                                     logger.info("Post-disconnect save skipped: empty payload")
+                                    # 空终态：清掉渐进落库的空 streaming 行
+                                    # （A4.9 r1 M2：行 id 精确删除，不跨 run 误删）
+                                    try:
+                                        async with AsyncSessionLocal() as _clean_db:
+                                            _clean_q = sa_delete(Message).where(
+                                                Message.delivery_status == "streaming",
+                                                (Message.content == "") | (Message.content.is_(None)),
+                                            )
+                                            _clean_row_id = getattr(_bg_buf, "streaming_message_id", None)
+                                            if _clean_row_id:
+                                                _clean_q = _clean_q.where(Message.id == _clean_row_id)
+                                            else:
+                                                _clean_q = _clean_q.where(Message.conversation_id == _cap_conversation_id)
+                                            await _clean_db.execute(_clean_q)
+                                            await _clean_db.commit()
+                                    except Exception:
+                                        logger.debug("empty streaming row cleanup failed", exc_info=True)
                                     try:
                                         await _bg_buf.mark_complete(None)
                                     except Exception:
@@ -3748,15 +4139,17 @@ async def chat_stream(
                                             )).scalar_one_or_none()
                                             if conv_row is None:
                                                 return
-                                            msg = Message(
+                                            # 渐进落库：streaming 在途行原地更新翻 final
+                                            msg = await _save_assistant_terminal(
+                                                bg_db,
                                                 conversation_id=_cap_conversation_id,
-                                                role="assistant",
                                                 content=_cap_content,
-                                                reasoning_content=_cap_reasoning if _cap_reasoning else None,
+                                                reasoning=_cap_reasoning if _cap_reasoning else None,
                                                 tool_results=_cap_tool_results,
                                                 tool_calls=_cap_tool_calls,
+                                                context_info=None,
+                                                status="final",
                                             )
-                                            bg_db.add(msg)
                                             conv_row.updated_at = datetime.utcnow()
                                             await bg_db.commit()
                                             await bg_db.refresh(msg)
@@ -3813,15 +4206,18 @@ async def chat_stream(
                                 and _dm_terminal_status_saved
                             )
                             if sanitized_content or (_cap_tool_results and not _skip_empty_final):
-                                assistant_message = Message(
+                                # 渐进落库（2026-10-06）：streaming 在途行原地更新
+                                # 翻 final，不插入重复行。
+                                assistant_message = await _save_assistant_terminal(
+                                    db,
                                     conversation_id=conversation_id,
-                                    role="assistant",
                                     content=sanitized_content,
-                                    reasoning_content=_cap_reasoning or None,
+                                    reasoning=_cap_reasoning or None,
                                     tool_results=_cap_tool_results,
                                     tool_calls=_cap_tool_calls,
+                                    context_info=None,
+                                    status="final",
                                 )
-                                db.add(assistant_message)
                                 conversation.updated_at = datetime.utcnow()
                                 await db.commit()
                                 await db.refresh(assistant_message)
@@ -3837,6 +4233,23 @@ async def chat_stream(
                                 except Exception:
                                     pass
                             else:
+                                # 空终态不落库——但渐进落库的 streaming 空行
+                                # 必须清掉，否则启动 sweep 会把它翻成
+                                # interrupted 空 bubble（2026-10-06）。
+                                try:
+                                    _clean_q = sa_delete(Message).where(
+                                        Message.delivery_status == "streaming",
+                                        (Message.content == "") | (Message.content.is_(None)),
+                                    )
+                                    _clean_row_id = getattr(_stream_buf, "streaming_message_id", None)
+                                    if _clean_row_id:
+                                        _clean_q = _clean_q.where(Message.id == _clean_row_id)
+                                    else:
+                                        _clean_q = _clean_q.where(Message.conversation_id == conversation_id)
+                                    await db.execute(_clean_q)
+                                    await db.commit()
+                                except Exception:
+                                    logger.debug("empty streaming row cleanup failed", exc_info=True)
                                 try:
                                     await _stream_buf.mark_complete(None)
                                 except Exception:
@@ -4602,14 +5015,18 @@ async def resume_stream(
                                 select(Conversation).where(Conversation.id == _cap_conv_id)
                             )).scalar_one_or_none()
                             if conv_row:
-                                msg = Message(
+                                # 渐进落库：resume 完成的 run 若在别的请求里建过
+                                # streaming 行，按 (conv, streaming) 反查原地更新。
+                                msg = await _save_assistant_terminal(
+                                    bg_db,
                                     conversation_id=_cap_conv_id,
-                                    role="assistant",
                                     content=_cap_content,
-                                    reasoning_content=_cap_reasoning if _cap_reasoning else None,
+                                    reasoning=_cap_reasoning if _cap_reasoning else None,
                                     tool_results=_cap_tr_json,
+                                    tool_calls=None,
+                                    context_info=None,
+                                    status="final",
                                 )
-                                bg_db.add(msg)
                                 conv_row.updated_at = datetime.utcnow()
                                 await bg_db.commit()
                                 await bg_db.refresh(msg)

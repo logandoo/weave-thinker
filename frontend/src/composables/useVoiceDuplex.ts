@@ -254,8 +254,8 @@ export function useVoiceDuplex() {
   let _proxReported = false // first transition ever reported
   let _proxLastSentAt = 0 // heartbeat: last time near was (re)reported
   const PROX_WARMUP_FRAMES = 10 // frames of ambient baseline before gating
-  const PROX_NEAR_RATIO = 4.0 // rms >= floor * ratio → near candidate
-  const PROX_NEAR_MIN = 0.02 // absolute floor of the near threshold
+  const PROX_NEAR_RATIO = 6.0 // rms >= floor * ratio → near candidate（2026-09-29 4→6：远场抑制）
+  const PROX_NEAR_MIN = 0.04 // absolute floor of the near threshold（2026-09-29 0.02→0.04）
   const PROX_NEAR_FRAMES = 2 // consecutive near frames to confirm (~170ms)
   const PROX_FAR_FRAMES = 4 // consecutive far frames to clear (~340ms)
   const PROX_FLOOR_MAX = 0.06 // cap so the near threshold stays ≤ 0.24

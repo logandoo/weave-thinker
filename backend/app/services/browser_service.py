@@ -4,8 +4,8 @@
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import httpx
@@ -90,6 +90,200 @@ class PageContent:
     title: str
     text: str
     error: Optional[str] = None
+    # 图片能力缺口修复（2026-10-05，conv 0d4caea5）：页面图片直址——
+    # og:image/<img>/srcset 抽取、绝对化、tracking/1x1/data 过滤、去重、
+    # ≤[browser] max_images_per_page。agent 可据此内嵌 ![alt](src) 或下载。
+    images: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# 图片候选过滤（2026-10-05）：明确的追踪/广告/占位图一律丢弃——
+# 宁可多留内容图，也不让像素噪音稀释 agent 上下文。
+# 评审 minor：/blanket、/ad-hoc 误伤收紧（/blank[.-]、去掉裸 /ad-）；
+# 裸端点形态（/spacer、/blank 无扩展名=经典 1x1 handler）补兜（minor⑩）。
+_IMAGE_URL_BLACKLIST = re.compile(
+    r"(?:/pixel|/beacon|/blank[.-]|spacer[.-]|/1x1|/track(?:ing|er)?[./]|analytics|"
+    r"doubleclick|googlesyndication|adsystem|adservice|/ads?/|"
+    r"scorecardresearch|quantserve|/stats?[./]|spinner|/loading[.-]"
+    r"|(?:/spacer|/blank)(?:[?]|$))",
+    re.I,
+)
+
+# 图片 src 上限（minor⑫）：签名巨 URL（1-2KB presigned 常见）放行，>2048 丢弃。
+_IMAGE_SRC_MAX_CHARS = 2048
+
+
+def _image_dims(img_tag) -> tuple:
+    def _d(v):
+        try:
+            return int(str(v).strip().rstrip("px"))
+        except (TypeError, ValueError):
+            return None
+    return _d(img_tag.get("width")), _d(img_tag.get("height"))
+
+
+_SRCSET_DESC_RE = re.compile(r"^\d+(?:\.\d+)?[wx]$", re.I)
+
+# srcset 最大档解算（JS 版，与 _pick_srcset_largest 同语义——node 对拍测试钉住）：
+# 空白切分 + 描述符分隔 + 描述符后逗号归一化（锚定行首/空白前导，URL query
+# 内的 400w,800w 不腐坏）+ data-URI 候选续段跳过。
+_SRCSET_PICK_JS = """function(ss) {
+    if (!ss) return '';
+    const norm = ss.replace(/(?:^|(\\s))(\\d+(?:\\.\\d+)?[wx])\\s*,\\s*/gi, '$1$2, ');
+    let best = '', bw = -1, parts = [], skipData = false;
+    const toks = norm.split(/\\s+/);
+    const flush = (desc) => {
+        const url = parts.join(' ').replace(/^,+|,+$/g, '');
+        parts = [];
+        if (!url || (!url.includes('/') && !url.includes('.'))) return;
+        const w = desc ? (parseFloat(desc) || 0) : 0;
+        if (w >= bw) { best = url; bw = w; }
+    };
+    for (let i = 0; i < toks.length; i++) {
+        const tok = toks[i].replace(/,+$/, '');
+        if (!tok) continue;
+        if (skipData) {
+            if (/^\\d+(\\.\\d+)?[wx]$/i.test(tok) && i + 1 < toks.length) skipData = false;
+            continue;
+        }
+        if (tok.startsWith('data:')) { parts = []; skipData = true; continue; }
+        const m = tok.match(/^(\\d+(?:\\.\\d+)?)([wx])$/i);
+        if (m) flush(m[1]); else parts.push(tok);
+    }
+    flush(null);
+    return best;
+}"""
+
+# 页面图片候选抽取 JS（Playwright 两路径共享）：og:image + <img>（currentSrc
+# 已含懒加载/srcset 解算；data: 时回退 data-src/data-original/data-lazy-src；
+# 再不行 srcset 解算）。
+_IMAGES_JS = """() => {
+    const out = [];
+    const og = document.querySelector(
+        'meta[property="og:image"],meta[name="og:image"],'
+        + 'meta[property="og:image:url"],meta[name="twitter:image"]');
+    if (og && og.content) {
+        out.push({src: og.content, kind: 'og', alt: document.title || ''});
+    }
+    const pickSrcset = __SRCSET_PICK_JS__;
+    for (const img of document.querySelectorAll('img')) {
+        let src = img.currentSrc || img.src || '';
+        if (!src || src.startsWith('data:')) {
+            src = img.getAttribute('data-src')
+                || img.getAttribute('data-original')
+                || img.getAttribute('data-lazy-src') || '';
+        }
+        if (!src) src = pickSrcset(img.getAttribute('srcset') || '');
+        if (!src) continue;
+        const w = img.naturalWidth
+            || (parseInt(img.getAttribute('width')) || null);
+        const h = img.naturalHeight
+            || (parseInt(img.getAttribute('height')) || null);
+        out.push({src, alt: img.alt || '', width: w, height: h, kind: 'img'});
+    }
+    return out;
+}""".replace("__SRCSET_PICK_JS__", "(" + _SRCSET_PICK_JS + ")")
+
+
+def _pick_srcset_largest(srcset: str) -> Optional[str]:
+    """srcset 取最大档（w/x 描述符；缺描述符取最后一项）。
+
+    按**空白**切分（srcset 语法里 URL 不含空格）；描述符后的逗号先归一化
+    补空格（`a.jpg 400w,b.jpg 800w` 合法形态——只切描述符紧跟的逗号，CDN
+    URL 内逗号（Cloudinary w_400,h_400）不动）；data-URI 候选单独丢弃
+    （minor⑨：URL query 里出现 `?fmt=data:uri` 不误杀整串）。
+    """
+    if not srcset:
+        return None
+    # 描述符后逗号归一化（`a.jpg 400w,b.jpg` → `a.jpg 400w, b.jpg`）——锚定
+    # 行首/空白前导（I-B2：URL query 内的 `sizes=400w,800w` 不前导空白，不切）。
+    norm = re.sub(r"(?:(?<=^)|(?<=\s))(\d+(?:\.\d+)?[wx])\s*,\s*", r"\1, ", srcset, flags=re.I)
+    best_url, best_w = None, -1.0
+    url_parts: List[str] = []
+    skip_until_desc = False
+    toks = norm.split()
+
+    def _flush(desc: Optional[str]) -> None:
+        nonlocal best_url, best_w
+        if not url_parts:
+            return
+        url = " ".join(url_parts).strip().strip(",")
+        url_parts.clear()
+        if not url or ("/" not in url and "." not in url):
+            return
+        w = 0.0
+        d = (desc or "").lower().rstrip("wx")
+        if d:
+            try:
+                w = float(d)
+            except ValueError:
+                w = 0.0
+        if w >= best_w:
+            best_url, best_w = url, w
+
+    for i, tok in enumerate(toks):
+        t = tok.strip().rstrip(",")
+        if not t:
+            continue
+        if skip_until_desc:
+            # data-URI 内空白/逗号碎出的续段：仅在「后面还有内容」的描述符处
+            # 退出跳过态（A-m5：尾巴恰像描述符的碎段不得越狱）
+            if _SRCSET_DESC_RE.match(t) and i + 1 < len(toks):
+                skip_until_desc = False
+            continue
+        if t.startswith("data:"):
+            # data-URI 候选：丢弃该候选已累积的 URL 段并进入续段跳过态
+            url_parts.clear()
+            skip_until_desc = True
+            continue
+        if _SRCSET_DESC_RE.match(t):
+            _flush(t)
+        else:
+            url_parts.append(t)
+    _flush(None)
+    return best_url
+
+
+def _filter_image_candidates(cands: List[Dict[str, Any]], base_url: str, limit: int) -> List[Dict[str, Any]]:
+    """候选清单统一过滤：http(s) 绝对化、tracking/1x1/data 丢弃、去重、限量。
+
+    og:image 候选（kind=og）须排最前（调用方保证顺序），去重保留先见者。
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    if limit <= 0:
+        return out  # 运营关闭档（评审 B#1 越位修复：limit=0 一张不出）
+    for c in cands:
+        src = (c.get("src") or "").strip()
+        if not src or src.startswith(("data:", "blob:", "javascript:", "#")):
+            continue
+        if len(src) > _IMAGE_SRC_MAX_CHARS:
+            continue  # 签名巨 URL（minor⑫）：丢弃不截断（截断即坏链）
+        src = urljoin(base_url, src)
+        if not src.startswith(("http://", "https://")):
+            continue
+        if _IMAGE_URL_BLACKLIST.search(src):
+            continue
+        w, h = c.get("width"), c.get("height")
+        # 1x1 追踪像素：仅当尺寸确知（>0）且 ≤3px 才丢；0/None=未知一律保留
+        if isinstance(w, int) and isinstance(h, int) and 0 < w <= 3 and 0 < h <= 3:
+            continue
+        if src in seen:
+            continue
+        seen.add(src)
+        item: Dict[str, Any] = {"src": src, "kind": c.get("kind") or "img"}
+        # 评审 A#2：alt 换行/连续空白折叠——页面可控文本不得伪造清单项注入
+        # LLM 的图片挑选通道（防「alt 藏一条假图片项」）
+        alt = re.sub(r"\s+", " ", (c.get("alt") or "").strip())
+        if alt:
+            item["alt"] = alt[:140]
+        if isinstance(w, int) and w > 0:
+            item["width"] = w
+        if isinstance(h, int) and h > 0:
+            item["height"] = h
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _is_challenge_page(title: str, text: str) -> bool:
@@ -224,6 +418,14 @@ class BrowserService:
                             title_text = await page.title()
 
                         text = (body_text or "")[:max_len]
+                        try:
+                            raw_imgs = await page.evaluate(_IMAGES_JS)
+                            images = _filter_image_candidates(
+                                raw_imgs or [], current_url,
+                                config.browser_max_images_per_page,
+                            )
+                        except Exception:
+                            images = []
                     except Exception as exc:
                         logger.debug(
                             "Paginated fetch failed for %s: %s", current_url, exc
@@ -242,6 +444,7 @@ class BrowserService:
                             url=current_url,
                             title=(title_text or "")[:_TITLE_TRUNCATION],
                             text=text,
+                            images=images,
                         )
                     )
 
@@ -425,12 +628,56 @@ class BrowserService:
                         title = await page.title()
 
                     text = (text or "")[:max_len]
-                    return PageContent(url=url, title=title or "", text=text)
+                    # 图片抽取（图片能力缺口修复）：同一页面上下文内取 og/img
+                    # 候选（currentSrc 已含懒加载解算），Python 侧统一过滤。
+                    try:
+                        raw_imgs = await page.evaluate(_IMAGES_JS)
+                        images = _filter_image_candidates(
+                            raw_imgs or [], url,
+                            config.browser_max_images_per_page,
+                        )
+                    except Exception:
+                        images = []
+                    return PageContent(url=url, title=title or "", text=text, images=images)
                 finally:
                     await browser.close()
         except Exception:
             logger.debug("Playwright fetch failed for %s", url)
             return None
+
+    @staticmethod
+    def _make_soup(html: str):
+        from bs4 import BeautifulSoup
+        return BeautifulSoup(html, "html.parser")
+
+    @staticmethod
+    def _extract_images(url: str, soup, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """从 soup 抽取页面图片直址（og:image 优先，其后 <img> 按文档序）。
+
+        <img> 取址顺序：src（非 data: 时）→ data-src/data-original/data-lazy-src
+        （懒加载真身）→ srcset 最大档。过滤/绝对化/去重由
+        _filter_image_candidates 统一承担。
+        """
+        if limit is None:
+            limit = config.browser_max_images_per_page
+        cands: List[Dict[str, Any]] = []
+        for prop in ("og:image", "og:image:url", "og:image:secure_url", "twitter:image"):
+            tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+            if tag and tag.get("content"):
+                cands.append({"src": tag["content"].strip(), "kind": "og",
+                              "alt": (soup.title.string.strip() if soup.title and soup.title.string else "")})
+        for img in soup.find_all("img"):
+            w, h = _image_dims(img)
+            src = img.get("src") or ""
+            if not src or src.startswith("data:"):
+                src = (img.get("data-src") or img.get("data-original")
+                       or img.get("data-lazy-src") or "")
+            if not src and img.get("srcset"):
+                src = _pick_srcset_largest(img.get("srcset") or "") or ""
+            if src:
+                cands.append({"src": src, "alt": img.get("alt") or "",
+                              "width": w, "height": h, "kind": "img"})
+        return _filter_image_candidates(cands, url, limit)
 
     @staticmethod
     async def _extract_content(url: str, html: str, max_len: int) -> PageContent:
@@ -445,6 +692,7 @@ class BrowserService:
 
         def _parse():
             soup = BeautifulSoup(html, "html.parser")
+            images = BrowserService._extract_images(url, soup)
             title = ""
             if soup.title and soup.title.string:
                 title = soup.title.string.strip()
@@ -455,7 +703,7 @@ class BrowserService:
             text = soup.get_text(separator="\n", strip=True)
             text = re.sub(r"\n{3,}", "\n\n", text)
             text = text[:max_len]
-            return PageContent(url=url, title=title, text=text)
+            return PageContent(url=url, title=title, text=text, images=images)
 
         return await asyncio.to_thread(_parse)
 
@@ -471,6 +719,7 @@ class BrowserService:
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html, "html.parser")
+        images = BrowserService._extract_images(url, soup)
         title = ""
         m = re.search(r"var msg_title\s*=\s*(['\"])(.*?)\1", html, re.S)
         if m:
@@ -503,4 +752,4 @@ class BrowserService:
             fallback = re.sub(r"\n{3,}", "\n\n", fallback)
             parts.append(fallback)
 
-        return PageContent(url=url, title=title, text="\n\n".join(parts)[:max_len])
+        return PageContent(url=url, title=title, text="\n\n".join(parts)[:max_len], images=images)

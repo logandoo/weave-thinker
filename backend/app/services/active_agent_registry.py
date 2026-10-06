@@ -163,6 +163,45 @@ class ActiveAgentRegistry:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._snapshot_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        # 部署排空（2026-10-06）：draining=True 时 chat 新 run 入口 503 拒收，
+        # 让 stop.sh 的排空窗口收敛（否则边排边进永远排不完）。
+        self._draining = False
+        # A4.9 r1 I6：drain TTL 看门狗——stop.sh 中止/Ctrl-C 不得把服务器
+        # 永久打进 503；超时自动解除（默认 600s，远超 WT_DRAIN_TIMEOUT 120s）。
+        self._drain_ttl_seconds = 600.0
+        self._drain_watchdog: Optional[asyncio.Task] = None
+
+    @property
+    def is_draining(self) -> bool:
+        return self._draining
+
+    async def set_draining(self, on: bool) -> None:
+        self._draining = bool(on)
+        logger.info("ActiveAgentRegistry draining=%s", self._draining)
+        if self._drain_watchdog is not None and not self._drain_watchdog.done():
+            self._drain_watchdog.cancel()
+            self._drain_watchdog = None
+        if self._draining:
+            async def _auto_release():
+                try:
+                    await asyncio.sleep(self._drain_ttl_seconds)
+                except asyncio.CancelledError:
+                    return
+                if self._draining:
+                    self._draining = False
+                    logger.warning(
+                        "drain auto-released after %.0fs TTL (stop script aborted?)",
+                        self._drain_ttl_seconds)
+            try:
+                self._drain_watchdog = asyncio.get_running_loop().create_task(_auto_release())
+            except RuntimeError:
+                pass  # 无运行中事件循环（测试/构造期）——TTL 跳过
+
+    async def active_run_count(self) -> int:
+        """在途 run 计数（含 provisional 预约槽——预约中的 run 即将启动，
+        排空等待必须把其计入，否则刚预约就被杀）。"""
+        async with self._lock:
+            return sum(1 for s in self._agents.values() if s.is_running)
 
     @classmethod
     def get_instance(cls) -> "ActiveAgentRegistry":

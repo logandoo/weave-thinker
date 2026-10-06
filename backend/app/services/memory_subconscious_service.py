@@ -297,6 +297,7 @@ async def _load_raw_by_kind(
                     SELECT a.id AS assistant_id, a.content AS assistant_content
                     FROM messages a
                     WHERE a.conversation_id = m.conversation_id AND a.role = 'assistant'
+                      AND a.delivery_status != 'streaming'
                       AND a.created_at >= m.created_at
                       AND a.created_at < COALESCE(
                           (SELECT m2.created_at FROM messages m2

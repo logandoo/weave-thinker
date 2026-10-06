@@ -29,7 +29,11 @@ from sqlalchemy import select
 from websockets.exceptions import ConnectionClosed
 
 from app.core.config import get_config
-from app.services.asr_service import ASRService, apply_hotword_phonetic_correction
+from app.services.asr_service import (
+    ASRService,
+    _recognition_tuning_params,
+    apply_hotword_phonetic_correction,
+)
 from app.services.llm_service import LLMService
 from app.services.provider_router import build_thinking_extra_body, get_provider_router
 from app.services.title_generator import TitleGeneratorService
@@ -206,8 +210,8 @@ _IDENTITY_WAIT_SECONDS = 2.5
 _MIC_ENERGY_FLOOR_INIT = 0.01 * 32768
 _MIC_ENERGY_FLOOR_MIN = 0.0005 * 32768
 _MIC_ENERGY_FLOOR_MAX = 0.06 * 32768
-_MIC_ENERGY_NEAR_RATIO = 4.0
-_MIC_ENERGY_NEAR_MIN = 0.003 * 32768
+_MIC_ENERGY_NEAR_RATIO = 6.0
+_MIC_ENERGY_NEAR_MIN = 0.04 * 32768
 # Freshness of a local-speech sample for the flush hold. Must cover the flush
 # decision latency (grace ~1.2s + processing) so speech that resumed just
 # before the would-be flush still holds it; a truly silent turn releases the
@@ -1286,12 +1290,13 @@ class _VoiceASR:
         # Ref: https://help.aliyun.com/zh/model-studio/fun-asr-realtime-python-sdk
         vcfg = get_config()
         params["speech_noise_threshold"] = vcfg.voice_asr_speech_noise_threshold
+        params.update(_recognition_tuning_params(cfg, self.service.dashscope_model))
         if self.vocabulary_id:
             params["vocabulary_id"] = self.vocabulary_id
         else:
-            hotwords_str = self.service._format_funasr_hotwords(self.hotwords)
-            if hotwords_str:
-                params["hotwords"] = hotwords_str
+            vocabulary = self.service._format_funasr_hotwords(self.hotwords)
+            if vocabulary and _supports_instant_vocabulary(self.service.dashscope_model):
+                params["vocabulary"] = vocabulary
         # fun-asr-realtime accepts a dialogue context that biases recognition
         # toward in-topic words and suppresses off-topic/background speech.
         # Ref: https://help.aliyun.com/zh/model-studio/improve-asr-accuracy
@@ -2250,9 +2255,14 @@ class VoiceDuplexSession:
         from app.db.database import Message
 
         result = await self.db.execute(
-            select(Message).where(Message.conversation_id == self.conversation_id)
+            select(Message).where(Message.conversation_id == self.conversation_id,
+                                  Message.delivery_status != "streaming")
             .order_by(Message.created_at)
         )
+        # 评审 I3：外置桩还原全文后再进语音上下文（否则 stub JSON 进模型/结构解析断裂）
+        from app.services.message_payload_service import resolve_message_fields
+        _rows = list(result.scalars())
+        _rows = await resolve_message_fields(_rows, self.db)
         # conv a040c24e (D-12): historical [N] citation markers and numbered
         # search lists must never re-enter the model context — the voice path
         # has no citation ledger (markers would be read out by TTS or mimicked
@@ -2261,7 +2271,7 @@ class VoiceDuplexSession:
             _denumber_search_formatted,
             neutralize_historical_citations,
         )
-        for msg in result.scalars():
+        for msg in _rows:
             if msg.role == "user" and msg.content:
                 self._history.append({"role": "user", "content": msg.content})
                 continue
@@ -2331,6 +2341,13 @@ class VoiceDuplexSession:
         final: bool = False,
     ) -> None:
         """Upsert the in-progress assistant message for the current turn.
+
+        CONTRACT — monotonic growth: ``content`` must be the CUMULATIVE turn
+        text (``full_reply + reply_text`` mid-loop, folded ``full_reply``
+        at finalize); every call replaces ``msg.content`` wholesale, so a
+        partial snapshot would silently shrink user-visible history (same
+        data-loss class as conv 4e159a79). Pinned by
+        tests/test_voice_turn_progress_cumulative.py.
 
         Voice turns used to persist ONLY at successful completion — exiting
         voice mode mid-tool-loop (WS close cancels the responder) erased every

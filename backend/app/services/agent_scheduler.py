@@ -336,10 +336,14 @@ class AgentScheduler:
             if conv_id:
                 result = await setup_db.execute(
                     select(Message)
-                    .where(Message.conversation_id == conv_id)
+                    .where(Message.conversation_id == conv_id,
+                           Message.delivery_status != "streaming")
                     .order_by(Message.created_at)
                 )
                 all_msgs = result.scalars().all()
+                # 评审 I3：外置桩还原全文后再进定时任务上下文
+                from app.services.message_payload_service import resolve_message_fields
+                all_msgs = await resolve_message_fields(list(all_msgs), setup_db)
                 cfg = get_config()
                 context_limit = cfg.agent_conversation_context_limit
                 recent = all_msgs[-context_limit:] if len(all_msgs) > context_limit else all_msgs

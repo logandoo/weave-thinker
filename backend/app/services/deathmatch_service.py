@@ -3949,10 +3949,14 @@ class DeathmatchManager:
         try:
             result = await db.execute(
                 select(Message)
-                .where(Message.conversation_id == self._conv.id)
+                .where(Message.conversation_id == self._conv.id,
+                       Message.delivery_status != "streaming")
                 .order_by(Message.created_at)
             )
             msgs = result.scalars().all()
+            # 评审 I3：外置桩还原全文（否则 provide_file 收割读到 stub JSON）
+            from app.services.message_payload_service import resolve_message_fields
+            msgs = await resolve_message_fields(list(msgs), db)
             messages = []
             # conv a040c24e (D-12): neutralize historical [N] citation markers
             # on assistant rows before they re-enter the goal-loop context.
@@ -8845,9 +8849,13 @@ intent 只能是以下之一：
                     select(Message).where(
                         Message.conversation_id == conv_id,
                         Message.role == "assistant",
+                        Message.delivery_status != "streaming",
                     ).order_by(Message.created_at)
                 )
                 messages = result.scalars().all()
+                # 评审 I3：外置桩还原全文（否则 provide_file 收割读到 stub JSON）
+                from app.services.message_payload_service import resolve_message_fields
+                messages = await resolve_message_fields(list(messages), db)
                 for msg in messages:
                     tr_json = msg.tool_results
                     if not tr_json:
@@ -8902,9 +8910,13 @@ intent 只能是以下之一：
                     select(Message).where(
                         Message.conversation_id == conv_id,
                         Message.role == "assistant",
+                        Message.delivery_status != "streaming",
                     ).order_by(Message.created_at)
                 )
                 messages = result.scalars().all()
+                # 评审 I3：外置桩还原全文（否则 provide_file 收割读到 stub JSON）
+                from app.services.message_payload_service import resolve_message_fields
+                messages = await resolve_message_fields(list(messages), db)
                 for msg in messages:
                     tr_json = msg.tool_results
                     if not tr_json:
@@ -9006,9 +9018,13 @@ intent 只能是以下之一：
                     select(Message).where(
                         Message.conversation_id == conv_id,
                         Message.role == "assistant",
+                        Message.delivery_status != "streaming",
                     ).order_by(Message.created_at)
                 )
                 messages = result.scalars().all()
+                # 评审 I3：外置桩还原全文（否则 provide_file 收割读到 stub JSON）
+                from app.services.message_payload_service import resolve_message_fields
+                messages = await resolve_message_fields(list(messages), db)
                 for msg in messages:
                     tr_json = msg.tool_results
                     if not tr_json:

@@ -58,156 +58,33 @@
 
     <!-- Desktop: notes / conversations panel swap with smooth transition -->
     <Transition name="sidebar-swap" mode="out-in">
-    <div class="notes-panel-inline" v-if="showNotesPanel" key="notes-panel">
-      <div class="notes-panel-header">
-        <span class="notes-panel-title">笔记本</span>
-        <button class="new-note-btn" @click="startNewNote" title="新建笔记">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-            <polyline points="14 2 14 8 20 8"/>
-            <line x1="12" y1="18" x2="12" y2="12"/>
-            <line x1="9" y1="15" x2="15" y2="15"/>
-          </svg>
-        </button>
-      </div>
-      <div class="notes-panel-loading" v-if="notesPanelLoading">加载中…</div>
-      <div class="notes-panel-list" v-else>
-           <!-- "首页" entry: same hierarchy as a notebook, jumps to the
-             notebook-picker page so the user can switch notebooks quickly. -->
-        <div
-          class="np-notebook np-home"
-          :class="{ active: isOnNotesRoot }"
-          @click="goToNotebooksHome"
-          role="button"
-          tabindex="0"
-          @keydown.enter.prevent="goToNotebooksHome"
-          @keydown.space.prevent="goToNotebooksHome"
-        >
-          <div class="np-notebook-row">
-            <svg class="np-chevron np-chevron-placeholder" width="13" height="13" viewBox="0 0 24 24" aria-hidden="true"></svg>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M3 12l2-2 7-7 7 7 2 2"/>
-              <path d="M5 10v10a1 1 0 0 0 1 1h3v-6h6v6h3a1 1 0 0 0 1-1V10"/>
+    <NotesPanelInline
+      v-if="showNotesPanel"
+      key="notes-panel"
+      ref="notesPanelRef"
+      :active-notebook-id="activeNotebookId"
+      :active-note-id="activeNoteId"
+      @open-notebook="openNotebookInPanel"
+      @open-note="openNoteInPanel"
+      @open-home="goToNotebooksHome"
+      @note-created="onPanelNoteCreated"
+      @active-note-deleted="onPanelActiveNoteDeleted"
+      @active-notebook-deleted="onPanelActiveNotebookDeleted"
+    >
+      <template #header>
+        <div class="notes-panel-header">
+          <span class="notes-panel-title">笔记本</span>
+          <button class="new-note-btn" @click="notesPanelRef?.openNewNote()" title="新建笔记">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="12" y1="18" x2="12" y2="12"/>
+              <line x1="9" y1="15" x2="15" y2="15"/>
             </svg>
-            <span class="np-nb-name">首页</span>
-          </div>
+          </button>
         </div>
-        <div
-          class="np-notebook"
-          v-for="nb in notesStore.notebooks"
-          :key="nb.id"
-        >
-          <div
-            class="np-swipe-wrap np-swipe-wrap--nb"
-            :class="{ 'np-swipe-open': npSwipedKey === 'nb:' + nb.id }"
-            @touchstart="npHandleTouchStart($event, 'nb:' + nb.id)"
-            @touchend="npHandleTouchEnd()"
-            @touchcancel="npHandleTouchEnd()"
-            @touchmove="npHandleTouchMove($event, 'nb:' + nb.id)"
-          >
-            <div class="np-swipe-actions np-swipe-actions--nb">
-              <button class="np-swipe-action rename" @click.stop="npSwipeRenameNotebook(nb)">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                </svg>
-                <span>重命名</span>
-              </button>
-              <button class="np-swipe-action delete" @click.stop="npSwipeDeleteNotebook(nb)">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="3 6 5 6 21 6"/>
-                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                </svg>
-                <span>删除</span>
-              </button>
-            </div>
-            <div
-              class="np-notebook-row"
-              :class="{ active: isActivePanelNotebook(nb.id) }"
-              :style="npRowStyle('nb:' + nb.id)"
-              @click="npRowClick('nb:' + nb.id, () => toggleNotesPanelNotebook(nb.id))"
-              @dblclick="openNotebookInPanel(nb.id)"
-            >
-              <svg class="np-chevron" :class="{ expanded: !!notesPanelExpanded[nb.id] }" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="9 6 15 12 9 18"/>
-              </svg>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-              </svg>
-              <span class="np-nb-name">{{ nb.name }}</span>
-              <span class="np-count">{{ nb.note_count }}</span>
-              <button
-                class="np-menu-btn hide-on-mobile"
-                :class="{ active: npMenuId === 'nb:' + nb.id }"
-                @click.stop="openNpNotebookMenu(nb, $event)"
-                title="更多操作"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
-              </button>
-            </div>
-          </div>
-          <div class="np-notes-list" v-show="!!notesPanelExpanded[nb.id]">
-            <div
-              v-for="note in notesStore.notes[nb.id] || []"
-              :key="note.id"
-              class="np-swipe-wrap np-swipe-wrap--note"
-              :class="{ 'np-swipe-open': npSwipedKey === 'note:' + note.id }"
-              @touchstart="npHandleTouchStart($event, 'note:' + note.id)"
-              @touchend="npHandleTouchEnd()"
-              @touchcancel="npHandleTouchEnd()"
-              @touchmove="npHandleTouchMove($event, 'note:' + note.id)"
-            >
-              <div class="np-swipe-actions np-swipe-actions--note">
-                <button class="np-swipe-action rename" @click.stop="npSwipeRenameNote(note)">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-                  </svg>
-                  <span>重命名</span>
-                </button>
-                <button class="np-swipe-action move" @click.stop="npSwipeMoveNote(note)">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M5 12h14M12 5l7 7-7 7"/>
-                  </svg>
-                  <span>移动</span>
-                </button>
-                <button class="np-swipe-action delete" @click.stop="npSwipeDeleteNote(note)">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="3 6 5 6 21 6"/>
-                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                  </svg>
-                  <span>删除</span>
-                </button>
-              </div>
-              <div
-                class="np-note-row"
-                :class="{ active: isActivePanelNote(nb.id, note.id) }"
-                :style="npRowStyle('note:' + note.id)"
-                @click="npRowClick('note:' + note.id, () => openNoteInPanel(nb.id, note.id))"
-              >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                  <polyline points="14 2 14 8 20 8"/>
-                </svg>
-                <span class="np-note-title">{{ note.title || '无标题' }}</span>
-                <button
-                  class="np-menu-btn hide-on-mobile"
-                  :class="{ active: npMenuId === 'note:' + note.id }"
-                  @click.stop="openNpNoteMenu(note, $event)"
-                  title="更多操作"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
-                </button>
-              </div>
-            </div>
-            <div v-if="!!notesPanelNotebookLoading[nb.id]" class="np-note-loading">加载中…</div>
-            <div v-else-if="!(notesStore.notes[nb.id] || []).length" class="np-empty">暂无笔记</div>
-          </div>
-        </div>
-        <div v-if="!notesStore.notebooks.length" class="np-empty">暂无笔记本</div>
-      </div>
-    </div>
+      </template>
+    </NotesPanelInline>
     <!-- conversation view: shown when notes panel is not active -->
     <div class="sidebar-body" v-else>
     <div class="action-buttons">
@@ -593,110 +470,6 @@
     </div><!-- /sidebar-body -->
     </Transition>
 
-    <!-- Notes panel context menu (notebook: 重命名/删除；note: 重命名/移动到/删除，与工作台笔记菜单一致) -->
-    <Teleport to="body">
-      <div
-        v-if="npMenuTarget"
-        class="np-context-menu"
-        :style="npMenuStyle"
-        @click.stop
-      >
-        <template v-if="npMenuTarget.kind === 'notebook'">
-          <button class="menu-item" @click="handleNpRenameNotebook">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7"/>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-            </svg>
-            <span>重命名</span>
-          </button>
-          <button class="menu-item delete" @click="handleNpDeleteNotebook">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="3 6 5 6 21 6"/>
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-            </svg>
-            <span>删除</span>
-          </button>
-        </template>
-        <template v-else>
-          <button class="menu-item" @click="handleNpRenameNote">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7"/>
-              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-            </svg>
-            <span>重命名</span>
-          </button>
-          <button class="menu-item" @click="handleNpMoveNote">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-              <line x1="12" y1="11" x2="12" y2="17"/>
-              <line x1="9" y1="14" x2="15" y2="14"/>
-            </svg>
-            <span>移动到</span>
-          </button>
-          <div class="menu-divider"></div>
-          <button class="menu-item delete" @click="handleNpDeleteNote">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="3 6 5 6 21 6"/>
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-            </svg>
-            <span>删除</span>
-          </button>
-        </template>
-      </div>
-    </Teleport>
-
-    <!-- Rename notebook/note dialog (notes panel menu) -->
-    <Teleport to="body">
-      <div v-if="showNpRenameDialog" class="modal-overlay" @mousedown.self="showNpRenameDialog = false">
-        <div class="modal-content" @click.stop>
-          <h3 class="modal-title">{{ npRenameTarget?.kind === 'notebook' ? '重命名笔记本' : '重命名笔记' }}</h3>
-          <div class="modal-body">
-            <input
-              ref="npRenameInputRef"
-              v-model="npRenameValue"
-              type="text"
-              :placeholder="npRenameTarget?.kind === 'notebook' ? '输入笔记本名称' : '输入新标题'"
-              @keyup.enter="confirmNpRename"
-            />
-          </div>
-          <div class="modal-actions">
-            <button class="modal-btn cancel" @click="showNpRenameDialog = false">取消</button>
-            <button class="modal-btn confirm" @click="confirmNpRename">保存</button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
-
-    <!-- Move note dialog (notes panel menu) -->
-    <Teleport to="body">
-      <div v-if="showNpMoveDialog" class="modal-overlay" @mousedown.self="showNpMoveDialog = false">
-        <div class="modal-content" @click.stop>
-          <h3 class="modal-title">移动到笔记本</h3>
-          <div class="modal-body">
-            <div class="np-move-options">
-              <button
-                v-for="nb in notesStore.notebooks"
-                :key="nb.id"
-                class="np-move-option"
-                :class="{ active: npMoveTargetNotebookId === nb.id }"
-                @click="npMoveTargetNotebookId = nb.id"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-                  <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-                </svg>
-                <span>{{ nb.name }}</span>
-              </button>
-            </div>
-          </div>
-          <div class="modal-actions">
-            <button class="modal-btn cancel" @click="showNpMoveDialog = false">取消</button>
-            <button class="modal-btn confirm" @click="confirmNpMove" :disabled="!npMoveTargetNotebookId">移动</button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
-
     <div class="sidebar-footer">
       <div class="user-info-wrapper" v-if="auth.user.value">
         <div ref="userInfoRef" class="user-info" @click.stop="showUserMenu = !showUserMenu">
@@ -771,12 +544,6 @@
       v-if="showNotebookPicker"
       @select="handleNotebookSelected"
       @close="showNotebookPicker = false"
-    />
-
-    <NotebookPicker
-      v-if="showNewNotePicker"
-      @select="handleNewNoteNotebookSelected"
-      @close="showNewNotePicker = false"
     />
 
     <SystemSettingsDialog
@@ -1046,6 +813,7 @@ import { isMobileViewport, navigateWithMobileHistory } from '@/composables/useMo
 import { useMediaQuery } from '@/composables/useMediaQuery'
 import AssistantModal from './AssistantModal.vue'
 import NotebookPicker from './NotebookPicker.vue'
+import NotesPanelInline from './NotesPanelInline.vue'
 import SystemSettingsDialog from './SystemSettingsDialog.vue'
 import ConversationRow from './ConversationRow.vue'
 import SortableList from './SortableList.vue'
@@ -1061,8 +829,8 @@ const auth = useAuth()
 const { show: showToast } = useToast()
 const { confirm: showConfirm } = useConfirmDialog()
 
+const notesPanelRef = ref<InstanceType<typeof NotesPanelInline> | null>(null)
 const showNotebookPicker = ref(false)
-const showNewNotePicker = ref(false)
 const saveToNoteConvId = ref<string | null>(null)
 const saveToNoteConvTitle = ref('')
 
@@ -1322,129 +1090,6 @@ const isSwipeDragging = ref(false)
 const SWIPE_ACTION_WIDTH = 250
 let suppressConversationClickUntil = 0
 
-// ── notes-panel 行左划（移动端；与 agent 端会话卡交互一致） ──
-const NP_SWIPE_WIDTH_NB = 120
-const NP_SWIPE_WIDTH_NOTE = 168
-let suppressNpClickUntil = 0
-const npSwipedKey = ref<string | null>(null)
-const npSwipeOffset = ref(0)
-const npSwipeTrackingKey = ref<string | null>(null)
-const npSwipeStartX = ref(0)
-const npSwipeStartY = ref(0)
-const npSwipeStartOffset = ref(0)
-const npSwipeDragging = ref(false)
-
-function npSwipeWidth(key: string): number {
-  return key.startsWith('nb:') ? NP_SWIPE_WIDTH_NB : NP_SWIPE_WIDTH_NOTE
-}
-
-function npRowStyle(key: string): Record<string, string> {
-  if (npSwipedKey.value === key) {
-    return { transform: `translateX(${npSwipeOffset.value}px)` }
-  }
-  return {}
-}
-
-function closeNpSwipe() {
-  npSwipedKey.value = null
-  npSwipeOffset.value = 0
-  npSwipeTrackingKey.value = null
-  npSwipeDragging.value = false
-}
-
-function npHandleTouchStart(e: TouchEvent, key: string) {
-  if (e.touches.length !== 1) return
-  const touch = e.touches[0]
-  npSwipeTrackingKey.value = key
-  npSwipeStartX.value = touch.clientX
-  npSwipeStartY.value = touch.clientY
-  npSwipeStartOffset.value = npSwipedKey.value === key ? npSwipeOffset.value : 0
-  npSwipeDragging.value = false
-  if (npSwipedKey.value && npSwipedKey.value !== key) {
-    closeNpSwipe()
-  }
-}
-
-function npHandleTouchEnd() {
-  if (!npSwipeTrackingKey.value) return
-  if (npSwipeDragging.value) {
-    suppressNpClickUntil = Date.now() + 300
-    const width = npSwipeTrackingKey.value ? npSwipeWidth(npSwipeTrackingKey.value) : 0
-    if (npSwipeOffset.value <= -width / 2 && npSwipeTrackingKey.value) {
-      npSwipedKey.value = npSwipeTrackingKey.value
-      npSwipeOffset.value = -width
-    } else {
-      closeNpSwipe()
-      return
-    }
-  }
-  npSwipeTrackingKey.value = null
-  npSwipeDragging.value = false
-}
-
-function npHandleTouchMove(e: TouchEvent, key: string) {
-  if (!npSwipeTrackingKey.value || npSwipeTrackingKey.value !== key || e.touches.length !== 1) {
-    return
-  }
-  const touch = e.touches[0]
-  const deltaX = touch.clientX - npSwipeStartX.value
-  const deltaY = touch.clientY - npSwipeStartY.value
-  if (!npSwipeDragging.value) {
-    if (Math.abs(deltaY) > 10 && Math.abs(deltaY) > Math.abs(deltaX)) {
-      npSwipeTrackingKey.value = null
-      return
-    }
-    if (Math.abs(deltaX) < 10) return
-    if (deltaX > 0 && npSwipeStartOffset.value === 0) {
-      npSwipeTrackingKey.value = null
-      return
-    }
-    npSwipeDragging.value = true
-  }
-  e.preventDefault()
-  npSwipedKey.value = key
-  npSwipeOffset.value = Math.max(-npSwipeWidth(key), Math.min(0, npSwipeStartOffset.value + deltaX))
-}
-
-function npRowClick(key: string, fn: () => void) {
-  if (Date.now() < suppressNpClickUntil) return
-  if (npSwipedKey.value === key) {
-    closeNpSwipe()
-    return
-  }
-  fn()
-}
-
-function npSwipeRenameNotebook(nb: { id: string; name: string }) {
-  closeNpSwipe()
-  npMenuTarget.value = { kind: 'notebook', id: nb.id, title: nb.name }
-  handleNpRenameNotebook()
-}
-
-function npSwipeDeleteNotebook(nb: { id: string; name: string }) {
-  closeNpSwipe()
-  npMenuTarget.value = { kind: 'notebook', id: nb.id, title: nb.name }
-  handleNpDeleteNotebook()
-}
-
-function npSwipeRenameNote(note: { id: string; title: string; notebook_id: string }) {
-  closeNpSwipe()
-  npMenuTarget.value = { kind: 'note', id: note.id, title: note.title || '', notebookId: note.notebook_id }
-  handleNpRenameNote()
-}
-
-function npSwipeMoveNote(note: { id: string; title: string; notebook_id: string }) {
-  closeNpSwipe()
-  npMenuTarget.value = { kind: 'note', id: note.id, title: note.title || '', notebookId: note.notebook_id }
-  handleNpMoveNote()
-}
-
-function npSwipeDeleteNote(note: { id: string; title: string; notebook_id: string }) {
-  closeNpSwipe()
-  npMenuTarget.value = { kind: 'note', id: note.id, title: note.title || '', notebookId: note.notebook_id }
-  handleNpDeleteNote()
-}
-
 function formatDate(dateStr: string): string {
   if (!dateStr) return ''
   const normalized = dateStr.endsWith('Z') || dateStr.includes('+') || dateStr.includes('-', 10) ? dateStr : dateStr + 'Z'
@@ -1660,56 +1305,13 @@ function goToNotebooksHome() {
   if (isMobileViewport()) emit('close-drawer')
 }
 
-// Desktop inline notes panel — driven by route
+// Desktop inline notes panel — 门控（树实现见 NotesPanelInline.vue，独立侧栏与
+// 工作台抽屉共享；此处仅保留宿主导航与门控）
 const showNotesPanel = ref(isOnNotesPage.value)
-const notesPanelLoading = ref(false)
-const NOTES_PANEL_EXPANDED_KEY = 'chatllm_notes_panel_expanded_v2'
-function _loadExpandedFromStorage(): Record<string, boolean> {
-  try {
-    return JSON.parse(localStorage.getItem(NOTES_PANEL_EXPANDED_KEY) || '{}')
-  } catch {
-    return {}
-  }
-}
-const notesPanelExpanded = ref<Record<string, boolean>>(_loadExpandedFromStorage())
-const notesPanelNotebookLoading = ref<Record<string, boolean>>({})
-
-function _saveExpandedToStorage() {
-  localStorage.setItem(NOTES_PANEL_EXPANDED_KEY, JSON.stringify(notesPanelExpanded.value))
-}
-
-function setNotesPanelExpanded(notebookId: string, expanded: boolean) {
-  if (expanded) {
-    notesPanelExpanded.value = { ...notesPanelExpanded.value, [notebookId]: true }
-  } else {
-    const next = { ...notesPanelExpanded.value }
-    delete next[notebookId]
-    notesPanelExpanded.value = next
-  }
-  _saveExpandedToStorage()
-}
 
 // Sync panel with route changes (e.g. back/forward, direct URL)
 watch(isOnNotesPage, (onNotes) => {
   showNotesPanel.value = onNotes
-  if (onNotes) _loadNotesPanelData()
-})
-
-// When notebooks become available (loaded by NotebooksList or NotesList),
-// ensure notes are loaded for expanded notebooks
-watch(() => notesStore.notebooks.length, async (len, oldLen) => {
-  if (len > 0 && (!oldLen || oldLen === 0) && showNotesPanel.value) {
-    await _loadNotesPanelData()
-  }
-})
-
-watch([isOnNotesPage, activeNotebookId], async ([onNotes, notebookId]) => {
-  if (!onNotes || !notebookId) return
-  if (!notesStore.notebooks.length) await _loadNotesPanelData()
-  if (!notesPanelExpanded.value[notebookId]) {
-    setNotesPanelExpanded(notebookId, true)
-  }
-  await loadNotesPanelNotebook(notebookId)
 })
 
 function navToChat() {
@@ -1733,58 +1335,6 @@ function navToVoice() {
   void navigateWithMobileHistory(router, '/voice')
 }
 
-async function _loadNotesPanelData() {
-  if (!notesStore.notebooks.length) {
-    await notesStore.loadNotebooks()
-    if (!notesStore.notebooks.length) return
-  }
-
-  notesPanelLoading.value = true
-  try {
-    if (Object.keys(notesPanelExpanded.value).length === 0) {
-      const firstId = notesStore.notebooks[0].id
-      setNotesPanelExpanded(firstId, true)
-    }
-    const expandedIds = Object.keys(notesPanelExpanded.value).filter(k => notesPanelExpanded.value[k])
-    const loadPromises = expandedIds
-      .filter(id => !notesStore.notes[id] || notesStore.notes[id].length === 0)
-      .map(id => loadNotesPanelNotebook(id))
-    if (loadPromises.length > 0) {
-      await Promise.all(loadPromises)
-    }
-  } finally {
-    notesPanelLoading.value = false
-  }
-}
-
-async function openNotesPanel() {
-  showNotesPanel.value = true
-  await _loadNotesPanelData()
-}
-
-// Load data on mount if already on notes page
-if (isOnNotesPage.value) _loadNotesPanelData()
-
-async function loadNotesPanelNotebook(notebookId: string) {
-  notesPanelNotebookLoading.value = { ...notesPanelNotebookLoading.value, [notebookId]: true }
-  try {
-    await notesStore.loadNotes(notebookId)
-  } finally {
-    const next = { ...notesPanelNotebookLoading.value }
-    delete next[notebookId]
-    notesPanelNotebookLoading.value = next
-  }
-}
-
-async function toggleNotesPanelNotebook(notebookId: string) {
-  if (notesPanelExpanded.value[notebookId]) {
-    setNotesPanelExpanded(notebookId, false)
-  } else {
-    setNotesPanelExpanded(notebookId, true)
-    await loadNotesPanelNotebook(notebookId)
-  }
-}
-
 function openNotebookInPanel(notebookId: string) {
   const targetPath = `/notes/${notebookId}`
   if (route.path === targetPath) return
@@ -1799,221 +1349,20 @@ function openNoteInPanel(notebookId: string, noteId: string) {
   if (isMobileViewport()) emit('close-drawer')
 }
 
-function isActivePanelNotebook(notebookId: string) {
-  return activeNotebookId.value === notebookId
+// NotesPanelInline 事件 → 宿主导航
+function onPanelNoteCreated(notebookId: string, noteId: string) {
+  void navigateWithMobileHistory(router, `/notes/${notebookId}/${noteId}`)
+  if (isMobileViewport()) emit('close-drawer')
 }
 
-function isActivePanelNote(notebookId: string, noteId: string) {
-  return activeNotebookId.value === notebookId && activeNoteId.value === noteId
+function onPanelActiveNoteDeleted(notebookId: string) {
+  void navigateWithMobileHistory(router, `/notes/${notebookId}`)
 }
 
-// ─── Notes panel context menu (notebook: 重命名/删除 · note: 重命名/移动到/删除) ───
-const npMenuId = ref<string | null>(null)
-const npMenuTarget = ref<{ kind: 'notebook' | 'note'; id: string; title: string; notebookId?: string } | null>(null)
-const npMenuStyle = ref<{ top: string; left: string }>({ top: '0px', left: '0px' })
-
-function openNpNotebookMenu(nb: { id: string; name: string }, event: MouseEvent) {
-  if (npMenuId.value === 'nb:' + nb.id) {
-    closeNpMenu()
-    return
-  }
-  positionNpMenu(event)
-  npMenuTarget.value = { kind: 'notebook', id: nb.id, title: nb.name }
-  npMenuId.value = 'nb:' + nb.id
+function onPanelActiveNotebookDeleted() {
+  notesStore.saveLastNotesPath('/notes')
+  void navigateWithMobileHistory(router, '/notes')
 }
-
-function openNpNoteMenu(note: { id: string; title: string | null; notebook_id: string }, event: MouseEvent) {
-  if (npMenuId.value === 'note:' + note.id) {
-    closeNpMenu()
-    return
-  }
-  positionNpMenu(event)
-  npMenuTarget.value = { kind: 'note', id: note.id, title: note.title || '', notebookId: note.notebook_id }
-  npMenuId.value = 'note:' + note.id
-}
-
-function positionNpMenu(event: MouseEvent) {
-  const target = event.currentTarget as HTMLElement
-  const rect = target.getBoundingClientRect()
-  const MENU_WIDTH = 140
-  const PADDING = 8
-  const GAP = 2
-  let top = rect.bottom + GAP
-  let left = rect.right - MENU_WIDTH
-  if (left < PADDING) left = PADDING
-  if (left + MENU_WIDTH > window.innerWidth - PADDING) {
-    left = window.innerWidth - MENU_WIDTH - PADDING
-  }
-  npMenuStyle.value = { top: `${top}px`, left: `${left}px` }
-  nextTick(() => {
-    const menuEl = document.querySelector('.np-context-menu') as HTMLElement
-    if (!menuEl) return
-    const spaceBelow = window.innerHeight - rect.bottom - PADDING
-    const spaceAbove = rect.top - PADDING
-    if (menuEl.getBoundingClientRect().height > spaceBelow && spaceAbove > spaceBelow) {
-      const newTop = Math.max(PADDING, rect.top - menuEl.getBoundingClientRect().height - GAP)
-      npMenuStyle.value = { top: `${newTop}px`, left: `${left}px` }
-    }
-  })
-}
-
-function closeNpMenu() {
-  npMenuId.value = null
-  npMenuTarget.value = null
-}
-
-// Rename
-const showNpRenameDialog = ref(false)
-const npRenameValue = ref('')
-const npRenameTarget = ref<{ kind: 'notebook' | 'note'; id: string; title: string; notebookId?: string } | null>(null)
-const npRenameInputRef = ref<HTMLInputElement | null>(null)
-
-function handleNpRenameNotebook() {
-  const t = npMenuTarget.value
-  closeNpMenu()
-  if (!t) return
-  npRenameTarget.value = t
-  npRenameValue.value = t.title
-  showNpRenameDialog.value = true
-  nextTick(() => npRenameInputRef.value?.focus())
-}
-
-function handleNpRenameNote() {
-  const t = npMenuTarget.value
-  closeNpMenu()
-  if (!t) return
-  npRenameTarget.value = t
-  npRenameValue.value = t.title
-  showNpRenameDialog.value = true
-  nextTick(() => npRenameInputRef.value?.focus())
-}
-
-async function confirmNpRename() {
-  const title = npRenameValue.value.trim()
-  const target = npRenameTarget.value
-  if (!title || !target) {
-    showNpRenameDialog.value = false
-    npRenameTarget.value = null
-    return
-  }
-  try {
-    if (target.kind === 'notebook') {
-      await notesStore.updateNotebook(target.id, title)
-    } else {
-      await notesStore.updateNote(target.id, { title })
-      await loadNotesPanelNotebook(target.notebookId!)
-    }
-    showToast('已重命名', 'success')
-  } catch (e) {
-    console.error('Failed to rename:', e)
-    showToast('重命名失败', 'error')
-  }
-  showNpRenameDialog.value = false
-  npRenameTarget.value = null
-}
-
-// Move note
-const showNpMoveDialog = ref(false)
-const npMoveTarget = ref<{ id: string; title: string; notebookId: string } | null>(null)
-const npMoveTargetNotebookId = ref('')
-
-function handleNpMoveNote() {
-  const t = npMenuTarget.value
-  closeNpMenu()
-  if (!t || t.kind !== 'note') return
-  npMoveTarget.value = { id: t.id, title: t.title, notebookId: t.notebookId! }
-  npMoveTargetNotebookId.value = ''
-  showNpMoveDialog.value = true
-}
-
-async function confirmNpMove() {
-  const note = npMoveTarget.value
-  if (!note || !npMoveTargetNotebookId.value) {
-    showNpMoveDialog.value = false
-    npMoveTarget.value = null
-    return
-  }
-  const from = note.notebookId
-  try {
-    await notesStore.moveNote(note.id, npMoveTargetNotebookId.value)
-    await loadNotesPanelNotebook(from)
-    if (npMoveTargetNotebookId.value !== from) {
-      await loadNotesPanelNotebook(npMoveTargetNotebookId.value)
-    }
-    showToast('已移动', 'success')
-  } catch (e) {
-    console.error('Failed to move note:', e)
-    showToast('移动失败', 'error')
-  }
-  npMoveTarget.value = null
-  showNpMoveDialog.value = false
-}
-
-// Delete notebook — 与笔记本主页(NotebooksList.handleDeleteNotebook)逻辑一致
-async function handleNpDeleteNotebook() {
-  const t = npMenuTarget.value
-  closeNpMenu()
-  if (!t || t.kind !== 'notebook') return
-  const nb = notesStore.notebooks.find(n => n.id === t.id)
-  if (!nb) return
-  if (nb.is_default) {
-    showToast('默认笔记本不能删除', 'error')
-    return
-  }
-  if (!await showConfirm({ message: '确定要删除这个笔记本吗？\n所有笔记也会被删除。', danger: true, confirmText: '删除' })) {
-    return
-  }
-  try {
-    await notesStore.deleteNotebook(t.id)
-    const panel = { ...notesPanelExpanded.value }
-    delete panel[t.id]
-    notesPanelExpanded.value = panel
-    if (activeNotebookId.value === t.id) {
-      notesStore.saveLastNotesPath('/notes')
-      void navigateWithMobileHistory(router, '/notes')
-    }
-    showToast('笔记本已删除', 'success')
-  } catch (e) {
-    console.error('Failed to delete notebook:', e)
-    showToast('删除笔记本失败', 'error')
-  }
-}
-
-// Delete note
-async function handleNpDeleteNote() {
-  const t = npMenuTarget.value
-  closeNpMenu()
-  if (!t || t.kind !== 'note') return
-  if (!await showConfirm({ message: '确定要删除这条笔记吗？', danger: true, confirmText: '删除' })) return
-  const noteId = t.id
-  const from = t.notebookId!
-  try {
-    await notesStore.deleteNote(noteId)
-    await loadNotesPanelNotebook(from)
-    if (activeNoteId.value === noteId) {
-      void navigateWithMobileHistory(router, `/notes/${from}`)
-    }
-    showToast('已删除', 'success')
-  } catch (e) {
-    console.error('Failed to delete note:', e)
-    showToast('删除失败', 'error')
-  }
-}
-
-function onNpMenuOutsideClick(e: MouseEvent) {
-  if (!npMenuId.value) return
-  const target = e.target as HTMLElement
-  if (target.closest('.np-context-menu') || target.closest('.np-menu-btn')) return
-  closeNpMenu()
-}
-
-onMounted(() => {
-  document.addEventListener('click', onNpMenuOutsideClick)
-})
-
-onUnmounted(() => {
-  document.removeEventListener('click', onNpMenuOutsideClick)
-})
 
 async function loadConversationsForAssistant() {
   loadingConversations.value = true
@@ -3072,6 +2421,8 @@ function processDragMouseMove(e: MouseEvent | TouchEvent) {
       dragHoverTimer = setTimeout(() => {
         if (dragHoverTargetGroupId === foundGroupId) {
           dragExpandedGroupId.value = foundGroupId
+          // 悬停展开折叠组：强制 SortableList 重初始化，使新展开的内层列表可接收拖放
+          forceReinitCounter.value++
         }
         dragHoverTimer = null
       }, DRAG_HOVER_DELAY)
@@ -3627,23 +2978,6 @@ async function handleNotebookSelected(notebookId: string) {
   saveToNoteConvTitle.value = ''
 }
 
-function startNewNote() {
-  notesStore.loadNotebooks()
-  showNewNotePicker.value = true
-}
-
-async function handleNewNoteNotebookSelected(notebookId: string) {
-  showNewNotePicker.value = false
-  try {
-    const note = await notesStore.createNote(notebookId, { content: '' })
-    await navigateWithMobileHistory(router, `/notes/${notebookId}/${note.id}`)
-    if (isMobileViewport()) emit('close-drawer')
-  } catch (e) {
-    console.error('Failed to create note:', e)
-    showToast('创建笔记失败', 'error')
-  }
-}
-
 async function handleSavePermissions(perms: Record<string, boolean>) {
   savingPermissions.value = true
   try {
@@ -3971,102 +3305,7 @@ const emit = defineEmits<{
   background-color: var(--color-hover);
 }
 
-.selection-bar {
-  padding: 8px 12px;
-  margin: 0 0 8px;
-  background-color: var(--color-hover);
-  border-radius: var(--radius-md);
-}
 
-.selection-bar-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-
-.select-all-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.select-all-label input {
-  cursor: pointer;
-}
-
-.selected-count {
-  font-size: 12px;
-  color: var(--color-text-light);
-}
-
-.selection-bar-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.selection-confirm-btn {
-  flex: 1;
-  padding: 8px 12px;
-  color: white;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  font-weight: 500;
-  transition: background-color var(--transition-fast), transform var(--transition-fast), opacity var(--transition-fast);
-}
-
-.selection-confirm-btn:active:not(:disabled) {
-  transform: scale(0.96);
-}
-
-.export-confirm-btn {
-  background-color: var(--color-primary);
-}
-
-.export-confirm-btn:hover:not(:disabled) {
-  background-color: var(--color-primary-dark);
-}
-
-.delete-confirm-btn {
-  background-color: var(--color-error);
-}
-
-.delete-confirm-btn:hover:not(:disabled) {
-  background-color: #a02c2c;
-}
-
-.selection-confirm-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.export-cancel-btn,
-.selection-cancel-btn {
-  padding: 8px 12px;
-  background-color: var(--color-white);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  transition: border-color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
-}
-
-.export-cancel-btn:hover {
-  border-color: var(--color-text-light);
-}
-
-.export-cancel-btn:active,
-.selection-cancel-btn:active {
-  transform: scale(0.96);
-}
-
-.selection-progress {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--color-primary);
-  text-align: center;
-}
 
 .group-checkbox {
   margin-right: 6px;
@@ -4088,48 +3327,7 @@ const emit = defineEmits<{
   cursor: pointer;
 }
 
-.conversation-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px;
-}
 
-
-
-.conversation-menu {
-  position: fixed;
-  background-color: var(--surface-panel-strong);
-  border: var(--menu-border);
-  border-radius: var(--menu-radius);
-  box-shadow: var(--menu-shadow);
-  z-index: 1000;
-  min-width: 140px;
-  padding: 4px 0;
-}
-
-.menu-item {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  color: var(--color-text);
-  font-size: 13px;
-  text-align: left;
-  transition: background-color var(--transition-fast);
-}
-
-.menu-item:hover {
-  background-color: var(--primary-tint);
-}
-
-.menu-item.delete {
-  color: var(--color-error);
-}
-
-.menu-item.delete:hover {
-  background-color: var(--danger-tint);
-}
 
 .empty-state {
   flex: 1;
@@ -4523,15 +3721,6 @@ const emit = defineEmits<{
   overflow: hidden;
 }
 
-.notes-panel-inline {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  background-color: var(--surface-panel-strong);
-}
-
 .notes-panel-header {
   display: flex;
   align-items: center;
@@ -4539,9 +3728,11 @@ const emit = defineEmits<{
   padding: 8px 14px 6px;
   position: sticky;
   top: 0;
-  background: var(--color-white);
-  z-index: 1;
-  border-bottom: 1px solid var(--color-border);
+  /* 实底 + 层级压过行（行带 position:relative z-index:1，平手时后绘者胜 →
+     上滑标题卡片盖住「笔记本」字样） */
+  background: var(--surface-panel-strong, var(--color-white));
+  z-index: 5;
+  border-bottom: 1px solid var(--panel-border, var(--color-border));
 }
 
 .notes-panel-title {
@@ -4579,604 +3770,10 @@ const emit = defineEmits<{
 .new-note-btn:hover { color: var(--color-primary); background-color: var(--color-hover); }
 .new-note-btn:active { transform: scale(0.96); }
 
-.notes-panel-loading {
-  padding: 12px 14px;
-  font-size: 12px;
-  color: var(--color-text-light);
-}
-
-.notes-panel-list {
-  padding: 4px 0;
-}
-
-.np-notebook { }
-
-/* Desktop-only "首页" row — same visual hierarchy as a notebook row. */
-.np-home {
-  outline: none;
-}
-/* Ensure the home row stretches to the full sidebar width so the active
-  background reads like the rest of the notebook tree. */
-.np-notebook.np-home {
-  display: block;
-}
-.np-home {
-  margin: 0 8px 8px;
-}
-.np-home:focus-visible .np-notebook-row {
-  background-color: var(--color-hover);
-}
-.np-home.active .np-notebook-row {
-  background-color: color-mix(in srgb, var(--color-primary) 14%, var(--surface-panel-subtle));
-  box-shadow: inset 0 0 0 1px var(--panel-border-strong);
-  font-weight: 600;
-}
-.np-chevron-placeholder {
-  visibility: hidden;
-}
-
-.np-notebook-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  margin: 0 8px;
-  border-radius: var(--shell-workbench-radius);
-  cursor: pointer;
-  user-select: none;
-}
-.np-notebook-row:hover { background-color: var(--color-hover); }
-.np-notebook-row.active {
-  background-color: color-mix(in srgb, var(--color-primary) 14%, var(--surface-panel-subtle));
-  box-shadow: inset 0 0 0 1px var(--panel-border-strong);
-}
-.np-notebook-row.active .np-nb-name {
-  color: var(--color-primary);
-}
-.np-notebook-row.active .np-count {
-  background: color-mix(in srgb, var(--color-primary) 16%, var(--surface-panel-strong));
-  color: var(--color-primary);
-}
-
-.np-chevron {
-  transition: transform var(--transition-fast);
-  color: var(--color-text-light);
-  flex-shrink: 0;
-}
-.np-chevron.expanded { transform: rotate(90deg); }
-
-.np-nb-name {
-  flex: 1;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.np-count {
-  font-size: 11px;
-  color: var(--color-text-light);
-  background: var(--color-bg);
-  padding: 1px 6px;
-  border-radius: 10px;
-  font-variant-numeric: tabular-nums;
-  min-width: 18px;
-  text-align: center;
-}
-
-.np-notes-list { padding-left: 18px; }
-
-.np-note-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 8px;
-  cursor: pointer;
-  border-radius: var(--shell-workbench-radius);
-  margin: 5px 8px;
-}
-.np-note-row:hover { background-color: var(--color-hover); }
-.np-note-row svg { flex-shrink: 0; color: var(--color-text-light); }
-.np-note-row.active {
-  background-color: color-mix(in srgb, var(--color-primary) 18%, var(--surface-panel-strong));
-  box-shadow: inset 0 0 0 1px var(--panel-border-strong);
-}
-.np-note-row.active svg,
-.np-note-row.active .np-note-title {
-  color: var(--color-primary);
-}
-.np-note-row.active .np-note-title {
-  font-weight: 600;
-}
-
-/* ── notes-panel 行左划（移动端；桌面零变化） ─────────────────── */
-.np-swipe-wrap {
-  position: relative;
-}
-.np-swipe-wrap--nb { margin: 0 8px; }
-.np-swipe-wrap--note { margin: 5px 8px; }
-.np-swipe-wrap .np-notebook-row,
-.np-swipe-wrap .np-note-row { margin: 0; position: relative; z-index: 1; }
-
-.np-swipe-actions {
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
-  display: flex;
-  clip-path: inset(0 100% 0 0);
-  pointer-events: none;
-  transition: clip-path 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
-  border-radius: var(--shell-workbench-radius);
-  overflow: hidden;
-}
-.np-swipe-actions--nb { width: 120px; }
-.np-swipe-actions--note { width: 168px; }
-.np-swipe-wrap.np-swipe-open .np-swipe-actions {
-  clip-path: inset(0 0 0 0);
-  pointer-events: auto;
-}
-
-.np-swipe-action {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  color: #fff;
-  font-size: 10px;
-  font-weight: 500;
-  border: none;
-  cursor: pointer;
-  padding: 0;
-  transition: transform 0.15s ease, filter 0.15s ease;
-}
-.np-swipe-action:active {
-  transform: scale(0.94);
-  filter: brightness(0.85);
-}
-.np-swipe-action.rename { background-color: var(--swipe-rename-bg); }
-.np-swipe-action.move { background-color: var(--swipe-move-bg); }
-.np-swipe-action.delete { background-color: var(--swipe-delete-bg); }
-
-.np-note-title {
-  font-size: 13px;
-  color: var(--color-text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-}
-
-.np-note-loading, .np-empty {
-  padding: 6px 12px;
-  font-size: 12px;
-  color: var(--color-text-light);
-}
-
-.np-menu-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 3px 5px;
-  opacity: 0;
-  color: var(--color-text-light);
-  border-radius: var(--radius-sm);
-  transition: all var(--transition-fast);
-  flex-shrink: 0;
-}
-.np-notebook-row:hover .np-menu-btn,
-.np-note-row:hover .np-menu-btn,
-.np-menu-btn.active {
-  opacity: 1;
-}
-.np-menu-btn:hover {
-  color: var(--color-text);
-  background-color: var(--color-hover);
-}
-@media (hover: none) {
-  .np-menu-btn { opacity: 1; }
-}
-
-.np-context-menu {
-  position: fixed;
-  background-color: var(--surface-panel-strong);
-  border: var(--menu-border);
-  border-radius: var(--menu-radius);
-  box-shadow: var(--menu-shadow);
-  z-index: 1000;
-  min-width: 140px;
-  padding: 4px 0;
-}
-
-.np-move-options {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 240px;
-  overflow-y: auto;
-}
-.np-move-option {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-radius: var(--radius-md);
-  color: var(--color-text);
-  font-size: 13px;
-  text-align: left;
-  transition: background-color var(--transition-fast);
-}
-.np-move-option:hover {
-  background-color: var(--color-hover);
-}
-.np-move-option.active {
-  background-color: color-mix(in srgb, var(--color-primary) 12%, transparent);
-  color: var(--color-primary);
-}
 
 /* ─── Action Buttons ─────────────────────────────────────────── */
 
-.action-buttons {
-  display: flex;
-  gap: 8px;
-  padding: 12px 12px 12px;
-}
 
-.new-chat-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  flex: 1;
-  padding: 12px 16px;
-  background-color: var(--color-primary);
-  color: white;
-  border-radius: var(--radius-md);
-  font-weight: 500;
-  transition: background-color var(--transition-fast), transform var(--transition-fast), box-shadow var(--transition-fast);
-}
-
-.new-chat-btn:hover {
-  background-color: var(--color-primary-dark);
-  transform: translateY(-1px);
-}
-
-.new-chat-btn:active {
-  transform: translateY(0) scale(0.96);
-}
-
-.new-group-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
-  padding: 0;
-  background-color: var(--surface-panel-subtle);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--radius-md);
-  color: var(--color-text);
-  transition: color var(--transition-fast), background-color var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
-  flex-shrink: 0;
-}
-
-.new-group-btn:hover {
-  background-color: var(--color-hover);
-  border-color: var(--color-primary);
-  color: var(--color-primary);
-}
-
-.new-group-btn:active {
-  transform: scale(0.96);
-}
-
-/* ─── Conversation Groups ─────────────────────────────────────── */
-
-.conversation-group {
-  margin-bottom: 4px;
-}
-
-.time-category-section {
-  margin-bottom: 8px;
-}
-
-.time-category-header {
-  padding: 6px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--color-text-light);
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  user-select: none;
-}
-
-.groups-directory {
-  margin-top: 8px;
-}
-
-.groups-directory-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  user-select: none;
-  transition: background-color var(--transition-fast);
-}
-
-.groups-directory-header:hover {
-  background-color: var(--color-hover);
-}
-
-.directory-chevron {
-  transition: transform var(--transition-fast);
-  color: var(--color-text-light);
-  flex-shrink: 0;
-}
-
-.directory-chevron.expanded {
-  transform: rotate(90deg);
-}
-
-.directory-name {
-  flex: 1;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--color-text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.directory-count {
-  font-size: 11px;
-  color: var(--color-text-light);
-  background: var(--color-bg);
-  padding: 1px 6px;
-  border-radius: 10px;
-  font-variant-numeric: tabular-nums;
-  min-width: 18px;
-  text-align: center;
-}
-
-.groups-directory-content {
-  padding-left: 4px;
-}
-
-.group-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  user-select: none;
-  transition: background-color var(--transition-fast);
-}
-
-.group-header:hover {
-  background-color: var(--color-hover);
-}
-
-.group-header.group-selected {
-  background-color: rgba(239, 68, 68, 0.15);
-}
-
-.group-header.group-focus {
-  background-color: color-mix(in srgb, var(--color-primary) 12%, transparent);
-  /* 焦点带高度减 2px×2，避免与组内首个激活会话的焦点色块粘连 */
-  padding-top: 6px;
-  padding-bottom: 6px;
-}
-
-.group-header.group-focus + .group-conversations:not(.group-convs-collapsed) {
-  margin-top: 2px;
-}
-
-.group-header.group-focus .group-name {
-  color: var(--color-primary-dark);
-}
-
-.group-header.group-focus .group-count {
-  background: color-mix(in srgb, var(--color-primary) 16%, var(--surface-panel-strong));
-  color: var(--color-primary-dark);
-}
-
-.group-chevron {
-  transition: transform var(--transition-fast);
-  color: var(--color-text-light);
-  flex-shrink: 0;
-}
-
-.group-chevron.expanded {
-  transform: rotate(90deg);
-}
-
-.group-color-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-
-.group-name {
-  flex: 1;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--color-text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.group-count {
-  font-size: 11px;
-  color: var(--color-text-light);
-  background: var(--color-bg);
-  padding: 1px 6px;
-  border-radius: 10px;
-  font-variant-numeric: tabular-nums;
-  min-width: 18px;
-  text-align: center;
-}
-
-.group-actions {
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity var(--transition-fast);
-}
-
-.group-header:hover .group-actions {
-  opacity: 1;
-}
-
-.group-action-btn {
-  padding: 8px;
-  color: var(--color-text-light);
-  border-radius: var(--radius-sm);
-  transition: color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-}
-
-.group-action-btn:hover {
-  color: var(--color-primary);
-  background-color: var(--color-sidebar);
-}
-
-.group-action-btn:active {
-  transform: scale(0.96);
-}
-
-.group-action-btn.delete:hover {
-  color: var(--color-error);
-}
-
-.group-conversations {
-  padding-left: 12px;
-  display: grid;
-  grid-template-rows: 1fr;
-  opacity: 1;
-  transition: grid-template-rows 0.25s cubic-bezier(0.25, 1, 0.5, 1),
-              opacity 0.2s ease;
-}
-
-/* Instant collapse during drag to prevent SortableJS position interference */
-.sidebar-dragging .group-conversations {
-  transition: none !important;
-}
-
-/* Collapsed groups during drag: show as droppable targets with min-height */
-.sidebar-dragging .group-convs-collapsed {
-  grid-template-rows: 1fr !important;
-  opacity: 1 !important;
-  overflow: hidden !important;
-  padding: 0 !important;
-  min-height: 40px !important;
-  border: 2px dashed var(--color-primary) !important;
-  border-radius: var(--radius-sm) !important;
-  margin: 4px 0 !important;
-  background-color: rgba(59, 130, 246, 0.05) !important;
-}
-
-.sidebar-dragging .group-conv-drag-list {
-  transition: none !important;
-  min-height: 24px !important;
-}
-
-.group-convs-collapsed {
-  grid-template-rows: 0fr;
-  opacity: 0;
-  overflow: hidden;
-  padding: 0;
-  margin: 0;
-  border: none;
-}
-
-.group-conversations > * {
-  min-height: 0;
-  overflow: hidden;
-}
-
-.group-conv-drag-list {
-  min-height: 4px;
-  transition: min-height 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
-}
-
-.sidebar-dragging .conversation-group.drag-hover .group-conv-drag-list:empty {
-  min-height: 48px;
-  border: 2px dashed var(--color-primary);
-  border-radius: var(--radius-sm);
-  margin: 4px 0;
-  background-color: rgba(59, 130, 246, 0.05);
-  transition: min-height 0.2s ease, background-color 0.2s ease;
-}
-
-.ungrouped-drop-zone {
-  margin-top: 8px;
-  padding: 4px 0;
-}
-
-.ungrouped-drop-zone-label {
-  padding: 6px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--color-text-light);
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-  user-select: none;
-}
-
-.ungrouped-empty-drag-list {
-  min-height: 40px;
-  border: 2px dashed var(--panel-border);
-  border-radius: var(--radius-md);
-  margin: 0 4px;
-  transition: border-color var(--transition-fast), background-color var(--transition-fast);
-}
-
-.ungrouped-empty-drag-list:empty {
-  display: block;
-}
-
-/* ─── Menu Divider ────────────────────────────────────────────── */
-
-.menu-divider {
-  height: 1px;
-  background-color: var(--color-border);
-  margin: 4px 0;
-}
-
-/* ─── Move Group Menu ─────────────────────────────────────────── */
-
-.move-group-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 999;
-}
-
-.move-group-menu {
-  min-width: 160px;
-}
-
-.move-group-menu .menu-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.move-group-menu .menu-item.active {
-  background-color: var(--color-hover);
-  color: var(--color-primary);
-}
 
 .menu-section-label {
   padding: 6px 12px 2px;
@@ -5189,204 +3786,13 @@ const emit = defineEmits<{
 
 /* ─── Modal / Dialog ──────────────────────────────────────────── */
 
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background-color: var(--overlay-scrim);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 10000;
-  padding: 16px;
-}
 
-.modal-content {
-  background-color: var(--surface-panel-strong);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--dialog-radius);
-  box-shadow: var(--dialog-shadow);
-  min-width: 320px;
-  max-width: 400px;
-  width: 100%;
-  overflow: hidden;
-}
 
-.modal-title {
-  padding: 16px 20px 0;
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--color-text);
-}
 
-.modal-body {
-  padding: 16px 20px;
-}
-
-.modal-actions {
-  display: flex;
-  gap: 8px;
-  padding: 0 20px 16px;
-  justify-content: flex-end;
-}
-
-.modal-btn {
-  padding: 8px 16px;
-  border-radius: var(--radius-md);
-  font-size: 13px;
-  font-weight: 500;
-  transition: background-color var(--transition-fast), transform var(--transition-fast), opacity var(--transition-fast);
-}
-
-.modal-btn:active {
-  transform: scale(0.96);
-}
-
-.modal-btn.cancel {
-  background-color: var(--color-bg);
-  color: var(--color-text);
-}
-
-.modal-btn.cancel:hover {
-  background-color: var(--color-hover);
-}
-
-.modal-btn.confirm {
-  background-color: var(--color-primary);
-  color: white;
-}
-
-.modal-btn.confirm:hover {
-  background-color: var(--color-primary-dark);
-}
-
-.modal-btn.delete {
-  background-color: var(--color-error);
-  color: white;
-}
-
-.modal-btn.delete:hover {
-  background-color: color-mix(in srgb, var(--color-error) 85%, black);
-}
-
-.form-group {
-  margin-bottom: 16px;
-}
-
-.form-group label {
-  display: block;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--color-text);
-  margin-bottom: 6px;
-}
-
-.form-group input,
-.modal-body input {
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  font-size: 14px;
-  color: var(--color-text);
-  background: var(--surface-input);
-  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
-}
-
-.form-group input:focus,
-.modal-body input:focus {
-  outline: none;
-  border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px var(--focus-ring-color);
-}
-
-.form-group select.form-select {
-  width: 100%;
-  padding: 8px 12px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  font-size: 14px;
-  color: var(--color-text);
-  background: var(--surface-input);
-  transition: border-color var(--transition-fast);
-  appearance: auto;
-}
-
-.form-group select.form-select:focus {
-  outline: none;
-  border-color: var(--color-primary);
-}
-
-.color-picker {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.color-option {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  border: 2px solid transparent;
-  cursor: pointer;
-  transition: transform var(--transition-fast), border-color var(--transition-fast);
-}
-
-.color-option:hover {
-  transform: scale(1.1);
-}
-
-.color-option.active {
-  border-color: var(--color-text);
-  transform: scale(1.15);
-}
-
-.checkbox-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  font-size: 13px;
-  color: var(--color-text);
-  cursor: pointer;
-}
-
-.checkbox-label input {
-  cursor: pointer;
-}
 
 /* ─── Draggable ───────────────────────────────────────────────── */
 
-.sidebar-dragging .ungrouped-empty-drag-list {
-  min-height: 48px;
-  border: 2px dashed var(--color-primary);
-  background-color: rgba(59, 130, 246, 0.06);
-  transition: min-height 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
-}
 
-.sidebar-dragging .time-category-section .ungrouped-conv-drag-list:empty {
-  min-height: 48px;
-  border: 2px dashed var(--color-primary);
-  border-radius: var(--radius-sm);
-  margin: 4px 0;
-  background-color: rgba(59, 130, 246, 0.04);
-  transition: min-height 0.2s ease, background-color 0.2s ease;
-}
-
-.sidebar-dragging .conversation-group.drag-hover {
-  background-color: rgba(59, 130, 246, 0.1) !important;
-  border-radius: var(--radius-sm);
-  outline: 2px solid var(--color-primary);
-  outline-offset: -2px;
-  transition: background-color 0.2s ease, outline-color 0.2s ease;
-}
-
-.sidebar-dragging [data-draggable="true"] {
-  cursor: grab;
-}
-
-.sidebar-dragging [data-draggable="true"]:active {
-  cursor: grabbing;
-}
 
 .sortable-ghost {
   opacity: 0.35;
@@ -5414,361 +3820,24 @@ const emit = defineEmits<{
   outline: 2px dashed var(--color-primary);
   outline-offset: -2px;
   border-radius: var(--radius-md);
-  background-color: rgba(59, 130, 246, 0.08);
+  background-color: color-mix(in srgb, var(--color-primary) 8%, transparent);
 }
 
 /* ─── Mobile Adaptations ──────────────────────────────────────── */
 
-@media (max-width: 767px) {
-  .action-buttons {
-    padding: 12px 8px 8px;
-  }
 
-  .new-group-btn {
-    width: 40px;
-    height: 40px;
-    padding: 0;
-  }
-
-  .group-actions {
-    opacity: 1;
-  }
-
-  .groups-directory-header {
-    padding: 10px 12px;
-  }
-
-  .time-category-header {
-    padding: 8px 12px;
-    font-size: 11px;
-  }
-
-  .group-action-btn {
-    min-width: 32px;
-    min-height: 32px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .modal-content {
-    margin: 16px;
-    min-width: auto;
-  }
-}
 
 /* ─── Marquee Selection Overlay ───────────────────────────────── */
 
-.marquee-overlay {
-  position: fixed;
-  border: 1px solid var(--color-primary);
-  background-color: rgba(59, 130, 246, 0.1);
-  z-index: 1000;
-  pointer-events: none;
-}
+
 
 /* ─── Spotlight Search Modal ─────────────────────────────────── */
 
-.spotlight-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(4px);
-  z-index: 10000;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding-top: 20vh;
-}
 
-.spotlight-modal {
-  width: 560px;
-  max-width: 90vw;
-  background: var(--surface-panel, #fff);
-  border-radius: 12px;
-  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.3);
-  overflow: hidden;
-  animation: spotlightIn 0.15s ease-out;
-}
-
-@keyframes spotlightIn {
-  from { opacity: 0; transform: translateY(-10px) scale(0.97); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-.spotlight-input-wrapper {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--panel-border, #e5e7eb);
-}
-
-.spotlight-search-icon {
-  flex-shrink: 0;
-  color: var(--color-text-light);
-}
-
-.spotlight-input {
-  flex: 1;
-  border: none;
-  outline: none;
-  font-size: 16px;
-  color: var(--color-text);
-  background: transparent;
-}
-
-.spotlight-input::placeholder {
-  color: var(--color-text-light);
-}
-
-.spotlight-results {
-  max-height: 400px;
-  overflow-y: auto;
-}
-
-.spotlight-status {
-  padding: 24px 20px;
-  text-align: center;
-  color: var(--color-text-light);
-  font-size: 14px;
-}
-
-.spotlight-result-item {
-  padding: 12px 20px;
-  cursor: pointer;
-  border-bottom: 1px solid var(--panel-border, #e5e7eb);
-  transition: background var(--transition-fast);
-}
-
-.spotlight-result-item:hover {
-  background: var(--color-hover);
-}
-
-.spotlight-result-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--color-text);
-  margin-bottom: 4px;
-}
-
-.spotlight-result-snippet {
-  font-size: 12px;
-  color: var(--color-text-light);
-  margin-top: 3px;
-}
-
-.spotlight-result-snippet--clickable {
-  cursor: pointer;
-  padding: 3px 4px;
-  border-radius: 4px;
-  transition: background-color 0.12s ease;
-}
-
-.spotlight-result-snippet--clickable:hover {
-  background: var(--color-hover);
-}
-
-.spotlight-snippet-role {
-  font-weight: 500;
-  color: var(--color-text);
-  margin-right: 4px;
-}
-
-.spotlight-snippet-text :deep(mark) {
-  background: var(--color-primary);
-  color: #fff;
-  padding: 0 2px;
-  border-radius: 2px;
-}
 
 /* ─── Batch Operation Popup ──────────────────────────────────── */
 
-.batch-popup-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  z-index: 10001;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
 
-.batch-popup {
-  width: 480px;
-  max-width: 90vw;
-  max-height: 80vh;
-  background: var(--surface-panel, #fff);
-  border-radius: 12px;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  animation: spotlightIn 0.15s ease-out;
-}
-
-.batch-popup-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--panel-border, #e5e7eb);
-}
-
-.batch-popup-header h2 {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--color-text);
-  margin: 0;
-}
-
-.batch-popup-close {
-  color: var(--color-text-light);
-  padding: 8px;
-  border-radius: var(--radius-sm);
-  transition: color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-}
-
-.batch-popup-close:hover {
-  color: var(--color-text);
-  background: var(--color-hover);
-}
-
-.batch-popup-close:active {
-  transform: scale(0.96);
-}
-
-.batch-popup-body {
-  flex: 1;
-  overflow-y: auto;
-}
-
-.batch-popup-toolbar {
-  padding: 10px 20px;
-  border-bottom: 1px solid var(--panel-border, #e5e7eb);
-}
-
-.batch-select-all {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--color-text);
-  cursor: pointer;
-}
-
-.batch-popup-list {
-  padding: 4px 0;
-}
-
-.batch-popup-empty {
-  padding: 32px 20px;
-  text-align: center;
-  color: var(--color-text-light);
-  font-size: 14px;
-}
-
-.batch-popup-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 20px;
-  cursor: pointer;
-  transition: background var(--transition-fast);
-  border-bottom: 1px solid var(--panel-border, #e5e7eb);
-}
-
-.batch-popup-item:hover {
-  background: var(--color-hover);
-}
-
-.batch-popup-item.selected {
-  background: rgba(122, 163, 90, 0.06);
-}
-
-.batch-popup-item-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.batch-popup-item-title {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--color-text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.batch-popup-item-meta {
-  font-size: 12px;
-  color: var(--color-text-light);
-  margin-top: 2px;
-}
-
-.batch-popup-footer {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 20px;
-  border-top: 1px solid var(--panel-border, #e5e7eb);
-}
-
-.batch-popup-status {
-  flex: 1;
-  font-size: 13px;
-  color: var(--color-primary);
-}
-
-.batch-popup-cancel {
-  padding: 8px 16px;
-  font-size: 13px;
-  color: var(--color-text);
-  background: var(--surface-panel-subtle);
-  border: 1px solid var(--panel-border);
-  border-radius: var(--radius-sm);
-  transition: background-color var(--transition-fast), transform var(--transition-fast);
-}
-
-.batch-popup-cancel:hover {
-  background: var(--color-hover);
-}
-
-.batch-popup-cancel:active {
-  transform: scale(0.96);
-}
-
-.batch-popup-confirm {
-  padding: 8px 20px;
-  font-size: 13px;
-  font-weight: 500;
-  color: #fff;
-  background: var(--color-primary);
-  border-radius: var(--radius-sm);
-  transition: background-color var(--transition-fast), opacity var(--transition-fast), transform var(--transition-fast);
-}
-
-.batch-popup-confirm:hover:not(:disabled) {
-  opacity: 0.9;
-}
-
-.batch-popup-confirm:active:not(:disabled) {
-  transform: scale(0.96);
-}
-
-.batch-popup-confirm:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.batch-popup-confirm.batch-popup-delete {
-  background: var(--color-error);
-}
 
 /* ─── Tools Item Danger ──────────────────────────────────────── */
 
@@ -5797,3 +3866,5 @@ const emit = defineEmits<{
   transform: none !important;
 }
 </style>
+
+<style scoped src="../styles/sidebar-panels.css"></style>

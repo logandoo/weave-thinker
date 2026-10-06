@@ -10,7 +10,6 @@ ref 为 `refs/snapshots/<id>`。恢复采用 `read-tree + checkout-index -a -f`
 一次当前状态（恢复可再撤销）。git 缺失/超时不抛异常，返回 ok=False + error，
 调用方（写/编辑）据此降级为 snapshot_error 而不阻断写入。
 """
-import asyncio
 import hashlib
 import logging
 import os
@@ -45,32 +44,17 @@ def _shadow_dir(user_id: str, workspace_path: str) -> Path:
 
 
 async def _run_git(git_dir: Path, work_tree: str, args: List[str]) -> Tuple[int, str, str]:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            f"--git-dir={git_dir}",
-            f"--work-tree={work_tree}",
-            *args,
-            # cwd=work_tree: pathspecs/paths resolve against the workspace root,
-            # never the server process cwd (A4.9 I-1 fix).
-            cwd=work_tree,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        return 127, "", "git executable not found"
-    except ValueError as exc:
-        # e.g. NUL byte in a path/ref argument (A4.9 M-4)
-        return 125, "", f"invalid git argument: {exc}"
-    except OSError as exc:
-        return 126, "", f"git spawn failed: {exc}"
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=_GIT_TIMEOUT)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return 124, "", "git timeout"
-    return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+    from app.services.git_binary import run_git_command
+
+    return await run_git_command(
+        args,
+        # cwd=work_tree: pathspecs/paths resolve against the workspace root,
+        # never the server process cwd (A4.9 I-1 fix).
+        cwd=work_tree,
+        timeout=_GIT_TIMEOUT,
+        git_dir=str(git_dir),
+        work_tree=work_tree,
+    )
 
 
 async def _ensure_repo(git_dir: Path, work_tree: str) -> Optional[str]:

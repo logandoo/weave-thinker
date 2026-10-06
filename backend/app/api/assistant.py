@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -113,6 +115,10 @@ async def update_assistant(
         if field in ("model_alias", "subtask_model_alias", "citation_style") and value == "":
             value = None  # "" = 清除别名（存 NULL，回退 legacy/默认解析）
         setattr(assistant, field, value)
+    if update_data:
+        # 同步发射侧契约：setattr 同值赋值照发事件跳 onupdate（I-1）——有赋值才 bump，
+        # 空 PATCH（无字段命中）零事件零 bump。
+        assistant.updated_at = datetime.utcnow()
 
     await db.commit()
     await db.refresh(assistant)

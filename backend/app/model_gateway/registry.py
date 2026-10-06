@@ -56,15 +56,15 @@ _CAPABILITIES_BY_PROVIDER = {
         },
     },
     # Doubao（火山方舟 Ark）：thinking{type} + 顶层 reasoning_effort；
-    # minimal=不思考（与 low 区分）；无 thinking_budget（profile 剥除）。
+    # 2026-10-04 用户裁定 minimal≡关闭（Ark 0 reasoning tokens）→ 档位移除，
+    # 仅菜单三档 +「关闭」开关；遗留 "minimal" 值由 profile 兜底映射 disable。
     "doubao": {
         "supports_reasoning": True,
-        "reasoning_efforts": ["high", "medium", "low", "minimal"],
+        "reasoning_efforts": ["high", "medium", "low"],
         "effort_meta": {
             "high": {"label": "high", "desc": "深度分析，处理复杂问题"},
             "medium": {"label": "medium", "desc": "均衡模式，兼顾速度与深度", "default": True},
             "low": {"label": "low", "desc": "轻量思考，侧重快速响应"},
-            "minimal": {"label": "minimal", "desc": "关闭思考，直接回答"},
         },
     },
 }
@@ -387,6 +387,35 @@ def synthesize(conf: dict) -> Tuple[Dict[str, ModelEndpoint], Dict[str, Any]]:
     return endpoints, routing
 
 
+def _clamp_capabilities(provider_type: str, caps: Dict[str, Any]) -> Dict[str, Any]:
+    """菜单档位钳到 thinking profile 的 wire 合法集。
+
+    遗留 config_model.toml 的 stale 档位（如 doubao "minimal"，2026-10-04
+    用户裁定移除）不得继续出现在思考菜单——所有 profile 的 enable() 均以
+    `effort in self.efforts` 为上 wire 前提，集合外档位本就发不出去。
+    profile.efforts 为 None（generic/custom）不钳。"""
+    try:
+        from app.model_gateway.profiles import get_thinking_profile
+        efforts = get_thinking_profile(provider_type or "").efforts
+    except Exception:  # pragma: no cover - 防御：profile 注册异常不阻断端点加载
+        return caps
+    if not efforts or not isinstance(caps, dict):
+        return caps
+    legal = set(efforts)
+    out = dict(caps)
+    listed = out.get("reasoning_efforts")
+    if isinstance(listed, list):
+        kept = [e for e in listed if e in legal]
+        if kept != listed:
+            out["reasoning_efforts"] = kept
+    meta = out.get("effort_meta")
+    if isinstance(meta, dict):
+        kept_meta = {k: v for k, v in meta.items() if k in legal}
+        if kept_meta != meta:
+            out["effort_meta"] = kept_meta
+    return out
+
+
 def _endpoint_from_toml(alias: str, data: dict) -> ModelEndpoint:
     return ModelEndpoint(
         alias=str(alias),
@@ -398,7 +427,10 @@ def _endpoint_from_toml(alias: str, data: dict) -> ModelEndpoint:
         display_name=str(data.get("display_name", "") or ""),
         is_custom=bool(data.get("is_custom", True)),
         params=dict(data.get("params", {}) or {}),
-        capabilities=dict(data.get("capabilities", {}) or {}),
+        capabilities=_clamp_capabilities(
+            str(data.get("provider_type", "") or ""),
+            dict(data.get("capabilities", {}) or {}),
+        ),
         extra=dict(data.get("extra", {}) or {}),
     )
 

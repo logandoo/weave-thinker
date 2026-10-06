@@ -211,17 +211,20 @@
  * 组件级覆写（mockup → 系统组件；FLUSH + 硬边框范式）
  * ========================================================================== */
 
-/* 布局：贴边 + 外壳左右 3px 硬边（mockup .shell/.layout） */
+/* 布局：外壳四周一圈 3px 硬框（mockup .shell/.layout；与 sidebar 边线同款
+   --skin-line 直角硬边——wave: 全模式外框，聊天/笔记/工作台/语音统一） */
 html[data-skin="mono-brutal"] .chat-layout {
   padding: 0;
   gap: 0;
-  border-left: 3px solid var(--skin-line);
-  border-right: 3px solid var(--skin-line);
+  border: 3px solid var(--skin-line);
+}
+html[data-skin="mono-brutal"] .voice-page {
+  border: 3px solid var(--skin-line);
 }
 
 /* 移动端豁免：抽屉侧栏全高无边 */
 @media (max-width: 767px) {
-  html[data-skin="mono-brutal"] .chat-layout { padding: 0; border-left: none; border-right: none; }
+  html[data-skin="mono-brutal"] .chat-layout { padding: 0; border: none; }
   html[data-skin="mono-brutal"] .sidebar {
     --sidebar-height: 100%;
     margin: 0 !important;
@@ -431,23 +434,33 @@ html[data-skin="mono-brutal"] .new-note-btn {
 }
 html[data-skin="mono-brutal"] .new-note-btn:hover { background: var(--skin-lt); transform: none; border-color: var(--skin-line); }
 html[data-skin="mono-brutal"] .notes-panel-list { padding: 0 12px; }
+
+/* ===== 笔记列表（严格对齐 design/mockups/04-mono-brutal/zen.html 的 .dr-grp/.dr-item 语言）=====
+   dr-grp（笔记本行）: flex | gap 8 | padding 8px 14px | 900 | 12px | 无框
+   dr-item（笔记行）: block | padding 8px 14px | 12px | border-left:4px transparent
+     hover/active: bg --skin-lt；active 左槽 --skin-yl + 800
+   非列表展示（行无全框、无双缝）——旧「四边成框」实现废除 */
 html[data-skin="mono-brutal"] .np-notebook-row {
-  border-radius: 0;
-  padding: 7px 0 7px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
   margin: 0;
+  border: 0;
+  border-radius: 0;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 900;
   color: var(--color-text);
-  border-left: 4px solid transparent;
+  background: transparent;
 }
 html[data-skin="mono-brutal"] .np-notebook-row:hover { background: var(--skin-lt); }
 html[data-skin="mono-brutal"] .np-notebook-row.active {
   background: var(--skin-lt);
   font-weight: 900;
-  border-left-color: var(--skin-fill);
 }
 html[data-skin="mono-brutal"] .np-chevron { color: var(--skin-gy); }
 html[data-skin="mono-brutal"] .np-count {
+  margin-left: auto;
   font-family: var(--font-mono, monospace);
   font-size: 11px;
   color: var(--skin-gy);
@@ -457,18 +470,44 @@ html[data-skin="mono-brutal"] .np-count {
 }
 html[data-skin="mono-brutal"] .np-notes-list { padding-left: 18px; }
 html[data-skin="mono-brutal"] .np-note-row {
+  /* 保持 flex（图标+标题+菜单一行）：display:block 会让标题退化为内联，
+     overflow/text-overflow 失效 → 长标题换行溢出 */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  margin: 0;
+  border: 0;
+  border-left: 4px solid transparent;
   border-radius: 0;
-  padding: 7px 0 7px 6px;
   font-size: 12px;
   color: var(--color-text);
+  cursor: pointer;
+  background: transparent;
 }
 html[data-skin="mono-brutal"] .np-note-row:hover { background: var(--skin-lt); }
 html[data-skin="mono-brutal"] .np-note-row.active {
   background: var(--skin-lt);
+  border-left-color: var(--skin-yl);
   font-weight: 800;
 }
+html[data-skin="mono-brutal"] .np-note-row .np-note-title,
+html[data-skin="mono-brutal"] .np-note-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  display: block;
+}
 html[data-skin="mono-brutal"] .np-note-row.active .np-note-title { color: var(--color-text); }
-html[data-skin="mono-brutal"] .np-empty,
+/* 空态 = mockup .dr-empty 语言 */
+html[data-skin="mono-brutal"] .np-empty {
+  padding: 26px 14px;
+  text-align: center;
+  color: var(--skin-gy);
+  font-size: 12px;
+  border-top: 2px dashed var(--skin-lt);
+}
 html[data-skin="mono-brutal"] .np-note-loading {
   font-family: var(--font-mono, monospace);
   font-size: 10px;
@@ -937,11 +976,10 @@ html[data-skin="mono-brutal"] .tool-pending .tool-card-icon { color: var(--tool-
  * 规格源：04-mono-brutal/zen.html（.shell 3px 框 / .zen-top 64px 底线 / .pane-head 3px 底 h2 26 AA / .znote-title 2px AA / .ztoolbar 2px）
  *        04-mono-brutal/chat.html（.ec-cards/.ec-card/.no/.ec-try） */
 
-/* 外壳 3px 硬边框（mockup .shell） */
+/* 外壳四周一圈 3px 硬框（mockup .shell；与 sidebar 边线同款） */
 html[data-skin="mono-brutal"] .zen-layout {
   background: var(--color-bg);
-  border-left: 3px solid var(--skin-line);
-  border-right: 3px solid var(--skin-line);
+  border: 3px solid var(--skin-line);
 }
 html[data-skin="mono-brutal"] .zen-left-panel,
 html[data-skin="mono-brutal"] .zen-right-panel {
@@ -1393,15 +1431,8 @@ html[data-skin="mono-brutal"] .zen-new-chat-btn {
 html[data-skin="mono-brutal"] .zen-new-chat-btn:hover { background: var(--skin-lt); }
 html[data-skin="mono-brutal"] .zen-notes-drawer .notebook-header { border-radius: 0; }
 html[data-skin="mono-brutal"] .zen-notes-drawer .notebook-header:hover { background: var(--skin-lt); }
-html[data-skin="mono-brutal"] .zen-notes-drawer .note-item {
-  border-radius: 0;
-  border-bottom: 2px solid var(--skin-lt);
-}
-html[data-skin="mono-brutal"] .zen-notes-drawer .note-item:hover { background: var(--skin-lt); }
-html[data-skin="mono-brutal"] .zen-notes-drawer .note-item.active {
-  background: var(--skin-lt);
-  border-left: 5px solid var(--skin-yl);
-}
+/* wave-2 A6：.zen-notes-drawer 内只渲染 NotesPanelInline 的 np-* 行，
+   .note-item 从未出现 —— 原 .zen-notes-drawer .note-item 规则族为死代码，已删。 */
 
 /* 笔记正文为用户内容：皮肤不得更改其任何属性（wave-8 用户红线，覆写已移除） */
 
@@ -1504,12 +1535,6 @@ html[data-skin="mono-brutal"] .chat-header {
 }
 /* 笔记页：焦点框拉通 sidebar 全宽（去 list 侧 padding），计数红方块右留 12px 收入框内 */
 html[data-skin="mono-brutal"] .notes-panel-list { padding: 0; }
-html[data-skin="mono-brutal"] .np-notebook-row {
-  padding: 7px 12px;
-}
-html[data-skin="mono-brutal"] .np-note-row {
-  padding-right: 12px;
-}
 
 /* wave-8：底部悬浮钮与 chat-input 容器背景一致（白面硬边，active 以黑字/黄边区分） */
 html[data-skin="mono-brutal"] .mobile-tab-bar .tab-item {
@@ -2063,3 +2088,10 @@ html[data-skin="mono-brutal"][data-theme="dark"] .np-swipe-action.delete { backg
   html[data-skin="mono-brutal"] .create-btn { border-radius: 0; border: 2px solid var(--skin-line); font-weight: 700; }
 }
 
+/* ── 移动端外框豁免（置于文末：同特异性下源序压过 zen/voice 后置 base 边框；
+      三模式统一口径，A4.9 round3 定位的「豁免被 base 规则反超」缺陷） ── */
+@media (max-width: 767px) {
+  html[data-skin="mono-brutal"] .chat-layout,
+  html[data-skin="mono-brutal"] .zen-layout,
+  html[data-skin="mono-brutal"] .voice-page { border: none; }
+}

@@ -213,6 +213,19 @@ class ProcessSessionManager:
         except Exception:
             project_bin = ""
         parts = [p for p in (project_bin, "/usr/local/bin", "/usr/bin", "/bin") if p]
+        bundled_git_env: Dict[str, str] = {}
+        try:
+            from app.services.git_binary import bundled_bin_dir
+            _bundled = bundled_bin_dir()
+        except Exception:
+            _bundled = ""
+        if _bundled:
+            parts.insert(0, _bundled)
+            try:
+                from app.services.git_binary import _bundled_git_env as _bge
+                bundled_git_env = _bge() or {}
+            except Exception:
+                bundled_git_env = {}
         return {
             "PATH": ":".join(parts),
             "HOME": cwd,
@@ -220,6 +233,7 @@ class ProcessSessionManager:
             "TERM": "dumb",
             "PYTHONDONTWRITEBYTECODE": "1",
             "TZ": "Asia/Shanghai",
+            **bundled_git_env,
         }
 
     # ------------------------------------------------------------- actions

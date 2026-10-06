@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 <template>
-  <div class="file-upload-overlay" @click.self="$emit('close')">
+  <div class="file-upload-overlay" @click.self="$emit('close')" @dragenter.prevent.stop @dragover.prevent.stop @drop.prevent.stop="handleDrop">
     <div class="file-upload-dialog">
       <div class="dialog-header">
         <h3>上传文件</h3>
@@ -18,10 +18,10 @@
         <div
           class="drop-zone"
           :class="{ dragging: isDragging }"
-          @dragenter.prevent="isDragging = true"
-          @dragover.prevent="isDragging = true"
-          @dragleave.prevent="isDragging = false"
-          @drop.prevent="handleDrop"
+          @dragenter.prevent.stop="onZoneDragEnter"
+          @dragover.prevent.stop="onZoneDragOver"
+          @dragleave.prevent.stop="onZoneDragLeave"
+          @drop.prevent.stop="handleDrop"
           @click="triggerFileInput"
         >
           <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5">
@@ -132,10 +132,26 @@ function handleFileSelect(e: Event) {
 }
 
 function handleDrop(e: DragEvent) {
+  dragDepth = 0
   isDragging.value = false
   if (e.dataTransfer?.files) {
     addFiles(Array.from(e.dataTransfer.files))
   }
+}
+
+// 拖拽高亮用深度计数：dragenter(new) 先于 dragleave(old) 到达，
+// 布尔翻转会在移入子元素（图标/文案）时误灭高亮（A4.9 R1）。
+let dragDepth = 0
+function onZoneDragEnter() {
+  dragDepth += 1
+  isDragging.value = true
+}
+function onZoneDragOver() {
+  isDragging.value = true
+}
+function onZoneDragLeave() {
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) isDragging.value = false
 }
 
 function addFiles(newFiles: File[]) {
@@ -194,7 +210,13 @@ async function handleUpload() {
     }
 
     if (saveToNotebook.value && response.notebook_id) {
-      await notesStore.loadNotebooks()
+      // 笔记本刷新失败不得阻断 emit('uploaded')：否则对话框带着同一批
+      // 文件停在原地，再点按钮会对相同文件二次上传（A4.9 R2 重复上传角）。
+      try {
+        await notesStore.loadNotebooks()
+      } catch {
+        // 刷新失败无碍上传结果，静默降级
+      }
     }
 
     emit('uploaded', response.results, saveToNotebook.value)

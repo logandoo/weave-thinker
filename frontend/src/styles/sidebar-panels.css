@@ -1,0 +1,1083 @@
+/* Copyright (c) 2026 Weave Thinker Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* ==========================================================================
+ * 会话侧栏共享 chrome 样式（独立模式 Sidebar + 工作台 Agent 历史抽屉共用）。
+ * 类名词汇 = Consistency Hub「会话 chrome 词汇」；皮肤覆写在 themes/*.css
+ * （html[data-skin=…] 前缀）命中同名类，故两处观感一致。
+ * 2026-10-03 波：从 Sidebar.vue scoped 迁出（scoped 仅加 [data-v] 特异性，
+ * 迁全局后由 host 根类约束）。
+ * ========================================================================== */
+
+.conversation-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+
+
+.conversation-menu {
+  position: fixed;
+  background-color: var(--surface-panel-strong);
+  border: var(--menu-border);
+  border-radius: var(--menu-radius);
+  box-shadow: var(--menu-shadow);
+  z-index: 1000;
+  min-width: 140px;
+  padding: 4px 0;
+}
+
+.menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  color: var(--color-text);
+  font-size: 13px;
+  text-align: left;
+  transition: background-color var(--transition-fast);
+}
+
+.menu-item:hover {
+  background-color: var(--primary-tint);
+}
+
+.menu-item.delete {
+  color: var(--color-error);
+}
+
+.menu-item.delete:hover {
+  background-color: var(--danger-tint);
+}
+.action-buttons {
+  display: flex;
+  gap: 8px;
+  padding: 12px 12px 12px;
+}
+
+.new-chat-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex: 1;
+  padding: 12px 16px;
+  background-color: var(--color-primary);
+  color: white;
+  border-radius: var(--radius-md);
+  font-weight: 500;
+  transition: background-color var(--transition-fast), transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.new-chat-btn:hover {
+  background-color: var(--color-primary-dark);
+  transform: translateY(-1px);
+}
+
+.new-chat-btn:active {
+  transform: translateY(0) scale(0.96);
+}
+
+.new-group-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  background-color: var(--surface-panel-subtle);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  transition: color var(--transition-fast), background-color var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.new-group-btn:hover {
+  background-color: var(--color-hover);
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.new-group-btn:active {
+  transform: scale(0.96);
+}
+
+/* ─── Conversation Groups ─────────────────────────────────────── */
+
+.conversation-group {
+  margin-bottom: 4px;
+}
+
+.time-category-section {
+  margin-bottom: 8px;
+}
+
+.time-category-header {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-light);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  user-select: none;
+}
+
+.groups-directory {
+  margin-top: 8px;
+}
+
+.groups-directory-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--transition-fast);
+}
+
+.groups-directory-header:hover {
+  background-color: var(--color-hover);
+}
+
+.directory-chevron {
+  transition: transform var(--transition-fast);
+  color: var(--color-text-light);
+  flex-shrink: 0;
+}
+
+.directory-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.directory-name {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.directory-count {
+  font-size: 11px;
+  color: var(--color-text-light);
+  background: var(--color-bg);
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-variant-numeric: tabular-nums;
+  min-width: 18px;
+  text-align: center;
+}
+
+.groups-directory-content {
+  padding-left: 4px;
+}
+
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--transition-fast);
+}
+
+.group-header:hover {
+  background-color: var(--color-hover);
+}
+
+.group-header.group-selected {
+  background-color: var(--danger-tint);
+}
+
+.group-header.group-focus {
+  background-color: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  /* 焦点带高度减 2px×2，避免与组内首个激活会话的焦点色块粘连 */
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.group-header.group-focus + .group-conversations:not(.group-convs-collapsed) {
+  margin-top: 2px;
+}
+
+.group-header.group-focus .group-name {
+  color: var(--color-primary-dark);
+}
+
+.group-header.group-focus .group-count {
+  background: color-mix(in srgb, var(--color-primary) 16%, var(--surface-panel-strong));
+  color: var(--color-primary-dark);
+}
+
+.group-chevron {
+  transition: transform var(--transition-fast);
+  color: var(--color-text-light);
+  flex-shrink: 0;
+}
+
+.group-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.group-color-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.group-name {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-count {
+  font-size: 11px;
+  color: var(--color-text-light);
+  background: var(--color-bg);
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-variant-numeric: tabular-nums;
+  min-width: 18px;
+  text-align: center;
+}
+
+.group-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.group-header:hover .group-actions {
+  opacity: 1;
+}
+
+.group-action-btn {
+  padding: 8px;
+  color: var(--color-text-light);
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+}
+
+.group-action-btn:hover {
+  color: var(--color-primary);
+  background-color: var(--color-sidebar);
+}
+
+.group-action-btn:active {
+  transform: scale(0.96);
+}
+
+.group-action-btn.delete:hover {
+  color: var(--color-error);
+}
+
+.group-conversations {
+  padding-left: 12px;
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition: grid-template-rows 0.25s cubic-bezier(0.25, 1, 0.5, 1),
+              opacity 0.2s ease;
+}
+
+/* Instant collapse during drag to prevent SortableJS position interference */
+.sidebar-dragging .group-conversations {
+  transition: none !important;
+}
+
+/* Collapsed groups during drag: show as droppable targets with min-height */
+.sidebar-dragging .group-convs-collapsed {
+  grid-template-rows: 1fr !important;
+  opacity: 1 !important;
+  overflow: hidden !important;
+  padding: 0 !important;
+  min-height: 40px !important;
+  border: 2px dashed var(--color-primary) !important;
+  border-radius: var(--radius-sm) !important;
+  margin: 4px 0 !important;
+  background-color: color-mix(in srgb, var(--color-primary) 5%, transparent) !important;
+}
+
+.sidebar-dragging .group-conv-drag-list {
+  transition: none !important;
+  min-height: 24px !important;
+}
+
+.group-convs-collapsed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0;
+  margin: 0;
+  border: none;
+}
+
+.group-conversations > * {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.group-conv-drag-list {
+  min-height: 4px;
+  transition: min-height 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.sidebar-dragging .conversation-group.drag-hover .group-conv-drag-list:empty {
+  min-height: 48px;
+  border: 2px dashed var(--color-primary);
+  border-radius: var(--radius-sm);
+  margin: 4px 0;
+  background-color: color-mix(in srgb, var(--color-primary) 5%, transparent);
+  transition: min-height 0.2s ease, background-color 0.2s ease;
+}
+
+.ungrouped-drop-zone {
+  margin-top: 8px;
+  padding: 4px 0;
+}
+
+.ungrouped-drop-zone-label {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-light);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  user-select: none;
+}
+
+.ungrouped-empty-drag-list {
+  min-height: 40px;
+  border: 2px dashed var(--panel-border);
+  border-radius: var(--radius-md);
+  margin: 0 4px;
+  transition: border-color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.ungrouped-empty-drag-list:empty {
+  display: block;
+}
+
+/* ─── Menu Divider ────────────────────────────────────────────── */
+
+.menu-divider {
+  height: 1px;
+  background-color: var(--color-border);
+  margin: 4px 0;
+}
+
+/* ─── Move Group Menu ─────────────────────────────────────────── */
+
+.move-group-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+}
+
+.move-group-menu {
+  min-width: 160px;
+}
+
+.move-group-menu .menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.move-group-menu .menu-item.active {
+  background-color: var(--color-hover);
+  color: var(--color-primary);
+}
+
+
+/* ── 移动端触屏目标（双宿主一致） ── */
+@media (max-width: 767px) {
+  .action-buttons {
+    padding: 12px 8px 8px;
+  }
+
+  .new-group-btn {
+    width: 40px;
+    height: 40px;
+    padding: 0;
+  }
+
+  .group-actions {
+    opacity: 1;
+  }
+
+  .groups-directory-header {
+    padding: 10px 12px;
+  }
+
+  .time-category-header {
+    padding: 8px 12px;
+    font-size: 11px;
+  }
+
+  .group-action-btn {
+    min-width: 32px;
+    min-height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+
+/* ── 框选批量（marquee） ── */
+.marquee-overlay {
+  position: fixed;
+  border: 1px solid var(--color-primary);
+  background-color: color-mix(in srgb, var(--color-primary) 10%, transparent);
+  z-index: 1000;
+  pointer-events: none;
+}
+
+
+/* ── 对话框全族（独立侧栏 / 工作台抽屉 / NotesPanelInline 共用；皮肤走 --dialog-* 令牌） ── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: var(--overlay-scrim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  padding: 16px;
+}
+
+.modal-content {
+  background-color: var(--surface-panel-strong);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--dialog-radius);
+  box-shadow: var(--dialog-shadow);
+  min-width: 320px;
+  max-width: 400px;
+  width: 100%;
+  overflow: hidden;
+}
+
+.modal-title {
+  padding: 16px 20px 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.modal-body {
+  padding: 16px 20px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  padding: 0 20px 16px;
+  justify-content: flex-end;
+}
+
+.modal-btn {
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background-color var(--transition-fast), transform var(--transition-fast), opacity var(--transition-fast);
+}
+
+.modal-btn:active {
+  transform: scale(0.96);
+}
+
+.modal-btn.cancel {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+}
+
+.modal-btn.cancel:hover {
+  background-color: var(--color-hover);
+}
+
+.modal-btn.confirm {
+  background-color: var(--color-primary);
+  color: white;
+}
+
+.modal-btn.confirm:hover {
+  background-color: var(--color-primary-dark);
+}
+
+.modal-btn.delete {
+  background-color: var(--color-error);
+  color: white;
+}
+
+.modal-btn.delete:hover {
+  background-color: color-mix(in srgb, var(--color-error) 85%, black);
+}
+
+.form-group {
+  margin-bottom: 16px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+  margin-bottom: 6px;
+}
+
+.form-group input,
+.modal-body input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  color: var(--color-text);
+  background: var(--surface-input);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.form-group input:focus,
+.modal-body input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--focus-ring-color);
+}
+
+.form-group select.form-select {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  color: var(--color-text);
+  background: var(--surface-input);
+  transition: border-color var(--transition-fast);
+  appearance: auto;
+}
+
+.form-group select.form-select:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.color-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.color-option {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: transform var(--transition-fast), border-color var(--transition-fast);
+}
+
+.color-option:hover {
+  transform: scale(1.1);
+}
+
+.color-option.active {
+  border-color: var(--color-text);
+  transform: scale(1.15);
+}
+
+
+/* ── 空态 / 分组选择框（双宿主） ── */
+.list-empty {
+  padding: 18px 12px;
+  font-size: 12px;
+  color: var(--color-text-light);
+  text-align: center;
+}
+
+.group-checkbox {
+  margin-right: 2px;
+  cursor: pointer;
+}
+
+
+/* ── 批量选择条（独立侧栏/工作台抽屉共用；.selection-bar 类名与
+   NotesList/NotebooksList/ChatArea 同名——scoped-src 托管后互不泄漏） ── */
+.selection-bar {
+  padding: 8px 12px;
+  margin: 0 0 8px;
+  background-color: var(--color-hover);
+  border-radius: var(--radius-md);
+}
+
+.selection-bar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.select-all-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.select-all-label input {
+  cursor: pointer;
+}
+
+.selected-count {
+  font-size: 12px;
+  color: var(--color-text-light);
+}
+
+.selection-bar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.selection-confirm-btn {
+  flex: 1;
+  padding: 8px 12px;
+  color: white;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background-color var(--transition-fast), transform var(--transition-fast), opacity var(--transition-fast);
+}
+
+.selection-confirm-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.export-confirm-btn {
+  background-color: var(--color-primary);
+}
+
+.export-confirm-btn:hover:not(:disabled) {
+  background-color: var(--color-primary-dark);
+}
+
+.delete-confirm-btn {
+  background-color: var(--color-error);
+}
+
+.delete-confirm-btn:hover:not(:disabled) {
+  background-color: #a02c2c;
+}
+
+.selection-confirm-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.export-cancel-btn,
+.selection-cancel-btn {
+  padding: 8px 12px;
+  background-color: var(--color-white);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  transition: border-color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.export-cancel-btn:hover {
+  border-color: var(--color-text-light);
+}
+
+.export-cancel-btn:active,
+.selection-cancel-btn:active {
+  transform: scale(0.96);
+}
+
+.selection-progress {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--color-primary);
+  text-align: center;
+}
+
+/* ── Spotlight 搜索对话（双宿主共用） ── */
+.spotlight-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
+  z-index: 10000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 20vh;
+}
+
+.spotlight-modal {
+  width: 560px;
+  max-width: 90vw;
+  background: var(--surface-panel, #fff);
+  border-radius: 12px;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+  animation: spotlightIn 0.15s ease-out;
+}
+
+@keyframes spotlightIn {
+  from { opacity: 0; transform: translateY(-10px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.spotlight-input-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--panel-border, #e5e7eb);
+}
+
+.spotlight-search-icon {
+  flex-shrink: 0;
+  color: var(--color-text-light);
+}
+
+.spotlight-input {
+  flex: 1;
+  border: none;
+  outline: none;
+  font-size: 16px;
+  color: var(--color-text);
+  background: transparent;
+}
+
+.spotlight-input::placeholder {
+  color: var(--color-text-light);
+}
+
+.spotlight-results {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.spotlight-status {
+  padding: 24px 20px;
+  text-align: center;
+  color: var(--color-text-light);
+  font-size: 14px;
+}
+
+.spotlight-result-item {
+  padding: 12px 20px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--panel-border, #e5e7eb);
+  transition: background var(--transition-fast);
+}
+
+.spotlight-result-item:hover {
+  background: var(--color-hover);
+}
+
+.spotlight-result-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 4px;
+}
+
+.spotlight-result-snippet {
+  font-size: 12px;
+  color: var(--color-text-light);
+  margin-top: 3px;
+}
+
+.spotlight-result-snippet--clickable {
+  cursor: pointer;
+  padding: 3px 4px;
+  border-radius: 4px;
+  transition: background-color 0.12s ease;
+}
+
+.spotlight-result-snippet--clickable:hover {
+  background: var(--color-hover);
+}
+
+.spotlight-snippet-role {
+  font-weight: 500;
+  color: var(--color-text);
+  margin-right: 4px;
+}
+
+.spotlight-snippet-text :deep(mark) {
+  background: var(--color-primary);
+  color: #fff;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+
+/* ── 复选标签（删除分组确认等，双宿主） ── */
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.checkbox-label input {
+  cursor: pointer;
+}
+
+
+/* ── 拖拽态（双宿主：悬停展开/空拖放区/指针） ── */
+.sidebar-dragging .ungrouped-empty-drag-list {
+  min-height: 48px;
+  border: 2px dashed var(--color-primary);
+  background-color: color-mix(in srgb, var(--color-primary) 6%, transparent);
+  transition: min-height 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.sidebar-dragging .time-category-section .ungrouped-conv-drag-list:empty {
+  min-height: 48px;
+  border: 2px dashed var(--color-primary);
+  border-radius: var(--radius-sm);
+  margin: 4px 0;
+  background-color: color-mix(in srgb, var(--color-primary) 4%, transparent);
+  transition: min-height 0.2s ease, background-color 0.2s ease;
+}
+
+.sidebar-dragging .conversation-group.drag-hover {
+  background-color: color-mix(in srgb, var(--color-primary) 10%, transparent) !important;
+  border-radius: var(--radius-sm);
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+  transition: background-color 0.2s ease, outline-color 0.2s ease;
+}
+
+.sidebar-dragging [data-draggable="true"] {
+  cursor: grab;
+}
+
+.sidebar-dragging [data-draggable="true"]:active {
+  cursor: grabbing;
+}
+
+
+/* ── 批量导出/删除弹层（与 spotlightIn keyframes 同块：scoped 键帧改名需同块引用） ── */
+.batch-popup-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.batch-popup {
+  width: 480px;
+  max-width: 90vw;
+  max-height: 80vh;
+  background: var(--surface-panel, #fff);
+  border-radius: 12px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: spotlightIn 0.15s ease-out;
+}
+
+.batch-popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--panel-border, #e5e7eb);
+}
+
+.batch-popup-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin: 0;
+}
+
+.batch-popup-close {
+  color: var(--color-text-light);
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+}
+
+.batch-popup-close:hover {
+  color: var(--color-text);
+  background: var(--color-hover);
+}
+
+.batch-popup-close:active {
+  transform: scale(0.96);
+}
+
+.batch-popup-body {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.batch-popup-toolbar {
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--panel-border, #e5e7eb);
+}
+
+.batch-select-all {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.batch-popup-list {
+  padding: 4px 0;
+}
+
+.batch-popup-empty {
+  padding: 32px 20px;
+  text-align: center;
+  color: var(--color-text-light);
+  font-size: 14px;
+}
+
+.batch-popup-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+  border-bottom: 1px solid var(--panel-border, #e5e7eb);
+}
+
+.batch-popup-item:hover {
+  background: var(--color-hover);
+}
+
+.batch-popup-item.selected {
+  background: rgba(122, 163, 90, 0.06);
+}
+
+.batch-popup-item-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.batch-popup-item-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.batch-popup-item-meta {
+  font-size: 12px;
+  color: var(--color-text-light);
+  margin-top: 2px;
+}
+
+.batch-popup-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--panel-border, #e5e7eb);
+}
+
+.batch-popup-status {
+  flex: 1;
+  font-size: 13px;
+  color: var(--color-primary);
+}
+
+.batch-popup-cancel {
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--color-text);
+  background: var(--surface-panel-subtle);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-sm);
+  transition: background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.batch-popup-cancel:hover {
+  background: var(--color-hover);
+}
+
+.batch-popup-cancel:active {
+  transform: scale(0.96);
+}
+
+.batch-popup-confirm {
+  padding: 8px 20px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--color-primary);
+  border-radius: var(--radius-sm);
+  transition: background-color var(--transition-fast), opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.batch-popup-confirm:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.batch-popup-confirm:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.batch-popup-confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.batch-popup-confirm.batch-popup-delete {
+  background: var(--color-error);
+}
+
+/* ── 移动端对话框覆写（置于文末：同特异性下源序压过 modal 族 base min-width:320px——
+      A4.9 round3fix 定位「覆写落位先于 base 仍是死规则」的二次修复） ── */
+@media (max-width: 767px) {
+  .modal-content {
+    margin: 16px;
+    min-width: auto;
+  }
+}

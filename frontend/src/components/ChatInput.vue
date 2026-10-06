@@ -138,11 +138,13 @@
     </div>
 
     <!-- Mobile voice mode: float toggle back to text (outside the overflow-clipped container) -->
+    <!-- 切换输入方式是纯 UI 状态，刻意**不**绑流式禁用：语音模式下工具栏整块
+         display:none，这个浮钮是唯一出口；流式期间锁死它 = 回答过程中提出的
+         query 之后再也切不回文字（需求 5）。 -->
     <button
       v-if="isMobile && isMobileVoiceMode"
       type="button"
       class="voice-mode-toggle-btn voice-mode-toggle-btn--float"
-      :disabled="chatStore.isStreamingCurrentConversation"
       @click="onVoiceToggleClick"
       aria-label="切换文字输入"
     >
@@ -1257,6 +1259,7 @@ function onDrop(e: DragEvent) {
   e.preventDefault()
   dragDepth = 0
   dragOver.value = false
+  if (showFileUpload.value) return // 上传面板打开期间：拖入只在面板暂存，点按钮才上传
   queueIncomingFiles(files)
 }
 

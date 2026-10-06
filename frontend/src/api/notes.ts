@@ -5,6 +5,11 @@ import api from './client'
 import { downloadBlob, type DownloadResult } from '@/composables/useDownload'
 import type { Notebook, Note, NoteListItem, BulkDeleteResult, BulkMoveResult, NoteSearchResult } from '@/types'
 
+// 尾注开关（与 stores/editorPrefs 同源 localStorage 键）——导出渲染随开关（wave-3 #5）
+function endnoteExportQuery(): { endnote_enabled: boolean } {
+  return { endnote_enabled: localStorage.getItem('wt-endnote-enabled') === '1' }
+}
+
 export const notesApi = {
   async getNotebooks(): Promise<Notebook[]> {
     const { data } = await api.get<Notebook[]>('/notes/notebooks')
@@ -38,8 +43,10 @@ export const notesApi = {
   },
 
   async exportNotebook(id: string): Promise<DownloadResult> {
-    const response = await api.get(`/notes/notebooks/${id}/export`, { responseType: 'blob' })
-    const blob = new Blob([response.data], { type: 'text/csv;charset=utf-8' })
+    // responseType:'blob'（2026-10-05 上游TODO项5）：二进制/大导出语义——
+    // axios 直收 Blob，不再经 string→Blob 往返（大 CSV 字符串化有内存/编码损耗）。
+    const response = await api.get(`/notes/notebooks/${id}/export`, { params: { ...endnoteExportQuery() }, responseType: 'blob' })
+    const blob = response.data as Blob
     const contentDisposition = response.headers['content-disposition']
     let filename = 'notebook.csv'
     if (contentDisposition) {
@@ -129,7 +136,7 @@ export const notesApi = {
 
   async exportNote(noteId: string, format: 'md' | 'pdf' = 'md', signal?: AbortSignal): Promise<DownloadResult> {
     const response = await api.get(`/notes/notes/${noteId}/export`, {
-      params: { format },
+      params: { format, ...endnoteExportQuery() },
       responseType: 'blob',
       signal,
     })

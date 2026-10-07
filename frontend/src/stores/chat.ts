@@ -13,6 +13,7 @@ import type {
   ContextInfo, ModelAlias,
 } from '@/types'
 import { chatApi, isExternalizedStub } from '@/api/chat'
+import { transientHintFor } from '@/api/streamDispatch'
 import { modelsApi } from '@/api/models'
 import { useAssistantStore } from '@/stores/assistant'
 import { useNotesStore } from '@/stores/notes'
@@ -46,6 +47,9 @@ interface StreamState {
   streaming: boolean
   abortController: AbortController | null
   tabSwitchAbort: boolean
+  /** 瞬时暂态因由（挂账清零波 T2）：按会话存储——resume 置位、busy 路文案消费，
+   *  跨会话并发不串（曾为 store 级共享旗标=串文案竞态）。 */
+  transientReason: string | null
   _lastEventTime: number
   /** False until the first SSE event of this stream arrives. The backend's
    *  setup phase (coordinator pre-pass / deathmatch classify — LLM calls that
@@ -76,6 +80,7 @@ function createStreamState(): StreamState {
     deathmatchVerdict: null,
     streaming: false,
     abortController: null,
+    transientReason: null,
     tabSwitchAbort: false,
     _lastEventTime: 0,
     _gotFirstEvent: false,
@@ -152,6 +157,8 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   const currentError = ref<string | null>(null)
+  // 轻提示（UPSTREAM_TODO 项 10/评审 B-3）：暂态面（drain 排空）不落红硬错
+  const currentNotice = ref<string | null>(null)
   const searchResults = ref<ConversationSearchResult[]>([])
   const searchQuery = ref('')
   const searchHighlightQuery = ref('')
@@ -404,6 +411,7 @@ export const useChatStore = defineStore('chat', () => {
     messagesEpoch[conversationId] = (messagesEpoch[conversationId] || 0) + 1
     ensureStallWatchdog()
     currentError.value = null
+    currentNotice.value = null
     _streamVersion.value++
   }
 
@@ -901,6 +909,7 @@ export const useChatStore = defineStore('chat', () => {
         // W3 项1：caughtUp 可能跑 fullWindow 补拉（多一次 RTT）——采信前要求在
         // 其之后列表仍归本流（stillOurs 已查）且该补拉未失败（caughtUp 内保证）。
         currentError.value = null
+        currentNotice.value = null
         endStreaming(conversationId)
         // 需求 4②：这是 syncAfterAbort 自述的**最常见**终态（abort 落地前回答已
         // 存库）—— 挂着的插话必须继续作答，不得就此搁置。
@@ -947,7 +956,7 @@ export const useChatStore = defineStore('chat', () => {
           && !s.abortController
         ) {
           const reattached = await resumeActiveStream(conversationId)
-          if (reattached) return
+          if (reattached === 'resumed') return
         }
         // setup_in_progress: the backend run is still in its SETUP phase —
         // no buffer exists yet (it is created only when the agent task
@@ -969,6 +978,7 @@ export const useChatStore = defineStore('chat', () => {
           if (await caughtUp()) {
             if (!stillOurs()) return
             currentError.value = null
+            currentNotice.value = null
             endStreaming(conversationId)
             // 需求 4②：run 已收尾，挂着的插话必须继续作答，不得随刷新静默丢弃。
             void flushUnconfirmedInterjections(conversationId, 'auto-send')
@@ -984,6 +994,7 @@ export const useChatStore = defineStore('chat', () => {
       if (!dmActiveNow() && await caughtUp()) {
         if (!stillOurs()) return
         currentError.value = null
+        currentNotice.value = null
         endStreaming(conversationId)
         // 需求 4②：同上 —— 终态冲刷队列。
         void flushUnconfirmedInterjections(conversationId, 'auto-send')
@@ -1001,6 +1012,7 @@ export const useChatStore = defineStore('chat', () => {
       if (!dmActiveNow() && await caughtUp()) {
         if (!stillOurs()) return
         currentError.value = null
+        currentNotice.value = null
         endStreaming(conversationId)
         void flushUnconfirmedInterjections(conversationId, 'auto-send')
         return
@@ -1028,16 +1040,19 @@ export const useChatStore = defineStore('chat', () => {
 
     if (!stillOurs()) return
     currentError.value = null
+    currentNotice.value = null
     endStreaming(conversationId)
     // 需求 4②：轮询兜底也走到了终态 —— 挂着的插话继续作答，不得静默丢弃。
     void flushUnconfirmedInterjections(conversationId, 'auto-send')
   }
 
-  async function resumeActiveStream(conversationId: string): Promise<boolean> {
-    if (_resumingSet.has(conversationId)) return false
+  async function resumeActiveStream(conversationId: string): Promise<'resumed' | 'failed' | 'transient'> {
+    // 因由入口复位（复审 Minor：先于一切早退，防上一轮因由残留）
+    getStream(conversationId).transientReason = null
+    if (_resumingSet.has(conversationId)) return 'failed'
     const s = getStream(conversationId)
     if (!s.streaming) {
-      return false
+      return 'failed'
     }
     // 接管守卫（结构不变量）：resume 的语义是「重挂一条**已经断掉**的流」，
     // 不是「替换任意活流」。本地已有一条未中止的健康连接时必须让路 —— 否则
@@ -1046,7 +1061,7 @@ export const useChatStore = defineStore('chat', () => {
     // loop" + "Final answer already persisted by producer" = 插话被静默丢弃）。
     // 中止过的前任（watchdog abort / tab-switch abort）不拦，照常重挂。
     if (s.abortController && !s.abortController.signal?.aborted) {
-      return false
+      return 'failed'
     }
     _resumingSet.add(conversationId)
 
@@ -1070,6 +1085,9 @@ export const useChatStore = defineStore('chat', () => {
 
     let replayStatus: string = 'incomplete'
     let replayDbMessageId: string | null = null
+    // 瞬时暂态（UPSTREAM_TODO_项 10 + 挂账清理波 criterion 3）：503 排空/429 限流/
+    // 502·504 网关瞬断——有界重试耗尽不落红硬错，return 'transient' 交还调用方的
+    // 有界恢复（重试 resume → syncAfterAbort 轮询），不 endStreaming。
 
     // dispatchStreamPayload calls h.onDone(conversation_id, message_id,
     // title, tool_results, search_failed, task_submitted) — the resume
@@ -1154,7 +1172,10 @@ export const useChatStore = defineStore('chat', () => {
           s.reasoning = pickStreamText({ live: s.reasoning, snapshot: replay.reasoning || '' })
           s.contentSegments = replay.content_segments || []
           s.displaySequence = mergeReplayIntoSequence(s.displaySequence, replay.display_sequence || [])
-          s.toolCalls = replay.tool_calls || []
+          // 懒加载桩兼容（A4.9 fix-round）：tool_calls 数组载荷可能以 {meta, items}
+          // 桩形到达（写侧 DB 数组恒定，仅列表读侧桩）——解包保数组不变量
+          const _tc = replay.tool_calls
+          s.toolCalls = (Array.isArray(_tc) ? _tc : (_tc?.items ?? [])) as typeof s.toolCalls
           s.toolResults = replay.tool_results || []
           s.agentSteps = replay.agent_steps || []
           s.fileAttachments = replay.file_attachments || []
@@ -1172,6 +1193,7 @@ export const useChatStore = defineStore('chat', () => {
           _streamVersion.value++
         },
         onDone: onDoneCallback,
+        onTransient: (reason: string) => { s.transientReason = reason },
         onError: (error) => {
           touch()
           if (s.abortController !== abortController) return // 连接令牌：被更新的连接接管后不得报错收尾
@@ -1197,6 +1219,9 @@ export const useChatStore = defineStore('chat', () => {
         },
       })
 
+      // 瞬时暂态：轻路径交还有界恢复，不终态化
+      if (s.transientReason !== null) return 'transient'
+
       if (replayStatus === 'none') {
         // 'none' 回放双义二判：run 仍在 SETUP 期（或 buffer 恰好在 resume
         // 后出现）→ 暂态，return false 交还调用方走有界恢复（重试 resume →
@@ -1208,13 +1233,13 @@ export const useChatStore = defineStore('chat', () => {
           transient = false
         }
         if (transient && s.streaming && s.abortController === abortController) {
-          return false
+          return 'failed'
         }
         // 连接令牌（A4.9 R1 I1）：getStreamStatus RTT 期间本会话可能已被更新
         // 的流程接管（重发/编辑重发/重选）——终态收尾（endStreaming/插话冲刷）
         // 只许在仍是本连接时执行，否则交还接管方。
         if (s.abortController !== abortController) {
-          return false
+          return 'failed'
         }
         endStreaming(conversationId)
         if (conversationId === currentConversationId.value) {
@@ -1223,7 +1248,7 @@ export const useChatStore = defineStore('chat', () => {
           void flushUnconfirmedInterjections(conversationId, 'auto-send')
         }
         void refreshConversation(conversationId)
-        return true
+        return 'resumed'
       }
 
       if (replayStatus === 'complete') {
@@ -1262,14 +1287,14 @@ export const useChatStore = defineStore('chat', () => {
         endStreaming(conversationId)
       }
 
-      return true
+      return 'resumed'
     } catch (e: any) {
       // An aborted resume must NOT be reported as "reconnected" — a watchdog
       // abort means the resume connection died too. Returning false routes the
       // caller into syncAfterAbort so the stream always reaches a terminal
       // state instead of getting stuck at streaming=true with no controller.
-      if (e?.name === 'AbortError') return false
-      return false
+      if (e?.name === 'AbortError') return 'failed'
+      return 'failed'
     } finally {
       _resumingSet.delete(conversationId)
       if (s.abortController === abortController) s.abortController = null
@@ -1311,7 +1336,7 @@ export const useChatStore = defineStore('chat', () => {
         if (s.abortController && s.abortController !== entryController) return
         try {
           const reconnected = await resumeActiveStream(conversationId)
-          if (reconnected) return
+          if (reconnected === 'resumed') return
         } catch {
           // Resume failed, fall through to retry / syncAfterAbort
         }
@@ -1583,7 +1608,7 @@ export const useChatStore = defineStore('chat', () => {
       if (status.has_buffer && status.status === 'incomplete' && status.is_running) {
         beginStreaming(id)
         const resumed = await resumeActiveStream(id)
-        if (!resumed) {
+        if (resumed !== 'resumed') {
           // A4.9 R1 M5：resume 暂态失败（如恰逢 buffer 尾声收 'none'）不能
           // 干等 30s 看门狗——直接走有界恢复（重试 → 轮询 → 重挂）。
           const s = streamStates[id]
@@ -2424,7 +2449,7 @@ export const useChatStore = defineStore('chat', () => {
           // 真的丢了）。这里显式宣告本 flow 的连接已死。
           if (s.abortController === abortController) s.abortController = null
           const attached = await resumeActiveStream(conversationId)
-          if (attached && _busyAttempts < 2) {
+          if (attached === 'resumed' && _busyAttempts < 2) {
             // The attached run has now finished (resume resolves at done) —
             // the slot is free, deliver the queued message. Capped at 2
             // resends so a persistent busy/resume disagreement (e.g.
@@ -2432,7 +2457,12 @@ export const useChatStore = defineStore('chat', () => {
             // A4.9 M4：定向发送的重试必须携带原目标会话，不得落回当前会话。
             await sendMessage(content, assistantId, _busyAttempts + 1, _targetConversationId)
           } else {
-            if (!attached) {
+            if (attached === 'transient') {
+              // 评审 B-3 + 挂账清理波 criterion 3：瞬时暂态=轻提示按因由，不落红硬错
+              currentNotice.value = transientHintFor(s.transientReason)
+              endStreaming(conversationId)
+              void flushUnconfirmedInterjections(conversationId, 'restore')
+            } else if (attached !== 'resumed') {
               currentError.value = '该会话已有正在进行的回答，请稍后重试。'
               endStreaming(conversationId)
               // 终态：挂着的插话不得静默搁置（回填给用户，由其决定何时重发）。
@@ -3057,6 +3087,7 @@ export const useChatStore = defineStore('chat', () => {
     }
     endStreaming(convId)
     currentError.value = null
+    currentNotice.value = null
     // 停止时仍未确认的插话：run 已被取消，队列不再被消费 —— 文本回填输入框，
     // 绝不在用户明确停止后隐式开启新 turn。先于锚计算
     // （A4.9 M1：气泡移除会改变列表，先取锚会被合成气泡干扰）。
@@ -3117,6 +3148,7 @@ export const useChatStore = defineStore('chat', () => {
     }
     localOnlyMessageIds.clear()
     currentError.value = null
+    currentNotice.value = null
     saveModeActive.value = false
     searchResults.value = []
     searchQuery.value = ''
@@ -3268,6 +3300,7 @@ export const useChatStore = defineStore('chat', () => {
     pendingInterjections,
     interjectionRestoreText,
     currentError,
+    currentNotice,
     currentMessages,
     isStreamingCurrentConversation,
     currentStreamingContent,

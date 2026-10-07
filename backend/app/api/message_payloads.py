@@ -39,23 +39,53 @@ _FIELDS = ("tool_results", "reasoning_content", "tool_calls")
 def slim_message_dict(m):
     """Return a slim copy of a message dict: fat fields → stub shape.
 
-    - Already-externalized stubs pass through unchanged.
+    - Already-externalized stubs pass through (loose-shape `__truncated__`/
+      `__size_bytes__` marker keys stripped — 评审 A Critical-1；payload_ref 等
+      解析键原样保留).
     - tool_results / tool_calls: structure-preserving slim JSON (UI can render
       tool cards from titles/status; heavy bodies carry __truncated__).
     - reasoning_content: meta stub with preview.
-    Thin messages are returned unchanged (identity).
+    - Thin messages are returned unchanged (identity).
+    - 出桩条件（D-11 修订，2026-10-06 懒加载回归）：**截断即出桩**——slim 形态
+      发生过截断（任一字符串被切/预览被切）或超 preview 容量 → 出桩；否则
+      原样返回（其全文即展示基线）。修复用户实测「全部都会加载」：≤32k 但
+      内含长串的思考/工具字段曾整包随列表下发（旧条件只看 payload_inline_max_chars）。
     """
     if not isinstance(m, dict):
         return m
     out = dict(m)
     changed = False
-    for field in _FIELDS:
+    # W6 fix-round（A4.9 B-I7 逆转 D-13）：tool_calls 恢复出桩（数组形载荷以
+    # {meta, items} 交付）——写侧 I5「不外置 tool_calls」不动（DB 数组恒定）；
+    # 读侧消费端按 items 解包（stores/chat.ts）。防 MB 级 arguments 随列表满载。
+    for field in ("tool_results", "reasoning_content", "tool_calls"):
         val = out.get(field)
-        if not val or not isinstance(val, str) or is_externalized_stub(val):
+        if not val or not isinstance(val, str):
             continue
-        if len(val) <= _inline_max_chars():  # 评审 M：与写路径阈值同源（配置可调不漂移）
+        if is_externalized_stub(val):
+            # 评审 A Critical-1（fix-round 1）：标记信任=严格 meta 形——宽松/伪造
+            # 桩形（无 meta）剥除 __truncated__/__size_bytes__ 再放行（payload_ref
+            # 等解析键原样保留，归属寻址语义不变）。
+            from app.services.message_payload_service import stub_markers_trusted
+            if not stub_markers_trusted(val):
+                def _strip_mk(v):
+                    if isinstance(v, list):
+                        return [_strip_mk(x) for x in v]
+                    if isinstance(v, dict):
+                        return {k: _strip_mk(x) for k, x in v.items()
+                                if k not in ("__truncated__", "__size_bytes__")}
+                    return v
+                try:
+                    out[field] = json.dumps(_strip_mk(json.loads(val)), ensure_ascii=False)
+                    changed = True  # 复审 round2 New-#1：剥除即变更（防 identity 快路径吞掉）
+                except (ValueError, TypeError):
+                    pass
             continue
-        out[field] = build_field_stub(field, val)
+        from app.services.message_payload_service import build_field_stub_ex, field_slim_cut
+        # W6 A4 热路：轻探先行——thin（无剪裁且 ≤inline cap）直接原样，免建桩
+        if not field_slim_cut(field, val) and len(val) <= _inline_max_chars():
+            continue
+        out[field] = build_field_stub_ex(field, val)[0]
         changed = True
     return out if changed else m
 

@@ -764,20 +764,27 @@ async def mark_interrupted_streams(db) -> int:
     部署约束（A4.9 r1 I1）：本 sweep 无实例归属——**同一数据库只支持单实例
     运行本服务**（多实例共库时 A 实例重启会把 B 实例的在途行翻 interrupted）。
     同库多副本（如 weave_blah 旧版）不建 streaming 行，不受影响。
-    """
 
-    await db.execute(
-        sa_delete(Message).where(
-            Message.delivery_status == "streaming",
-            (Message.content == "") | (Message.content.is_(None)),
-        )
-    )
-    result = await db.execute(
-        sa_update(Message)
+    W4 项5（2026-10-06）：翻转/删除必须走 ORM 实例路径而非 Core bulk DML——
+    bulk update()/delete() 不触发 mapper 事件（仅 flush 逐对象触发），sync_capture
+    捕获不到 streaming→interrupted 的终态翻转，残稿跨设备不可见直至全量 resync，
+    与 sync_capture「翻 terminal 后由当次提交正常发射」承诺相悖。ORM 翻转经
+    after_update 发射（_emit 将 update coerce 为 create）；空壳 ORM 删除的
+    after_delete 被 _emit 的 streaming 守卫抑制（该行 create 从未发射，delete
+    也不该发射/留墓碑）。
+    """
+    rows = (await db.execute(
+        select(Message)
         .where(Message.delivery_status == "streaming")
-        .values(delivery_status="interrupted")
-    )
-    return int(getattr(result, "rowcount", 0) or 0)
+    )).scalars().all()
+    flipped = 0
+    for row in rows:
+        if row.content:
+            row.delivery_status = "interrupted"
+            flipped += 1
+        else:
+            await db.delete(row)
+    return flipped
 
 
 def _drop_unshown_pre_tool_prose(assistant_content: str, gate) -> str:
@@ -4566,7 +4573,16 @@ async def resume_stream(
     Accepts JSON body: {"conversation_id": "xxx"}
     Uses subscribe_with_snapshot() for atomic replay + subscribe —
     no duplication gap between replay and live deltas.
+
+    部署排空扩面（D-12，2026-10-06）：drain 中拒收 resume——排空窗口不接入
+    新客户端流（重连请等新进程），先于任何 buffer 访问。
     """
+    if _agent_registry.is_draining:
+        raise HTTPException(
+            status_code=503,
+            detail="server is draining for restart — please retry in a few seconds",
+            headers={"Retry-After": "5"},
+        )
     body = await request.json()
     conversation_id = body.get("conversation_id")
     if not conversation_id:

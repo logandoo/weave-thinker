@@ -86,8 +86,9 @@ if (typeof window !== 'undefined' && !_visibilityChangeHandler) {
             s.streaming = true
             s.tabSwitchAbort = false
             store.currentError = null
+            store.currentNotice = null
             const resumed = await store.resumeActiveStream(convId)
-            if (!resumed && s.streaming && !s.abortController) {
+            if (resumed !== 'resumed' && s.streaming && !s.abortController) {
               void store.tryReconnectOrSync(convId, null, s)
             }
             return
@@ -105,7 +106,7 @@ if (typeof window !== 'undefined' && !_visibilityChangeHandler) {
       // resume 失败时进入有界恢复（重试 resume → syncAfterAbort 轮询），
       // 不能停在 streaming=true 无人驱动的状态。
       const resumed = await store.resumeActiveStream(convId)
-      if (!resumed && s.streaming && !s.abortController) {
+      if (resumed !== 'resumed' && s.streaming && !s.abortController) {
         void store.tryReconnectOrSync(convId, null, s)
       }
     }

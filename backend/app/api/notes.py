@@ -315,6 +315,11 @@ def estimate_tokens(content: str) -> int:
     return cjk + (other + 3) // 4
 
 
+def _read_export_file(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', '_', name).strip()
     if not name:
@@ -2714,10 +2719,14 @@ async def list_notes(
 @router.post("/notes/bulk-export")
 async def bulk_export_notes(
     export_data: NoteBulkExport,
+    endnote_enabled: bool = True,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """Export multiple notes as PDF or MD. Returns a ZIP archive."""
+    # UPSTREAM_TODO_20261006 项 7（评审 A Critical-1）：此前 endnote_enabled 未定义 →
+    # 端点全格式 500（key_parts 无条件求值连 md 路径一并炸）。镜像 export_note 的
+    # 查询参数模式（本文件 export_note 签名）。
     note_ids = list(dict.fromkeys(export_data.note_ids))
     fmt = export_data.format.lower()
     if fmt not in ("md", "pdf"):
@@ -2737,29 +2746,46 @@ async def bulk_export_notes(
 
     workspace_root = await _get_note_workspace_root(db, current_user.id)
 
-    items: list[tuple[str, str, bytes]] = []
-    for note in notes:
-        title = note.title or "untitled"
-        safe_name = sanitize_filename(title)
-        if fmt == "md":
-            content = await asyncio.to_thread(_build_note_md, note, workspace_root)
-            items.append((safe_name, "md", content.encode("utf-8")))
-        else:
-            try:
-                pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root, endnote_enabled)
-            except Exception:
-                logger.exception("PDF rendering failed for note %s", note.id)
-                pdf_bytes = b""
-            items.append((safe_name, "pdf", pdf_bytes))
+    # W6 fix-round（A4.9 B-I5）：批量同步导出整体走去重入口（登记/去重/单飞/护栏）
+    from app.services.export_registry import render_with_dedup, workspace_fingerprint
 
-    def _build_zip() -> bytes:
+    def _render_all_items() -> list[tuple[str, str, bytes]]:
+        out: list[tuple[str, str, bytes]] = []
+        for note in notes:
+            title = note.title or "untitled"
+            safe_name = sanitize_filename(title)
+            if fmt == "md":
+                content = _build_note_md(note, workspace_root)
+                out.append((safe_name, "md", content.encode("utf-8")))
+            else:
+                try:
+                    pdf_bytes = _render_note_pdf(note, workspace_root, endnote_enabled)
+                except Exception:
+                    logger.exception("PDF rendering failed for note %s", note.id)
+                    pdf_bytes = b""
+                out.append((safe_name, "pdf", pdf_bytes))
+        return out
+
+    def _render_zip() -> bytes:
+        _items = _render_all_items()
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for safe_name, ext, data in items:
+            for safe_name, ext, data in _items:
                 zf.writestr(f"{safe_name}.{ext}", data)
         return zip_buffer.getvalue()
 
-    zip_data = await asyncio.to_thread(_build_zip)
+    key_parts = ("note-sync-bulk", fmt,
+                 *(f"{n.id}:{n.updated_at}" for n in notes),
+                 str(endnote_enabled) if fmt == "pdf" else "-",
+                 workspace_fingerprint(workspace_root))
+    output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output_files")
+    os.makedirs(output_dir, exist_ok=True)
+    file_path, _name, _cached = await render_with_dedup(
+        db, current_user.id, task_type="note-sync-bulk", fmt=fmt,
+        key_parts=key_parts, render_fn=_render_zip,
+        output_dir=output_dir, filename_base="notes_export", ext="zip",
+        endnote_enabled=endnote_enabled)
+    zip_data = await asyncio.to_thread(_read_export_file, file_path)
     return StreamingResponse(
         io.BytesIO(zip_data),
         media_type="application/zip",
@@ -2796,31 +2822,37 @@ async def export_note(
 
     title = note.title or "untitled"
     safe_name = sanitize_filename(title)
-
+    # W6 fix-round（A4.9 B-I5）：同步导出同样登记/去重/护栏（render_with_dedup）
+    from app.services.export_registry import render_with_dedup, workspace_fingerprint
+    key_parts = ("note-sync", fmt, title, getattr(note, "content", "") or "",
+                 str(note.updated_at), str(endnote_enabled) if fmt == "pdf" else "-",
+                 workspace_fingerprint(workspace_root))
+    output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output_files")
+    os.makedirs(output_dir, exist_ok=True)
     if fmt == "md":
-        content = await asyncio.to_thread(_build_note_md, note, workspace_root)
-        encoded = quote(f"{safe_name}.md", safe='')
-        return StreamingResponse(
-            io.BytesIO(content.encode("utf-8")),
-            media_type="text/markdown; charset=utf-8",
-            headers={
-                "Content-Disposition": f"attachment; filename=\"note.md\"; filename*=UTF-8''{encoded}"
-            },
-        )
+        render_fn = lambda: _build_note_md(note, workspace_root).encode("utf-8")
+        media, ext = "text/markdown; charset=utf-8", "md"
     else:
-        try:
-            pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root, endnote_enabled)
-        except Exception:
-            logger.exception("PDF rendering failed")
-            raise HTTPException(status_code=500, detail="PDF rendering failed")
-        encoded = quote(f"{safe_name}.pdf", safe='')
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename=\"note.pdf\"; filename*=UTF-8''{encoded}"
-            },
-        )
+        render_fn = lambda: _render_note_pdf(note, workspace_root, endnote_enabled)
+        media, ext = "application/pdf", "pdf"
+    try:
+        file_path, _name, _cached = await render_with_dedup(
+            db, current_user.id, task_type="note-sync", fmt=fmt,
+            key_parts=key_parts, render_fn=render_fn,
+            output_dir=output_dir, filename_base=safe_name, ext=ext,
+            endnote_enabled=endnote_enabled)
+    except Exception:
+        logger.exception("export rendering failed")
+        raise HTTPException(status_code=500, detail="PDF rendering failed")
+    data = await asyncio.to_thread(_read_export_file, file_path)
+    encoded = quote(f"{safe_name}.{ext}", safe='')
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=media,
+        headers={
+            "Content-Disposition": f"attachment; filename=\"note.{ext}\"; filename*=UTF-8''{encoded}"
+        },
+    )
 
 
 @router.post("/notes/bulk-delete", response_model=BulkDeleteResponse)

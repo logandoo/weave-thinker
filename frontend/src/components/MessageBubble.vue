@@ -57,7 +57,7 @@
       <!-- P0-1 懒挂载：折叠态不渲染 body（formattedReasoning 不求值），首开才挂载 -->
       <div v-if="message.reasoning_content && message.role === 'assistant' && !hasReasoningStep" class="reasoning-block">
         <details @toggle="(e) => onLazyToggle('top-reasoning', e)">
-          <summary class="reasoning-summary">💭 思考过程<span v-if="topReasoningStubbed" class="trunc-badge">已截断 · 展开取全文</span></summary>
+          <summary class="reasoning-summary"><span class="step-title">💭 思考过程</span><span v-if="topReasoningStubbed" class="trunc-badge">展开取全文</span></summary>
           <div v-if="isLazyOpen('top-reasoning')" class="reasoning-text" v-html="formattedReasoning"></div>
         </details>
       </div>
@@ -65,18 +65,19 @@
         <template v-for="(item, idx) in displaySequence" :key="idx">
           <template v-if="item.type === 'text'">
             <div class="text segment-text" v-html="formatTextWithCitations(item.content)"></div>
-            <span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span>
+            <!-- 正文段恒全量：仅显式截断标记才出徽标（不按长度造噪音） -->
+            <span v-if="item.__truncated__ && truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span>
           </template>
           <div v-else-if="item.type === 'reasoning_step'" class="reasoning-block">
             <details @toggle="(e) => onLazyToggle(`rs-${idx}`, e)">
-              <summary class="reasoning-summary">{{ item.title || '💭 思考过程' }}<span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
+              <summary class="reasoning-summary"><span class="step-title">{{ item.title || '💭 思考过程' }}</span><span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
               <div v-if="isLazyOpen(`rs-${idx}`)" class="reasoning-text" v-html="renderMarkdownToHtml(item.content)"></div>
             </details>
           </div>
           <ToolPartCard v-else-if="isToolSequenceItem(item)" :item="toToolPartItem(item)" />
           <div v-else class="agent-step-block">
             <details @toggle="(e) => onLazyToggle(`as-${idx}`, e)">
-              <summary class="agent-step-summary">⚙️ {{ item.title || item.name }}<span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
+              <summary class="agent-step-summary"><span class="step-title">⚙️ {{ item.title || item.name }}</span><span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
               <template v-if="isLazyOpen(`as-${idx}`)">
                 <div v-if="item.step_type === 'llm'" class="agent-step-markdown">
                   <StreamMarkdown :content="item.content" />
@@ -397,7 +398,7 @@ import MediaLightbox from './MediaLightbox.vue'
 import { useInlineImageZoom } from '@/composables/useInlineImageZoom'
 import { useChatStore } from '@/stores/chat'
 import { resolveDisplaySequence, forceFullBody } from '@/stores/streamReducer'
-import { isExternalizedStub } from '@/api/chat'
+import { isExternalizedStub, stubMarkersTrusted } from '@/api/chat'
 import { classifyFile } from '@/composables/filePreview'
 import { buildDownloadUrl } from '@/api/workspaceFiles'
 import { downloadUrl } from '@/composables/useDownload'
@@ -833,6 +834,24 @@ const parsedToolResultsData = computed<ToolResultsData | null>(() => {
   if (!props.message.tool_results) return null
   try {
     let parsed = JSON.parse(props.message.tool_results)
+    // W6 fix-round（A4.9 spoof 修）：非桩原文的 __* 标记键=内容伪造面，剥除——
+    // 取回后徽标 N 只信实长 walk（桩期标记由后端签发）。
+    // 评审 A Critical-1（fix-round 1）：跳过剥除的判据=**严格 meta 形**标记信任
+    // （stubMarkersTrusted）——伪造 `_externalized`+标记的宽松桩不得免剥。
+    if (!stubMarkersTrusted(props.message.tool_results)) {
+      const stripMk = (v: unknown): unknown => {
+        if (Array.isArray(v)) return v.map(stripMk)
+        if (v && typeof v === 'object') {
+          const o: Record<string, unknown> = {}
+          for (const [k, x] of Object.entries(v)) {
+            if (!k.startsWith('__')) o[k] = stripMk(x)
+          }
+          return o
+        }
+        return v
+      }
+      parsed = stripMk(parsed) as typeof parsed
+    }
     // P2-1（评审 I5）：数组形 tool_results 的外置桩是 {meta..., items:[...]} 包装——解包回数组
     if (parsed && !Array.isArray(parsed) && parsed._externalized && Array.isArray(parsed.items)) {
       parsed = parsed.items
@@ -1079,7 +1098,15 @@ const isSearchFailed = computed(() => {
   return parsedToolResultsData.value?.search_failed === true
 })
 
-function handleUseUnqualified() {
+async function handleUseUnqualified() {
+  // 懒加载协同（2026-10-06 二波）：unqualified_results 可能住在桩预览里——
+  // 强制重跑的 forceJson 喂给模型的必须是全文而非 500 字预览（A4.9 B-M）
+  const m = props.message
+  if (m.conversation_id) {
+    const ok = await useChatStore().ensureMessageFull(m.conversation_id, m.id, ['tool_results'])
+    // fail-closed（scoped 复审 Minor）：取回失败不得把桩预览喂给模型
+    if (!ok) return
+  }
   const data = parsedToolResultsData.value
   if (!data?.unqualified_results) return
   const forceJson = JSON.stringify(data.unqualified_results)
@@ -1164,10 +1191,44 @@ async function retryFetchFull(field?: PayloadFieldName): Promise<void> {
   }))
 }
 
-function truncBadge(item: { __truncated__?: boolean; __size_bytes__?: number }): string | null {
-  if (!item || !item.__truncated__) return null
-  const n = item.__size_bytes__
-  return typeof n === 'number' && n > 0 ? `已截断 · 共 ${n} 字` : '已截断 · 展开取全文'
+// D-14（2026-10-06 三波）：徽标按项**实长派生**，跨字段取回恒稳——桩期取
+// __size_bytes__（被剪值全量累计）、取回后取内容实长；N>预览容量(500) 才显示。
+// 旧实现钉桩标记，字段级取回后全卡徽标蒸发（用户实测）。
+// N=项文本总量（与后端 _item_text_total 同构：Σlen(子树字符串)，__ 键除外）
+// ——跨字段取回恒稳（A4.9 C2）
+// 徽标 N 计数口径（与后端 _item_text_total 同构）：跳标签/元数据键，同值去重
+const LABEL_KEYS = new Set(['type', 'step_type', 'name', 'status', 'id', 'message_id', 'conversation_id'])
+
+function _textTotal(v: unknown, seen: Set<string> = new Set()): number {
+  if (typeof v === 'string') {
+    // 同值去重（双侧同构，A4.9 C2）：toToolPartItem 的 content 复制键不得双计
+    if (seen.has(v)) return 0
+    seen.add(v)
+    return v.length
+  }
+  if (Array.isArray(v)) return v.reduce((a: number, x) => a + _textTotal(x, seen), 0)
+  if (v && typeof v === 'object') {
+    let s = 0
+    for (const [k, x] of Object.entries(v)) {
+      if (k.startsWith('__') || LABEL_KEYS.has(k)) continue
+      s += _textTotal(x, seen)
+    }
+    return s
+  }
+  return 0
+}
+
+function _itemChars(it: Record<string, unknown>): number {
+  const declared = it.__size_bytes__
+  if (typeof declared === 'number' && declared > 0) return declared
+  return _textTotal(it)
+}
+
+function truncBadge(item: Record<string, unknown> | null | undefined): string | null {
+  if (!item) return null
+  const n = _itemChars(item)
+  // D-10：删「已截断」字样；共 N 字=项内容总字数（感知+规模双义）
+  return n > 500 ? `共 ${n} 字` : null
 }
 
 const topReasoningStubbed = computed(() => isExternalizedStub(props.message.reasoning_content))
@@ -3129,6 +3190,23 @@ onMounted(() => {
 }
 
 /* ─── 正文截断 UX（2026-10-03）：截断徽标 / 取回状态 / 长文折叠 ─────────── */
+/* W6 D-15（2026-10-06）：summary 行手机动态省略——标题承担收缩（CSS ellipsis
+   按布局宽自适应，禁固定字数机械截断），徽标/图标 shrink-0 恒全显。 */
+.reasoning-summary,
+.agent-step-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+}
+
+.reasoning-summary .step-title,
+.agent-step-summary .step-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .trunc-badge {
   display: inline-block;
   margin-left: 0.5em;
@@ -3139,6 +3217,8 @@ onMounted(() => {
   font-weight: 400;
   color: var(--color-text-light);
   vertical-align: middle;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 /* 渐进落库（2026-10-06）：中断残稿徽标——skin token 体系，禁硬编码色 */

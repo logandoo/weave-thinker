@@ -6,7 +6,7 @@ import { downloadBlob, type DownloadResult } from '@/composables/useDownload'
 import type { Notebook, Note, NoteListItem, BulkDeleteResult, BulkMoveResult, NoteSearchResult } from '@/types'
 
 // 尾注开关（与 stores/editorPrefs 同源 localStorage 键）——导出渲染随开关（wave-3 #5）
-function endnoteExportQuery(): { endnote_enabled: boolean } {
+export function endnoteExportQuery(): { endnote_enabled: boolean } {
   return { endnote_enabled: localStorage.getItem('wt-endnote-enabled') === '1' }
 }
 
@@ -159,7 +159,7 @@ export const notesApi = {
     const response = await api.post('/notes/notes/bulk-export', {
       note_ids: noteIds,
       format,
-    }, { responseType: 'blob', signal })
+    }, { responseType: 'blob', signal, params: { ...endnoteExportQuery() } })
     const blob = new Blob([response.data], { type: 'application/zip' })
     return await downloadBlob(blob, 'notes_export.zip', 'application/zip')
   },

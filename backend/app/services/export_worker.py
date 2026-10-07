@@ -132,22 +132,22 @@ class ExportWorker:
             await asyncio.to_thread(os.makedirs, output_dir, exist_ok=True)
 
             if task.task_type == "single":
-                file_path, filename = await self._export_single(task, output_dir)
+                file_path, filename, chash = await self._export_single(task, output_dir)
             elif task.task_type == "bulk":
-                file_path, filename = await self._export_bulk(task, output_dir)
+                file_path, filename, chash = await self._export_bulk(task, output_dir)
             else:
                 raise ValueError(f"Unknown task_type: {task.task_type}")
 
             async with AsyncSessionLocal() as db:
                 t = await db.get(ExportTask, task_id)
                 if t is None or t.status == "cancelled":
-                    if await asyncio.to_thread(os.path.isfile, file_path):
-                        await asyncio.to_thread(os.remove, file_path)
+                    # W6 fix-round：产物可能是去重共享文件——不删（_cleanup_old_files TTL 兜底）
                     return
                 t.status = "completed"
                 t.progress = 1.0
                 t.file_path = file_path
                 t.filename = filename
+                t.content_hash = chash  # W6 fix-round A4.9 C1：哈希随完成块落库
                 t.completed_at = datetime.utcnow()
                 await db.commit()
 
@@ -160,7 +160,7 @@ class ExportWorker:
             logger.exception("Export task %s failed", task_id)
             await self._mark_failed(task_id, str(exc))
 
-    async def _export_single(self, task: ExportTask, output_dir: str) -> tuple[str, str]:
+    async def _export_single(self, task: ExportTask, output_dir: str) -> tuple[str, str, str]:
         async with AsyncSessionLocal() as db:
             result = await db.execute(
                 select(Note).join(Notebook).where(
@@ -176,26 +176,36 @@ class ExportWorker:
 
         title = note.title or "untitled"
         from app.api.notes import sanitize_filename, _render_note_pdf, _build_note_md
+        from app.services.export_registry import (
+            fingerprint, render_with_dedup, workspace_fingerprint)
         safe_name = sanitize_filename(title)
+        fmt = task.format or "pdf"
 
-        if task.format == "pdf":
-            await self._update_progress(task.id, 0.1)
-            pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root)
+        # W6 fix-round（A4.9 C1）：笔记导出同享登记/去重/单飞/护栏——
+        # render_with_dedup 的 registry 行落在单飞窗口内（等待方复用首个产物）；
+        # 指纹含工作区指纹+渲染版本盐（改图/改管线不失配旧缓存）。
+        ee = getattr(task, "endnote_enabled", True)
+        # 挂账清零波 T3：ee 仅 pdf 渲染输入——md 键不得按 ee 分叉（缓存恒等）
+        ee_key = str(ee) if fmt == "pdf" else "-"
+        key_parts = ("note", fmt, title, getattr(note, "content", "") or "",
+                     str(note.updated_at), ee_key, workspace_fingerprint(workspace_root))
+        if fmt == "pdf":
+            render_fn = lambda: _render_note_pdf(note, workspace_root, ee)
             ext = "pdf"
-            file_data = pdf_bytes
         else:
-            content = await asyncio.to_thread(_build_note_md, note, workspace_root)
+            render_fn = lambda: _build_note_md(note, workspace_root).encode("utf-8")
             ext = "md"
-            file_data = content.encode("utf-8")
 
-        unique_name = f"{safe_name}_{task.id[:8]}.{ext}"
-        file_path = os.path.join(output_dir, unique_name)
-        await asyncio.to_thread(self._write_file, file_path, file_data)
+        async with AsyncSessionLocal() as db:
+            file_path, file_name, _cached = await render_with_dedup(
+                db, task.user_id, task_type="note", fmt=fmt,
+                key_parts=key_parts, render_fn=render_fn,
+                output_dir=output_dir, filename_base=safe_name, ext=ext,
+                endnote_enabled=ee)
         await self._update_progress(task.id, 1.0)
+        return file_path, file_name, fingerprint(task.user_id, *key_parts)
 
-        return file_path, f"{safe_name}.{ext}"
-
-    async def _export_bulk(self, task: ExportTask, output_dir: str) -> tuple[str, str]:
+    async def _export_bulk(self, task: ExportTask, output_dir: str) -> tuple[str, str, str]:
         note_ids = json.loads(task.note_ids) if task.note_ids else []
         if not note_ids:
             raise ValueError("No notes selected")
@@ -214,9 +224,21 @@ class ExportWorker:
             raise ValueError("Notes not found")
 
         from app.api.notes import sanitize_filename, _render_note_pdf, _build_note_md
+        from app.services.export_registry import (
+            fingerprint, render_with_dedup, workspace_fingerprint)
+        fmt = task.format or "pdf"
 
-        unique_name = f"notes_export_{task.id[:8]}.zip"
-        file_path = os.path.join(output_dir, unique_name)
+        # W6 fix-round（A4.9 C1/B-I6）：批量导出同样走 render_with_dedup——
+        # 登记 fmt=task.format（旧 "zip" 查询永不命中已修）；单飞覆盖完成窗口；
+        # 指纹含工作区指纹+渲染版本盐。
+        ee = getattr(task, "endnote_enabled", True)
+        # 挂账清零波 T3：ee 仅 pdf 渲染输入——md 键不得按 ee 分叉（缓存恒等）
+        ee_key = str(ee) if fmt == "pdf" else "-"
+        key_parts = (
+            "notes-bulk", fmt,
+            *(f"{n.id}:{n.updated_at}:{getattr(n, 'content', '') or ''}" for n in notes),
+            ee_key, workspace_fingerprint(workspace_root))
+        chash = fingerprint(task.user_id, *key_parts)
 
         def build_zip() -> bytes:
             zip_buffer = io.BytesIO()
@@ -224,42 +246,23 @@ class ExportWorker:
                 for note in notes:
                     title = note.title or "untitled"
                     safe_name = sanitize_filename(title)
-                    if task.format == "pdf":
-                        pdf_bytes = _render_note_pdf(note, workspace_root)
+                    if fmt == "pdf":
+                        pdf_bytes = _render_note_pdf(note, workspace_root, ee)
                         zf.writestr(f"{safe_name}.pdf", pdf_bytes)
                     else:
                         content = _build_note_md(note, workspace_root)
                         zf.writestr(f"{safe_name}.md", content)
             return zip_buffer.getvalue()
 
-        total = len(notes)
         await self._update_progress(task.id, 0.05)
-
-        if task.format == "pdf" and total > 1:
-            pdf_items: list[tuple[str, bytes]] = []
-            for idx, note in enumerate(notes):
-                title = note.title or "untitled"
-                safe_name = sanitize_filename(title)
-                pdf_bytes = await asyncio.to_thread(_render_note_pdf, note, workspace_root)
-                pdf_items.append((safe_name, pdf_bytes))
-                progress = 0.05 + 0.9 * ((idx + 1) / total)
-                await self._update_progress(task.id, min(progress, 0.95))
-
-            def _build_pdf_zip(items: list[tuple[str, bytes]]) -> bytes:
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for safe_name, pdf_bytes in items:
-                        zf.writestr(f"{safe_name}.pdf", pdf_bytes)
-                return zip_buffer.getvalue()
-
-            zip_data = await asyncio.to_thread(_build_pdf_zip, pdf_items)
-        else:
-            zip_data = await asyncio.to_thread(build_zip)
-
-        await asyncio.to_thread(self._write_file, file_path, zip_data)
+        async with AsyncSessionLocal() as db:
+            file_path, file_name, _cached = await render_with_dedup(
+                db, task.user_id, task_type="note-bulk", fmt=fmt,
+                key_parts=key_parts, render_fn=build_zip,
+                output_dir=output_dir, filename_base="notes_export", ext="zip",
+                endnote_enabled=ee)
         await self._update_progress(task.id, 1.0)
-
-        return file_path, "notes_export.zip"
+        return file_path, "notes_export.zip", chash
 
     @staticmethod
     def _write_file(path: str, data: bytes) -> None:
@@ -272,7 +275,7 @@ class ExportWorker:
                 stmt = (
                     update(ExportTask)
                     .where(ExportTask.id == task_id, ExportTask.status == "running")
-                    .values(progress=min(progress, 0.99), updated_at=datetime.utcnow())
+                    .values(progress=min(progress, 0.99))  # W6 fix-round：updated_at 列不存在（幽灵列，曾误claim已修）
                 )
                 await db.execute(stmt)
                 await db.commit()
@@ -323,13 +326,13 @@ class ExportWorker:
                 )
                 result = await db.execute(stmt)
                 old_tasks = result.scalars().all()
+                # UPSTREAM_TODO_20261006 项 8 + 评审 B-1/B-2（fix-round 1）：
+                # content-addressed 产物共享命名——删行+独占收割同文件锁原子序
+                # （delete_row_and_reap_file：在写产物不收割、并发双删由后到者收割）。
+                from app.services.export_registry import delete_row_and_reap_file
+
                 for t in old_tasks:
-                    if t.file_path and await asyncio.to_thread(os.path.isfile, t.file_path):
-                        await asyncio.to_thread(os.remove, t.file_path)
-                    await db.delete(t)
-                if old_tasks:
-                    await db.commit()
-                    logger.info("Cleaned up %d old export tasks", len(old_tasks))
+                    await delete_row_and_reap_file(db, t)
         except Exception:
             pass
 

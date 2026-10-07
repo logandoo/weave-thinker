@@ -62,6 +62,10 @@ app.add_middleware(
     allow_credentials=config.security_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
+    # UPSTREAM_TODO_20261007 项2：drain 门 503 的 Retry-After 不在 CORS 安全
+    # 清单——跨源（app://weave → http://127.0.0.1:<端口>）必须显式 expose，
+    # 否则客户端读不到服务端建议退避、恒回退内置 5000ms。
+    expose_headers=["Retry-After"],
 )
 
 app.include_router(auth.router)
@@ -166,6 +170,14 @@ async def startup_event():
     except Exception:
         logger.exception("drain token bootstrap failed (fail-open; drain 端点将拒绝无令牌调用)")
 
+    # sync 波（2026-09-26 自 weave-thinker-client 上游）：注册 ORM 变更捕获；
+    # [sync].enabled 在发射期逐事件读取（端点侧同配置请求期 404），SIGHUP 热改不脱钩。
+    # W4 项5（2026-10-06）：注册必须先于 boot sweep——sweep 经 ORM 翻转/删除，
+    # mapper 事件在 sweep 提交的 flush 里触发，晚注册=事件时零监听器=零 SyncEvent
+    # （残稿依旧跨端不可见，A4.9 双评审 Critical 实证）。
+    from app.services.sync_capture import register_sync_capture
+    register_sync_capture()
+
     # 渐进落库 sweep（2026-10-06，conv ae9aa092）：上次进程死亡（部署强杀/
     # 崩溃/OOM）遗留的 streaming 在途行全部翻 interrupted——用户刷新后看到
     # 部分正文+「已中断」徽标，而不是整段蒸发。fail-open 不阻塞启动。
@@ -179,11 +191,6 @@ async def startup_event():
             logger.warning("boot sweep: %d streaming message(s) marked interrupted", _swept)
     except Exception:
         logger.exception("boot sweep mark_interrupted_streams failed (fail-open)")
-
-    # sync 波（2026-09-26 自 weave-thinker-client 上游）：注册 ORM 变更捕获；
-    # [sync].enabled 在发射期逐事件读取（端点侧同配置请求期 404），SIGHUP 热改不脱钩。
-    from app.services.sync_capture import register_sync_capture
-    register_sync_capture()
 
     # 死磕 DAG 波次 W2d：进程重启后残留的 active 目标循环不可能存活（SSE
     # 驱动随进程消失）——统一停泊为 paused + PAUSED 包，避免幽灵 active 状态。

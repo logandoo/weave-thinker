@@ -5,20 +5,10 @@ import api from './client'
 import { downloadBlob, type DownloadResult } from '@/composables/useDownload'
 import { clearStoredAuth } from '@/composables/useAuth'
 import type { Conversation, Message, ChatRequest, ConversationUpdate, BulkDeleteResult, ConversationSearchResult, ImportResult } from '@/types'
-import { dispatchStreamPayload, type StreamHandlers, type ResumeHandlers, type StreamStatusResult, type ReplayPayload } from './streamDispatch'
+import { dispatchStreamPayload, fetchWithDrainRetry, classifyResumeFailure, type StreamHandlers, type ResumeHandlers, type StreamStatusResult, type ReplayPayload } from './streamDispatch'
 
-export { dispatchStreamPayload } from './streamDispatch'
+export { dispatchStreamPayload, isExternalizedStub, stubMarkersTrusted } from './streamDispatch'
 export type { StreamHandlers, ResumeHandlers, StreamStatusResult, ReplayPayload } from './streamDispatch'
-
-/** P2-1：外置桩检测（JSON 语义，键序无关——tool_results 桩以 display_sequence 开头）。 */
-export function isExternalizedStub(v: unknown): boolean {
-  if (typeof v !== 'string' || v.length < 2 || !v.startsWith('{')) return false
-  try {
-    return (JSON.parse(v) as { _externalized?: boolean })._externalized === true
-  } catch {
-    return false
-  }
-}
 
 function authHeaders(): Record<string, string> {
   const token = localStorage.getItem('chatllm_token')
@@ -106,7 +96,11 @@ export const chatApi = {
   },
 
   async getMessages(conversationId: string): Promise<Message[]> {
-    const { data } = await api.get(`/conversations/${conversationId}/messages`)
+    // 懒加载默认 slim（2026-10-06 二波）：本接口现无调用方——默认 slim 拆掉
+    // 「未来调用方静默全量载荷」的脚枪（A4.9 minor）
+    const { data } = await api.get(`/conversations/${conversationId}/messages`, {
+      params: { include: 'slim' },
+    })
     return data
   },
 
@@ -116,8 +110,10 @@ export const chatApi = {
     limit: number,
   ): Promise<{ messages: Message[]; has_more_messages: boolean; oldest_message_id: string | null }> {
     // 游标分页：返回 [messages 升序 + has_more + oldest]（服务端 /messages?before_id 窗口）
+    // include=slim（2026-10-06 懒加载回归修复）：上滚页不得解桩回全文——思考/工具
+    // 字段以桩交付，全文只经 /messages/{id}/payload/{field} 按字段取回
     const { data } = await api.get(`/conversations/${conversationId}/messages`, {
-      params: { before_id: beforeId, limit },
+      params: { before_id: beforeId, limit, include: 'slim' },
     })
     const messages: Message[] = Array.isArray(data) ? data : []
     return {
@@ -240,7 +236,9 @@ export const chatApi = {
 
   async resumeStream(conversationId: string, handlers: ResumeHandlers): Promise<void> {
     const baseUrl = (import.meta as any).env?.VITE_API_BASE || ''
-    const response = await fetch(`${baseUrl}/api/chat/stream/resume`, {
+    // drain 门 503+Retry-After 瞬时重试（UPSTREAM_TODO_20261006 项 10）：有界退避，
+    // 耗尽走轻提示（onTransient）交还有界恢复——不落红硬错。
+    const response = await fetchWithDrainRetry(fetch, `${baseUrl}/api/chat/stream/resume`, {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify({ conversation_id: conversationId }),
@@ -248,12 +246,19 @@ export const chatApi = {
     })
 
     if (!response.ok) {
-      if (response.status === 404) {
+      const failure = classifyResumeFailure(response.status)
+      if (failure === 'skip') {
         return
       }
-      if (response.status === 401) {
+      if (failure === 'auth-expired') {
         clearStoredAuth()
         window.location.href = '/app/frontend/login?expired=1'
+        return
+      }
+      if (failure === 'transient-drain' || failure === 'transient-retry') {
+        // 因由三分类（挂账清理波 criterion 3）：排空/限流/网关——轻提示按因由
+        const reason = failure === 'transient-drain' ? 'drain' : (response.status === 429 ? 'busy' : 'gateway')
+        handlers.onTransient?.(reason)
         return
       }
       handlers.onError(`Resume failed: HTTP ${response.status}`)

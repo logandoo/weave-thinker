@@ -86,13 +86,15 @@ async def get_voice_session_messages(
         .order_by(Message.created_at)
     )
     messages = msg_result.scalars().all()
+    # W6 A5（2026-10-06 欠账）：列表读同样 slim——未展开工具/思考全文不随列表下发
+    from app.api.message_payloads import slim_message_dict
     return [
-        {
+        slim_message_dict({
             "role": m.role,
             "content": m.content or "",
             "tool_calls": m.tool_calls,
             "tool_results": m.tool_results,
-        }
+        })
         for m in messages
         if m.role in ("user", "assistant") and m.content
     ]
@@ -108,6 +110,12 @@ async def voice_duplex_ws(
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="Voice mode disabled")
         return
 
+    # 部署排空扩面（D-12，2026-10-06）：drain 中拒接新语音会话——accept 后以
+    # 1013 TRY_AGAIN_LATER 关闭（accept 前 close 只会得到握手 403，1013 到不了
+    # 客户端，A4.9 二波 A-M3）；在途会话由 active_session_count 计入排空计数。
+    from app.services.active_agent_registry import ActiveAgentRegistry
+    draining = ActiveAgentRegistry.get_instance().is_draining
+
     try:
         current_user = await get_current_user_from_websocket(websocket, db)
     except HTTPException as exc:
@@ -115,8 +123,13 @@ async def voice_duplex_ws(
         return
 
     await websocket.accept()
+    if draining:
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="server is draining")
+        return
     conversation_id = websocket.query_params.get("conversation_id") or None
     session = VoiceDuplexSession(websocket, current_user, db, conversation_id=conversation_id)
+    from app.services import voice_service as _vs
+    _vs.begin_session()
     try:
         await session.run()
     except Exception as exc:
@@ -128,6 +141,7 @@ async def voice_duplex_ws(
         except Exception:
             pass
     finally:
+        _vs.end_session()
         try:
             await websocket.close()
         except Exception:

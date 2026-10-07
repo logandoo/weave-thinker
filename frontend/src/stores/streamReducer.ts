@@ -360,15 +360,16 @@ export function resolveDisplaySequence(
       : (textCount === 1 && body ? body : '')
     const curLen = typeof it.content === 'string' ? it.content.length : 0
     if (!full || full.length <= curLen) continue
-    // 校验和守卫（评审 R1 I2 / R2 I4）：__size_bytes__ 是原文精确长度（字），
+    // 校验和守卫（评审 R1 I2 / R2 I4）：__size_bytes__ 是原文精确长度，
     // 位置映射错位（压缩路径曾整体清空 content_segments）时宁可保持预览+标记，
     // 也绝不把「错段」当全文渲染——错内容比截断更糟。无标记（legacy）退化为
     // 长度对比。
     const want = it.__size_bytes__
-    // 码位对齐（复审 N1）：__size_bytes__ 记的是 Python len(v)（Unicode 码位），
-    // JS string.length 是 UTF-16 码元——含 emoji 等非 BMP 字符时二者不等，
-    // 必须用 Array.from 折算码位，否则正文永不愈合
-    if (typeof want === 'number' && want > 0 && Array.from(full).length !== want) continue
+    // UTF-16 码元对齐（UPSTREAM_TODO_20261007 项3；W6 后端口径）：__size_bytes__
+    // = _item_text_total（Python 侧按 UTF-16 码元计数，与 JS string.length 同构）——
+    // 含 emoji 等 astral 字符时码点数≠码元数，用 Array.from 折算会让守卫恒不等，
+    // 正文永不愈合（多发一次取回请求）。守卫度量与后端同源：直接比 full.length。
+    if (typeof want === 'number' && want > 0 && full.length !== want) continue
     if (!out) out = seq.slice()
     const healed: TimelineItem = { ...it, content: full }
     delete healed.__truncated__

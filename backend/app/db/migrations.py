@@ -451,6 +451,139 @@ $$"""),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )"""),
+    # ==== 非 memory-v2 迁移区（W4 归位 2026-10-06）========================
+    # 与 memory v2 无关的迁移一律置于 pgvector_extension 之前（同上方两处约定）：
+    # run_startup_migrations 在 pgvector 缺失时跳过该标记起的连续后缀（§9.5 降级），
+    # 落在后缀里的非 memory 迁移随 memory 块整体跳过 → 无 pgvector 库缺列/缺表。
+    # 后缀纯度由 tests/test_startup_migrations_sql.py
+    # ::test_pgvector_skip_window_suffix_purity 守卫。
+    # UI 偏好（皮肤选择等）：JSON 字符串，见 app/api/skins.py
+    ("users_ui_preferences", "ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_preferences TEXT"),
+    # F2/DC9（2026-09-14）：messages 分页复合索引（加法式，可随时建）
+    ("idx_messages_conv_created", "CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at)"),
+    # F1（2026-09-14）：后台任务运行中补充消息（可空 JSON 数组）
+    ("at_pending_messages", "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS pending_messages TEXT"),
+    # ── 死磕 DAG 波次 W0-W2（2026-09-18）─────────────────────────────
+    ("conversations_deathmatch_acceptance_criteria", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_acceptance_criteria JSON"),
+    ("conversations_deathmatch_failed_directions", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_failed_directions JSON"),
+    ("conversations_deathmatch_pause_state", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_pause_state JSON"),
+    ("conversations_deathmatch_events", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_events JSON"),
+    ("conversations_deathmatch_no_progress_replans", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_no_progress_replans INTEGER DEFAULT 0"),
+    # AEWM 借鉴波（2026-09-25）：证伪台账（anti task-state contamination）
+    ("conversations_deathmatch_retracted_claims", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_retracted_claims JSONB"),
+    # conv-open 性能治理 P1-1（2026-10-03）：超限 tool_results/reasoning_content/
+    # tool_calls 全文外置（DESIGN_conv_open_performance.md），行内留显式 stub。
+    ("message_payloads_v1", (
+        "CREATE TABLE IF NOT EXISTS message_payloads ("
+        "id VARCHAR(36) PRIMARY KEY, "
+        "message_id VARCHAR(36) NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
+        "field VARCHAR(32) NOT NULL, "
+        "content TEXT NOT NULL, "
+        "size_bytes INTEGER NOT NULL DEFAULT 0, "
+        "sha256 VARCHAR(64) NOT NULL, "
+        "created_at TIMESTAMP WITHOUT TIME ZONE)"
+    )),
+    ("idx_message_payloads_message", "CREATE INDEX IF NOT EXISTS idx_message_payloads_message ON message_payloads(message_id, field)"),
+    # 评审 C1 修复（2026-10-03）：per-(message_id,field) 归属唯一，弃 sha 全局去重
+    # （共享行 + CASCADE = 删一消息毁他消息的静默数据丢失）。
+    ("idx_message_payloads_sha", "CREATE INDEX IF NOT EXISTS idx_message_payloads_sha ON message_payloads(sha256)"),
+    ("message_payloads_v2_uniq", (
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='message_payloads_sha256_key') THEN "
+        "ALTER TABLE message_payloads DROP CONSTRAINT message_payloads_sha256_key; END IF; "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='uq_message_payloads_msg_field') THEN "
+        "ALTER TABLE message_payloads ADD CONSTRAINT uq_message_payloads_msg_field UNIQUE (message_id, field); END IF; "
+        "END $$"
+    )),
+    # v3（2026-10-05）：v2 只卸了 CONSTRAINT 形态；v1 窗口期由 create_all 建的库
+    # 携带的是 UNIQUE INDEX 形态 ix_message_payloads_sha256——残留会导致两条字节
+    # 相同的肥字段外置时 IntegrityError（写路径 500）。卸唯一索引并按模型
+    # index=True 语义重建为普通索引（asyncpg 单语句限制：两条迁移分开执行）。
+    ("message_payloads_v3_sha_idx_drop", (
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='ix_message_payloads_sha256' "
+        "AND indexdef ILIKE 'CREATE UNIQUE%') THEN "
+        "DROP INDEX ix_message_payloads_sha256; END IF; END $$"
+    )),
+    ("message_payloads_v3_sha_idx_recreate",
+     "CREATE INDEX IF NOT EXISTS ix_message_payloads_sha256 ON message_payloads(sha256)"),
+    # 渐进落库（2026-10-06，conv ae9aa092）：run 开始即建 assistant 行
+    # （delivery_status='streaming'），周期刷写正文；进程死亡 → 启动 sweep 翻
+    # 'interrupted'；正常 finalize/用户 stop → 'final'。
+    ("messages_delivery_status",
+     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(16) NOT NULL DEFAULT 'final'"),
+    ("idx_messages_delivery_status",
+     "CREATE INDEX IF NOT EXISTS idx_messages_delivery_status ON messages(delivery_status)"),
+    # 被拒/中断草稿台账：审计打回的草稿全文+裁决元数据保留并标记（用户裁定）。
+    ("message_attempts_v1", (
+        "CREATE TABLE IF NOT EXISTS message_attempts ("
+        "id VARCHAR(36) PRIMARY KEY, "
+        "message_id VARCHAR(36) NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
+        "conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, "
+        "attempt_no INTEGER NOT NULL DEFAULT 1, "
+        "status VARCHAR(16) NOT NULL DEFAULT 'rejected', "
+        "content TEXT NOT NULL DEFAULT '', "
+        "verdict_json TEXT, "
+        "created_at TIMESTAMP WITHOUT TIME ZONE)"
+    )),
+    ("idx_message_attempts_message",
+     "CREATE INDEX IF NOT EXISTS idx_message_attempts_message ON message_attempts(message_id, attempt_no)"),
+    # A4.9 r1 M3：message_id 可空 + ON DELETE SET NULL——空终态清理删行时台账
+    # 不随 CASCADE 消失（「被拒草稿保留并标记」用户裁定）。幂等：约束存在才换。
+    ("message_attempts_v2_setnull", (
+        "DO $$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='message_attempts_message_id_fkey') THEN "
+        "ALTER TABLE message_attempts DROP CONSTRAINT message_attempts_message_id_fkey; END IF; "
+        "END $$"
+    )),
+    ("message_attempts_v2_setnull_col",
+     "ALTER TABLE message_attempts ALTER COLUMN message_id DROP NOT NULL"),
+    ("message_attempts_v2_setnull_fk", (
+        "ALTER TABLE message_attempts ADD CONSTRAINT message_attempts_message_id_fkey "
+        "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL"
+    )),
+    # W4 项6a（2026-10-06）双索引去重：model Column(index=True) 以 ix_<table>_<col>
+    # 为正名（create_all 建）；迁移异名索引会造成全新库双索引（写放大）。
+    # 存量库已按旧名建过 → drop 异名 + ensure 模型名（create_all 不给旧表补索引）。
+    ("messages_delivery_status_idx_unify_drop",
+     "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_messages_delivery_status') "
+     "THEN DROP INDEX idx_messages_delivery_status; END IF; END $$"),
+    ("messages_delivery_status_idx_unify_create",
+     "CREATE INDEX IF NOT EXISTS ix_messages_delivery_status ON messages(delivery_status)"),
+    # W4 项6a：message_payloads.sha256 同款遮蔽——ix_message_payloads_sha256 由
+    # message_payloads_v3_sha_idx_recreate 保证存在，idx_message_payloads_sha 为
+    # 异名残留，仅需 drop。
+    ("message_payloads_sha_idx_unify_drop",
+     "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_message_payloads_sha') "
+     "THEN DROP INDEX idx_message_payloads_sha; END IF; END $$"),
+    # W4 Minor-4 二波（2026-10-06）复合/前缀冗余去重：同列组/严格前缀的短方是纯
+    # 写放大，长索引（uq/复合）已覆盖其查询面。守卫
+    # test_no_redundant_index_pairs 钉住「存活索引同列组 ≤1 · 非唯一短方必 drop」。
+    ("idx_msg_payloads_redundant_drop",
+     "DO $$ BEGIN "
+     "IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_message_payloads_message') THEN "
+     "DROP INDEX idx_message_payloads_message; END IF; "
+     "IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='ix_message_payloads_message_id') THEN "
+     "DROP INDEX ix_message_payloads_message_id; END IF; END $$"),
+    ("idx_msg_attempts_redundant_drop",
+     "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='ix_message_attempts_message_id') "
+     "THEN DROP INDEX ix_message_attempts_message_id; END IF; END $$"),
+    ("idx_prefix_redundant_drop",
+     "DO $$ BEGIN "
+     "IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_messages_conversation_id') THEN "
+     "DROP INDEX idx_messages_conversation_id; END IF; "
+     "IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_user_skills_user') THEN "
+     "DROP INDEX idx_user_skills_user; END IF; END $$"),
+    # W6（2026-10-06 三波）：导出登记/去重——内容指纹列（同内容复用产物零渲染）。
+    # 与 memory v2 无关，置于 pgvector_extension 之前（后缀纯度守卫）。
+    ("export_tasks_content_hash",
+     "ALTER TABLE export_tasks ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)"),
+    ("ix_export_tasks_content_hash",
+     "CREATE INDEX IF NOT EXISTS ix_export_tasks_content_hash ON export_tasks(content_hash)"),
+    # 挂账清理波（2026-10-07）：endnote 全链——worker 渲染开关列。与 memory v2 无关，
+    # 置于 pgvector_extension 之前（后缀纯度守卫 test_startup_migrations_sql）。
+    ("export_tasks_endnote_enabled",
+     "ALTER TABLE export_tasks ADD COLUMN IF NOT EXISTS endnote_enabled BOOLEAN NOT NULL DEFAULT TRUE"),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (
@@ -540,6 +673,11 @@ $$"""),
     )"""),
     ("idx_clar_user", "CREATE INDEX IF NOT EXISTS idx_clar_user ON memory_clarifications(user_id)"),
     ("idx_clar_applied", "CREATE INDEX IF NOT EXISTS idx_clar_applied ON memory_clarifications(user_id, applied)"),
+    # W4 Minor-4 二波（2026-10-06）：idx_clar_user 是 (user_id, applied) 的严格前缀
+    # 冗余——长索引覆盖 user_id 查询；drop 短方（守卫 test_no_redundant_index_pairs）。
+    ("idx_clar_user_redundant_drop",
+     "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='idx_clar_user') "
+     "THEN DROP INDEX idx_clar_user; END IF; END $$"),
     # subconscious_log
     ("create_subconscious_log", """CREATE TABLE IF NOT EXISTS subconscious_log (
         id VARCHAR(36) PRIMARY KEY,
@@ -603,8 +741,6 @@ $$"""),
         created_at TIMESTAMP DEFAULT NOW()
     )"""),
     ("idx_mlc_user_ts", "CREATE INDEX IF NOT EXISTS idx_mlc_user_ts ON memory_llm_calls(user_id, created_at DESC)"),
-    # UI 偏好（皮肤选择等）：JSON 字符串，见 app/api/skins.py
-    ("users_ui_preferences", "ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_preferences TEXT"),
     # DC2（2026-09-14）：集群向量溯源列（A1 修复时写入；其余向量表 B7 补齐）
     ("mc_cluster_embedding_model", "ALTER TABLE memory_clusters ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100)"),
     # DC1（2026-09-14）：记忆 LLM 调用计费分类——read 类调用只做遥测，
@@ -642,89 +778,6 @@ $$"""),
     ("me_locations", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS locations VARCHAR(1000)"),
     # D1/DC5（2026-09-14）：边来源列（存量行默认 llm 语义；读侧白名单门控）
     ("cr_edge_source", "ALTER TABLE concept_relations ADD COLUMN IF NOT EXISTS edge_source VARCHAR(20) DEFAULT 'llm'"),
-    # F2/DC9（2026-09-14）：messages 分页复合索引（加法式，可随时建）
-    ("idx_messages_conv_created", "CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at)"),
-    # F1（2026-09-14）：后台任务运行中补充消息（可空 JSON 数组）
-    ("at_pending_messages", "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS pending_messages TEXT"),
-    # ── 死磕 DAG 波次 W0-W2（2026-09-18）─────────────────────────────
-    ("conversations_deathmatch_acceptance_criteria", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_acceptance_criteria JSON"),
-    ("conversations_deathmatch_failed_directions", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_failed_directions JSON"),
-    ("conversations_deathmatch_pause_state", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_pause_state JSON"),
-    ("conversations_deathmatch_events", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_events JSON"),
-    ("conversations_deathmatch_no_progress_replans", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_no_progress_replans INTEGER DEFAULT 0"),
-    # AEWM 借鉴波（2026-09-25）：证伪台账（anti task-state contamination）
-    ("conversations_deathmatch_retracted_claims", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_retracted_claims JSONB"),
-    # conv-open 性能治理 P1-1（2026-10-03）：超限 tool_results/reasoning_content/
-    # tool_calls 全文外置（DESIGN_conv_open_performance.md），行内留显式 stub。
-    ("message_payloads_v1", (
-        "CREATE TABLE IF NOT EXISTS message_payloads ("
-        "id VARCHAR(36) PRIMARY KEY, "
-        "message_id VARCHAR(36) NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
-        "field VARCHAR(32) NOT NULL, "
-        "content TEXT NOT NULL, "
-        "size_bytes INTEGER NOT NULL DEFAULT 0, "
-        "sha256 VARCHAR(64) NOT NULL, "
-        "created_at TIMESTAMP WITHOUT TIME ZONE)"
-    )),
-    ("idx_message_payloads_message", "CREATE INDEX IF NOT EXISTS idx_message_payloads_message ON message_payloads(message_id, field)"),
-    # 评审 C1 修复（2026-10-03）：per-(message_id,field) 归属唯一，弃 sha 全局去重
-    # （共享行 + CASCADE = 删一消息毁他消息的静默数据丢失）。
-    ("idx_message_payloads_sha", "CREATE INDEX IF NOT EXISTS idx_message_payloads_sha ON message_payloads(sha256)"),
-    ("message_payloads_v2_uniq", (
-        "DO $$ BEGIN "
-        "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='message_payloads_sha256_key') THEN "
-        "ALTER TABLE message_payloads DROP CONSTRAINT message_payloads_sha256_key; END IF; "
-        "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='uq_message_payloads_msg_field') THEN "
-        "ALTER TABLE message_payloads ADD CONSTRAINT uq_message_payloads_msg_field UNIQUE (message_id, field); END IF; "
-        "END $$"
-    )),
-    # v3（2026-10-05）：v2 只卸了 CONSTRAINT 形态；v1 窗口期由 create_all 建的库
-    # 携带的是 UNIQUE INDEX 形态 ix_message_payloads_sha256——残留会导致两条字节
-    # 相同的肥字段外置时 IntegrityError（写路径 500）。卸唯一索引并按模型
-    # index=True 语义重建为普通索引（asyncpg 单语句限制：两条迁移分开执行）。
-    ("message_payloads_v3_sha_idx_drop", (
-        "DO $$ BEGIN "
-        "IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname='ix_message_payloads_sha256' "
-        "AND indexdef ILIKE 'CREATE UNIQUE%') THEN "
-        "DROP INDEX ix_message_payloads_sha256; END IF; END $$"
-    )),
-    ("message_payloads_v3_sha_idx_recreate",
-     "CREATE INDEX IF NOT EXISTS ix_message_payloads_sha256 ON message_payloads(sha256)"),
-    # 渐进落库（2026-10-06，conv ae9aa092）：run 开始即建 assistant 行
-    # （delivery_status='streaming'），周期刷写正文；进程死亡 → 启动 sweep 翻
-    # 'interrupted'；正常 finalize/用户 stop → 'final'。
-    ("messages_delivery_status",
-     "ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_status VARCHAR(16) NOT NULL DEFAULT 'final'"),
-    ("idx_messages_delivery_status",
-     "CREATE INDEX IF NOT EXISTS idx_messages_delivery_status ON messages(delivery_status)"),
-    # 被拒/中断草稿台账：审计打回的草稿全文+裁决元数据保留并标记（用户裁定）。
-    ("message_attempts_v1", (
-        "CREATE TABLE IF NOT EXISTS message_attempts ("
-        "id VARCHAR(36) PRIMARY KEY, "
-        "message_id VARCHAR(36) NOT NULL REFERENCES messages(id) ON DELETE CASCADE, "
-        "conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, "
-        "attempt_no INTEGER NOT NULL DEFAULT 1, "
-        "status VARCHAR(16) NOT NULL DEFAULT 'rejected', "
-        "content TEXT NOT NULL DEFAULT '', "
-        "verdict_json TEXT, "
-        "created_at TIMESTAMP WITHOUT TIME ZONE)"
-    )),
-    ("idx_message_attempts_message",
-     "CREATE INDEX IF NOT EXISTS idx_message_attempts_message ON message_attempts(message_id, attempt_no)"),
-    # A4.9 r1 M3：message_id 可空 + ON DELETE SET NULL——空终态清理删行时台账
-    # 不随 CASCADE 消失（「被拒草稿保留并标记」用户裁定）。幂等：约束存在才换。
-    ("message_attempts_v2_setnull", (
-        "DO $$ BEGIN "
-        "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='message_attempts_message_id_fkey') THEN "
-        "ALTER TABLE message_attempts DROP CONSTRAINT message_attempts_message_id_fkey; END IF; "
-        "END $$"
-    )),
-    ("message_attempts_v2_setnull_col",
-     "ALTER TABLE message_attempts ALTER COLUMN message_id DROP NOT NULL"),
-    ("message_attempts_v2_setnull_fk", (
-        "ALTER TABLE message_attempts ADD CONSTRAINT message_attempts_message_id_fkey "
-        "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL"
-    )),
 ]
 
 
@@ -891,7 +944,8 @@ async def run_startup_migrations(conn) -> None:
     for idx, (version, statement) in enumerate(STARTUP_MIGRATIONS):
         if idx >= mem_start and not PGVECTOR_AVAILABLE:
             # memory v2 迁移块（pgvector_extension 起，必须保持连续后缀——
-            # 由 tests/memory_md_round4_test.py #7 后缀纯度断言守护）整体跳过，
+            # 由 tests/test_startup_migrations_sql.py::test_pgvector_skip_window_suffix_purity
+            # 后缀纯度断言守护）整体跳过，
             # 不记录版本号，安装 pgvector 后重启可补跑
             if idx == mem_start:
                 msg = (

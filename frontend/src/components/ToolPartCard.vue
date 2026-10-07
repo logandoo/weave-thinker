@@ -38,12 +38,39 @@ async function fetchFullIfNeeded(): Promise<void> {
   }
 }
 
-// A3：截断徽标（slim 桩的 __truncated__/__size_bytes__ 同级标记）
+// A3：截断徽标 → D-14（2026-10-06 三波）实长派生：跨字段取回恒稳（桩期
+// __size_bytes__ 累计真长、取回后内容实长）；N>预览容量(500) 才显示。
+// D-10：删「已截断」字样——「共 N 字」保感知
 const truncBadgeText = computed(() => {
   const it = props.item as Record<string, unknown>
-  if (!it.__truncated__) return null
-  const n = it.__size_bytes__
-  return typeof n === 'number' && n > 0 ? `已截断 · 共 ${n} 字` : '已截断 · 展开取全文'
+  // N=项文本总量（与后端 _item_text_total 同构，A4.9 C2）：跨取回恒稳
+  const declared = it.__size_bytes__
+  let n = typeof declared === 'number' && declared > 0 ? declared : 0
+  if (!n) {
+// 徽标 N 计数口径（与后端 _item_text_total 同构）：跳标签/元数据键，同值去重
+const LABEL_KEYS = new Set(['type', 'step_type', 'name', 'status', 'id', 'message_id', 'conversation_id'])
+
+    const seen = new Set<string>()
+    const walk = (v: unknown): number => {
+      if (typeof v === 'string') {
+        if (seen.has(v)) return 0  // 同值去重（双侧同构）
+        seen.add(v)
+        return v.length
+      }
+      if (Array.isArray(v)) return v.reduce((a: number, x) => a + walk(x), 0)
+      if (v && typeof v === 'object') {
+        let s = 0
+        for (const [k, x] of Object.entries(v)) {
+          if (k.startsWith('__') || LABEL_KEYS.has(k)) continue
+          s += walk(x)
+        }
+        return s
+      }
+      return 0
+    }
+    n = walk(it)
+  }
+  return n > 500 ? `共 ${n} 字` : null
 })
 
 const toolName = computed(() => props.item.title || formatToolName(props.item.name || ''))
@@ -191,10 +218,57 @@ function formatToolName(name: string): string {
 .tool-card-header {
   display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 8px;
   padding: 8px 14px;
   font-size: 13px;
   user-select: none;
+}
+
+/* D-10/D-15（2026-10-06）：卡头单行 + 手机动态省略——收缩全部由 name/args
+   承担（CSS ellipsis 按布局宽自适应=动态省略，禁固定字数机械截断）；
+   icon/status/按钮/徽标 shrink-0+nowrap 恒全显（「共 N 字」不得被裁）。 */
+.tool-card-icon {
+  flex-shrink: 0;
+}
+
+.tool-card-name {
+  /* 挂账清零波（含复审 Critical 合并）：恢复左聚合——name 不 grow 但**可收缩**
+     （曾遗留重复块 flex-shrink:0 覆盖致长名不缩、窄屏溢出裁徽标）；收缩由
+     name/args 共同承担（D-15 窄屏省略契约真态）。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--color-text-primary, #1f2937);
+}
+
+.tool-card-args {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-secondary, #6b7280);
+  font-size: 12px;
+}
+
+.tool-card-status {
+  flex-shrink: 0;
+  white-space: nowrap;
+  /* 标题行左聚合后，状态组以自动外边距恒贴右（空余左留隙、右留状态组） */
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--color-bg-secondary, #f3f4f6);
+}
+
+.tool-card-toggle {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .tool-card-header.clickable {
@@ -228,29 +302,6 @@ function formatToolName(name: string): string {
 
 .tool-error .tool-card-icon {
   color: #dc2626;
-}
-
-.tool-card-name {
-  font-weight: 600;
-  color: var(--color-text-primary, #1f2937);
-  flex-shrink: 0;
-}
-
-.tool-card-args {
-  color: var(--color-secondary, #6b7280);
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-}
-
-.tool-card-status {
-  flex-shrink: 0;
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: var(--color-bg-secondary, #f3f4f6);
 }
 
 .tool-card-status.running {
@@ -305,6 +356,8 @@ function formatToolName(name: string): string {
   font-size: 0.72em;
   color: var(--color-text-light);
   vertical-align: middle;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .fetch-hint {

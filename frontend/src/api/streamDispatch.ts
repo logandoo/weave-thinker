@@ -100,6 +100,102 @@ export interface StreamHandlers {
 
 export interface ResumeHandlers extends StreamHandlers {
   onReplay: (replay: ReplayPayload) => void
+  /** 轻提示口（UPSTREAM_TODO_20261006 项 10）：drain 503 瞬时面——不落红硬错。 */
+  onTransient?: (reason: string) => void
+}
+
+/** 外置桩识别（宽松形——懒取回/解析触发用；伪造 ref=404 安全）。
+ * 与 backend `is_externalized_stub` 同构。 */
+export function isExternalizedStub(v: unknown): boolean {
+  if (typeof v !== 'string' || v.length < 2 || !v.startsWith('{')) return false
+  try {
+    return (JSON.parse(v) as { _externalized?: boolean })._externalized === true
+  } catch {
+    return false
+  }
+}
+
+/** 标记信任（评审 A Critical-1，fix-round 1）：徽标/愈合只信后端签发 meta——
+ * `_externalized` + `field` + 64hex `payload_ref` + 数值 `size_bytes`
+ * （build_field_stub_ex 同构）。内容伪造 `_externalized`+标记不得免剥。
+ * 与 backend `stub_markers_trusted` 同构。 */
+export function stubMarkersTrusted(v: unknown): boolean {
+  if (!isExternalizedStub(v)) return false
+  try {
+    const o = JSON.parse(v as string) as Record<string, unknown>
+    const ref = o.payload_ref
+    return typeof o.field === 'string' && o.field.length > 0
+      && typeof ref === 'string' && /^[0-9a-f]{64}$/.test(ref)
+      && typeof o.size_bytes === 'number' && Number.isFinite(o.size_bytes)
+  } catch {
+    return false
+  }
+}
+
+/** drain 门 503+Retry-After 瞬时重试（UPSTREAM_TODO_20261006 项 10，评审 B m6）。
+ * 契约：503 → 按 Retry-After（秒，默认 5s，上限 30s）退避重试，至多
+ * DRAIN_MAX_RETRIES 次；耗尽交轻提示（onTransient），交还有界恢复。
+ * 纯函数 + 注入式 fetch/sleep——Node 直跑测试缝（同模块既有约定）。 */
+export const DRAIN_MAX_RETRIES = 3
+
+const TRANSIENT_STATUSES = new Set([503, 429, 502, 504])
+
+export function nextRetryAfterMs(status: number, retryAfterHeader: string | null, defaultMs = 5000): number | null {
+  // 瞬时面（挂账清理波 criterion 3）：503 排空 / 429 限流 / 502·504 网关瞬断
+  if (!TRANSIENT_STATUSES.has(status)) return null
+  const raw = (retryAfterHeader ?? '').trim()
+  if (raw !== '') {
+    // Number('')===0 会把空头误当 0 秒——空/非法一律回落默认（drain 门=5s）
+    const secs = Number(raw)
+    // 下限 1s（评审 A-5 minor：Retry-After: 0 不得紧打排空中服务）
+    if (Number.isFinite(secs) && secs >= 0) return Math.max(1000, Math.min(secs * 1000, 30000))
+  }
+  return defaultMs
+}
+
+/** 可中断退避睡眠（评审 A-5）：abort 即醒——不睡满、不压住 _resumingSet/watchdog。 */
+export function sleepWithAbort(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) { resolve(); return }
+    const onAbort = () => { clearTimeout(timer); resolve() }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/** 瞬时暂态轻提示文案（挂账清理波 criterion 3 / 复审 A Important-3）：按因由三分类
+ * ——纯函数（node 行为腿缝），store 与任何消费端同此一口。 */
+export function transientHintFor(reason: string | null | undefined): string {
+  const hints: Record<string, string> = {
+    'drain': '服务重启排空中，消息未能送达，请稍后重发。',
+    'busy': '服务繁忙（限流），消息未能送达，请稍后重发。',
+    'gateway': '网络波动/网关瞬断，消息未能送达，请稍后重发。',
+  }
+  return hints[reason ?? 'gateway'] ?? hints['gateway']
+}
+
+export type ResumeFailureClass = 'skip' | 'auth-expired' | 'transient-drain' | 'transient-retry' | 'error'
+
+export function classifyResumeFailure(status: number): ResumeFailureClass {
+  if (status === 404) return 'skip'
+  if (status === 401) return 'auth-expired'
+  if (status === 503) return 'transient-drain'
+  if (status === 429 || status === 502 || status === 504) return 'transient-retry'
+  return 'error'
+}
+
+export async function fetchWithDrainRetry<T extends { ok: boolean; status: number; headers: { get(name: string): string | null } }>(
+  fetchFn: (url: string, init?: unknown) => Promise<T>,
+  url: string,
+  init?: unknown,
+  sleepFn: (ms: number) => Promise<void> = (ms) => sleepWithAbort(ms, (init as { signal?: AbortSignal } | undefined)?.signal),
+): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetchFn(url, init)
+    const waitMs = nextRetryAfterMs(response.status, response.headers.get('retry-after'))
+    if (waitMs === null || attempt >= DRAIN_MAX_RETRIES) return response
+    await sleepFn(waitMs)
+  }
 }
 
 /** Shared SSE payload dispatch. Returns true when the stream must terminate. */

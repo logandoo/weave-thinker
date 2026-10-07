@@ -72,6 +72,10 @@ class AgentWorker:
         # 优雅停机标记——drain 中断的任务落 resumable 非 cancelled
         self._draining = False
 
+    def running_count(self) -> int:
+        """部署排空计数（D-12）：在途后台任务数（GET /api/server/active-runs 三源之一）。"""
+        return len(self._running_task_ids)
+
     async def start(self) -> None:
         if not config.agent_background_tasks_enabled:
             logger.info("Background tasks disabled in config")
@@ -204,6 +208,13 @@ class AgentWorker:
             await asyncio.sleep(interval)
 
     async def _poll_pending_tasks(self) -> None:
+        # 部署排空扩面（D-12，2026-10-06）：drain 中停止领取新任务——在途任务
+        # 照常完成（计入排空计数），未领任务留给重启后的新进程（或 TTL 复位后
+        # 下轮领取）。进程内优雅停机 _draining 同义（stop() 置位后不再领）。
+        from app.services.active_agent_registry import ActiveAgentRegistry
+        if self._draining or ActiveAgentRegistry.get_instance().is_draining:
+            return
+
         max_concurrent = config.agent_background_tasks_max_concurrent
         available_slots = max_concurrent - len(self._worker_tasks)
         if available_slots <= 0:

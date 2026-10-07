@@ -1324,7 +1324,9 @@ async function handleNotebookSelected(notebookId: string) {
   showNotebookPicker.value = false
   const convId = saveToNoteConvId.value; if (!convId) return
   try {
-    const conversation = await chatApi.getConversation(convId)
+    // 懒加载（2026-10-06 二波）：正文恒全量 + attachments 随 slim 结构保留——
+    // 未展开的思考/工具全文不加载（A4.9 B-I1）
+    const conversation = await chatApi.getConversation(convId, { include: 'slim' })
     const msgs = conversation.messages || []
     if (msgs.length === 0) { showToast('对话无消息内容', 'error'); return }
     const content = msgs.map((m: any) => {

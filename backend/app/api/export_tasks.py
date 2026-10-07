@@ -27,6 +27,8 @@ class ExportTaskCreate(BaseModel):
     format: str = "pdf"
     note_id: Optional[str] = None
     note_ids: Optional[List[str]] = None
+    # 挂账清理波（D-18 全链）：尾注开关随任务载荷（尊重 UI 开关，默认开）
+    endnote_enabled: bool = True
 
 
 class ExportTaskResponse(BaseModel):
@@ -68,6 +70,7 @@ async def create_export_task(
         format=fmt,
         note_id=payload.note_id,
         note_ids=__import__('json').dumps(payload.note_ids) if payload.note_ids else None,
+        endnote_enabled=payload.endnote_enabled,
         status="pending",
         progress=0.0,
     )
@@ -165,13 +168,11 @@ async def delete_export_task(
     task = await db.get(ExportTask, task_id)
     if task is None or task.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.file_path and os.path.isfile(task.file_path):
-        try:
-            os.remove(task.file_path)
-        except Exception:
-            pass
-    await db.delete(task)
-    await db.commit()
+    # UPSTREAM_TODO_20261006 项 8 + 评审 B-1/B-2：产物按 content_hash 共享命名——
+    # 删行+独占收割同文件锁原子序（它任务/单飞复用同文件时不删，防下载 404）。
+    from app.services.export_registry import delete_row_and_reap_file
+
+    await delete_row_and_reap_file(db, task)
     return {"ok": True, "task_id": task_id}
 
 

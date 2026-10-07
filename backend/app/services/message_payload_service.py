@@ -18,6 +18,7 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import math
 import logging
 from types import SimpleNamespace
 
@@ -56,53 +57,140 @@ def compute_sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _slim_seq_item(item):
+# 徽标 N 的计数口径（双侧同构，A4.9 C2 fix 定稿）：只计**内容键**——
+# 标签/元数据键（type/status/name/id/message_id/conversation_id）双侧同跳，
+# 字符串同值去重（toToolPartItem 的 result=content 复制不双计）。
+_ITEM_LABEL_KEYS = {"type", "step_type", "name", "status", "id",
+                    "message_id", "conversation_id"}
+
+
+def _item_text_total(obj, _seen=None) -> int:
+    """项文本总量：Σlen(内容键子树字符串)，同值去重——徽标 N 双侧同构口径。"""
+    if _seen is None:
+        _seen = set()
+    if isinstance(obj, str):
+        if obj in _seen:
+            return 0
+        _seen.add(obj)
+        # UTF-16 码元计数=JS .length（A4.9 fix-round：astral 字符双侧同构）
+        return sum(2 if ord(c) > 0xFFFF else 1 for c in obj)
+    if isinstance(obj, list):
+        return sum(_item_text_total(v, _seen) for v in obj)
+    if isinstance(obj, dict):
+        return sum(_item_text_total(v, _seen) for k, v in obj.items()
+                   if not str(k).startswith("__") and k not in _ITEM_LABEL_KEYS)
+    return 0
+
+
+def _slim_seq_item(item, state=None):
     """display_sequence 直系项瘦身：type=="text" 的 content（回答正文段）豁免，
-    其余项与项内嵌套结构照常预览（复审 N3：豁免只及直系项，不粘滞进嵌套字典）。"""
+    其余项与项内嵌套结构照常预览（复审 N3：豁免只及直系项，不粘滞进嵌套字典）。
+    state：外层剪裁标记 {"cut","hidden"}（出桩条件用）。
+    项内嵌套剪裁（数组串/深层字典）落**项级** `__truncated__` 标记；`__size_bytes__`
+    = 整值 `_item_text_total(item)`（A4.9 C2 定稿口径，非累加）。"""
     if not isinstance(item, dict):
-        return slim_tool_results_json(item)
+        return slim_tool_results_json(item, state)
+    own = {"cut": False, "hidden": 0}
     out = {}
     is_body = item.get("type") == "text"
     for k, v in item.items():
+        if k in ("__truncated__", "__size_bytes__"):
+            continue  # 源键剥除（UPSTREAM_TODO_20261006 项 12）：标记仅由后端签发
         if isinstance(v, str) and len(v) > INNER_TRUNCATE_CHARS and not (is_body and k == "content"):
+            own["cut"] = True
+            own["hidden"] += len(v)
             out[k] = v[:INNER_PREVIEW_CHARS]
-            out["__truncated__"] = True
-            out["__size_bytes__"] = len(v)
         else:
-            out[k] = slim_tool_results_json(v)
+            out[k] = slim_tool_results_json(v, own)
+    if own["cut"]:
+        out["__truncated__"] = True
+        # W6 fix-round（A4.9 C2）：__size_bytes__ = 项文本总量 Σlen(所有字符串)——
+        # 与前端取回后的递归 Σ 同构（N 跨取回恒稳，多切/参数切不失真）；
+        # 整值覆盖（非累加源键）→ 内容伪造的同名键不可抬/压徽标（A4.9 M5）。
+        out["__size_bytes__"] = _item_text_total(item)  # 原始项（预览长度≠真长）
+        if state is not None:
+            state["cut"] = True
+            state["hidden"] += own["hidden"]
     return out
 
 
-def slim_tool_results_json(obj):
+def slim_tool_results_json(obj, state=None):
     """Recursively truncate long string values, keeping structure intact.
 
     Truncated strings keep INNER_PREVIEW_CHARS of the head and are annotated
     with sibling markers `__truncated__` (bool) and `__size_bytes__` (int,
-    码位计数——命名历史遗留，取值为 len(v) 即字符数).
-
-    正文豁免（2026-10-03 断层修复，红线：回答正文永不静默截断）：仅
-    ``display_sequence`` **直系项**中 ``type == "text"`` 的 ``content``
-    原样通过——正文 KB 级且 messages.content 本就全量内联，预览收益为零、
-    截断代价是用户可见的回答残缺（conv 8c03ff8e 事故）。树内其他 type:"text"
-    字典与工具/思考 content 维持预览（性能不回吐；折叠卡后有展开取全文链路）。
-    """
+    **整值** `_item_text_total(obj)`=Σ内容键——UPSTREAM_TODO_20261006 项 12 修
+    累加源键伪造面，与 `_slim_seq_item`/前端 `_textTotal` 同构). 正文豁免（2026-10-03 conv 8c03ff8e）：
+    display_sequence 直系 type=="text" 的 content + `content_segments` 整键原样。
+    数组串照剪（W6）：list 元素长串截断，剪裁计入所在 dict 范围（同级标记）。
+    state：{"cut": bool, "hidden": int} 剪裁标记贯穿（禁内容嗅探）。"""
+    if state is None:
+        state = {"cut": False, "hidden": 0}
     if isinstance(obj, str):
         return obj
     if isinstance(obj, list):
-        return [slim_tool_results_json(v) for v in obj]
+        out = []
+        for v in obj:
+            if isinstance(v, str) and len(v) > INNER_TRUNCATE_CHARS:
+                state["cut"] = True
+                state["hidden"] += len(v)
+                out.append(v[:INNER_PREVIEW_CHARS])
+            else:
+                out.append(slim_tool_results_json(v, state))
+        return out
     if not isinstance(obj, dict):
         return obj
+    own = {"cut": False, "hidden": 0}
     out = {}
     for k, v in obj.items():
+        if k in ("__truncated__", "__size_bytes__"):
+            continue  # 源键剥除（UPSTREAM_TODO_20261006 项 12）：标记仅由后端签发
         if k == "display_sequence" and isinstance(v, list):
-            out[k] = [_slim_seq_item(i) for i in v]
+            out[k] = [_slim_seq_item(i, state) for i in v]
+        elif k == "content_segments":
+            out[k] = v  # 正文段数组豁免（正文红线）
         elif isinstance(v, str) and len(v) > INNER_TRUNCATE_CHARS:
+            own["cut"] = True
+            own["hidden"] += len(v)
             out[k] = v[:INNER_PREVIEW_CHARS]
-            out["__truncated__"] = True
-            out["__size_bytes__"] = len(v)
         else:
-            out[k] = slim_tool_results_json(v)
+            out[k] = slim_tool_results_json(v, own)
+    if own["cut"]:
+        out["__truncated__"] = True
+        # UPSTREAM_TODO_20261006 项 12（A4.9 M5 整值覆盖契约）：__size_bytes__ =
+        # _item_text_total(obj)（Σ内容键·同值去重·跳标签键）——非累加源键，
+        # 内容自带同名键不可抬/压徽标；与 _slim_seq_item 同口径。
+        out["__size_bytes__"] = _item_text_total(obj)
+        state["cut"] = True
+        state["hidden"] += own["hidden"]
     return out
+
+
+def build_field_stub_ex(field: str, value: str, preview_chars: int | None = None):
+    """build_field_stub 的出桩判定版（A4.9 二波 I1）：返回 (stub, cut)。
+    cut=展示基线之外真的发生了截断（slim 剪裁标记，非内容嗅探）——
+    slim_message_dict 以它决定是否出桩（截断即出桩，D-11 修订）。"""
+    pv = preview_chars if preview_chars is not None else _preview_chars()
+    sha = compute_sha256(value)
+    state = {"cut": False, "hidden": 0}
+    meta = {"_externalized": True, "field": field, "payload_ref": sha,
+            "size_bytes": len(value.encode("utf-8")), "size_chars": len(value)}
+    if field in ("tool_results", "tool_calls"):
+        try:
+            obj = json.loads(value)
+            slimmed = slim_tool_results_json(obj, state)
+        except (ValueError, TypeError):
+            slimmed = None
+        if isinstance(slimmed, (dict, list)):
+            if isinstance(slimmed, dict):
+                slimmed = {**slimmed, **meta}
+            else:
+                slimmed = {**meta, "items": slimmed}
+            return json.dumps(slimmed, ensure_ascii=False), state["cut"]
+    if len(value) > pv:
+        state["cut"] = True
+    meta["preview"] = value[:pv]
+    return json.dumps(meta, ensure_ascii=False), state["cut"]
 
 
 def build_field_stub(field: str, value: str, preview_chars: int | None = None) -> str:
@@ -113,26 +201,13 @@ def build_field_stub(field: str, value: str, preview_chars: int | None = None) -
       consumers keep working and truncated items are detectable.
     - reasoning_content (plain text): compact JSON stub with preview.
     """
-    pv = preview_chars if preview_chars is not None else _preview_chars()
-    sha = compute_sha256(value)
-    meta = {"_externalized": True, "field": field, "payload_ref": sha, "size_bytes": len(value.encode("utf-8"))}
-    if field in ("tool_results", "tool_calls"):
-        try:
-            obj = json.loads(value)
-            slimmed = slim_tool_results_json(obj)
-        except (ValueError, TypeError):
-            slimmed = None
-        if isinstance(slimmed, (dict, list)):
-            if isinstance(slimmed, dict):
-                slimmed = {**slimmed, **meta}
-            else:
-                slimmed = {**meta, "items": slimmed}
-            return json.dumps(slimmed, ensure_ascii=False)
-    meta["preview"] = value[:pv]
-    return json.dumps(meta, ensure_ascii=False)
+    return build_field_stub_ex(field, value, preview_chars)[0]
 
 
 def is_externalized_stub(s) -> bool:
+    """外置桩识别（解析/取回触发用）——宽松形：`_externalized: true` 的 JSON 对象。
+    解析路径本身安全（payload 按 (message_id, field) 归属寻址 + sha 完整性，伪造
+    ref=404），故不做 meta 形校验（既有路由契约钉 test_message_payload_route_scoping）。"""
     if not s or not isinstance(s, str):
         return False
     stripped = s.lstrip()
@@ -143,6 +218,28 @@ def is_externalized_stub(s) -> bool:
     except (ValueError, TypeError):
         return False
     return isinstance(obj, dict) and obj.get("_externalized") is True
+
+
+def stub_markers_trusted(s) -> bool:
+    """标记信任（评审 A Critical-1，fix-round 1）：徽标/愈合校验只信**后端签发**
+    的桩标记——桩必须带 meta（`field` + 64hex `payload_ref` + 数值 `size_bytes`，
+    与 build_field_stub_ex 同构）。内容伪造 `_externalized`+标记（无 meta/坏 meta）
+    不可信：剥除其 `__truncated__`/`__size_bytes__` 后放行（宽松桩=解析语义不变）。"""
+    if not is_externalized_stub(s):
+        return False
+    try:
+        obj = json.loads(s)
+    except (ValueError, TypeError):
+        return False
+    ref = obj.get("payload_ref")
+    size = obj.get("size_bytes")
+    return (isinstance(obj.get("field"), str) and bool(obj.get("field"))
+            and isinstance(ref, str) and len(ref) == 64
+            and all(c in "0123456789abcdef" for c in ref)
+            and isinstance(size, (int, float)) and not isinstance(size, bool)
+            # 幅值闸先行（复审 B Important）：巨整数 abs() 无损比较、isfinite 前拒
+            # ——NaN/±Inf/巨整数同前端 Number.isFinite(JSON.parse→Infinity) 口径
+            and abs(size) < 2 ** 1023 and math.isfinite(size))
 
 
 def should_externalize(value: str | None, max_chars: int | None = None) -> bool:
@@ -352,3 +449,17 @@ async def resolve_dict_fields(rows: list, db) -> list:
                     d[field] = content
             out.append(d)
     return out
+
+
+def field_slim_cut(field: str, value: str) -> bool:
+    """W6 热路轻探（A4）：只做 parse+walk 置剪裁标记，无 sha/dumps——thin 字段
+    免建桩开销（conv-open 快路径）；返回展示基线之外是否真发生剪裁。"""
+    if field == "reasoning_content":
+        return len(value) > _preview_chars()
+    try:
+        obj = json.loads(value)
+    except (ValueError, TypeError):
+        return len(value) > _preview_chars()
+    state = {"cut": False, "hidden": 0}
+    slim_tool_results_json(obj, state)
+    return state["cut"]

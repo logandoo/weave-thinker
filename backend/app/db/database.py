@@ -282,8 +282,10 @@ class MessagePayload(Base):
     # 评审 C1/C2 修复：payload 行按 (message_id, field) 唯一、归属单条消息——
     # 不跨消息共享（旧 sha 全局去重 + message_id CASCADE 会在删除任一消息时
     # 连带销毁他消息的共享行=静默数据丢失）；sha256 仅作完整性元数据不作寻址。
+    # 索引（2026-10-06 冗余去重）：message_id 不再单列建索引——uq_message_payloads_
+    # msg_field(message_id,field) 前缀已覆盖归属查询，单列索引是纯写放大。
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    message_id = Column(String(36), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_id = Column(String(36), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)
     field = Column(String(32), nullable=False)
     content = Column(Text, nullable=False)
     size_bytes = Column(Integer, nullable=False, default=0)
@@ -308,7 +310,9 @@ class MessageAttempt(Base):
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     # A4.9 r1 M3：message_id 可空 + SET NULL——空终态清理删除 streaming 空行时，
     # 该轮的被打回草稿台账不随行的 CASCADE 消失（用户裁定「保留并标记」）。
-    message_id = Column(String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True, index=True)
+    # 索引（2026-10-06 冗余去重）：message_id 不再单列建索引——
+    # idx_message_attempts_message(message_id,attempt_no) 前缀已覆盖。
+    message_id = Column(String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
     conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
     attempt_no = Column(Integer, nullable=False, default=1)
     status = Column(String(16), nullable=False, default="rejected")
@@ -835,6 +839,10 @@ class ExportTask(Base):
     file_path = Column(String(500), nullable=True)
     filename = Column(String(255), nullable=True)
     error = Column(Text, nullable=True)
+    # W6（2026-10-06 三波）：导出内容指纹——同内容命中即复用产物零渲染（D-16）
+    content_hash = Column(String(64), nullable=True, index=True)
+    # 挂账清理波（2026-10-07）：尾注渲染开关（尊重 UI 开关默认开；D-18 全链穿线）
+    endnote_enabled = Column(Boolean, nullable=False, default=True, server_default="TRUE")
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)

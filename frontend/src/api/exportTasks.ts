@@ -10,6 +10,7 @@ export const exportTasksApi = {
     format: 'md' | 'pdf'
     note_id?: string
     note_ids?: string[]
+    endnote_enabled?: boolean
   }): Promise<ExportTaskInfo> {
     const { data } = await api.post<ExportTaskInfo>('/export-tasks', params)
     return data

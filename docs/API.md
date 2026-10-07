@@ -6048,6 +6048,9 @@ temperature 1.0 / top_p 0.95 / top_k 20 / min_p 0.0 / presence_penalty 0.0 / rep
   `=true` 解析文档（Word/PPT/Excel/CSV/PDF → Markdown，处理内嵌/本地/远程图片）存为笔记（图片文件拒绝）。
 - `GET /api/files/download`：认证支持 `Authorization` 头**或** `?token=`（供 `<img>` 标签）；路径不在
   工作区时按文件名递归查找。
+- `GET /api/files/list`：工作区目录列表（文件夹管理器）——`path` 为工作区相对/工作区内目录路径；
+  目录优先、名称不区分大小写排序；单次最多 1000 条（`truncated=true` 表示被截断），符号链接
+  不列出；越界/不存在 404。
 - `GET /api/images/serve`：路径逃逸工作区 403；不存在 404。
 - 笔记导出 PDF 走 `POST /api/export-tasks` 异步（WeasyPrint，Markdown→HTML→PDF，支持 Mermaid/LaTeX、
   本地图片 base64 内嵌），`/download` 取件。

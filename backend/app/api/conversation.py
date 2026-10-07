@@ -201,6 +201,8 @@ class ExportMessagesPDFRequest(BaseModel):
 class ExportMessagesPDFBulkRequest(BaseModel):
     items: List[ExportMessagesPDFRequest]
     action: str = "single"  # "single" or "bulk"
+    # 挂账清零波 T4：尾注开关随请求（尊重 UI 开关；缺省 True=旧调用方兼容）
+    endnote_enabled: bool = True
 
 
 def _chunked_ids(values: List[str], size: int = 200):
@@ -1148,6 +1150,7 @@ async def get_messages(
     conversation_id: str,
     before_id: str | None = None,
     limit: int | None = None,
+    include: str = "full",
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1188,8 +1191,14 @@ async def get_messages(
             params,
         )).mappings().all()
         messages = list(reversed(rows))
-        from app.services.message_payload_service import resolve_dict_fields
-        messages = await resolve_dict_fields(messages, db)
+        if include == "slim":
+            # 懒加载（D-11 修订，2026-10-06）：slim 分支不 resolve——桩即交付形
+            # 态，全文只经 /messages/{id}/payload/{field} 按字段取回
+            from app.api.message_payloads import slim_message_dict
+            messages = [slim_message_dict(dict(m)) for m in messages]
+        else:
+            from app.services.message_payload_service import resolve_dict_fields
+            messages = await resolve_dict_fields(messages, db)
         return [
             MessageResponse(
                 id=m["id"],
@@ -1215,6 +1224,11 @@ async def get_messages(
         ).order_by(Message.created_at)
     )
     messages = msg_result.scalars().all()
+    if include == "slim":
+        return [
+            MessageResponse(**_message_response_fields(m, slim=True))
+            for m in messages
+        ]
     from app.services.message_payload_service import resolve_message_fields
     messages = await resolve_message_fields(messages, db)
 
@@ -1791,7 +1805,20 @@ async def import_conversations(
     return {"created": total_created, "conversations": created_info, "errors": errors}
 
 
-def _render_messages_pdf(title: str, content: str, created_at: str = "", workspace_root: str | None = None) -> bytes:
+def _ws_fp(workspace_root: str | None) -> str:
+    """导出指纹的工作区切片（图片内容变更→缓存失配）。"""
+    from app.services.export_registry import workspace_fingerprint
+    return workspace_fingerprint(workspace_root)
+
+
+def _read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _render_messages_pdf(title: str, content: str, created_at: str = "",
+                         workspace_root: str | None = None,
+                         endnote_enabled: bool = True) -> bytes:
     """Render messages as PDF using the same pipeline as note PDF export.
 
     When *workspace_root* is provided, local image references (relative
@@ -1808,7 +1835,7 @@ def _render_messages_pdf(title: str, content: str, created_at: str = "", workspa
     content = _strip_media_tags(content)
     if workspace_root:
         content = _materialize_note_images(content, workspace_root)
-    html_body = _markdown_to_html_with_mermaid(content)
+    html_body = _markdown_to_html_with_mermaid(content, endnote_enabled=endnote_enabled)
     html_body = _ensure_heading_ids(html_body)
     title_html = f'<h1 id="_note_title">{title}</h1>' if title else ""
     meta = f'<div class="meta">{created_at}</div>' if created_at else ""
@@ -1851,11 +1878,25 @@ async def export_messages_pdf(
             if not combined_created:
                 combined_created = item.title[:50]
         safe_name = sanitize_filename(combined_title or "对话记录")
+        # W6（2026-10-06 三波，D-16）：导出登记 + 同内容去重（命中回文件零渲染）
+        # + 渲染并发护栏——18:00 冻结画像=无界并行渲染风暴且零登记
+        from app.services.export_registry import render_with_dedup
+        output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output_files")
+        os.makedirs(output_dir, exist_ok=True)
         try:
-            pdf_bytes = await _asyncio.to_thread(_render_messages_pdf, combined_title, combined_content, "", workspace_root)
+            file_path, file_name, cached = await render_with_dedup(
+                db, current_user.id, task_type="conversation", fmt="pdf",
+                key_parts=("conv", combined_title, combined_content, export_data.action,
+                           str(export_data.endnote_enabled), _ws_fp(workspace_root)),
+                render_fn=lambda: _render_messages_pdf(
+                    combined_title, combined_content, "", workspace_root,
+                    export_data.endnote_enabled),
+                output_dir=output_dir, filename_base=safe_name or "messages",
+                endnote_enabled=export_data.endnote_enabled)
         except Exception:
             logger.exception("PDF rendering failed for messages export")
             raise HTTPException(status_code=500, detail="PDF rendering failed")
+        pdf_bytes = await _asyncio.to_thread(_read_file_bytes, file_path)
         encoded = quote(f"{safe_name}.pdf", safe='')
         return StreamingResponse(
             io.BytesIO(pdf_bytes),
@@ -1873,7 +1914,9 @@ async def export_messages_pdf(
                     role = item.role if item.role in ("user", "assistant") else ("user" if "user" in item.title.lower() or "用户" in item.title else "assistant")
                     safe_name = sanitize_filename(f"{role}_{idx+1}")
                     try:
-                        pdf_bytes = _render_messages_pdf(item.title, item.content, "", workspace_root)
+                        pdf_bytes = _render_messages_pdf(item.title, item.content, "",
+                                                          workspace_root,
+                                                          export_data.endnote_enabled)
                     except Exception:
                         logger.exception("PDF rendering failed for message %d", idx)
                         pdf_bytes = b""
@@ -1881,7 +1924,25 @@ async def export_messages_pdf(
                     exported_files.append(f"{safe_name}.pdf")
             return zip_buffer.getvalue(), exported_files
 
-        zip_data, _ = await _asyncio.to_thread(_build_zip)
+        # W6（2026-10-06 三波，D-16）：zip 同享登记/去重/渲染护栏（整包为一个产物）
+        from app.services.export_registry import render_with_dedup
+        output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output_files")
+        os.makedirs(output_dir, exist_ok=True)
+        # 键分片按独立 part 喂指纹（长度前缀消歧义，A4.9 M1）
+        zip_key = ("conv-bulk",) + tuple(
+            x for it in export_data.items for x in (it.role or "", it.title, it.content)) \
+            + (str(export_data.endnote_enabled), _ws_fp(workspace_root),)
+        try:
+            zip_file_path, _zip_name, _cached = await render_with_dedup(
+                db, current_user.id, task_type="conversation", fmt="zip",
+                key_parts=zip_key,
+                render_fn=lambda: _build_zip()[0],
+                output_dir=output_dir, filename_base="对话记录",
+                endnote_enabled=export_data.endnote_enabled)
+        except Exception:
+            logger.exception("PDF rendering failed for messages export (bulk)")
+            raise HTTPException(status_code=500, detail="PDF rendering failed")
+        zip_data = await _asyncio.to_thread(_read_file_bytes, zip_file_path)
         zip_buffer = io.BytesIO(zip_data)
         safe_name = sanitize_filename("对话记录")
         encoded = quote(f"{safe_name}.zip", safe='')

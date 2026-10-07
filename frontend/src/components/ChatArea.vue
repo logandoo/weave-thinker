@@ -335,9 +335,6 @@
           </div>
         </div>
 
-        <div v-if="chatStore.currentError" class="error-message">
-          {{ chatStore.currentError }}
-        </div>
 
         <!-- Grilling questions rendered as chat bubbles inside the message list -->
         <template v-if="isGrilling">
@@ -416,6 +413,15 @@
       </template>
     </div>
 
+    <!-- 状态消息面恒挂载（UPSTREAM_TODO 项 10 复审：busy 回滚可致空态，v-else 内
+         的提示/错误曾随区域卸载而不可见）——位置仍在消息列表下方。 -->
+    <div v-if="chatStore.currentError" class="error-message" role="alert">
+      {{ chatStore.currentError }}
+    </div>
+    <div v-if="chatStore.currentNotice" class="soft-notice" role="status" @click="chatStore.currentNotice = null">
+      {{ chatStore.currentNotice }}
+    </div>
+
     <NotebookPicker
       v-if="showPicker"
       @select="handleSaveToNotebook"
@@ -439,6 +445,7 @@
 
 <script setup lang="ts">
 import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { endnoteExportQuery } from '@/api/notes'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import { useChatStore } from '@/stores/chat'
 import { useNotesStore } from '@/stores/notes'
@@ -1078,6 +1085,7 @@ async function handleDownloadSingle() {
     const response = await api.post('/conversations/export-pdf', {
       items,
       action: 'single',
+      endnote_enabled: endnoteExportQuery().endnote_enabled,
     }, { responseType: 'blob' })
     const titleText = selected[0].content.replace(/[#*`\n]/g, '').trim().slice(0, 30)
     const filename = `对话记录_${titleText || '对话片段'}.pdf`
@@ -1108,6 +1116,7 @@ async function handleDownloadBulk() {
     const response = await api.post('/conversations/export-pdf', {
       items,
       action: 'bulk',
+      endnote_enabled: endnoteExportQuery().endnote_enabled,
     }, { responseType: 'blob' })
     const titleText = selected[0].content.replace(/[#*`\n]/g, '').trim().slice(0, 30)
     const filename = `对话记录_${titleText || '对话片段'}.zip`
@@ -1873,6 +1882,13 @@ watch(
   padding: 12px 20px;
   color: var(--color-error);
   font-size: 13px;
+}
+
+.soft-notice {
+  padding: 12px 20px;
+  color: var(--color-info);
+  font-size: 13px;
+  cursor: pointer;
 }
 
 .deathmatch-status-bar {

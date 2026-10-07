@@ -4,7 +4,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import type { Notebook, Note, NoteListItem, NoteSearchResult, ExportTaskInfo } from '@/types'
-import { notesApi } from '@/api/notes'
+import { endnoteExportQuery, notesApi } from '@/api/notes'
 import { exportTasksApi } from '@/api/exportTasks'
 import { downloadBlob, type DownloadResult } from '@/composables/useDownload'
 
@@ -404,7 +404,7 @@ export const useNotesStore = defineStore('notes', () => {
     format: 'md' | 'pdf',
     onProgress?: (task: ExportTaskInfo) => void,
   ): Promise<DownloadResult> {
-    const task = await exportTasksApi.create({ task_type: 'single', format, note_id: noteId })
+    const task = await exportTasksApi.create({ task_type: 'single', format, note_id: noteId, endnote_enabled: endnoteExportQuery().endnote_enabled })
     onProgress?.(task)
     const result = await pollExportTask(task.id, onProgress)
     return await downloadExportResult(result)
@@ -415,7 +415,7 @@ export const useNotesStore = defineStore('notes', () => {
     format: 'md' | 'pdf',
     onProgress?: (task: ExportTaskInfo) => void,
   ): Promise<DownloadResult> {
-    const task = await exportTasksApi.create({ task_type: 'bulk', format, note_ids: noteIds })
+    const task = await exportTasksApi.create({ task_type: 'bulk', format, note_ids: noteIds, endnote_enabled: endnoteExportQuery().endnote_enabled })
     onProgress?.(task)
     const result = await pollExportTask(task.id, onProgress)
     return await downloadExportResult(result)

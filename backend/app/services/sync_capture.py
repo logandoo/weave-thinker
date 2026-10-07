@@ -23,6 +23,7 @@ ContextVar，捕获写入 sync_events.origin_device；delta 携带 device_id 时
 同源事件（推送者已持有该状态，无需回传）。
 """
 import contextvars
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -163,6 +164,71 @@ def _resolve_user_id(connection, entity_type: str, target):
     return None
 
 
+def _resolve_payload_fields(connection, target, payload: dict) -> None:
+    """快照期解析（UPSTREAM_TODO_20261007 项1，方案 D；规格 v2 修订版）：
+    外置桩字段以本端 message_payloads 全文替换入事件载荷——接收端零改动
+    （对端 ORM apply 触发既有 before_flush 钩子自动重外置）。
+
+    ⚠ 同 flush 可见性（规格 v2 实现必读）：`_emit` 运行在 Message 的
+    after_insert/after_update（flush 中途），payload 行由钩子在同一 flush
+    创建/更新，FK 依赖排序（messages → message_payloads）使尚未 INSERT 的行
+    对 Core 查询不可见——纯 `connection.execute(SELECT …)` 在新消息路径恒查空、
+    更新路径可能读到旧值（sha 假阴性）。取值顺序（v2）：
+    ① session 优先：`object_session(target)` 的 `sess.new + sess.identity_map`
+       中匹配 `(message_id, field)` 的 MessagePayload，**优先取 sha 相符的
+       候选**（同 flush 新值；identity_map 覆盖原地更新的行）；
+    ② DB 兜底：session 无命中才查 `connection.execute(select …)`（已持久化
+       且本次未变的行）；
+    ③ 命中且 ``compute_sha256(content) == payload_ref`` 才替换；孤儿/完整性
+       不符一律保持桩 + warning——绝不外发未校验内容（与展开路由 404 同立场）。
+    仅在 op 携带载荷时调用（delete payload=None 无需解析）。
+    注：`tool_calls` 不在 `_EXTERNALIZED_FIELDS`（钩子不外置）——存储值=全文，
+    读路径动态桩由展开路由对非外置值直接返回，无同款同步问题。"""
+    from sqlalchemy.orm import object_session
+
+    from app.db.database import MessagePayload
+    from app.services.message_payload_service import (
+        _EXTERNALIZED_FIELDS,
+        compute_sha256,
+        is_externalized_stub,
+    )
+
+    for field in _EXTERNALIZED_FIELDS:
+        stub = payload.get(field)
+        if not is_externalized_stub(stub):
+            continue
+        try:
+            ref = json.loads(stub).get("payload_ref")
+        except (ValueError, TypeError):
+            ref = None
+        content = None
+        sess = object_session(target)
+        if sess is not None and ref:
+            for obj in (*tuple(sess.new), *tuple(sess.identity_map.values())):
+                if (isinstance(obj, MessagePayload)
+                        and obj.message_id == target.id
+                        and obj.field == field
+                        and obj.content is not None
+                        and compute_sha256(obj.content) == ref):
+                    content = obj.content
+                    break
+        if content is None:
+            row = connection.execute(
+                select(MessagePayload.content).where(
+                    MessagePayload.message_id == target.id,
+                    MessagePayload.field == field,
+                )
+            ).first()
+            content = row[0] if row else None
+        if content is not None and ref and compute_sha256(content) == ref:
+            payload[field] = content
+        else:
+            logger.warning(
+                "sync_capture: unresolved payload for message %s field %s "
+                "(orphan/integrity) — keeping stub", target.id, field,
+            )
+
+
 def _emit(connection, entity_type: str, op: str, target) -> None:
     # 运行时开关（A4.9 I3）：捕获在发射期读配置而非仅启动期注册门——SIGHUP
     # 热改 [sync].enabled 时捕获与端点（请求期 _sync_enabled）同进同退。
@@ -179,9 +245,9 @@ def _emit(connection, entity_type: str, op: str, target) -> None:
         if op == "update":
             # A4.9 r1 B#1 + scoped 复审 Critical：streaming 期 create 被跳过，
             # 终态翻转的 update 对端无行可命中（update-without-create = 跨设备
-            # 丢失）。op 词表是 create/update/delete（sync_apply 对 append-only
-            # messages 只认 create，其余 SKIPPED）——终态翻转必须按 "create"
-            # 发射（对端无行→幂等插入；有行→SKIPPED，正是 append-only 语义）。
+            # 丢失）。op 词表是 create/update/delete（sync_apply 对 messages：
+            # create 幂等插入、update 恒 SKIPPED、delete 存在即删）——终态翻转
+            # 必须按 "create" 发射（对端无行→幂等插入；有行→SKIPPED）。
             op = "create"
     # 记忆域独立开关（S5）：默认捕获（全量保真波口径），[sync] memory_enabled=false 可关
     if entity_type in MEMORY_SYNC_ENTITIES and not config.sync_memory_enabled:
@@ -204,6 +270,10 @@ def _emit(connection, entity_type: str, op: str, target) -> None:
         payload = {"kind": getattr(target, "kind", None), "provider": getattr(target, "provider", None)}
     else:
         payload = None if op == "delete" else row_snapshot(target)
+    if entity_type == "messages" and payload is not None:
+        # UPSTREAM_TODO_20261007 项1（方案 D）：外置桩字段快照期解析为全文
+        # （接收端零改动；仅在携带载荷的事件上执行）。
+        _resolve_payload_fields(connection, target, payload)
     connection.execute(
         SyncEvent.__table__.insert().values(
             user_id=user_id,

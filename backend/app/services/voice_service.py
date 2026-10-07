@@ -43,6 +43,24 @@ from app.services.retry_utils import parse_tool_arguments, truncated_tool_args_f
 
 logger = logging.getLogger(__name__)
 
+# 部署排空扩面（D-12，2026-10-06）：在途语音会话计数——GET /api/server/active-runs
+# 三源之一（registry + 后台 + 语音），stop.sh 排空等待覆盖语音面。
+_active_voice_sessions = 0
+
+
+def begin_session() -> None:
+    global _active_voice_sessions
+    _active_voice_sessions += 1
+
+
+def end_session() -> None:
+    global _active_voice_sessions
+    _active_voice_sessions = max(0, _active_voice_sessions - 1)
+
+
+def active_session_count() -> int:
+    return _active_voice_sessions
+
 # Punctuation that ends a speakable segment (clause / sentence boundary).
 _SEGMENT_PUNCT = "，。！？；、…,.!?;~\n"
 # Resume-breakpoint snap boundaries: after a mid-segment pause the breakpoint
@@ -4421,6 +4439,14 @@ class VoiceDuplexSession:
         the responder skips the fragment-merge wait for it (the judge already
         ruled the text complete — no need to wait for a possible continuation
         fragment; 2026-09-20 latency fix)."""
+        # 部署排空扩面（D-12，A4.9 二波 B-I2）：drain 中新轮次停领——已有会话
+        # 不再发起新 LLM run（丢轮+日志，排空窗≤WT_DRAIN_TIMEOUT 秒）；在途轮
+        # 照常完成并计入排空计数。notice 通道是后台任务专用（_deliver_bg_task_
+        # notice 形状），不复用。
+        from app.services.active_agent_registry import ActiveAgentRegistry
+        if ActiveAgentRegistry.get_instance().is_draining:
+            logger.info("voice enqueue dropped (server draining): %r", text)
+            return
         self._turn_enqueued_at = _now()
         norm = _norm_barge_compare(text)
         if norm:
@@ -4490,6 +4516,17 @@ class VoiceDuplexSession:
             await self._on_user_turn_locked(text)
 
     async def _on_user_turn_locked(self, text: str) -> None:
+        # 部署排空扩面（D-12，scoped 复审新发现）：drain 中整轮停摆——barge
+        # 分类/预取/ack 语音/入队全部不发生（它们是新 LLM run 或对永不作答之轮
+        # 的承诺）；错误事件给用户可感知反馈。_enqueue_turn 门为二道防线。
+        from app.services.active_agent_registry import ActiveAgentRegistry
+        if ActiveAgentRegistry.get_instance().is_draining:
+            logger.info("voice user turn dropped (server draining): %r", text)
+            try:
+                await self._send_json({"event": "error", "error": "server_draining"})
+            except Exception:
+                pass
+            return
         # Normalise: a genuine user utterance never starts with punctuation.
         # Streaming ASR can emit a slice beginning with the previous sentence's
         # terminator (e.g. "，快点"); strip it so turns are clean.

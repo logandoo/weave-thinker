@@ -80,8 +80,19 @@ async def set_drain(req: DrainRequest, request: Request):
     return {"draining": reg.is_draining}
 
 
+async def _active_run_total() -> int:
+    """排空计数三源求和（D-12，2026-10-06）：交互 chat（registry 含预约槽）+
+    后台 running 任务 + 语音在途会话——stop.sh 排空等待覆盖这三面。"""
+    from app.services import voice_service
+    from app.services.agent_worker import agent_worker
+    reg = ActiveAgentRegistry.get_instance()
+    return (await reg.active_run_count()
+            + agent_worker.running_count()
+            + voice_service.active_session_count())
+
+
 @router.get("/active-runs")
 async def active_runs(request: Request):
     _check_auth(request)
     reg = ActiveAgentRegistry.get_instance()
-    return {"draining": reg.is_draining, "active": await reg.active_run_count()}
+    return {"draining": reg.is_draining, "active": await _active_run_total()}

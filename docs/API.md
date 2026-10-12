@@ -16,7 +16,7 @@
 
 - **Base URL**：`http(s)://<host>:8158`（默认端口，见 `backend/config.toml [server]`）
 - **交互式文档**：运行时 `/docs`（Swagger UI）
-- **接口规模**：178 个 HTTP operations / 141 条 path（26 个业务模块 + main.py 根路由）+ 3 条 WebSocket（voice / asr / device，见第二、三部分）
+- **接口规模**：178 个 HTTP operations / 141 条 path（26 个业务模块 + main.py 根路由）+ 3 条 WebSocket（voice / asr / device，见第二部分专项语义）
 - **认证**：JWT Bearer Token（请求头 `Authorization: Bearer <token>`）。`POST /api/auth/login` 获取，
   有效期 `[security] token_expire_days`（默认 7 天）；`POST /api/auth/refresh` 用仍有效的 Token 滑动续期
   （单条原子 CAS 轮换，登出后其 token 永久不可续期——详见二.1）。WebSocket 以 `?token=<jwt>` 或
@@ -6731,7 +6731,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### GET `/api/server/active-runs`
 **Active Runs**
 
-认证：公开　|　源码模块：`app/api/server_admin.py`
+认证：非 JWT——`X-Drain-Token` 头（启动期随机令牌，落盘 `backend/.drain_token` 0600、每次启动轮换）+ 仅 loopback 直连；令牌缺失/不符 403、未配置 503（fail-closed）　|　源码模块：`app/api/server_admin.py`
 
 **输入**
 
@@ -6756,7 +6756,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### POST `/api/server/drain`
 **Set Drain**
 
-认证：公开　|　源码模块：`app/api/server_admin.py`
+认证：非 JWT——`X-Drain-Token` 头（启动期随机令牌，落盘 `backend/.drain_token` 0600、每次启动轮换）+ 仅 loopback 直连；令牌缺失/不符 403、未配置 503（fail-closed）　|　源码模块：`app/api/server_admin.py`
 
 **输入**
 

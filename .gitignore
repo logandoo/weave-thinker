@@ -70,3 +70,6 @@ Thumbs.db
 # Test evidence (local scratch only — this release ships no test files)
 tests/
 test-results*/
+
+# Runtime drain token (rotated per server start; never ship)
+**/.drain_token

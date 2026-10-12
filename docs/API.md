@@ -6096,6 +6096,692 @@ HTTP 200
 ---
 
 
+## 联网同步 Sync
+
+前缀 `/api/sync`（`app/api/sync.py`）
+
+### DELETE `/api/sync/account`
+**Delete Sync Account**
+
+> 解绑：停同步 + 清密码（游标保留，重新绑定后续推）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X DELETE "https://<host>:8158/api/sync/account" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/sync/account`
+**Get Sync Account**
+
+> 本人云端绑定（per-user 波；密码永不回显）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/sync/account" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### PUT `/api/sync/account`
+**Put Sync Account**
+
+> 自助绑定云端账号（per-user 波）：验证凭据真实可登录后才落库。
+> 
+> 密码仅存本机 DB（同盒威胁模型，D-13）；bind 成功后 worker 下周期自动接管。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X PUT "https://<host>:8158/api/sync/account" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### POST `/api/sync/account/resync`
+**Resync Sync Account**
+
+> 手动重跑全量基线（全量保真波）：重置 pull_cursor/last_sync_at，worker
+> 下周期重跑 resync（幂等 upsert 合并，不丢本地）。用于新域上线后补拉。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/sync/account/resync" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/sync/blobs`
+**List Blobs**
+
+> blob 元数据列表（S3：客户端上行 diff / 运维审计；仅本人）。
+> 
+> 元组游标 (since=created_at, after=sha256)：同 created_at 并列行不丢页
+> （评审 I4）。返回 。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `since` | query | string|null | 否 |  |
+| `after` | query | string|null | 否 |  |
+| `limit` | query | int | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/sync/blobs" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/sync/blobs/{sha256}`
+**Get Blob**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `sha256` | path | string | 是 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/sync/blobs/{sha256}" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### PUT `/api/sync/blobs/{sha256}`
+**Put Blob**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `sha256` | path | string | 是 |  |
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `sha256` | string | 是 |  |
+| `size` | int | 是 |  |
+| `dedup` | bool | 否 | （默认 False） |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X PUT "https://<host>:8158/api/sync/blobs/{sha256}" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+{
+  "sha256": "string",
+  "size": 0,
+  "dedup": false
+}
+```
+
+---
+
+### GET `/api/sync/conflicts`
+**List Conflicts**
+
+> 本人冲突记录（S4 冲突面；新到旧，offset 分页）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `offset` | query | int | 否 |  |
+| `limit` | query | int | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/sync/conflicts" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/sync/delta`
+**Get Delta**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `cursor` | query | int | 否 |  |
+| `limit` | query | int | 否 |  |
+| `device_id` | query | string|null | 否 |  |
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `events` | DeltaEvent[] | 是 |  |
+| `cursor` | int | 是 |  |
+| `has_more` | bool | 是 |  |
+| `min_available_seq` | ∪int|null | 否（可空） |  |
+| `resync_required` | bool | 否 | （默认 False） |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/sync/delta" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+{
+  "events": [
+    {
+      "seq": null,
+      "entity_type": null,
+      "entity_id": null,
+      "op": null,
+      "payload": null,
+      "origin_device": null,
+      "created_at": null
+    }
+  ],
+  "cursor": 0,
+  "has_more": true,
+  "min_available_seq": 0,
+  "resync_required": false
+}
+```
+
+---
+
+### GET `/api/sync/devices`
+**List Devices**
+
+> 本人设备列表（S4 设备管理面）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/sync/devices" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### POST `/api/sync/devices`
+**Register Device**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `id` | ∪string|null | 否（可空） |  |
+| `name` | ∪string|null | 否（可空） |  |
+| `platform` | ∪string|null | 否（可空） |  |
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `id` | string | 是 |  |
+| `name` | ∪string|null | 否（可空） |  |
+| `platform` | ∪string|null | 否（可空） |  |
+| `last_seen_at` | ∪string|null | 否（可空） |  |
+| `revoked` | bool | 否 | （默认 False） |
+| `created_at` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/sync/devices" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"id": "string", "name": "string", "platform": "string"}
+```
+
+**返回示例**
+
+```json
+{
+  "id": "string",
+  "name": "string",
+  "platform": "string",
+  "last_seen_at": "string",
+  "revoked": false,
+  "created_at": "string"
+}
+```
+
+---
+
+### POST `/api/sync/devices/{device_id}/revoke`
+**Revoke Device**
+
+> 幂等撤销设备（S4）：撤销后 push/重复注册 403；越权 404。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/sync/devices/{device_id}/revoke" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### POST `/api/sync/push`
+**Push Events**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `device_id` | string | 是 |  |
+| `events` | PushEvent[] | 否 |  |
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `applied` | string[] | 是 |  |
+| `skipped` | string[] | 是 |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/sync/push" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"device_id": "string", "events": [{"entity_type": "string", "entity_id": "string", "op": "string", "payload": null}]}
+```
+
+**返回示例**
+
+```json
+{
+  "applied": [
+    "string"
+  ],
+  "skipped": [
+    "string"
+  ]
+}
+```
+
+---
+
+### POST `/api/sync/resync`
+**Resync**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `entities` | object | 是 |  |
+| `cursor` | int | 是 |  |
+| `tombstones` | object[] | 否 |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/sync/resync" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+{
+  "entities": {},
+  "cursor": 0,
+  "tombstones": [
+    {}
+  ]
+}
+```
+
+---
+
+### GET `/api/sync/status`
+**Sync Status**
+
+> 同步状态面（S4）：服务端开关 + 客户端 worker 游标/错误 + 待推送量。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/sync.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/sync/status" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+## 引用样式 Citation Styles
+
+前缀 `/api/citation-styles`（`app/api/citations.py`）
+
+### GET `/api/citation-styles`
+**Get Citation Styles**
+
+> 可用引用样式目录（供助手配置 UI 与死磕规划）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/citations.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/citation-styles" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+## 引用 Citations
+
+前缀 `/api/citations`（`app/api/citations.py`）
+
+### POST `/api/citations/render`
+**Post Citation Render**
+
+> 把正文 [N] 角标按目标样式渲染为文内引用 + 参考文献节（含 F1 剥节）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/citations.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `content` | string | 是 | 含 [N] 角标的正文（Markdown） |
+| `style_id` | ∪string|null | 否（可空） | 样式逻辑 id；缺省走存档汇点默认 |
+| `tool_results` | ∪string|object[] | 否（可空） | 消息 tool_results JSON（web_search results 数组）或直接条目列表 |
+| `entries` | ∪object[]|null | 否（可空） | 直接条目列表 [{id,url,title,published_date,author,site_name}] |
+| `accessed` | ∪string|null | 否（可空） | 引用日期 YYYY-MM-DD；缺省当天 |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/citations/render" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"content": "string", "style_id": "string", "tool_results": "string", "entries": [{}], "accessed": "string"}
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+## 消息载荷 Message Payloads
+
+前缀 `/api/messages`（`app/api/message_payloads.py`）
+
+### GET `/api/messages/{message_id}/payload/{field}`
+**Get Message Payload**
+
+> Return the full text of one message field (externalized or inline).
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/message_payloads.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `message_id` | path | string | 是 |  |
+| `field` | path | string | 是 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/messages/{message_id}/payload/{field}" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+## 服务运维 Server
+
+前缀 `/api/server`（`app/api/server_admin.py`）
+
+### GET `/api/server/active-runs`
+**Active Runs**
+
+认证：公开　|　源码模块：`app/api/server_admin.py`
+
+**输入**
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/server/active-runs"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### POST `/api/server/drain`
+**Set Drain**
+
+认证：公开　|　源码模块：`app/api/server_admin.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `on` | bool | 否 | （默认 True） |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/server/drain" -H "Content-Type: application/json" -d {"on": true}
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
 ## 设备执行 Device Executor（W16 云端/客户端执行切换：配对/管理/文件代理）
 
 前缀 `/api/devices`（`app/api/client_devices.py + app/api/device_ws.py`）

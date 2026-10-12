@@ -1350,25 +1350,32 @@ html[data-skin="verdant-flat"] .skill-source-badge {
 /* wave-11 登录按钮：14px 圆角矩形（青野家族） */
  html[data-skin="verdant-flat"] .login-btn { border-radius: var(--radius-md); }
 
-/* wave-8：底部悬浮钮与 chat-input 容器背景一致（白玻璃卡，active 以文字/边色区分） */
-html[data-skin="verdant-flat"] .mobile-tab-bar .tab-item {
+/* 任务块 9（2026-10-11）：移动端底 tab 对齐 mockup——居中浮动白胶囊 + #e9f1e2 活动 pill
+   规格源 design/mockups/01-verdant-flat/mobile.html .m-tabbar */
+html[data-skin="verdant-flat"] .mobile-tab-bar {
   background: #ffffff;
   border-color: #dfe7d8;
-  box-shadow: 0 1px 2px rgba(45, 59, 36, 0.06);
+  box-shadow: 0 4px 16px rgba(45, 59, 36, 0.14);
+}
+html[data-skin="verdant-flat"] .mobile-tab-bar .tab-item {
+  color: #6b7d5e;
+  background: transparent;
+  border-color: transparent;
 }
 html[data-skin="verdant-flat"] .mobile-tab-bar .tab-item.active {
-  background: #ffffff;
-  color: var(--color-primary-dark);
-  border-color: #cfdbc4;
+  background: #e9f1e2;
+  color: #2d3b24;
+  font-weight: 700;
 }
- html[data-skin="verdant-flat"][data-theme="dark"] .mobile-tab-bar .tab-item,
-html[data-skin="verdant-flat"][data-theme="dark"] .mobile-tab-bar .tab-item.active {
+html[data-skin="verdant-flat"][data-theme="dark"] .mobile-tab-bar {
   background: #1d201d;
   border-color: #343a34;
-  color: var(--color-text-light);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
 }
+html[data-skin="verdant-flat"][data-theme="dark"] .mobile-tab-bar .tab-item { color: #9fae94; }
 html[data-skin="verdant-flat"][data-theme="dark"] .mobile-tab-bar .tab-item.active {
-  color: var(--color-primary-dark);
+  background: rgba(122, 163, 90, 0.24);
+  color: #d7e6c8;
 }
 
 /* ══════════ wave-12：深色模式全表面对比度修复 + 浅色次级文字加深 ══════════

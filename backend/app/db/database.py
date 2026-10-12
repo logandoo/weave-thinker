@@ -234,6 +234,9 @@ class Conversation(Base):
     deathmatch_last_verification_result = Column(JSON, nullable=True)
     deathmatch_verify_failures = Column(Integer, default=0)   # consecutive verifier non-complete
     deathmatch_human_gate = Column(Text, nullable=True)       # structured human-gate report
+    # W16 设备执行模式：执行环境（NULL=云端 workspace；device:<device_id>=配对设备）。
+    # 创建即定（D-6）：首设 adopt，之后 API 拒绝变更——切换=新建会话。
+    execution_target = Column(String(80), nullable=True)
 
     messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
     user = relationship("User", back_populates="conversations")
@@ -960,7 +963,11 @@ class SyncEvent(Base):
 
 
 class SyncTombstone(Base):
-    """删除墓碑（业务表全硬删除，同步必须显式记录删除事实）。"""
+    """删除墓碑（业务表全硬删除，同步必须显式记录删除事实）。
+
+    `payload`（W9 项9，UPSTREAM_TODO_20261007）：删除载荷——当前仅
+    user_model_providers 写自然键 `{kind, provider}`（两端独立建行同自然键 id
+    不同，墓碑回放时 apply_change 需 payload 才能定位归并行）；其余类型 NULL。"""
     __tablename__ = "sync_tombstones"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -968,6 +975,9 @@ class SyncTombstone(Base):
     entity_type = Column(String(40), nullable=False)
     entity_id = Column(String(36), nullable=False)
     deleted_at = Column(DateTime, default=datetime.utcnow)
+    # none_as_null=True（W9 复审 A4）：空载荷存 SQL NULL（而非 JSON null 字符串），
+    # 与文档「其余保持 NULL」及迁移/审计的 IS NULL 语义一致。
+    payload = Column(JSONB(none_as_null=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("user_id", "entity_type", "entity_id", name="uq_sync_tombstone"),
@@ -984,6 +994,42 @@ class SyncDevice(Base):
     platform = Column(String(40), nullable=True)
     last_seen_at = Column(DateTime, default=datetime.utcnow)
     revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ClientExecutorDevice(Base):
+    """W16 设备执行模式：可被云端 agent 驱动执行工具的客户端设备注册表。
+
+    与 SyncDevice（sync 红线，两仓 byte-identical）刻意独立——本表只服务
+    /api/device/ws 工具执行通道（docs/PLAN_device_execution_mode.md §6.1）。
+    token 仅存 sha256 hash；撤销即踢线拒新调用。"""
+    __tablename__ = "client_executor_devices"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    device_id = Column(String(64), nullable=False, unique=True)
+    name = Column(String(255), nullable=True)
+    platform = Column(String(40), nullable=True)
+    token_hash = Column(String(64), nullable=False)
+    capabilities = Column(JSON, nullable=True)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+    revoked = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ClientExecAudit(Base):
+    """W19 P3：远端执行审计——每次设备工具调用一条（ok/err/duration），
+    用户维度查询入口 GET /api/devices/executions。"""
+    __tablename__ = "client_exec_audit"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    device_id = Column(String(64), nullable=False)
+    conversation_id = Column(String(36), nullable=True)
+    tool = Column(String(64), nullable=False)
+    ok = Column(Boolean, default=False)
+    error = Column(Text, nullable=True)
+    duration_ms = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -1026,8 +1072,26 @@ class SyncState(Base):
     tls_verify = Column(Boolean, default=True)  # 自签内网服务器置 false（D-15）
 
 
+class SyncPruneWatermark(Base):
+    """per-user 裁剪水位（W8 8a，UPSTREAM_TODO_20261007）：该用户被 prune 删除的
+    最大事件 seq。
+
+    缺口信号修正（D-w8-1）：delta 的 `resync_required` 判定引入本表——零事件用户
+    无水位不误报（原 `min_seq is None` 恒真致 resync 风暴）；日志被全部裁剪的
+    滞后客户端（cursor < 水位）仍收到 `resync_required=true`（「绝不静默返回
+    不完整数据」）。水位只增不减（max 合并），由
+    `sync_retention.prune_sync_history` 落库。"""
+
+    __tablename__ = "sync_prune_watermarks"
+
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    max_deleted_seq = Column(BigInteger, nullable=False, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
 class SyncConflict(Base):
     """LWW 败方留痕：pull 时本地更新被远端覆盖 / push 时远端拒收。"""
+
     __tablename__ = "sync_conflicts"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))

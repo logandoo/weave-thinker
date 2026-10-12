@@ -10,6 +10,7 @@
  *   the existing download cards).
  */
 import api from './client'
+import { resolveDownloadUrl, normalizeDeviceEntries } from '@/utils/deviceUrls'
 
 export interface WorkspaceEntry {
   name: string
@@ -31,26 +32,50 @@ function tokenParam(): string {
   return token ? `&token=${encodeURIComponent(token)}` : ''
 }
 
-export function buildDownloadUrl(target: string): string {
-  return `/api/files/download?path=${encodeURIComponent(target)}${tokenParam()}`
+export function buildDownloadUrl(target: string, deviceId?: string | null): string {
+  // W18 G3/G4：设备上下文 → 设备文件代理（仅 workspace 相对路径）；
+  // 绝对路径/无设备上下文 → 云端下载（原语义）。纯派生在 utils/deviceUrls（单测缝）。
+  return resolveDownloadUrl(target, deviceId, localStorage.getItem('chatllm_token'))
 }
 
-export function buildZipUrl(relPath: string): string {
+// W19 P1：设备上下文 → 设备端 zip/office 转换代理（fs/zip · fs/office-* RPC）
+export function buildZipUrl(relPath: string, deviceId?: string | null): string {
+  if (deviceId) {
+    return `/api/devices/${encodeURIComponent(deviceId)}/fs/zip?path=${encodeURIComponent(relPath)}${tokenParam()}`
+  }
   return `/api/files/zip?path=${encodeURIComponent(relPath)}${tokenParam()}`
 }
 
-export function buildOfficePdfUrl(relPath: string): string {
+export function buildOfficePdfUrl(relPath: string, deviceId?: string | null): string {
+  if (deviceId) {
+    return `/api/devices/${encodeURIComponent(deviceId)}/fs/office-pdf?path=${encodeURIComponent(relPath)}${tokenParam()}`
+  }
   return `/api/files/office-pdf?path=${encodeURIComponent(relPath)}${tokenParam()}`
 }
 
-export function buildOfficeHtmlUrl(relPath: string): string {
+export function buildOfficeHtmlUrl(relPath: string, deviceId?: string | null): string {
+  if (deviceId) {
+    return `/api/devices/${encodeURIComponent(deviceId)}/fs/office-html?path=${encodeURIComponent(relPath)}${tokenParam()}`
+  }
   return `/api/files/office-html?path=${encodeURIComponent(relPath)}${tokenParam()}`
 }
 
 export async function fetchDirectory(
   relPath: string,
   signal?: AbortSignal,
+  deviceId?: string | null,
 ): Promise<DirectoryListing> {
+  // W18 G4：设备上下文 → 设备 fs/list 代理（响应形状归一，宽容目录枚举）
+  if (deviceId) {
+    const { data } = await api.get<{
+      ok?: boolean
+      entries?: Array<Record<string, unknown>>
+    }>(`/devices/${encodeURIComponent(deviceId)}/fs/list`, {
+      params: { path: relPath },
+      signal,
+    })
+    return { path: relPath, entries: normalizeDeviceEntries(data.entries, relPath), truncated: false }
+  }
   const { data } = await api.get<DirectoryListing>('/files/list', {
     params: { path: relPath },
     signal,

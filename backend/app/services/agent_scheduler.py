@@ -454,6 +454,32 @@ class AgentScheduler:
                     enable_compression=cfg.agent_compression_enabled,
                     session_factory=AsyncSessionLocal,
                 )
+                # W17-P1（审计 I-1）：定时任务同口径轮次门控（同 worker）。
+                # 复审 MINOR-1：整块 fail-open（异常保持默认 True，不拖挂任务）。
+                try:
+                    from app.services.vibeweaver_turn_gate import (
+                        explicit_trigger_hit as _vw_explicit,
+                        extract_recent_user_text as _vw_extract,
+                        resolve_effective_active as _vw_resolve_eff,
+                    )
+                    _vw_last, _vw_ctx = _vw_extract(messages)
+                    try:
+                        _vw_gating = bool(cfg.vibeweaver_task_gating_enabled)
+                    except Exception:
+                        _vw_gating = True
+                    loop.vibeweaver_active = _vw_resolve_eff(
+                        _vw_last, None, _vw_gating, context_text=_vw_ctx
+                    )
+                    logger.info(
+                        "vibeweaver turn gate active=%s explicit=%s coding=None gating=%s task=%s",
+                        loop.vibeweaver_active, _vw_explicit(_vw_last), _vw_gating,
+                        setup_scalars.get("task_id"),
+                    )
+                except Exception:
+                    logger.debug(
+                        "vibeweaver turn gate wiring failed (fail-open to active=True)",
+                        exc_info=True,
+                    )
 
                 tool_results_list = []
                 last_activity_ts = _time.monotonic()

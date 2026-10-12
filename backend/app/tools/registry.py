@@ -230,6 +230,29 @@ class ToolRegistry:
                     "_permission_description": f"工具 {name} 需要确认执行",
                 }, ensure_ascii=False)
 
+        # W16 设备执行模式路由缝（docs/PLAN_device_execution_mode.md §6.4）：
+        # 唯一接入点=本 dispatch 外壳（覆盖 agent_loop 初发/权限重发、voice、worker、
+        # PTC、scheduler、delegate 全部调用面）。execution_target=device 且工具在
+        # 远端白名单 → 经 WS 在设备执行并还原结果；路由层永不静默落回本地执行。
+        remote_result = None
+        try:
+            from app.services.remote_dispatch_router import try_remote_dispatch
+            remote_result = await try_remote_dispatch(name, args, kwargs)
+        except Exception:
+            logger.exception("device-exec routing seam failed for tool '%s'", name)
+            _target = None
+            try:
+                _target = kwargs.get("execution_target") or getattr(
+                    kwargs.get("conversation"), "execution_target", None
+                )
+            except Exception:
+                _target = None
+            if isinstance(_target, str) and _target.startswith("device:"):
+                remote_result = tool_error("设备执行路由失败（fail-closed，不回退云端执行）")
+        if remote_result is not None:
+            self._usage_counter[name] += 1
+            return remote_result
+
         try:
             self._usage_counter[name] += 1
             if entry.is_async:

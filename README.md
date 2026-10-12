@@ -164,6 +164,8 @@ cd ..
 
 **联网同步**：多台设备登录同一账号即可同步会话与分组、笔记、助手配置（含模型供应商）、语音热词、技能、用户资料与记忆——超长的工具结果与思考过程也随同步携带全文，其他设备打开即可见完整内容；只传增量，大文件走独立文件通道；设备可绑定 / 撤销 / 手动全量重同步，换绑不回灌旧改动；记忆默认纳入同步（可配置关闭）；自签证书的内网服务器可按设备绑定跳过证书校验。
 
+**远程设备执行**：在电脑上装好配套客户端并完成配对后，会话的「执行环境」可切到这台设备——Agent 的文件读写、搜索、终端、Git、代码执行等本地类操作都在设备本机运行，用手机或网页即可远程指挥自己的电脑干活；设备工作区的文件预览、下载、整包与 Office 预览由设备侧提供，图片解读与语音转写的文件字节也从设备取回（模型调用仍在云端）。设备离线时明确报错、绝不静默改在云端执行；设备可随时解绑，远端执行留有审计记录；执行环境随会话固定（切换 = 新建会话）。
+
 **全双工语音**：单条 WebSocket 上做流式识别与流式合成，播报中持续拾音，插话即时暂停并从断点续播；语义判端、近场声学门控、情绪应声、热词纠音；输出停滞自动回到聆听、语音识别掉线自动重连；语音里可以调用搜索、代码、笔记、记忆等工具，随口提的事自动转笔记，长内容的分块写入不再因单轮预算不足而失败。当前针对 DashScope FunASR 识别 + MiMo 合成组合调优，其他 ASR/TTS 供应商未经完整测试。
 
 **原生渲染**：LaTeX 公式即时渲染；代码沙箱生成 Word 文档时，公式转为 OMML 原生对象（双击可编辑）；Mermaid 矢量图、ECharts 交互图表（数据须来自真实检索）；图片 lightbox、音视频行内播放。
@@ -182,21 +184,22 @@ cd ..
 
 ## 内置工具与技能
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 50 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 11 项系统技能。
+后端 `app/tools/` 经 `registry.register()` 静态注册 52 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 11 项系统技能。
 
 <details>
-<summary>完整工具清单（50 个）</summary>
+<summary>完整工具清单（52 个）</summary>
 
 | 类别 | 工具函数 | 说明 |
 | --- | --- | --- |
 | 联网检索 | `web_search` | 多引擎接力搜索（主引擎 + fallback 链可配置），农场域名黑名单，来源逐条落库 |
 | 网页深读 | `browser` | 打开网页并抽取正文 |
-| 浏览器操作 | `browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type` / `browser_scroll` / `browser_press` / `browser_back` / `browser_extract` / `browser_execute_js` / `browser_screenshot` | 交互式会话全套操作（10 件套） |
+| 浏览器操作 | `browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type` / `browser_scroll` / `browser_press` / `browser_back` / `browser_extract` / `browser_execute_js` / `browser_screenshot` / `browser_video` | 交互式会话全套操作（11 件套，含录像留证） |
 | 代码执行 | `execute_code` | Python 代码沙箱（自动修复循环、中文字体内置、超时长任务自检引导） |
 | 计算 | `calculate` | AST 白名单安全计算 |
 | 视觉 | `vision_interpret` | VLM 图片解读（purpose `vlm` 优先；未配置时探测主模型视觉能力） |
 | 终端 | `terminal` | 受控 shell 命令执行（敏感操作走审批） |
 | 进程会话 | `process` | 持久进程会话（启动 / 写入 / 增量读取 / 终止；开发服务器与长任务） |
+| 版本控制 | `git` | 受控仓库操作（status/diff/log/rev-parse 只读 + add/commit/restore/stash/init 白名单，危险选项与越界路径拒绝） |
 | 文档查询 | `context7_resolve_library_id` / `context7_query_docs` | Context7 库 ID 解析与官方文档查询 |
 | 笔记 | `notes` | 笔记本与笔记的列表、读取、创建、修改、追加、删除 |
 | 记忆 | `memory` | 跨会话长期记忆（agent/user 双目标 + system 只读系统文档） |
@@ -227,9 +230,9 @@ cd ..
 frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI · 3 皮肤令牌体系）
                      │  /api/*（JWT）
 backend/    FastAPI + async SQLAlchemy 2.0
-  ├─ app/api/        26 个路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/sync/server-drain/…）
+  ├─ app/api/        27 个路由模块（auth/chat/conversations/notes/assistants/skills/voice/asr/sync/devices/server-drain/…）
   ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出 · 联网同步
-  ├─ app/tools/      工具体系（50 个工具函数 + MCP 动态扩展）
+  ├─ app/tools/      工具体系（52 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）
   └─ skills/         系统技能（SKILL.md 目录，Agent 可加载执行）
 webview-app/ Android WebView 壳（可选，JS 桥 window.WeaverNoteApp）
@@ -267,7 +270,7 @@ npx playwright install chromium
 npx playwright test e2e/chat.spec.ts --config playwright.prod8158.config.ts
 ```
 
-服务端「网页深读 / 浏览器 10 件套」依赖 Python 侧 Playwright Chromium：`.venv/bin/python -m playwright install chromium`。两侧 playwright 锁定同一版本（npm `1.60.0` 与 pip `==1.60.0`），浏览器缓存共享，任一侧装一次即可双侧复用。
+服务端「网页深读 / 浏览器 11 件套」依赖 Python 侧 Playwright Chromium：`.venv/bin/python -m playwright install chromium`。两侧 playwright 锁定同一版本（npm `1.60.0` 与 pip `==1.60.0`），浏览器缓存共享，任一侧装一次即可双侧复用。
 
 本开源发行不含后端单元测试集；后端改动的验证要求见 [CONTRIBUTING.md](CONTRIBUTING.md) 的「测试要求」。
 

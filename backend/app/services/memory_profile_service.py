@@ -157,6 +157,14 @@ async def _extract_profile_facts(llm, summaries: list[str]) -> list[dict]:
         "3. 概念名（name）用短语（≤20字，如'用户的孩子（老大5岁）'）；描述（desc）≤80字\n"
         "4. 输出 JSON 数组：[{\"name\": \"...\", \"desc\": \"...\"}]\n"
         "5. 如果摘要中没有稳定个人画像事实，输出 []\n"
+        "6. 用户自身的角色/性别/家庭关系必须严格按用户陈述保真：用户说'我是妈妈'就写"
+        "'用户是…的妈妈'，严禁改写成'爸爸'或性别中性表述；关系保持方向性——"
+        "'蛮蛮是弟弟'（年幼男性）不得写成哥哥，'年年是姐姐'（年长女性）不得写成妹妹，"
+        "兄弟姐妹的长幼与性别不可互换。\n"
+        "7. 主体归属必须精确：'用户'指当前对话的人类本人；AI 助手/产品自身的名字"
+        "（如'Weave Thinker'、'小航'、Weave Thinker）指 AI 不是用户——严禁把用户的观点、经历或"
+        "身份记到产品名下（如'Weave Thinker认为…'当主体是用户时必须写'用户认为…'），"
+        "也严禁把产品名当作用户姓名（除非用户明确自称该名字）。\n"
         f"当前时间: {now_str}\n\n摘要：\n" + "\n\n---\n\n".join(s[:800] for s in summaries[:5])
     )
     resp = await llm.complete_chat(
@@ -230,17 +238,22 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
         if not force and key in existing_keys:
             skipped += 1
             continue
-        # 已有同名 profile 概念则更新描述；否则新建
+        # 已有同名 profile 概念则更新描述；否则新建。
+        # status='active' 限定（W12 Dx-1）：merged 行不参与复活，避免与合并目标重复入读路径。
         existing = await db.execute(
-            text("SELECT id FROM memory_concepts WHERE user_id = :uid AND source_type = :st AND canonical_name = :nm"),
+            text("SELECT id, source_raw_ids FROM memory_concepts WHERE user_id = :uid AND source_type = :st AND canonical_name = :nm AND status = 'active'"),
             {"uid": user_id, "st": _PROFILE_SOURCE, "nm": fact["name"]},
         )
         row = existing.fetchone()
         if row:
+            # W12 Dx-1（08-24 根因 6）：命中已被置 valid_to 的同名行时复活——
+            # 事实仍被近期记忆支持，旧实现只 UPDATE 描述不清 valid_to，
+            # 画像行永久僵尸（读路径 valid_to IS NULL 恒过滤）。
             await db.execute(
                 text("""
                     UPDATE memory_concepts
-                    SET description_short = :d, updated_at = NOW()
+                    SET description_short = :d, updated_at = NOW(),
+                        valid_to = NULL, needs_review = FALSE
                     WHERE id = :cid
                 """),
                 {"d": fact["desc"], "cid": row[0]},
@@ -248,11 +261,20 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
             # 描述变化后需重生成 embedding 与 BM25 索引
             from app.services.memory_concept_service import update_concept_description
             await update_concept_description(db, row[0], fact["desc"], fact["desc"])
-            # A4.9 复审 Important #2：更新分支也持久化 key（缺 key 的旧行补写，
-            # 否则每次扫描都走更新分支重复 re-embed）
+            # A-M4（W12 复审）：profile_fact 键 append 合并——仅空补写会让携带
+            # 迁移期死 raw_ids 的行每晚 reconcile 误标 → rebalance 误杀 → sync 复活
+            # 循环 flap。
+            try:
+                _keys = json.loads(row[1]) if row[1] else []
+                if not isinstance(_keys, list):
+                    _keys = [row[1]] if row[1] else []
+            except (json.JSONDecodeError, TypeError):
+                _keys = [row[1]] if row[1] else []
+            if key not in _keys:
+                _keys.append(key)
             await db.execute(
-                text("UPDATE memory_concepts SET source_raw_ids = :keys WHERE id = :cid AND (source_raw_ids IS NULL OR source_raw_ids = '')"),
-                {"keys": json.dumps([key], ensure_ascii=False), "cid": row[0]},
+                text("UPDATE memory_concepts SET source_raw_ids = :keys WHERE id = :cid"),
+                {"keys": json.dumps(_keys, ensure_ascii=False), "cid": row[0]},
             )
             updated += 1
         else:

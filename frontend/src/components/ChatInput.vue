@@ -214,19 +214,7 @@
 
         <!-- Bottom toolbar: always-visible buttons + more menu -->
         <div class="input-bottom-toolbar">
-          <button
-            v-show="!isRecording"
-            class="toolbar-btn note-ref-btn"
-            @click="onNoteButtonClick"
-            title="引用笔记"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
-              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
-            </svg>
-            <span class="toolbar-btn-label toolbar-btn-label--full">笔记引用</span>
-            <span class="toolbar-btn-label toolbar-btn-label--short">笔记</span>
-          </button>
+          <!-- 任务块 11：思考在前、笔记引用在后（DOM 源序=视觉序，WCAG C27；弃 CSS order） -->
           <div class="reasoning-toggle-group" ref="reasoningGroupRef">
             <button
               v-show="!isRecording"
@@ -277,6 +265,106 @@
               </div>
             </Teleport>
           </div>
+          <button
+            v-show="!isRecording"
+            class="toolbar-btn note-ref-btn"
+            @click="onNoteButtonClick"
+            title="引用笔记"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+            </svg>
+            <span class="toolbar-btn-label toolbar-btn-label--full">笔记引用</span>
+            <span class="toolbar-btn-label toolbar-btn-label--short">笔记</span>
+          </button>
+          <!-- W16 执行环境切换：云端服务器 / 已配对客户端设备 -->
+          <div class="reasoning-toggle-group" ref="execGroupRef">
+            <button
+              v-show="!isRecording"
+              class="toolbar-btn exec-env-btn"
+              :class="{ active: !!chatStore.executionTarget, offline: selectedDeviceOffline }"
+              @click="openExecMenu"
+              :title="execButtonTitle"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="3" width="20" height="14" rx="2"/>
+                <line x1="8" y1="21" x2="16" y2="21"/>
+                <line x1="12" y1="17" x2="12" y2="21"/>
+              </svg>
+              <span class="toolbar-btn-label toolbar-btn-label--full">执行：{{ execTargetLabel }}</span>
+              <span class="toolbar-btn-label toolbar-btn-label--short">{{ execTargetLabel }}</span>
+            </button>
+            <Teleport to="body">
+              <div
+                v-if="showExecMenu"
+                class="reasoning-menu-overlay"
+                @click="closeExecMenu"
+              >
+                <div class="reasoning-menu" :style="execMenuStyle" @click.stop>
+                  <div class="reasoning-menu-title">执行环境</div>
+                  <button
+                    class="reasoning-menu-item"
+                    :class="{ active: !chatStore.executionTarget }"
+                    @click="selectExecTarget(null)"
+                  >
+                    <span class="reasoning-menu-label">云端服务器</span>
+                    <span class="reasoning-menu-desc">在服务器工作区中执行文件/终端操作</span>
+                  </button>
+                  <div
+                    v-for="dev in execDevices"
+                    :key="dev.device_id"
+                    class="reasoning-menu-item exec-device-row"
+                    :class="{ active: chatStore.executionTarget === `device:${dev.device_id}` }"
+                    @click="selectExecTarget(`device:${dev.device_id}`)"
+                  >
+                    <span class="reasoning-menu-label">
+                      <span class="exec-online-dot" :class="{ online: dev.online }"></span>
+                      {{ dev.name || dev.device_id }}
+                    </span>
+                    <span class="reasoning-menu-desc">
+                      {{ dev.revoked ? '已解绑' : (dev.online ? '在线' : '离线') }} · 在该设备上执行本地工作
+                      <button
+                        v-if="!dev.revoked"
+                        class="exec-revoke-btn"
+                        :class="{ armed: revokeArmId === dev.device_id }"
+                        @click.stop="revokeDevice(dev)"
+                      >{{ revokeArmId === dev.device_id ? '确认撤销?' : '撤销' }}</button>
+                    </span>
+                  </div>
+                  <div v-if="!execDevices.length" class="reasoning-menu-desc" style="padding: 8px 12px;">
+                    暂无已配对设备——点击下方「生成配对码」，在客户端「设备执行」面板输入完成配对
+                  </div>
+                  <div class="exec-pair-section">
+                    <button
+                      class="reasoning-menu-item"
+                      :disabled="pairingBusy"
+                      @click="generatePairingCode"
+                    >
+                      <span class="reasoning-menu-label">{{ pairingCode ? '重新生成配对码' : '生成配对码' }}</span>
+                      <span class="reasoning-menu-desc">一次性短时码，输入到客户端「设备执行」面板完成绑定</span>
+                    </button>
+                    <div v-if="pairingCode" class="exec-pair-code">
+                      <code>{{ pairingCode }}</code>
+                      <span class="reasoning-menu-desc">{{ pairingHint }}</span>
+                    </div>
+                  </div>
+                  <div v-if="execAuditItems.length" class="exec-pair-section">
+                    <div class="reasoning-menu-title">最近远端执行</div>
+                    <div
+                      v-for="item in execAuditItems"
+                      :key="item.id"
+                      class="exec-audit-row"
+                    >
+                      <span class="exec-online-dot" :class="{ online: item.ok }"></span>
+                      <span class="exec-audit-tool">{{ item.tool }}</span>
+                      <span class="exec-audit-meta">{{ item.ok ? `${item.duration_ms}ms` : (item.error || '失败') }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </Teleport>
+          </div>
           <!-- More menu (after thinking mode) -->
           <div class="more-menu-wrapper" ref="moreMenuRef">
             <button
@@ -284,13 +372,14 @@
               :class="{ active: showMoreMenu }"
               @click="toggleMoreMenu"
               title="更多功能"
+              aria-label="更多功能"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <circle cx="12" cy="5" r="2"/>
                 <circle cx="12" cy="12" r="2"/>
                 <circle cx="12" cy="19" r="2"/>
               </svg>
-              <span class="toolbar-btn-label">更多</span>
+              <span class="toolbar-btn-label toolbar-btn-label--full">更多</span>
             </button>
           </div>
           <div class="toolbar-spacer"></div>
@@ -427,6 +516,10 @@ import { useAssistantStore } from '@/stores/assistant'
 import { useDraftsStore } from '@/stores/drafts'
 import { useUploadStore } from '@/stores/upload'
 import { notesApi } from '@/api/notes'
+import { clientDevicesApi } from '@/api/clientDevices'
+import { saveUiPreferences, getUiPreferences } from '@/api/skins'
+import type { ClientDevice } from '@/types'
+import type { ClientExecAuditItem } from '@/api/clientDevices'
 import { renderMarkdownToHtml } from '@/composables/useMarkdown'
 import { useAsrStreaming } from '@/composables/useAsrStreaming'
 import { useAsrHotwords } from '@/composables/useAsrHotwords'
@@ -438,6 +531,7 @@ import FilePreviewDialog from './FilePreviewDialog.vue'
 import { skillsApi } from '@/api/skills'
 import type { Skill } from '@/types'
 import { fileUploadApi, type FileParseResult } from '@/api/fileUpload'
+import { dropRestoredChips } from '@/utils/fileRefs'
 import { classifyFile } from '@/composables/filePreview'
 import { buildDownloadUrl } from '@/api/workspaceFiles'
 import { downloadUrl } from '@/composables/useDownload'
@@ -475,17 +569,19 @@ const editorRef = ref<HTMLDivElement | null>(null)
 const isComposing = ref(false)
 const editorHasContent = ref(false)
 // 当前会话生成中（非 deathmatch）→ 发送即插话；停止按钮占用语音槽位。
-const canInterject = computed(() => chatStore.isStreamingCurrentConversation && !chatStore.deathmatchMode)
+const canInterject = computed(() => chatStore.isStreamingCurrentConversation && !chatStore.deathmatchMode && !editMessageId.value)
 const sendBtnDisabled = computed(() => {
   if (chatStore.isStreamingCurrentConversation) {
     if (chatStore.deathmatchMode) return true  // deathmatch 生成中保持阻断（自有交互机制）
-    return !inputText.value.trim() || uploadedFiles.value.length > 0  // 插话 v1 纯文本
+    if (editMessageId.value) return !inputText.value.trim() && uploadedFiles.value.length === 0  // 编辑重发（自处理在途流），与 handleSend 空发守卫同式
+    return !inputText.value.trim() || dropRestoredChips(uploadedFiles.value).length > 0  // 插话 v1 纯文本（restored 芯片不计）
   }
-  return !inputText.value.trim() && uploadedFiles.value.length === 0
+  return !inputText.value.trim() && (editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)).length === 0
 })
 const sendBtnTitle = computed(() => {
+  if (chatStore.isStreamingCurrentConversation && !chatStore.deathmatchMode && editMessageId.value) return '发送编辑（将停止当前生成）'
   if (canInterject.value) {
-    if (uploadedFiles.value.length > 0) return '插话暂不支持附件，请先停止生成或移除附件'
+    if (dropRestoredChips(uploadedFiles.value).length > 0) return '插话暂不支持附件，请先停止生成或移除附件'
     return '发送插话（注入当前回答）'
   }
   return '发送'
@@ -587,6 +683,11 @@ function effortDesc(e: string) { return effortMetaMap.value[e]?.desc ?? EFFORT_M
 const showReasoningMenu = ref(false)
 const reasoningGroupRef = ref<HTMLDivElement | null>(null)
 const reasoningMenuStyle = ref<Record<string, string>>({})
+// W16 设备执行模式：执行环境按钮 + 设备菜单（云端/客户端切换，PLAN §6.6）
+const showExecMenu = ref(false)
+const execGroupRef = ref<HTMLDivElement | null>(null)
+const execMenuStyle = ref<Record<string, string>>({})
+const execDevices = ref<ClientDevice[]>([])
 const showMoreMenu = ref(false)
 const moreMenuRef = ref<HTMLDivElement | null>(null)
 
@@ -713,6 +814,141 @@ function handleDeathmatchClick() {
     chatStore.deathmatchMode = true
     chatStore.deathmatchAction = 'start'
   }
+}
+
+// ---- W16 执行环境切换（set-once D-6：已有消息的会话禁止换环境） ----
+// W18 G5：配对码/撤销管理 + 离线 UX + G7 偏好持久化
+const pairingCode = ref<string | null>(null)
+const pairingBusy = ref(false)
+const pairingHint = ref('在客户端「设备执行」面板输入此码（短时有效，一次性）')
+const revokeArmId = ref<string | null>(null)
+// W19 P3：最近远端执行审计（菜单打开时拉取）
+const execAuditItems = ref<ClientExecAuditItem[]>([])
+// A4.9 I-3：用户显式选择标记——偏好恢复竞态护栏
+const execUserSelected = ref(false)
+
+const selectedDeviceOffline = computed(() => {
+  const t = chatStore.executionTarget
+  if (!t || !t.startsWith('device:')) return false
+  const dev = execDevices.value.find(d => `device:${d.device_id}` === t)
+  return !!dev && (!dev.online || dev.revoked)
+})
+
+const execButtonTitle = computed(() => {
+  if (!chatStore.executionTarget) return '执行环境：云端服务器'
+  if (selectedDeviceOffline.value) return '执行环境：客户端设备（离线/已解绑）'
+  return `执行环境：客户端设备（${execTargetLabel.value}）`
+})
+
+const execTargetLabel = computed(() => {
+  const t = chatStore.executionTarget
+  if (!t) return '云端'
+  const dev = execDevices.value.find(d => `device:${d.device_id}` === t)
+  return dev?.name || '客户端'
+})
+
+async function openExecMenu() {
+  if (execGroupRef.value) {
+    const rect = execGroupRef.value.getBoundingClientRect()
+    execMenuStyle.value = {
+      position: 'fixed',
+      left: `${rect.left}px`,
+      bottom: `${window.innerHeight - rect.top + 8}px`,
+      zIndex: '10000',
+    }
+  }
+  showExecMenu.value = true
+  revokeArmId.value = null
+  try {
+    execDevices.value = await clientDevicesApi.list()
+  } catch {
+    // 列表拉取失败保持空态提示，允许重开菜单重试
+  }
+  try {
+    execAuditItems.value = await clientDevicesApi.listExecutions(8)
+  } catch {
+    execAuditItems.value = []
+  }
+}
+
+function closeExecMenu() {
+  showExecMenu.value = false
+}
+
+async function generatePairingCode() {
+  pairingBusy.value = true
+  try {
+    const rec = await clientDevicesApi.createPairingCode()
+    pairingCode.value = rec.code
+    pairingHint.value = `在客户端「设备执行」面板输入此码（${Math.round(rec.expires_in_seconds / 60)} 分钟内有效，一次性）`
+  } catch {
+    showToast('配对码生成失败，请稍后重试', 'error')
+  } finally {
+    pairingBusy.value = false
+  }
+}
+
+async function revokeDevice(dev: ClientDevice) {
+  if (revokeArmId.value !== dev.device_id) {
+    revokeArmId.value = dev.device_id
+    return
+  }
+  revokeArmId.value = null
+  try {
+    await clientDevicesApi.revoke(dev.device_id)
+    showToast(`设备「${dev.name || dev.device_id}」已解绑`, 'info')
+    execDevices.value = await clientDevicesApi.list()
+  } catch {
+    showToast('撤销失败，请稍后重试', 'error')
+  }
+}
+
+function selectExecTarget(target: string | null) {
+  const convId = chatStore.currentConversationId
+  const meta = convId ? chatStore.conversationMeta[convId] : null
+  const fixed = meta?.execution_target ?? null
+  const hasMessages = !!(convId && (chatStore.messages[convId]?.length))
+  if (hasMessages && fixed !== target) {
+    showToast('执行环境已固定：切换云端/客户端请新建会话', 'error')
+    showExecMenu.value = false
+    return
+  }
+  execUserSelected.value = true
+  revokeArmId.value = null
+  chatStore.executionTarget = target
+  showExecMenu.value = false
+  // G7：默认执行环境持久化（合并 PUT，不抹 skin 等并存键；失败静默=仅本次会话级）
+  void saveUiPreferences({ default_execution_target: target ?? '' }).catch(() => {})
+  if (target && target.startsWith('device:')) {
+    const dev = execDevices.value.find(d => `device:${d.device_id}` === target)
+    if (dev && (!dev.online || dev.revoked)) {
+      showToast(dev.revoked ? '该设备已解绑：请撤销绑定后重新配对，或改用云端' : '该设备当前离线：发送后工具将无法执行', 'error')
+    }
+  }
+}
+
+// G5 发送前校验（fail-fast，D-8 一致）：设备离线/已解绑即拦截，不静默改道。
+// A4.9 I-2：execDevices 仅在菜单打开时填充——设备目标下发送前强制刷新列表
+// （菜单从未打开/偏好恢复的目标不得 fail-open）。
+async function execPreSendCheck(): Promise<boolean> {
+  const t = chatStore.executionTarget
+  if (!t || !t.startsWith('device:')) return true
+  try {
+    execDevices.value = await clientDevicesApi.list()
+  } catch {
+    // 列表拉取失败无法判定在线态——放行由服务端 fail-closed 兜底（D-8）
+    return true
+  }
+  const dev = execDevices.value.find(d => `device:${d.device_id}` === t)
+  if (dev && dev.revoked) {
+    showToast('设备已解绑：请改用云端新建会话', 'error')
+    return false
+  }
+  if (dev && !dev.online) {
+    showToast('设备离线：请保持客户端在线，或改用云端执行环境', 'error')
+    return false
+  }
+  return true
 }
 
 function openReasoningMenu() {
@@ -1096,16 +1332,25 @@ async function handleSend() {
   // the message (repro 2026-08-03: keyboard.type + immediate Enter → no
   // POST /api/chat/stream fired).
   syncInputText()
+  // W18 G5：发送前执行环境校验（fail-fast，D-8）——设备离线/已解绑即拦截
+  if (!(await execPreSendCheck())) return
   const text = inputText.value.trim()
   // 当前会话生成中：发送即插话（迭代边界注入，不打断在途生成）。
-  // deathmatch 会话不支持插话（有自有暂停/讨论机制），保持阻断。
+  // deathmatch 会话生成中全阻断（复审 r4：按钮禁用之外 Enter 直调 handleSend
+  // 也在此同拦——编辑态经 fall-through 调 editAndResendMessage 会 abort 死磕流）。
+  // 编辑态不走插话（复审 r3）：editAndResendMessage 自带 abort+stop 在途流的
+  // 时序——若误入插话分支会清掉编辑草稿而 editMessageId 仍武装，下一次发送
+  // 以空正文+附件块替换整条消息。
   if (chatStore.isStreamingCurrentConversation) {
-    if (!text || chatStore.deathmatchMode) return
-    if (uploadedFiles.value.length > 0) return  // 插话 v1 不支持附件
-    await handleInterject(text)
-    return
+    if (chatStore.deathmatchMode) return
+    if (!editMessageId.value) {
+      if (!text) return
+      if (dropRestoredChips(uploadedFiles.value).length > 0) return  // 插话 v1 不支持附件（restored 芯片不计——弃编辑残留）
+      await handleInterject(text)
+      return
+    }
   }
-  if (!text && uploadedFiles.value.length === 0) return
+  if (!text && (editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)).length === 0) return
 
   let fullContent = ''
   if (referencedNotes.value.length > 0) {
@@ -1113,8 +1358,11 @@ async function handleSend() {
       fullContent += `[note-ref:${noteRef.id}|${noteRef.title}]\n${noteRef.content}\n[/note-ref]\n\n`
     }
   }
-  if (uploadedFiles.value.length > 0) {
-    for (const f of uploadedFiles.value) {
+  // Restored-tagged chips belong to an edit session (utils/fileRefs): a normal
+  // send after an abandoned edit must not attach the edited message's files.
+  const filesToAttach = editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)
+  if (filesToAttach.length > 0) {
+    for (const f of filesToAttach) {
       if (f.file_path || f.rel_path) {
         const sizeStr = f.size
           ? f.size < 1024
@@ -1530,6 +1778,22 @@ onMounted(() => {
   document.addEventListener('keydown', handleKeyDown)
     document.addEventListener('click', handleOutsideClick)
   chatStore.loadModels() // 模型别名能力表（思考菜单驱动），懒加载一次
+  // W18 G7：恢复用户默认执行环境（仅新会话/无目标时生效；失败静默）。
+  // A4.9：execUserSelected 竞态护栏——恢复请求在途时用户显式选择不得被晚到的
+  // GET 覆盖（含显式选云端）。
+  void getUiPreferences()
+    .then((prefs) => {
+      const t = prefs.default_execution_target || null
+      if (
+        t
+        && !execUserSelected.value
+        && !chatStore.executionTarget
+        && !chatStore.currentConversationId
+      ) {
+        chatStore.executionTarget = t
+      }
+    })
+    .catch(() => {})
   if (editorRef.value && inputText.value) {
     editorRef.value.textContent = inputText.value
     // Draft restored into the DOM — the placeholder class binds to
@@ -1916,7 +2180,7 @@ defineExpose({ setEditContent })
   font-size: 11px;
   color: var(--color-text-light);
   opacity: 0.7;
-  margin-top: 8px;
+  margin-top: 2px;
 }
 
 .reasoning-toggle-group {
@@ -2103,6 +2367,89 @@ defineExpose({ setEditContent })
   padding: 4px 8px 8px;
   border-bottom: 1px solid var(--color-border);
   margin-bottom: 4px;
+}
+
+/* W16 执行环境菜单：设备在线状态点 */
+.exec-online-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-text-light);
+  margin-right: 6px;
+  vertical-align: middle;
+  opacity: 0.5;
+}
+
+.exec-online-dot.online {
+  background: #22c55e;
+  opacity: 1;
+}
+
+/* W18 G5：设备管理——撤销二段确认 + 配对码块 + 离线按钮态 */
+.exec-device-row {
+  cursor: pointer;
+}
+
+.exec-revoke-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-light);
+  cursor: pointer;
+}
+
+.exec-revoke-btn.armed {
+  border-color: #ef4444;
+  color: #ef4444;
+}
+
+.exec-pair-section {
+  border-top: 1px solid var(--color-border);
+  margin-top: 4px;
+  padding-top: 4px;
+}
+
+.exec-pair-code {
+  padding: 6px 12px 8px;
+}
+
+.exec-pair-code code {
+  display: block;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  border-radius: var(--radius-md);
+  background: var(--color-hover);
+}
+
+.exec-env-btn.offline {
+  opacity: 0.55;
+}
+
+/* W19 P3：最近远端执行审计行 */
+.exec-audit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  font-size: 12px;
+  color: var(--color-text-light);
+}
+
+.exec-audit-tool {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.exec-audit-meta {
+  margin-left: auto;
+  opacity: 0.8;
 }
 
 .reasoning-menu-item {
@@ -2943,7 +3290,7 @@ defineExpose({ setEditContent })
 }
 
 .input-hint {
-  margin-top: 10px;
+  margin-top: 2px;
   opacity: 0.82;
 }
 
@@ -3309,6 +3656,24 @@ defineExpose({ setEditContent })
     background: var(--surface-panel-strong);
   }
 
+  /* 任务块 12/13：输入板底衬收零（三皮肤覆写为 calc(8px+safe) 松值）。
+     html[data-skin] + scoped data-v 提升特异性 (0,3,1) 压过皮肤 (0,2,1)——
+     hint 行盒底=板缘，gapB=0+slabGap */
+  html[data-skin] .chat-input-wrapper {
+    padding-bottom: 0;
+  }
+
+  /* 任务块 14（用户裁定·三皮肤位置解耦）：
+     verdant——胶囊在绿区居中（offset 76 → slabGap 12=下隙），hint mt 12 → gapA=gapB=12 等距；
+     mono——hint 在卡黑色硬影底（卡底+5）与胶囊顶之间居中：mt 7 → 影上隙 2 = 下隙 2；
+     ink 保持基座 mt 2（gapA=gapB=2） */
+  html[data-skin="verdant-flat"] .input-hint {
+    margin-top: 12px;
+  }
+  html[data-skin="mono-brutal"] .input-hint {
+    margin-top: 7px;
+  }
+
   .chat-input-wrapper.voice-active {}
 
   .drafts-panel {
@@ -3361,6 +3726,14 @@ defineExpose({ setEditContent })
   .input-bottom-toolbar .toolbar-btn svg {
     width: 14px;
     height: 14px;
+  }
+
+  /* 更多：移动端纯纵向三点（⋮）图标钮——输入行拥挤治理（2026-10-11 用户指令）；
+     文字由全局 toolbar-btn-label--full 规则在 ≤767px 隐藏，此处只收窄成方形触区 */
+  .input-bottom-toolbar .more-btn {
+    min-width: 32px;
+    padding-left: 6px;
+    padding-right: 6px;
   }
 
   .toolbar-btn-label {
@@ -3476,7 +3849,7 @@ defineExpose({ setEditContent })
 
   .input-hint {
     font-size: 10px;
-    margin-top: 10px;
+    margin-top: 2px;
   }
 }
 

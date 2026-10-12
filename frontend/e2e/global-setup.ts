@@ -17,6 +17,7 @@ async function globalSetup() {
   const python = path.join(projectRoot, '.venv', 'bin', 'python');
   const seeds = [
     path.join(projectRoot, 'tests', 'memory_ui_seed.py'),
+    path.join(projectRoot, 'tests', 'citation_ui_seed.py'),
     path.join(projectRoot, 'tests', 'seed_workspace_preview_fixtures.py'),
   ];
   for (const seed of seeds) {

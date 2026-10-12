@@ -584,6 +584,64 @@ $$"""),
     # 置于 pgvector_extension 之前（后缀纯度守卫 test_startup_migrations_sql）。
     ("export_tasks_endnote_enabled",
      "ALTER TABLE export_tasks ADD COLUMN IF NOT EXISTS endnote_enabled BOOLEAN NOT NULL DEFAULT TRUE"),
+    # W9 parked 项 9（UPSTREAM_TODO_20261007）：墓碑载荷列——user_model_providers
+    # 自然键（kind/provider）供 resync 墓碑回放的 apply_change 兜底（异 id 归并
+    # 行）；存量从仍存的 delete 事件回填。与 memory v2 无关，置于
+    # pgvector_extension 之前（后缀纯度守卫 test_startup_migrations_sql）。
+    ("sync_tombstones_payload",
+     "ALTER TABLE sync_tombstones ADD COLUMN IF NOT EXISTS payload JSONB"),
+    # 回填守则（W9 复审 A2/A4）：
+    # ① 仅对象载荷（jsonb_typeof='object'）——delete 事件的 payload=None 按
+    #    JSON null 落库，裸 IS NOT NULL 会误纳 null 字面量导致任意命中；
+    # ② 确定性取最新（max(seq)）——同 id 多条 delete 事件时不得任意选；
+    # ③ 目标覆盖 SQL NULL 与 JSON null（旧列存量两态）。
+    ("sync_tombstones_payload_backfill",
+     "UPDATE sync_tombstones t SET payload = e.payload "
+     "FROM sync_events e "
+     "WHERE t.entity_type = 'user_model_providers' "
+     "AND (t.payload IS NULL OR jsonb_typeof(t.payload) = 'null') "
+     "AND e.entity_type = 'user_model_providers' AND e.op = 'delete' "
+     "AND e.entity_id = t.entity_id AND e.user_id = t.user_id "
+     "AND jsonb_typeof(e.payload) = 'object' "
+     "AND e.seq = (SELECT max(e2.seq) FROM sync_events e2 "
+     "WHERE e2.user_id = t.user_id AND e2.entity_type = 'user_model_providers' "
+     "AND e2.op = 'delete' AND e2.entity_id = t.entity_id "
+     "AND jsonb_typeof(e2.payload) = 'object')"),
+    # W16 设备执行模式（2026-10-10）：会话执行环境列（NULL=云端；device:<id>=配对设备，
+    # 创建即定 D-6）+ 客户端执行器设备注册表（与 SyncDevice 独立，护 sync 红线）。
+    # 与 memory v2 无关，置于 pgvector_extension 之前（后缀纯度守卫）。
+    ("conversations_execution_target",
+     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS execution_target VARCHAR(80)"),
+    ("client_executor_devices_v1", (
+        "CREATE TABLE IF NOT EXISTS client_executor_devices ("
+        "id VARCHAR(36) PRIMARY KEY, "
+        "user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "device_id VARCHAR(64) NOT NULL UNIQUE, "
+        "name VARCHAR(255), "
+        "platform VARCHAR(40), "
+        "token_hash VARCHAR(64) NOT NULL, "
+        "capabilities JSON, "
+        "last_seen_at TIMESTAMP WITHOUT TIME ZONE, "
+        "revoked BOOLEAN DEFAULT FALSE, "
+        "created_at TIMESTAMP WITHOUT TIME ZONE)"
+    )),
+    # W19 P3（2026-10-10）：远端执行审计表（与 memory v2 无关，置于 pgvector 之前）
+    ("client_exec_audit_v1", (
+        "CREATE TABLE IF NOT EXISTS client_exec_audit ("
+        "id VARCHAR(36) PRIMARY KEY, "
+        "user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+        "device_id VARCHAR(64) NOT NULL, "
+        "conversation_id VARCHAR(36), "
+        "tool VARCHAR(64) NOT NULL, "
+        "ok BOOLEAN DEFAULT FALSE, "
+        "error TEXT, "
+        "duration_ms INTEGER DEFAULT 0, "
+        "created_at TIMESTAMP WITHOUT TIME ZONE)"
+    )),
+    ("idx_client_exec_audit_user", (
+        "CREATE INDEX IF NOT EXISTS idx_client_exec_audit_user_created "
+        "ON client_exec_audit(user_id, created_at DESC)"
+    )),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (

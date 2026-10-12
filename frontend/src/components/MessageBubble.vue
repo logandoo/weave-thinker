@@ -71,7 +71,7 @@
           <div v-else-if="item.type === 'reasoning_step'" class="reasoning-block">
             <details @toggle="(e) => onLazyToggle(`rs-${idx}`, e)">
               <summary class="reasoning-summary"><span class="step-title">{{ item.title || '💭 思考过程' }}</span><span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
-              <div v-if="isLazyOpen(`rs-${idx}`)" class="reasoning-text" v-html="renderMarkdownToHtml(item.content)"></div>
+              <div v-if="isLazyOpen(`rs-${idx}`)" class="reasoning-text" v-html="renderMarkdownToHtml(item.content, { deviceId: messageDeviceId })"></div>
             </details>
           </div>
           <ToolPartCard v-else-if="isToolSequenceItem(item)" :item="toToolPartItem(item)" />
@@ -160,14 +160,14 @@
           :key="'search-' + num"
           class="msg-ref-tag msg-ref-tag--search"
           :class="{ 'msg-ref-tag--active': searchPreviewIdx === num }"
-          :title="`[${num}] ${bibText || result.title || extractDomain(result.url)}`"
+          :title="`[${num}] ${(bibText || result.title || extractDomain(result.url)).replace(/^\[\d+\]\s*/, '')}`"
           @click.stop="searchPreviewIdx = searchPreviewIdx === num ? null : num"
         >
           <span class="msg-ref-index">[{{ num }}]</span>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
           </svg>
-          {{ result.url ? extractDomain(result.url) : (bibText || result.title || '').slice(0, 40) }}
+          {{ bibText ? bibText.replace(/^\[\d+\]\s*/, '').slice(0, 48) : (result.url ? extractDomain(result.url) : (result.title || '').slice(0, 40)) }}
         </span>
       </div>
 
@@ -193,6 +193,7 @@
       <FileAttachmentComp
         v-if="parsedAttachments.length"
         :attachments="parsedAttachments"
+        :device-id="messageDeviceId"
       />
 
       <div v-if="message.role === 'assistant' && !saveMode" class="message-actions">
@@ -401,6 +402,7 @@ import { resolveDisplaySequence, forceFullBody } from '@/stores/streamReducer'
 import { isExternalizedStub, stubMarkersTrusted } from '@/api/chat'
 import { classifyFile } from '@/composables/filePreview'
 import { buildDownloadUrl } from '@/api/workspaceFiles'
+import { buildDeviceDownloadUrl, deviceIdFromTarget } from '@/api/clientDevices'
 import { downloadUrl } from '@/composables/useDownload'
 import {
   renderMarkdownToHtml,
@@ -415,27 +417,9 @@ import {
   stripDsmlTags,
 } from '@/composables/useMarkdown'
 import { convertTabTablesToMarkdown } from '@/composables/tabTableConvert'
+import { parseBibliographyEntries, INLINE_SOURCE_REGEX, maxCitationIndexFor, assembleChips, buildCitationChips, applyCitationInText, type BibEntry, type CitationsPayload } from '@/utils/citations'
 import { useToast } from '@/composables/useToast'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
-
-// Pre-compile bibliography regexes to avoid re-creating them on every computed
-// re-evaluation during streaming.
-const BIB_HEADER_RE = /(?:^|\n)\s*(?:#{1,6}\s|\*{1,2})?(?:参考文献|参考资料|参考来源|References|Sources)\s*[：:]?\s*(?:\*{1,2})?\s*/i
-const BIB_LINE_RE = /(?:^|\n)\s*\[(\d{1,3})\]\s*([^\n]+(?:\n(?!\s*\[\d{1,3}\])[^\n]+)*)/g
-// Inline source annotation pattern: "来源：XXX [N]" — strip the prefix, keep [N].
-// The capture group intentionally excludes '[' so it won't greedily swallow the
-// citation marker, and leading/trailing markdown bold/italic markers are
-// stripped in parseBibliography to avoid rendering "**" as the card text.
-const BIB_INLINE_RE = /来源[：:]\s*([^\n\[]+?)\s*\[(\d{1,3})\]/g
-
-// Strip markdown formatting markers (bold/italic/heading) from bibliography text
-// so reference cards never display raw "**" or "##" characters.
-function stripBibMarkdown(text: string): string {
-  return text
-    .replace(/^[\s#*_]+/, '')
-    .replace(/[\s#*_]+$/, '')
-    .trim()
-}
 
 // Lightweight memoization helper keyed by a derived string. Used to avoid
 // re-scanning bibliography content when the message is streaming and only the
@@ -739,10 +723,13 @@ async function onContentClick(e: MouseEvent) {
       return
     }
   }
-  if (target.classList.contains('citation-ref')) {
+  const citationEl = target.closest('.citation-ref') as HTMLElement | null
+  if (citationEl) {
     e.stopPropagation()
-    const idx = parseInt(target.dataset.citeIndex || '', 10)
-    const maxIdx = citationNumberMap.value.size || maxCitationIndex.value
+    const idx = parseInt(citationEl.dataset.citeIndex || '', 10)
+    const maxIdx = citationsPayload.value
+      ? citationsPayload.value.entries.length
+      : (citationNumberMap.value.size || maxCitationIndex.value)
     if (!isNaN(idx) && idx >= 1 && idx <= maxIdx) {
       searchPreviewIdx.value = searchPreviewIdx.value === idx ? null : idx
     }
@@ -899,41 +886,8 @@ const parsedToolResults = computed<SearchResult[]>(() => {
 // to *this* bibliography, not to positions in `parsedToolResults`.
 // Also parses inline "来源：XXX [N]" annotations (common in image-search answers)
 // so that [N] markers can be fuzzy-matched to the correct tool_result.
-interface BibEntry { num: number; text: string }
-
-const parseBibliography = createMemo((content: string): BibEntry[] => {
-  const entries: BibEntry[] = []
-  const m = content.match(BIB_HEADER_RE)
-  if (m) {
-    const after = content.slice((m.index ?? 0) + m[0].length)
-    // Try line-based entries first.
-    let lm: RegExpExecArray | null
-    while ((lm = BIB_LINE_RE.exec(after)) !== null) {
-      entries.push({ num: parseInt(lm[1], 10), text: stripBibMarkdown(lm[2]) })
-    }
-    // Fallback for inline semicolon-separated entries such as:
-    // "**引用来源：** [1] A; [2] B; [3] C"
-    if (entries.length === 0) {
-      const inline = after.replace(/\n+/g, ' ').trim()
-      const inlineRe = /\[(\d{1,3})\]\s*([^\[\n;]+?)(?=\[\d{1,3}\]|$|;)/g
-      let im: RegExpExecArray | null
-      while ((im = inlineRe.exec(inline)) !== null) {
-        const text = stripBibMarkdown(im[2])
-        if (text) entries.push({ num: parseInt(im[1], 10), text })
-      }
-    }
-  }
-  if (entries.length === 0) {
-    let im: RegExpExecArray | null
-    while ((im = BIB_INLINE_RE.exec(content)) !== null) {
-      const text = stripBibMarkdown(im[1])
-      if (text) {
-        entries.push({ num: parseInt(im[2], 10), text })
-      }
-    }
-  }
-  return entries
-})
+// 实现已归位 @/utils/citations（纯模块，node 可测——W14 误匹配修复同源）。
+const parseBibliography = createMemo((content: string): BibEntry[] => parseBibliographyEntries(content))
 
 const parsedBibliography = computed<BibEntry[]>(() => {
   const content = props.message.content || ''
@@ -988,11 +942,20 @@ const bibliographyMatches = computed<Array<{ entry: BibEntry; result: SearchResu
   return matchBibliography(`${JSON.stringify(bib)}\x00${JSON.stringify(results)}`)
 })
 
+// M4/M6：服务端 citations 载荷（存在时卡片与文内形态由载荷驱动）。
+const citationsPayload = computed<CitationsPayload | null>(() => {
+  const c = parsedToolResultsData.value?.citations
+  return c && Array.isArray(c.entries) && c.entries.length > 0 ? c : null
+})
+
 // Highest valid citation number for inline-marker clicks.
+// 并集语义（review R1/R2 Critical + r2 I1）：total = max(匹配条目最大编号,
+// 检索结果数)——短 bib 不得把范围坍缩到条目数（否则「1 条真注释+37 结果」
+// 复现「引用卡片仅留第一个」）；fabricated 未匹配条目也不得抬范围
+// （否则 prose [38]-[99] 括号数字变死徽标）。
 const maxCitationIndex = computed(() => {
-  return parsedBibliography.value.length > 0
-    ? parsedBibliography.value.length
-    : parsedToolResults.value.length
+  const matchedBib = bibliographyMatches.value.filter(m => m.result).map(m => m.entry)
+  return maxCitationIndexFor(matchedBib, parsedToolResults.value.length)
 })
 
 // Indices [1..N] actually cited in the body text (numbers in [..] within the
@@ -1037,42 +1000,33 @@ const citationNumberReverseMap = computed<Map<number, number>>(() => {
 
 // Chips/cards to actually render. The `num` field is the 1-based citation
 // index shown on the badge — renumbered sequentially to eliminate gaps.
+// 组装归位 @/utils/citations.assembleChips（每被引用标记恰一芯片：
+// bib 匹配优先、位置映射补位——短 bib 不得坍缩芯片列表）。
 const displayedToolResults = computed<Array<{ result: SearchResult; num: number; bibText?: string }>>(() => {
+  // M6：服务端载荷优先——卡片=规范 reference 文本（每被引条目恰一芯片；
+  // URL 可有可无，无链接条目（古籍/书籍）同样成卡）。
+  const payload = citationsPayload.value
+  if (payload) {
+    return buildCitationChips(payload).map((chip) => ({
+      result: chip.result as SearchResult,
+      num: chip.num,
+      bibText: chip.bibText,
+    }))
+  }
   // Don't show any chips if there are no actual search results — fabricated
   // bibliography entries (when the LLM answers from its own knowledge without
   // web_search) should not appear as reference tags.
   if (parsedToolResults.value.length === 0) return []
   const refs = referencedCitationIndices.value
   if (refs.size === 0) return []
-  const numMap = citationNumberMap.value
   const bib = bibliographyMatches.value
-  if (bib.length > 0) {
-    // Only entries that fuzzy-matched a REAL search result become chips.
-    // An entry with no match is a fabricated source — rendering it as a
-    // chip with an empty URL gave hallucinated sources a UI badge
-    // (grounded-citations integrity fix).
-    const matched = bib.filter(({ entry, result }) => refs.has(entry.num) && result)
-    if (matched.length > 0) {
-      const items = matched.map(({ entry, result }) => ({
-        result: result as SearchResult,
-        num: numMap.get(entry.num) || entry.num,
-        bibText: entry.text,
-      }))
-      items.sort((a, b) => a.num - b.num)
-      return items
-    }
-    // No bibliography entry matched a real result — fall through to the
-    // positional mapping so genuine citations still render as chips.
-  }
-  let items = parsedToolResults.value
-    .map((result, i) => ({ result, num: i + 1 }))
-    .filter(({ num }) => refs.has(num))
-    .map(({ result, num }) => ({
-      result,
-      num: numMap.get(num) || num,
-    }))
-  items.sort((a, b) => a.num - b.num)
-  return items
+  // Only entries that fuzzy-matched a REAL search result become bib chips.
+  // An entry with no match is a fabricated source — rendering it as a
+  // chip with an empty URL gave hallucinated sources a UI badge
+  // (grounded-citations integrity fix); uncovered markers fall back to the
+  // positional mapping in assembleChips.
+  const matched = bib.filter(({ entry, result }) => refs.has(entry.num) && result)
+  return assembleChips(matched, parsedToolResults.value, refs, citationNumberMap.value) as Array<{ result: SearchResult; num: number; bibText?: string }>
 })
 
 // Result currently shown in the preview popup, resolved by citation number.
@@ -1396,9 +1350,6 @@ const NOTE_REF_REGEX = /\[note-ref:([^|]*)\|([^\]]*)\]\n([\s\S]*?)\n\[\/note-ref
 // not as inline text sections. Chicago-style references are added only when saving to notes.
 const BIBLIOGRAPHY_SECTION_REGEX = /(?:\n\n?---[^\S\n]*\n+)?(?:^|\n)[^\S\n]*(?:#{1,6}[^\S\n]*|\*{1,2}[^\S\n]*)?(?:参考文献|参考资料|参考来源|References|Sources|Reference)[：:]?[^\S\n]*(?:\*{1,2})?[^\S\n]*\n[\s\S]*$/i
 
-// Inline source annotation pattern: "来源：XXX [N]" — strip the prefix, keep [N]
-const INLINE_SOURCE_REGEX = /来源[：:]\s*[^\n\[]+?\s*\[(\d{1,2})\]/g
-
 interface NoteRefInfo {
   id: string
   title: string
@@ -1457,8 +1408,23 @@ const previewFileRef = computed<FileRefInfo | null>(() => {
 })
 
 function fileRefUrl(ref: FileRefInfo): string {
-  return buildDownloadUrl(ref.relPath || ref.absolutePath)
+  // W16 设备执行模式：会话绑定客户端设备时，文件字节走设备代理（PLAN §6.2/§6.6）
+  const deviceId = messageDeviceId.value
+  if (deviceId && ref.relPath) {
+    return buildDeviceDownloadUrl(deviceId, ref.relPath)
+  }
+  return buildDownloadUrl(ref.relPath || ref.absolutePath, deviceId)
 }
+
+// W18 G4：消息所属会话的设备 id——meta-miss 时经 resolveExecTargetFor 兜底
+// （refresh/create 均写 meta 后，兜底仅剩极端时序）
+const messageDeviceId = computed(() => {
+  const convId = props.message.conversation_id
+  const target = convId
+    ? (chatStore.conversationMeta[convId]?.execution_target ?? chatStore.resolveExecTargetFor(convId))
+    : null
+  return deviceIdFromTarget(target)
+})
 
 function onFileRefClick(ref: FileRefInfo) {
   const kind = classifyFile(ref.filename, ref.fileType)
@@ -1486,7 +1452,7 @@ const previewHtml = computed(() => {
   if (previewIdx.value === null) return ''
   const ref = noteRefs.value[previewIdx.value]
   if (!ref) return ''
-  return renderMarkdownToHtml(ref.content)
+  return renderMarkdownToHtml(ref.content, { deviceId: messageDeviceId.value })
 })
 
 const formattedContent = computed(() => {
@@ -1497,8 +1463,11 @@ const formattedContent = computed(() => {
   const source = props.message.role === 'user'
     ? convertTabTablesToMarkdown(strippedContent.value)
     : strippedContent.value
-  let html = renderMarkdownToHtml(source)
-  if (parsedToolResults.value.length > 0) {
+  let html = renderMarkdownToHtml(source, { deviceId: messageDeviceId.value })
+  if (citationsPayload.value) {
+    // M6：服务端载荷驱动（样式族形态 + 服务端编号），跳过本地启发式/重排
+    html = applyCitationInText(html, citationsPayload.value)
+  } else if (parsedToolResults.value.length > 0) {
     html = addCitationSuperscripts(html, true, referencedCitationIndices.value)
     if (citationNumberMap.value.size > 0) {
       html = renumberCitationSuperscripts(html, citationNumberMap.value)
@@ -1517,8 +1486,10 @@ function formatTextWithCitations(content: string): string {
   let processed = content
     .replace(BIBLIOGRAPHY_SECTION_REGEX, '')
     .replace(INLINE_SOURCE_REGEX, '[$1]')
-  let html = renderMarkdownToHtml(processed)
-  if (parsedToolResults.value.length > 0) {
+  let html = renderMarkdownToHtml(processed, { deviceId: messageDeviceId.value })
+  if (citationsPayload.value) {
+    html = applyCitationInText(html, citationsPayload.value)
+  } else if (parsedToolResults.value.length > 0) {
     html = addCitationSuperscripts(html, true, referencedCitationIndices.value)
     if (citationNumberMap.value.size > 0) {
       html = renumberCitationSuperscripts(html, citationNumberMap.value)
@@ -1535,10 +1506,10 @@ const formattedReasoning = computed(() => {
   if (isExternalizedStub(props.message.reasoning_content)) {
     try {
       const stub = JSON.parse(props.message.reasoning_content)
-      return renderMarkdownToHtml(stub.preview || '')
+      return renderMarkdownToHtml(stub.preview || '', { deviceId: messageDeviceId.value })
     } catch { /* fall through */ }
   }
-  return renderMarkdownToHtml(props.message.reasoning_content)
+  return renderMarkdownToHtml(props.message.reasoning_content, { deviceId: messageDeviceId.value })
 })
 
 // P0-1：只 watch formattedContent——watch 数组里放 formattedReasoning 会在挂载时

@@ -298,6 +298,21 @@ export const useChatStore = defineStore('chat', () => {
   }
   const deathmatchMode = ref(false)
   const deathmatchAction = ref<string | null>(null)
+  // W16 设备执行模式：当前会话执行环境（null=云端；device:<id>=客户端设备）。
+  // set-once（D-6）：随会话切换同步；发送时随 ChatRequest 透传（首设 adopt）。
+  const executionTarget = ref<string | null>(null)
+  // A4.9 I-10：定向发送/编辑/重生成必须按目标会话派生，禁止全局 ref 跨会话泄漏
+  function resolveExecTargetFor(convId: string | null | undefined): string | null {
+    if (!convId) return executionTarget.value
+    const meta = conversationMeta.value[convId]
+    if (meta && meta.execution_target !== undefined) return meta.execution_target ?? null
+    return convId === currentConversationId.value ? executionTarget.value : null
+  }
+  // W18 G4：活跃会话的设备 id（workspace 面/预览/内联图 URL 派生用）
+  const activeDeviceId = computed(() => {
+    const t = executionTarget.value
+    return t && t.startsWith('device:') ? t.slice('device:'.length) : null
+  })
   const grillingQuestions = ref<GrillingQuestion[]>([])
   const grillingAnswers = ref<Record<string, string>>({})
 
@@ -669,6 +684,7 @@ export const useChatStore = defineStore('chat', () => {
         title: conversation.title,
         group_id: conversation.group_id,
         assistant_id: conversation.assistant_id,
+        execution_target: conversation.execution_target ?? null,
         deathmatch_mode: conversation.deathmatch_mode,
         deathmatch_status: conversation.deathmatch_status,
         deathmatch_goal: conversation.deathmatch_goal,
@@ -1428,10 +1444,20 @@ export const useChatStore = defineStore('chat', () => {
 
   async function createConversation(title?: string, assistantId?: string | null) {
     try {
-      const conversation = await chatApi.createConversation(title, assistantId)
+      const conversation = await chatApi.createConversation(title, assistantId, executionTarget.value)
       conversations.value.unshift(conversation)
       currentConversationId.value = conversation.id
       messages.value[conversation.id] = []
+      executionTarget.value = conversation.execution_target ?? null
+      // W18 G4：meta 同步写入——否则文件面在无 select/refresh 前查不到目标（meta-miss）
+      conversationMeta.value[conversation.id] = {
+        ...conversationMeta.value[conversation.id],
+        id: conversation.id,
+        title: conversation.title,
+        group_id: conversation.group_id,
+        assistant_id: conversation.assistant_id,
+        execution_target: conversation.execution_target ?? null,
+      } as Conversation
       return conversation
     } catch (e) {
       console.error('Failed to create conversation:', e)
@@ -1463,6 +1489,7 @@ export const useChatStore = defineStore('chat', () => {
         title: conversation.title,
         group_id: conversation.group_id,
         assistant_id: conversation.assistant_id,
+        execution_target: conversation.execution_target ?? null,
         deathmatch_mode: conversation.deathmatch_mode,
         deathmatch_status: conversation.deathmatch_status,
         deathmatch_goal: conversation.deathmatch_goal,
@@ -1539,6 +1566,8 @@ export const useChatStore = defineStore('chat', () => {
       // Restore deathmatchMode from conversation state
       deathmatchMode.value = !!(conversation.deathmatch_mode && conversation.deathmatch_status !== 'inactive' && conversation.deathmatch_status !== 'done' && conversation.deathmatch_status !== 'cleared')
       deathmatchAction.value = null
+      // W16：执行环境随会话同步（set-once，D-6）
+      executionTarget.value = conversation.execution_target ?? null
       // 首次从侧栏打开死磕会话（无 deep link、本会话无历史流）：种入
       // verdict——状态栏与 isGrilling 均读 getCurrentStream().deathmatchVerdict；
       // 缺它则问题虽拉到也不渲染（A4.9 r2 residual）。仅在无既有 verdict
@@ -2400,6 +2429,7 @@ export const useChatStore = defineStore('chat', () => {
           // 能泄漏当前会话的 deathmatchMode 全局 ref。
           deathmatch_mode: _targetConversationId ? false : deathmatchMode.value,
           deathmatch_action: _targetConversationId ? null : deathmatchAction.value,
+          execution_target: resolveExecTargetFor(_targetConversationId || conversationId),
         },
         {
           ...callbacks,
@@ -2579,6 +2609,7 @@ export const useChatStore = defineStore('chat', () => {
           enable_reasoning: enableReasoning.value,
           reasoning_effort: reasoningEffort.value,
           thinking_budget: thinkingBudget.value,
+          execution_target: resolveExecTargetFor(convId),
         },
         {
           ...callbacks,
@@ -2691,6 +2722,7 @@ export const useChatStore = defineStore('chat', () => {
           enable_reasoning: enableReasoning.value,
           reasoning_effort: reasoningEffort.value,
           thinking_budget: thinkingBudget.value,
+          execution_target: resolveExecTargetFor(convId),
         },
         {
           ...callbacks,
@@ -2848,6 +2880,7 @@ export const useChatStore = defineStore('chat', () => {
         enable_reasoning: enableReasoning.value,
         reasoning_effort: reasoningEffort.value,
         thinking_budget: thinkingBudget.value,
+        execution_target: resolveExecTargetFor(convId),
       },
       {
         ...callbacks,
@@ -3329,6 +3362,9 @@ export const useChatStore = defineStore('chat', () => {
     capabilitiesForAlias,
     deathmatchMode,
     deathmatchAction,
+    executionTarget,
+    activeDeviceId,
+    resolveExecTargetFor,
     grillingQuestions,
     grillingAnswers,
     pendingPermissionRequest,

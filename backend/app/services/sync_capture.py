@@ -28,7 +28,7 @@ import logging
 import uuid
 from datetime import datetime
 
-from sqlalchemy import event, inspect as sa_inspect, select
+from sqlalchemy import event, func, inspect as sa_inspect, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db.database import (
@@ -164,6 +164,17 @@ def _resolve_user_id(connection, entity_type: str, target):
     return None
 
 
+def _session_payload_candidates(sess):
+    """session 候选集（new + identity_map 的 MessagePayload 实例）。
+
+    项7（W7）：per-flush 缓存未命中时的回退扫描；抽成函数以便测试计数
+    （缓存命中路径必须零扫描——批量应用 O(S×N) 退化的判别腿）。"""
+    from app.db.database import MessagePayload
+
+    return [obj for obj in (*tuple(sess.new), *tuple(sess.identity_map.values()))
+            if isinstance(obj, MessagePayload)]
+
+
 def _resolve_payload_fields(connection, target, payload: dict) -> None:
     """快照期解析（UPSTREAM_TODO_20261007 项1，方案 D；规格 v2 修订版）：
     外置桩字段以本端 message_payloads 全文替换入事件载荷——接收端零改动
@@ -189,6 +200,7 @@ def _resolve_payload_fields(connection, target, payload: dict) -> None:
     from app.db.database import MessagePayload
     from app.services.message_payload_service import (
         _EXTERNALIZED_FIELDS,
+        FLUSH_PAYLOAD_CACHE_KEY,
         compute_sha256,
         is_externalized_stub,
     )
@@ -204,9 +216,14 @@ def _resolve_payload_fields(connection, target, payload: dict) -> None:
         content = None
         sess = object_session(target)
         if sess is not None and ref:
-            for obj in (*tuple(sess.new), *tuple(sess.identity_map.values())):
-                if (isinstance(obj, MessagePayload)
-                        and obj.message_id == target.id
+            # 项7（W7）：per-flush 缓存优先（O(1)；hook 同 flush 写入，sha 校验不减）
+            cache = getattr(sess, "info", {}).get(FLUSH_PAYLOAD_CACHE_KEY) or {}
+            cand = cache.get((str(target.id), field))
+            if cand is not None and compute_sha256(cand) == ref:
+                content = cand
+        if content is None and sess is not None and ref:
+            for obj in _session_payload_candidates(sess):
+                if (obj.message_id == target.id
                         and obj.field == field
                         and obj.content is not None
                         and compute_sha256(obj.content) == ref):
@@ -220,6 +237,14 @@ def _resolve_payload_fields(connection, target, payload: dict) -> None:
                 )
             ).first()
             content = row[0] if row else None
+        if content is None and sess is None and ref:
+            # 项7 附带（W7 评审 B，复审 Minor 收口）：无 session 上下文且 DB 兜底
+            # 亦未命中时才告警（v1 盲区只在真正未解析时成立，不产生误报噪音）。
+            logger.warning(
+                "sync_capture: no session context for payload resolution "
+                "(message %s field %s) — DB fallback missed (same-flush rows blind)",
+                target.id, field,
+            )
         if content is not None and ref and compute_sha256(content) == ref:
             payload[field] = content
         else:
@@ -227,6 +252,76 @@ def _resolve_payload_fields(connection, target, payload: dict) -> None:
                 "sync_capture: unresolved payload for message %s field %s "
                 "(orphan/integrity) — keeping stub", target.id, field,
             )
+
+
+# asyncpg 单语句绑定参数上限 32767（复审 Important）：resync 批量解析按块查询。
+_PAYLOAD_LOOKUP_CHUNK = 1000
+
+
+async def resolve_payload_stubs_batch(db, snapshots: list) -> int:
+    """resync 序列化面批量解析（UPSTREAM_TODO_20261007 项6.1，W7 评审 A/B）。
+
+    快照外置桩 → 全文：按 (message_id, field) 归属分块 IN 查询 + sha 相符才
+    替换；孤儿/完整性不符保持桩 + warning（与 `_resolve_payload_fields`/展开
+    路由 404 同立场）。迭代 `_RESOLVE_FIELDS`（读侧超集）——legacy tool_calls
+    桩（I5 之前外置的历史行）同样可解析，与展开路由一致。resync 面全为已提交
+    行——无同 flush 陷阱，无需 session 缓存。返回替换字段数。"""
+    from app.db.database import MessagePayload
+    from app.services.message_payload_service import (
+        _RESOLVE_FIELDS,
+        compute_sha256,
+        is_externalized_stub,
+    )
+
+    wanted: dict = {}
+    for snap in snapshots or []:
+        mid = snap.get("id")
+        if not mid:
+            continue
+        for field in _RESOLVE_FIELDS:
+            stub = snap.get(field)
+            if not is_externalized_stub(stub):
+                continue
+            try:
+                ref = json.loads(stub).get("payload_ref")
+            except (ValueError, TypeError):
+                ref = None
+            wanted[(str(mid), field)] = ref
+    if not wanted:
+        return 0
+    ids = sorted({mid for mid, _f in wanted})
+    # W8 8d：逐块并入 map（不累积行列表——大史峰值内存约减半）
+    content_map: dict = {}
+    for i in range(0, len(ids), _PAYLOAD_LOOKUP_CHUNK):
+        chunk = ids[i:i + _PAYLOAD_LOOKUP_CHUNK]
+        for r in (await db.execute(
+            select(MessagePayload.message_id, MessagePayload.field, MessagePayload.content)
+            .where(MessagePayload.message_id.in_(chunk))
+        )).all():
+            content_map[(str(r[0]), r[1])] = r[2]
+    replaced = 0
+    orphans: list = []
+    for snap in snapshots or []:
+        mid = str(snap.get("id") or "")
+        for field in _RESOLVE_FIELDS:
+            key = (mid, field)
+            if key not in wanted:
+                continue
+            ref = wanted[key]
+            content = content_map.get(key)
+            if content is not None and ref and compute_sha256(content) == ref:
+                snap[field] = content
+                replaced += 1
+            else:
+                orphans.append(key)
+    if orphans:
+        # W8 8d：按批汇总（大史孤儿逐字段刷屏 → 一条含计数与样本）
+        logger.warning(
+            "sync_capture: resync unresolved payload for %d field(s) "
+            "(orphan/integrity) — keeping stub; samples=%s",
+            len(orphans), orphans[:5],
+        )
+    return replaced
 
 
 def _emit(connection, entity_type: str, op: str, target) -> None:
@@ -286,17 +381,27 @@ def _emit(connection, entity_type: str, op: str, target) -> None:
         )
     )
     if op == "delete":
-        connection.execute(
-            pg_insert(SyncTombstone.__table__)
-            .values(
-                id=str(uuid.uuid4()),
-                user_id=user_id,
-                entity_type=entity_type,
-                entity_id=str(entity_id),
-                deleted_at=datetime.utcnow(),
-            )
-            .on_conflict_do_nothing(constraint="uq_sync_tombstone")
+        tombstone_ins = pg_insert(SyncTombstone.__table__).values(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            entity_type=entity_type,
+            entity_id=str(entity_id),
+            deleted_at=datetime.utcnow(),
+            # W9 项9：墓碑载荷随事件 payload（delete 分支仅 user_model_providers
+            # 非空=自然键 {kind, provider}；其余 NULL）——resync 墓碑回放时对端
+            # apply_change 据此兜底定位异 id 归并行。
+            payload=payload,
         )
+        # W9 复审 A1 收口：载荷可补写——存量/旧墓碑（payload 空，如迁移前产生）
+        # 在「同 (user,type,id) 再次删除」时以新载荷治愈；新载荷为空则保持原值
+        # （coalesce）。deleted_at 保持首次删除时间（删除事实不变）。
+        tombstone_ins = tombstone_ins.on_conflict_do_update(
+            constraint="uq_sync_tombstone",
+            set_={"payload": func.coalesce(
+                tombstone_ins.excluded.payload,
+                SyncTombstone.__table__.c.payload)},
+        )
+        connection.execute(tombstone_ins)
 
 
 def register_sync_capture() -> None:

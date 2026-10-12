@@ -6,6 +6,8 @@
 事实源：server/API.md 二.13。任何一侧应用同步变更都必须经 apply_change，
 保证两端仲裁规则逐字节一致（否则双端会得出不同的胜出版本）。
 """
+import asyncio
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -92,6 +94,16 @@ async def owns(db: AsyncSession, user: User, entity_type: str, row) -> bool:
     if entity_type == "messages":
         conv = await db.get(Conversation, row.conversation_id)
         return bool(conv and conv.user_id == user.id)
+    if entity_type == "skill_files":
+        # W9 项10（UPSTREAM_TODO_20261007）：skill_files 经父 user_skills 归属
+        # （此前缺分支→delete/update 恒 SKIPPED，仅父子级联可达=潜伏；红线 B 双端同源）
+        from app.db.database import UserSkill
+
+        skill_id = getattr(row, "skill_id", None)
+        if not skill_id:
+            return False  # 复审 B3：NULL 主键查询会触发 SAWarning/未来报错
+        skill = await db.get(UserSkill, skill_id)
+        return bool(skill and skill.user_id == user.id)
     return False
 
 
@@ -120,6 +132,47 @@ async def parents_owned(db: AsyncSession, user: User, entity_type: str, data: di
             if not group or group.user_id != user.id:
                 return False
     return True
+
+
+async def _heal_broken_payload_fields(db, row, data: dict) -> int:
+    """项6.2（W7，UPSTREAM_TODO_20261007）：messages create 的窄修复。
+
+    仅当本端某外置字段为**不可解析孤儿桩**（无 payload 行 / sha 不符）且入站
+    载荷携带非桩全文时治愈该字段；健康行、桩入站、普通行一律不动（append-only
+    幂等语义的唯一窄例外，见 D-w1 裁定）。返回治愈字段数（0=无需修复）。
+
+    W8（8d，D-w8-3）：
+    - 存值信任用**严格** `stub_markers_trusted`（后端签发 meta 形）——合法内容
+      恰形如 `{"_externalized": true}` 的 ≤阈值字段不得被误判孤儿而覆盖；
+    - 字段集与解析面 `_RESOLVE_FIELDS` 对齐（含 legacy `tool_calls` 桩）。"""
+    from app.services.message_payload_service import (
+        _RESOLVE_FIELDS,
+        _lookup_payload,
+        compute_sha256,
+        is_externalized_stub,
+        stub_markers_trusted,
+    )
+
+    healed = 0
+    for field in _RESOLVE_FIELDS:
+        existing = getattr(row, field, None)
+        incoming = data.get(field)
+        if not existing or not stub_markers_trusted(existing):
+            continue
+        if not incoming or not isinstance(incoming, str) or is_externalized_stub(incoming):
+            continue
+        try:
+            ref = json.loads(existing).get("payload_ref")
+        except (ValueError, TypeError):
+            ref = None
+        content = _lookup_payload(db, row.id, field)
+        if asyncio.iscoroutine(content):
+            content = await content
+        if content is not None and ref and compute_sha256(content) == ref:
+            continue  # 健康（可解析）——append-only 不动
+        setattr(row, field, incoming)
+        healed += 1
+    return healed
 
 
 async def apply_change(
@@ -224,7 +277,21 @@ async def apply_change(
         if op != "create":
             return SKIPPED
         if row is not None:
-            return SKIPPED
+            # 复审 Critical（A/B 共同实锤）：写路径必须先过行归属（与 LWW 分支
+            # 同规）——防跨租户借 heal 改写他人消息（仅个人数据也须租户隔离，
+            # 不依赖 UUID 保密）。非本用户行=SKIPPED。
+            if not await owns(db, user, entity_type, row):
+                return SKIPPED
+            # 项6.2（W7）：孤儿桩修复窄例外——入站携非桩全文且本端字段不可解析
+            # 时治愈；健康/桩入站保持 SKIPPED（append-only 幂等语义不变，D-w1）。
+            # no_autoflush（复审 Minor）：双字段治愈不得中途 autoflush 出半治
+            # 事件（一次显式 flush，单事件）。
+            with db.no_autoflush:
+                healed = await _heal_broken_payload_fields(db, row, data)
+            if not healed:
+                return SKIPPED
+            await db.flush()
+            return APPLIED
         data["id"] = entity_id
         obj = model(**data)
         db.add(obj)

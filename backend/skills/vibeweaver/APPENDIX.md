@@ -619,7 +619,7 @@ git commit -m "feat: add <specific behavior>"
 > Flags: `--existing` (Modify-Existing task → skip new-project §A5 design-doc
 > + git checks) · `--backend-only` (no UI → skip `PAGE_DESIGN.html` and
 > `script/linux/project_build.sh`).
-> The 16 assertion groups mirror COMPLETION_GATE.md §A4.4.1's minimum-check table.
+> The assertion groups (1-19) mirror COMPLETION_GATE.md §A4.4.1's minimum-check table.
 
 **The canonical script is `scripts/assert_artifacts.py` in this skill's
 directory** — copy it, do NOT retype it (self-written variants omit check
@@ -669,7 +669,7 @@ cp <skill-dir>/scripts/assert_artifacts.py tests/assert_artifacts.py
   `tests/review_package.md` on disk (A4.9 review non-skippable for
   risk-tier paths).
 
-Self-verify the copy with the 16 markers listed in COMPLETION_GATE.md §A4.4.1; an
+Self-verify the copy with the 19 markers listed in COMPLETION_GATE.md §A4.4.1; an
 incomplete variant is re-copied, never patched by hand.
 
 ---

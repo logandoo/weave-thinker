@@ -39,6 +39,9 @@ class ToolHookContext:
     conversation_id: str = ""
     user_id: str = ""
     workspace_path: str = ""
+    # W17 轮次门控：False=本轮非 vibeweaver 激活轮（非代码任务），
+    # gate/audit 钩子对本事件 stand-down（loop-guard 观察不受影响）。
+    vibeweaver_active: bool = True
     # after 阶段填充
     result: str = ""
     is_error: bool = False
@@ -60,6 +63,8 @@ class StopContext:
     user_id: str = ""
     workspace_path: str = ""
     assistant_content: str = ""
+    # W17 轮次门控（同 ToolHookContext.vibeweaver_active）
+    vibeweaver_active: bool = True
     turn_tool_names: List[str] = field(default_factory=list)
     iterations: int = 0
     # 防递归：本次收尾已因 stop hook 续跑过（同 stop 序列只拦一次语义由

@@ -2203,7 +2203,9 @@ class VoiceDuplexSession:
         try:
             from app.tools.skill_tools import build_skills_system_prompt
 
-            skills_prompt = await build_skills_system_prompt(self.user)
+            # W17 轮次门控：语音轮为对话形态，不携带 force-inject 全文
+            # （旧实现 [:2500] 截断本就只带入半截注入；目录保留可显式调用）。
+            skills_prompt = await build_skills_system_prompt(self.user, include_force_inject=False)
             if skills_prompt:
                 sections.append(skills_prompt.strip()[:2500])
         except Exception as exc:

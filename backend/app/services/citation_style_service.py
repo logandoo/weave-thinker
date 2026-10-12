@@ -142,8 +142,10 @@ _FENCE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
 # 正则缺这两项导致笔记双参考节/自污染循环；此处为三路径共享的唯一口径）
 
 # 审计 M1：行内「来源：XXX [N]」注记——剥前缀保 [N]（与 MessageBubble/StreamMarkdown
-# 的 INLINE_SOURCE_REGEX 同口径），否则保存笔记残留行内来源行 + 参考文献节双重展示
-INLINE_SOURCE_RE = re.compile(r"来源[：:]\s*[^\n\[]+?\s*\[(\d{1,3})\]")
+# 的 INLINE_SOURCE_REGEX 同口径），否则保存笔记残留行内来源行 + 参考文献节双重展示。
+# W14（conv f1499710）：lookbehind 锚定——字母/数字紧贴「来源」= 复合词 prose
+# （技术来源/信息来源/GPT来源…），不是注记；三路径同口径保持。
+INLINE_SOURCE_RE = re.compile(r"(?<!\w)来源[：:]\s*[^\n\[]+?\s*\[(\d{1,3})\]")
 
 # 参考文献节标题行（不带尾部贪婪——供 finditer 逐命中校验，A4.9 I2）
 _BIB_HEADING_LINE_RE = re.compile(
@@ -304,7 +306,11 @@ def _parse_date_parts(value: str) -> Optional[Dict[str, Any]]:
 
 
 def _parse_author(author: str) -> List[Dict[str, str]]:
-    """'Family, Given; Family, Given' 或 '张三; 李四' → CSL name 列表。"""
+    """'Family, Given; Family, Given' 或 '张三; 李四' → CSL name 列表。
+
+    A4.9 ⑧（引文改造）：**先拆分再逐段转义**——旧实现先 `_html_escape` 会把
+    'AT&T' 转成 'AT&amp;T'，其分号被后续 split 误当姓名分隔符。
+    """
     if not author:
         return []
     names = []
@@ -314,9 +320,9 @@ def _parse_author(author: str) -> List[Dict[str, str]]:
             continue
         if "," in part:
             family, _, given = part.partition(",")
-            names.append({"family": family.strip(), "given": given.strip()})
+            names.append({"family": _html_escape(family.strip()), "given": _html_escape(given.strip())})
         else:
-            names.append({"literal": part})
+            names.append({"literal": _html_escape(part)})
     return names
 
 
@@ -335,30 +341,129 @@ def infer_csl_type(url: str) -> str:
     return "webpage"
 
 
+# M3（引文体系改造）：显式书目类型 → CSL type 映射（plan §3.2 矩阵）。
+# 优先级：显式 type（CSL type 字符串）> genre 映射 > source_type 映射 > URL 推断 > webpage。
+_SOURCE_TYPE_TO_CSL = {
+    "web": "webpage",
+    "book": "book",
+    "gazetteer": "book",
+    "periodical": "article-journal",
+    "database": "",          # 全文数据库（识典古籍/ctext）：按 genre/type 定，缺省 webpage
+    "archive": "manuscript",
+}
+
+_GENRE_TO_CSL = {
+    "标准": "standard",
+    "专利": "patent",
+    "学位论文": "thesis",
+    "毕业论文": "thesis",
+    "报告": "report",
+    "数据集": "dataset",
+    "古籍": "book",
+    "方志": "book",
+    "档案": "manuscript",
+    "会议": "paper-conference",
+    "图书析出": "chapter",
+}
+
+
+def _genre_type(genre: str) -> str:
+    g = (genre or "").strip()
+    if not g:
+        return ""
+    if g in _GENRE_TO_CSL:
+        return _GENRE_TO_CSL[g]
+    for key, t in _GENRE_TO_CSL.items():
+        if key in g:
+            return t
+    return ""
+
+
+def csl_type_for_entry(entry: Dict[str, Any]) -> str:
+    """条目 → CSL type（M3 全映射）。显式 type/genre/source_type 逐级优先，
+    全部缺省才回退 URL 推断（_TYPE_INFER_RULES）。"""
+    explicit = (entry.get("type") or "").strip()
+    if explicit:
+        return explicit
+    genre_type = _genre_type(entry.get("genre") or "")
+    if genre_type:
+        return genre_type
+    source_type = (entry.get("source_type") or "").strip()
+    mapped = _SOURCE_TYPE_TO_CSL.get(source_type, "")
+    if mapped:
+        return mapped
+    return infer_csl_type(entry.get("url") or "")
+
+
+def _parse_year_parts(value: str) -> Optional[Dict[str, Any]]:
+    """年份字段 → date-parts：'1790' / '乾隆五十五年[1790]' 均取 4 位年。"""
+    if not value:
+        return None
+    m = re.search(r"(?<!\d)(\d{4})(?!\d)", str(value))
+    if m:
+        return {"date-parts": [[int(m.group(1))]]}
+    return None
+
+
 def _entry_to_csl(entry: Dict[str, Any], accessed: Tuple[int, int, int]) -> Dict[str, Any]:
-    """台账/搜索条目 → CSL-JSON item。F2：issued 取 published_date，不从 URL 猜。"""
+    """台账/搜索条目 → CSL-JSON item（M3 全字段映射）。
+
+    - 类型：csl_type_for_entry（显式 type > genre > source_type > URL 推断）。
+    - 书目字段：author/editor/edition/publisher-place/publisher/issued/volume/
+      page/container-title/number（standard_no）/genre。
+    - **URL 仅当存在才写**（GB/T 7714：获取路径非必备）；accessed 亦仅随 URL。
+    - title 缺失回退 container+year（修复旧实现回退 url=空串的 bug）。
+    """
     url = (entry.get("url") or "").strip()
-    etype = (entry.get("type") or "").strip() or infer_csl_type(url)
+    etype = csl_type_for_entry(entry)
+    title = (entry.get("title") or "").strip()
+    container = (entry.get("container") or "").strip() or (entry.get("site_name") or "").strip()
+    year_raw = str(entry.get("year") or "").strip()
+    if not title:
+        fallback = " ".join(x for x in (container, year_raw) if x).strip()
+        title = fallback or url or "（无题名）"
     item: Dict[str, Any] = {
-        "id": str(entry.get("id") or url),
+        "id": str(entry.get("id") or url or title),
         "type": etype,
-        "title": _html_escape((entry.get("title") or url).strip()),
-        "URL": _html_escape(url),
-        "accessed": {"date-parts": [list(accessed)]},
+        "title": _html_escape(title),
     }
-    issued = _parse_date_parts((entry.get("published_date") or "").strip())
+    if url:
+        item["URL"] = _html_escape(url)
+        # 引用日期只随电子资源（国标：获取和访问路径仅电子资源必备）
+        item["accessed"] = {"date-parts": [list(accessed)]}
+    issued = _parse_year_parts(year_raw) if year_raw else None
+    if not issued:
+        issued = _parse_date_parts((entry.get("published_date") or "").strip())
     if issued:
         item["issued"] = issued
-    author = _parse_author(_html_escape((entry.get("author") or "").strip()))
+    author = _parse_author((entry.get("author") or "").strip())
     if author:
         item["author"] = author
-    container = _html_escape((entry.get("site_name") or "").strip())
+    editor = _parse_author((entry.get("editor") or "").strip())
+    if editor:
+        item["editor"] = editor
+    if entry.get("edition"):
+        item["edition"] = _html_escape(str(entry["edition"]).strip())
+    if entry.get("publisher_place"):
+        item["publisher-place"] = _html_escape(str(entry["publisher_place"]).strip())
+    if entry.get("publisher"):
+        item["publisher"] = _html_escape(str(entry["publisher"]).strip())
+    if entry.get("volume"):
+        item["volume"] = _html_escape(str(entry["volume"]).strip())
+    if entry.get("page"):
+        item["page"] = _html_escape(str(entry["page"]).strip())
+    g = (entry.get("genre") or "").strip()
+    if g and not _genre_type(g):
+        # 分类关键词（古籍/标准/…）不作文本透传；其余 genre（如 博士学位论文）透传
+        item["genre"] = _html_escape(g)
+    if entry.get("standard_no"):
+        item["number"] = _html_escape(str(entry["standard_no"]).strip())
     if not container and url:
         m = re.match(r"https?://(?:www\.)?([^/]+)", url)
         if m:
-            container = _html_escape(m.group(1))
+            container = m.group(1)
     if container:
-        item["container-title"] = container
+        item["container-title"] = _html_escape(container)
     return item
 
 
@@ -497,6 +602,94 @@ def render_citations(
 
 def _is_int_id(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) or (isinstance(value, str) and value.isdigit())
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def strip_html_text(html_text: str) -> str:
+    """citeproc HTML 输出 → 纯文本（引用卡片可显示；元数据已在边界转义）。"""
+    text = _HTML_TAG_RE.sub("", html_text or "")
+    text = (text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", '"').replace("&#39;", "'"))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def render_entry_references(
+    entries: Sequence[Dict[str, Any]],
+    style_id: Optional[str] = None,
+    accessed: Optional[Tuple[int, int, int]] = None,
+) -> List[Dict[str, Any]]:
+    """逐条渲染参考文献条目（M4 出货载荷用）——返回 [{id, reference, reference_html}]。
+
+    数值族（顺序编码制）批量渲染：一次注册全部（给定顺序=首现序），书目按引用
+    编号排序 → 位置对齐（逐条独立渲染会令每条都从 [1] 重新编号——卡片编号错位）。
+    作者-年/注释族无编号前缀，逐条渲染即正确；批量失败回退逐条。引擎失败
+    fail-safe 用降级文本。
+    """
+    from citeproc import Citation, CitationItem, CitationStylesBibliography
+    from citeproc import formatter
+    from citeproc.source.json import CiteProcJSON
+
+    sid = resolve_style_id(style_id)
+    accessed = accessed or (date.today().year, date.today().month, date.today().day)
+    meta = STYLE_REGISTRY.get(sid) or {}
+    family = meta.get("family") or ""
+    out: List[Dict[str, Any]] = []
+    try:
+        style = _load_style(sid)
+    except Exception as exc:
+        logger.warning("citation style load failed for %s: %s", sid, exc)
+        style = None
+
+    if style is not None and family in ("numeric-superscript", "numeric-bracket") and len(entries) > 1:
+        try:
+            source = CiteProcJSON([_entry_to_csl(e, accessed) for e in entries])
+            bib = CitationStylesBibliography(style, source, formatter.html)
+            for e in entries:
+                cit = Citation([CitationItem(str(e.get("id")))])
+                bib.register(cit)
+                bib.cite(cit, lambda msg: None)
+            bib.sort()
+            rendered = [str(x) for x in bib.bibliography()]
+            if len(rendered) == len(entries):
+                for e, ref_html in zip(entries, rendered):
+                    out.append({
+                        "id": e.get("id"),
+                        "reference_html": ref_html,
+                        "reference": strip_html_text(ref_html),
+                    })
+                return out
+            logger.debug("batch bibliography size mismatch (%d vs %d) — per-entry fallback",
+                         len(rendered), len(entries))
+            out = []
+        except Exception as exc:
+            logger.debug("batch bibliography failed: %s — per-entry fallback", exc)
+            out = []
+
+    for e in entries:
+        item = _entry_to_csl(e, accessed)
+        ref_html = ""
+        if style is not None:
+            try:
+                source = CiteProcJSON([item])
+                bib = CitationStylesBibliography(style, source, formatter.html)
+                cit = Citation([CitationItem(str(item["id"]))])
+                bib.register(cit)
+                bib.cite(cit, lambda msg: None)
+                bib.sort()
+                rendered = [str(x) for x in bib.bibliography()]
+                ref_html = rendered[0] if rendered else ""
+            except Exception as exc:
+                logger.debug("per-entry bibliography failed (%s): %s", item.get("id"), exc)
+        if not ref_html:
+            ref_html = _fallback_section([e])
+        out.append({
+            "id": e.get("id"),
+            "reference_html": ref_html,
+            "reference": strip_html_text(ref_html),
+        })
+    return out
 
 
 def _render_notes_family(result, stripped, occurrences, entry_by_id, bib, warn, meta, ordered_entries):

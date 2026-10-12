@@ -12,6 +12,11 @@ export interface FileParseResult {
   file_path?: string | null
   rel_path?: string | null
   size?: number
+  /** True for chips restored from a message's [file-ref] blocks by edit-mode
+   *  (not a fresh upload) — scoped to the edit session: a normal send drops
+   *  them (utils/fileRefs dropRestoredChips), a new edit session replaces
+   *  them (restoreEditChips). The upload API never sets this. */
+  restored?: boolean
 }
 
 export interface FileUploadResponse {

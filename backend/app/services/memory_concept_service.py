@@ -607,6 +607,11 @@ async def reconcile_concept_sources(db: AsyncSession, user_id: str) -> int:
             if rid.startswith("legacy:"):
                 raw_alive += 1  # 迁移键永久有效
                 continue
+            if rid.startswith("profile_fact:"):
+                # W12 Dx-1：画像提炼的自证出处（非 messages/notes 行号），
+                # 查库恒 0 → 误标 needs_review → nightly 误杀（与 consolidation 同洞）。
+                raw_alive += 1
+                continue
             r = await db.execute(
                 text("""SELECT (
                         (SELECT COUNT(*) FROM messages WHERE id = :rid) +

@@ -51,17 +51,27 @@ async def asr_transcribe(args: dict, **kwargs) -> str:
     workspace_path = kwargs.get("workspace_path") or ""
     if not workspace_path:
         return _err("无工作区上下文，无法解析音频路径")
-    resolved = _resolve_workspace_path(audio_path, workspace_path)
+    # W19 P1 混合：设备会话下字节由路由层经设备代理取回注入——不依赖本地盘
+    override = kwargs.get("file_bytes_override")
+    if isinstance(override, (bytes, bytearray)):
+        resolved = audio_path
+        data = bytes(override)
+    else:
+        resolved = _resolve_workspace_path(audio_path, workspace_path)
+        data = None
     if not resolved:
         return _err(f"音频文件不存在或不在工作区内（路径越界会被拒绝）: {audio_path}")
     ext = os.path.splitext(resolved)[1].lower()
     if ext not in _AUDIO_EXTS:
         return _err(f"不支持的音频类型 {ext}（支持: {', '.join(sorted(_AUDIO_EXTS))}）")
     try:
-        size = os.path.getsize(resolved)
-        if size > _MAX_AUDIO_BYTES:
-            return _err(f"音频过大（{size} 字节 > {_MAX_AUDIO_BYTES}）")
-        data = await asyncio_read(resolved)
+        if data is None:
+            size = os.path.getsize(resolved)
+            if size > _MAX_AUDIO_BYTES:
+                return _err(f"音频过大（{size} 字节 > {_MAX_AUDIO_BYTES}）")
+            data = await asyncio_read(resolved)
+        if len(data) > _MAX_AUDIO_BYTES:
+            return _err(f"音频过大（{len(data)} 字节 > {_MAX_AUDIO_BYTES}）")
     except Exception as exc:
         return _err(f"读取音频失败: {exc}")
     svc = _get_asr_service()
@@ -82,7 +92,10 @@ async def asr_transcribe(args: dict, **kwargs) -> str:
         "text": text,
         "language": (result or {}).get("language"),
         "segments": len((result or {}).get("segments") or []),
-        "audio_path": os.path.relpath(resolved, str(Path(workspace_path).resolve())),
+        "audio_path": (
+            audio_path if isinstance(kwargs.get("file_bytes_override"), (bytes, bytearray))
+            else os.path.relpath(resolved, str(Path(workspace_path).resolve()))
+        ),
     }, ensure_ascii=False)
 
 

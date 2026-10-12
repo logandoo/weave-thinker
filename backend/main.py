@@ -95,6 +95,10 @@ app.include_router(skins_api.router)
 app.include_router(user_settings.router)
 app.include_router(sync_api.router)
 app.include_router(citations_api.router)
+from app.api import client_devices as client_devices_api
+from app.api import device_ws as device_ws_api
+app.include_router(client_devices_api.router)
+app.include_router(device_ws_api.router)
 
 
 async def _memory_reprobe_after_reload() -> None:
@@ -125,6 +129,11 @@ _durable_job_worker = None  # durable job worker 句柄（lifespan 启停）
 async def startup_event():
     if not config.security_jwt_secret_key:
         raise RuntimeError("JWT secret key is not configured")
+
+    # W18 G8（PLAN §11）：多 worker 自检——设备执行注册表/配对码为进程内态，
+    # workers>1 即禁用 client_exec 并 ERROR 告警。
+    from app.services.device_session_service import guard_multiworker_client_exec
+    guard_multiworker_client_exec()
 
     # conv-open 性能治理 P1-1（DESIGN_conv_open_performance）：所有 Message 写点
     # 的超限 tool_results/reasoning_content/tool_calls 自动外置到 message_payloads。

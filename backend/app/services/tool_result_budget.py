@@ -99,6 +99,10 @@ async def enforce_turn_budget(
     if not tool_messages:
         return tool_messages
 
+    # M5：引用台账 manifest 是 system 消息，结构化地不进入本函数（本函数只
+    # 处理 role=tool 消息）；真实折叠保护在 context_compressor 摘出/挂回 +
+    # agent_loop._refresh_citation_manifest 重注入（见 test_citation_manifest_*）。
+
     total_chars = sum(len(m.get("content", "")) for m in tool_messages)
     if total_chars <= config.turn_budget_chars:
         return tool_messages

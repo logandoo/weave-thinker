@@ -576,6 +576,11 @@ async def _rebalance_clusters(db: AsyncSession, user_id: str, result: dict) -> N
         for rid in raw_ids:
             if isinstance(rid, str) and rid.startswith("legacy:"):
                 raw_alive += 1
+            elif isinstance(rid, str) and rid.startswith("profile_fact:"):
+                # W12 Dx-1：profile_fact: 是画像提炼的自证出处（指向提炼事件本身，
+                # 非 messages/notes 行号）。不计入 → 全部画像概念被 nightly 当零证据
+                # 误杀（valid_to 置位），60 生产 2026-10-08 仍在发生（08-24 根因 4）。
+                raw_alive += 1
         if unit_alive == 0 and raw_alive == 0:
             await db.execute(
                 text("UPDATE memory_concepts SET valid_to = NOW(), updated_at = NOW() WHERE id = :id"),

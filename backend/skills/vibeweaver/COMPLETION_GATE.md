@@ -16,7 +16,7 @@
 - **A4.4 Completion Output** — Covenant Recall · 9-item pre-output self-audit ·
   Gate Function · log-discipline rule · gate-line field semantics · E2E depth
   ladder · 8-column table spec + forbidden alternatives
-- **A4.4.1 G-DED Executable Artifact Assertions** — 16-assertion table · flags ·
+- **A4.4.1 G-DED Executable Artifact Assertions** — 19-group assertion table · flags ·
   copy + self-verify
 - **A4.4.3 Artifact Chain** — every artifact names its upstream link; the
   chain is the audit trail
@@ -102,20 +102,8 @@ Output this audit line immediately before the completion table (the two
 contain the strings `HARD-GATE-1: NO-TEST-NO-DONE` and
 `HARD-GATE-2: SCRIPT-ONLY`, each marked `pass` / `na`):
 ```
-[Verification Gate] Verifier: mm-sensor [video+audio|video|image] | model-native [image] | direct-read | Lane: S/M/L | Class: DOC|CONFIG|CODE | Loop executed: yes/no/N/A | Media graded externally: N/N (video N · audio N · screenshots N) | Iterations: N | Tests executed with artifacts: yes/no | E2E depth: real-HTTP / workflow-trace / service-direct / unit-only | Script-only build/lifecycle: yes/no | Fresh-run on final tree: yes/no | Fresh-verify: pass/N/A | TDD RED evidence: yes/no/N/A | Code review: clean / N-fixed / N/A | assert_artifacts.py: pass=N/fail=0 | covenant_recall: pass/na | memory_gate: pass/na | HARD-GATE-1: NO-TEST-NO-DONE=pass/na | HARD-GATE-2: SCRIPT-ONLY=pass/na
+[Verification Gate] Verifier: mm-sensor [video+audio|video|image] | model-native [image] | direct-read | Loop executed: yes/no/N/A | Media graded externally: N/N (video N · audio N · screenshots N) | Iterations: N | Tests executed with artifacts: yes/no | E2E depth: real-HTTP / workflow-trace / service-direct / unit-only | Script-only build/lifecycle: yes/no | Fresh-run on final tree: yes/no | TDD RED evidence: yes/no/N/A | Code review: clean / N-fixed / N/A | assert_artifacts.py: pass=N/fail=0 | covenant_recall: pass/na | memory_gate: pass/na | HARD-GATE-1: NO-TEST-NO-DONE=pass/na | HARD-GATE-2: SCRIPT-ONLY=pass/na
 ```
-
-**`[Coverage]` line (VERIFICATION_UPGRADES §V3) — output immediately after
-`[Convergence]`, before `[Covenant Recall]`:**
-```
-[Coverage] criteria: N/M covered | unchecked: <comma-separated criterion names or none>
-```
-`covered` = verified with evidence this session. `unchecked` = applicable but
-NOT verified — name it; an unchecked item is NEVER phrased as done anywhere in
-the final answer. The 8-column table's Verification Evidence cell MAY say
-`UNVERIFIED — <why not checked>`; every such cell appears in `unchecked`.
-`na` (not applicable + reason) is not `unchecked` — do not launder unchecked
-into `na`.
 
 **E2E depth ladder (what each value means):** `real-HTTP` = the flow was
 exercised through the running server's HTTP API (chat/API request → handler
@@ -151,26 +139,6 @@ Changed` concise modification description · `Verification Evidence`
 screenshot filename+what was confirmed, or log file+key excerpt (not "tests
 passed") · `Commit` short hash; `N/A` if no commit made yet.
 
-**Lite table (Class DOC/CONFIG — COV-13 · VERIFICATION_UPGRADES §V11.6).**
-When the gate line declares `Class: DOC|CONFIG`, the 8-column table is
-replaced by ONE row per logical change:
-
-```markdown
-| # | Problem | What Changed & Evidence |
-|---|---------|--------------------------|
-| 1 | ...     | README.md — entry added; read-back confirms format |
-| 2 | ...     | report.docx — delivered; tests/report_p1.png rendered page verified (§V11.9) |
-```
-
-Available ONLY with `Class: DOC|CONFIG` in the gate line — without that
-field the 8-column table above stays mandatory and the FORBIDDEN rules
-apply in full. Class-inapplicable gate-line fields carry `na` with a reason
-(`Loop executed: no (Class: DOC — read-back verify)` · `Fresh-verify: N/A` ·
-`HARD-GATE-1: NO-TEST-NO-DONE=na` · `memory_gate: na`). The lite shape is a
-contract shape for prose/config deliverables, not a discount: the diff +
-read-back evidence rule (§V11.3) still binds, and `[Coverage]` still names
-every unchecked item.
-
 If multiple changes were made, add one row per logical change.
 
 (6) **AUTO-mode tasks** (COV-12) add the line `[Decisions] N auto-decisions
@@ -183,7 +151,7 @@ Formal compliance is not evidence. Before emitting the `[Verification Gate]`
 line, you MUST run the executable assertion script in the project root:
 
 ```bash
-python3 tests/assert_artifacts.py [--existing] [--backend-only]
+python3 tests/assert_artifacts.py [--existing] [--backend-only] --final   # --final: completion-time run (group 19)
 ```
 
 - Exit code 0 → append the LITERAL field `assert_artifacts.py: pass=N/fail=0`
@@ -193,13 +161,16 @@ python3 tests/assert_artifacts.py [--existing] [--backend-only]
   paste fabricated output, never skip the run — then re-run until exit 0.
 - Flags: `--existing` (Modify-Existing task → skips the new-project §A5
   design-doc checks and the git-init expectation) · `--backend-only` (no UI
-  → skips `PAGE_DESIGN.html` and `script/linux/project_build.sh`) ·
-  `--class DOC|CONFIG|CODE` (COV-13 — or the `- class: <X> — <basis>` first
-  entry of the task block in `tests/verification_log.md`): Class DOC
-  structurally N/A's the memory (4) and service-lifecycle (5) groups, Class
-  CONFIG N/A's the memory group when the log carries `- memory: na (<why>)`;
-  each N/A prints `class: <X> — group N/A …` as gate evidence.
-  New-project tasks run WITHOUT `--existing`. **Profiles:**
+  → skips `PAGE_DESIGN.html` and `script/linux/project_build.sh`).
+  New-project tasks run WITHOUT `--existing`. **`--final`: the
+  completion-time run** (the manual A4.4.1 invocation before the gate line)
+  additionally enforces group 19 (working-note lifecycle, §A7.15); mid-task
+  runs and the physical gate (§A4.4.2) omit it so an in-use
+  `tests/working_note.md` never blocks iteration. **Record the run:** append
+  `- final-run: --final — assert_artifacts.py: pass=N/fail=0` to the current
+  task block of `tests/verification_log.md` — the audit's B12 check
+  machine-verifies this line at completion (without it, group 19's
+  enforcement is unprovable). **Profiles:**
   `--profile service|backend-api|web-static|cli|library` (or
   `tests/project_profile.json`) declaratively skips structurally-N/A groups
   (service lifecycle for libraries/CLIs; UI for backend-only kinds) — the
@@ -213,21 +184,24 @@ python3 tests/assert_artifacts.py [--existing] [--backend-only]
 | 1 | `tests/verification_log.md` exists with ≥1 `- iter N PASS/FAIL:` entry | COV-1 / A4.1 Step 4 |
 | 2 | `tests/acceptance.md` exists, first line `> cap=5  stall=3×` | COV-7 / A4.1 Step 1 |
 | 3 | every `tests/*.png` cited in those two files exists and >0 bytes | A4.4 |
-| 4 | `memory/MEMORY.md` exists, has ≥1 topic-file link, and ≥1 topic `.md` besides MEMORY.md exists — Class DOC (`- class: DOC` basis line) N/A · Class CONFIG N/A when `- memory: na (<why>)` is logged (§V11.3 lesson-triggered) | A7.9 / A7.10 |
-| 5 | `script/linux/start.sh` + `stop.sh` + `restart.sh` exist and are executable (`project_build.sh` too, unless `--backend-only`) — Class DOC N/A (a prose change wave carries no service lifecycle, §V11.3) | A2 / COV-2 |
+| 4 | `memory/MEMORY.md` exists, has ≥1 topic-file link, and ≥1 topic `.md` besides MEMORY.md exists | A7.9 / A7.10 |
+| 5 | `script/linux/start.sh` + `stop.sh` + `restart.sh` exist and are executable (`project_build.sh` too, unless `--backend-only`) | A2 / COV-2 |
 | 6 | new-project tasks (no `--existing`): git repo exists with ≥2 commits (`git init` + initial commit + final commit; `git log --oneline` count) | C1 step 1/15, A9 |
 | 7 | §A5 design docs exist: `FLOW_DESIGN.html` + `DATABASE_DESIGN.html` + `BACKEND_DESIGN.html` (+ `PAGE_DESIGN.html` unless `--backend-only`) — skipped with `--existing` | A5 / C1 step 2 |
 | 8 | new-project tasks (no `--existing`): `README.md` or `README.html` exists, AND `requirements.txt` exists (backend; `package.json` for frontend projects) | C1 step 15 |
 | 9 | Modify-Existing (`--existing`): `verification_log.md` contains `Baseline verified GREEN` or `COV-9 skipped` | COV-9 |
 | 10 | every `tests/workflows/*.trace.log` cited in `verification_log.md` exists and >0 bytes | A4.7b |
 | 11 | every `tests/*.webm` / `tests/*.wav` / `tests/*.mp4` / `tests/*.mp3` cited in `verification_log.md` exists and >0 bytes | A4.1 Step 2/3 |
-| 12 | every `- iter N FAIL:` log line carries its `diagnosis:` clause | A4.1 Step 4 |
+| 12 | every `- iter N FAIL:` log line carries its `diagnosis:` clause, and (12b log-format lint) the clause is substantive — ≥10 chars, not a placeholder token (`-`/`?`/`none`/`na`/`idk`/`unknown`/`tbd`) | A4.1 Step 4 |
 | 13 | no claim word (verified/confirmed/validated/tested/proven + Chinese 已验证/已确认/已测试…) appears on a prose log line without a coverage scope on that same line (fenced blocks, headings, tables, iter/baseline lines exempt) | A4.4 claim rule |
 | 14 | **secret scan** — no credential-looking string (AWS access key · `-----BEGIN … PRIVATE KEY-----` block · `ghp_`/`github_pat_`/`xox*`/`sk-` incl. `sk-proj-`/`sk-ant-` tokens · JSON or k=v form `api_key`/`secret`/`password`/`token` `= value` with value ≥12 chars; unquoted reference/call values like `os.environ.get(…)`/`config.x`/`self.x` are NOT flagged) appears on an ADDED line of the change-wave diff (per-commit patches of newest `backup: before changes` commit..HEAD + uncommitted; no backup commit → last commit + uncommitted; untracked non-ignored files are scanned whole). Lines carrying a placeholder marker (example/sample/dummy/placeholder/changeme/redacted/fake/`<…>`) are exempt; `*.md` hits print WARN but do not FAIL; any `assert_artifacts.py` is never scanned. **User-approved credentials:** a `vw-approved` marker exempts a line ONLY when the line also matches a credential pattern (prose mentions are no-ops) AND `verification_log.md` carries the path-scoped pairing `- secret-approved: <path> — <reason>` (marker count per path ≤ approvals; pairing failure FAILs regardless of file type) | A4.4 content gate |
 | 15 | **test-change guard** — no REMOVED assertion line (`assert` · `self.assert*` · `expect(` · `pytest.raises` · `require(` · `def test_` · `it(` · `test(` · `func Test` · `@Test`) in a test code file (path segment `test`/`tests`/`__tests__`/`spec` or `test_*`/`*_test.*`/`*.test.*`/`*.spec.*` basename; code extensions only — whole-file deletions included) unless `verification_log.md` carries a `- test-change: <path> — <reason>` line. An agent fixing code must not silently weaken the check on that code; writing NEW tests stays free | A4.8 test integrity |
 | 16 | **risk-tier** — when the change-wave diff or an untracked file touches a risk-tier code path (`auth`/`security`/`payment`/`billing`/`crypto`/`migration`/`permission`/`acl` path segment; code extensions only — deletions included), `tests/review_package.md` exists and >0 bytes — A4.9 review is non-skippable for risk-tier paths (existence check; package FRESHNESS is enforced by the §A4.9 scoped re-review process) | A4.9 risk tiering |
-| 17 | **DOC-asset render gate (FILE-KIND — every class)** — when the wave delivers an office asset (`.docx/.xlsx/.pptx/.pdf/.odt/…` via `git --name-status` + untracked, deletions excluded — binary-safe), the CURRENT task block carries ONE `render: <asset> — …` line per asset whose evidence is an EXISTING non-probe `tests/…png\|webm` page image or a `render: <asset> — N/A (<concrete missing tool: soffice\|libreoffice\|pymupdf\|pdftoppm\|poppler\|imagemagick>)` — placeholders, quoted echoes, prior-block citations and `probe_vision.*` don't license (§V11.9 **NO RENDER, NO DONE**) | §V11.9 render gate |
-| 18 | **DOC-asset exec-check** — every delivered office asset has `exec-check: <asset> — clean` or `exec-check: <asset> — escalated → Class CODE` in the current task block (the named vbaProject.bin / PDF `/JS` / macro-sheet check, run at DELIVERY time) | §V11.9 exec-check |
+| 17a | **DOC-asset render gate (§V11.9)** — when the change wave DELIVERS an office/document asset (`docx/doc/xlsx/xls/pptx/ppt/pdf/odt/ods/odp/rtf/odg/epub/mht/docm/xlsm/pptm`, whole-wave scope: `backup: before changes`..HEAD + uncommitted + untracked, deletions excluded), `tests/verification_log.md` carries a `render:` line naming that asset bound to existing >0-byte page evidence in `tests/` (png/webm, `probe_vision.*` excluded) — or `render: <asset> — N/A (<named missing toolchain: soffice/libreoffice/pymupdf/pdftoppm/poppler/imagemagick>)`. **NO RENDER, NO DONE**; fires in EVERY class (a mixed CODE wave shipping a docx owes the same render) | §V11.9 render gate |
+| 17b | **exec-check (§V11.9)** — every delivered office asset also needs a recorded executable-behavior check: an `exec-check:` line naming the asset with `clean` or `escalat…` (vbaProject.bin / PDF JavaScript / macro sheet — `escalated → Class CODE` promotes the wave) | §V11.9 delivery exec-check |
+| 18 | **task-class coherence (COV-13)** — `--class DOC\|CONFIG\|CODE` (or the log's `- class:` first entry of the current task block) N/A's only the class's structurally-free groups (DOC: memory 4 + service-lifecycle 5; CONFIG: memory 4 when the log carries `- memory: na (<why>)`); a `--class` flag contradicting the log's class is a NAMED failure (§V11.7 one class per task); a class never weakens an applicable group | COV-13 / §V11 |
+| 19 | **working-note lifecycle (§A7.15, `--final` only)** — `tests/working_note.md` must NOT exist at completion time: the task working memory is distilled into `memory/` (A7.9) and deleted before the completion table; a leftover is an undistilled lesson or zombie state leaking into the next task | A7.15 / A7.10 check 6 |
+| 20 | **working-note creation side (§A7.15)** — group 19 checks the note is GONE at completion; this group checks it EXISTED during the work. Current task block (last `## ` block) with ≥2 iteration entries or ≥1 FAIL owes `- working-note:` lifecycle lines (`created → updated → distilled → deleted`) or a stated `- working-note: na (<why>)` — the block's iter count is the machine proxy for the §A7.15 create rule | A7.15 creation side |
 
 The script byte-checks the artifacts behind every Gate Function claim — the
 external verifier for claims mm-sensor cannot see. The **canonical file is
@@ -243,15 +217,16 @@ cp <skill-dir>/scripts/assert_artifacts.py tests/assert_artifacts.py
 ```
 
 The only allowed edit after copying is adding project-specific assertion
-lines — never remove or weaken groups 1-18.
+lines — never remove or weaken groups 1-19.
 
 **Self-verify the copy is complete (MUST do after copying it):** the script
-MUST contain each of these 19 markers — `verification_log` · `cap=5` ·
+MUST contain each of these 21 markers — `verification_log` · `cap=5` ·
 `screenshot` · `MEMORY.md` · `start.sh` · `git repo needs` · `FLOW_DESIGN` ·
 `README` · `Baseline verified GREEN` · `workflow trace` · `media evidence` ·
 `diagnosis:` · `claim without stated coverage` · `secret scan` ·
 `test-change:` · `risk-tier` · `secret-approved` · `DOC-asset render gate` ·
-`exec-check`. Grep the file for all 19; ANY
+`exec-check` · `working_note` · `working-note`. Grep the file for all 21;
+ANY
 missing marker means an incomplete variant — re-copy from the canonical file.
 A script missing a marker will not catch the missing artifact; a complete
 script is what the exit-0 gate verifies.
@@ -270,7 +245,12 @@ is vibeweaver-active (has `tests/verification_log.md`), it runs
 variants) and **throws a GATE-BLOCKED error into the tool result** while
 verification evidence is missing or falsified. Bash is deliberately NOT
 gated (screenshots / server start must be free to produce evidence), and
-non-vibeweaver projects are silent.
+non-vibeweaver projects are silent. **Known boundary (named, accepted):**
+file mutations performed THROUGH bash (`sed -i`, `>`, editor scripts) bypass
+both the gate and §A7.16 cue delivery — hooking bash command text costs more
+false alarms than it catches. Mitigation is procedural, not mechanical: the
+completion-time `assert_artifacts.py --final` run + the audit's B12
+final-run check examine the resulting tree regardless of how it was edited.
 
 - **Evidence failures BLOCK** (missing/fake `verification_log.md` entries,
   missing `acceptance.md` cap-stall line, cited media missing/empty —
@@ -377,11 +357,48 @@ AUDIT: BAD=n UNCERTAIN=n escalate=true|false reasons=[BAD,UNCERTAIN,HIGH-RISK,SA
     report is GREEN the latch clears. No human action is needed.
   - A latch must NEVER outlive its session and hold the next task hostage:
     it auto-releases on the first write/idle of a DIFFERENT session
-    (session takeover), or after the TTL (`redTtlHours` in `audit.json`,
+    (session takeover), on the latching session's OWN next task (see the
+    new-task key below), or after the TTL (`redTtlHours` in `audit.json`,
     default 24h), or immediately for legacy (pre session-scoping) state.
     Every release is recorded — `redReleases` in the state file (bounded
     to 5), the opencode app log, and a `## Stale RED releases` section of
     the report — never silently dropped.
+  - **Same-session new-task key (2026-10-02, multi-wave DOC→CODE deadlock):**
+    the latching session never needs another session, a TTL wait, or
+    `VIBEWEAVER_AUDIT=off` to begin its next task. Per protocol the first
+    action of a new task is writing `tests/acceptance.md` (Step 1, and
+    `tests/` stays writable under the latch) — an acceptance rewrite whose
+    floor(mtime) is strictly AFTER the latch's `ts` releases the latch on
+    the session's next gated write or session idle, journaled as `new-task`
+    (an already-TTL-expired latch journals `ttl-expiry` — the dominant fact
+    wins). The old wave's debt stays in `tests/gate_audit.md`, and the new
+    wave's own completion claim re-checks everything (see the re-arm leg
+    below). Same-millisecond rewrites resolve to "no release" — the teeth
+    win ties; a backward wall-clock step between latch and rewrite is the
+    remaining skew corner (rare; fail-safe direction is "stays blocked").
+  - **BAD-signature guard (no re-latch treadmill; r2 hardening):** a final
+    audit scores the WHOLE session buffer, and multi-wave buffers keep the
+    previous wave's residue — so re-audits of an unchanged failure must not
+    re-latch. A RED final re-latches only when at least one of two legs
+    says "genuinely new failure":
+    *session signature* — the sorted BAD-check ids, keyed PER SESSION
+    (root-level keys would amnesty a DIFFERENT session's genuine first
+    failure: template-driven BAD sets are identical across sessions); and
+    *completion-marker count* — the number of `[Verification Gate]` markers
+    in the capped buffer, which grows by one on every NEW completion claim,
+    so a new claim re-arms the teeth even with an identical signature
+    (same-claim re-audits — mid-wave idles over a stale marker — stay
+    suppressed). A live latch is never refreshed (its `ts` keeps the TTL
+    backstop real); a GREEN final clears the latch, the session's signature
+    entry, and the marker count. Boundary: two completion claims separated
+    by >150KB of session text can land the earlier marker in the trimmed
+    middle (the first 20KB head is kept) — the count leg then misses one
+    re-arm (the signature leg still fires on any evidence change). Quoted
+    prose mentions of the marker count too — fail-closed (an extra re-arm
+    after a release), bounded and journaled. Latches from before this deploy carry no recorded
+    signature: after a takeover/TTL release they may re-latch once on a
+    same-signature re-audit before the guard has their signature —
+    conservative, self-healing in one cycle.
   - Any `test`/`tests` directory in the project (top-level `tests/`,
     `dev/tests/`, `src/test/`, …) stays writable while RED, so the
     evidence-fix path can never deadlock.
@@ -409,11 +426,9 @@ AUDIT: BAD=n UNCERTAIN=n escalate=true|false reasons=[BAD,UNCERTAIN,HIGH-RISK,SA
    verdicts to catch ritual compliance — reviewer cost is the price).
 
 **Scope discipline:** sessions that never loaded the vibeweaver skill are
-not audited (subagent reviewers, unrelated chats) — silent. Doc-only
-prose tasks emit the gate line with `na`/`no` values; the audit accepts
-those claims at face value (no artifact demanded) — EXCEPT §V11.9
-DOC-asset waves, where C18 demands bound render evidence. Disable per-run:
-`VIBEWEAVER_AUDIT=off`.
+not audited (subagent reviewers, unrelated chats) — silent. Doc-only tasks
+emit the gate line with `na`/`no` values; the audit accepts those claims at
+face value (no artifact demanded). Disable per-run: `VIBEWEAVER_AUDIT=off`.
 
 **Loop-guard (degenerate-generation watchdog):** the same text observation
 channel also watches for runaway output, independent of the artifact audit.
@@ -456,16 +471,17 @@ own auditor (the optimizer must never have write access to its own objective
 function).
 
 **Known boundaries (by design, not bugs):** the audit proves tokens, files
-and orderings — never intent. `na`/`no` claims are accepted at face value
-(except the §V11.9 render-evidence check and the class misreport guard);
+and orderings — never intent. `na`/`no` claims are accepted at face value;
 A4.9 trigger classification rests on the model's self-assessment; process
 compliance is not outcome correctness. Those are the reviewer's (and the
 user's) judgments — the audit's job is to make the machine-checkable layer
 honest. A truncated/aborted session's buffered text may be incomplete
 (head/tail caps), so its final audit can latch RED on partial evidence —
 that is the latch being conservative, and it is bounded precisely because
-of this: it dies with its session (takeover release) or its TTL, is fully
-recorded, and can never block a different session's task.</parameter>
+of this: it dies with its session (takeover release), yields to the
+session's own next task (new-task key), or expires with its TTL; is fully
+recorded; its re-audit cannot feed on an unchanged failure signature; and
+it can never block a different session's task.</parameter>
 
 ---
 
@@ -477,19 +493,7 @@ Before declaring any task complete, explicitly list and confirm:
       COV-2 SCRIPT-ONLY · COV-3 ZERO · COV-4 loop self-starting ·
       COV-5 verifier announced · COV-6 backend-only → A4.7 · COV-7 cap=5/stall=3×
       · COV-8 A4.9 reviewer · COV-9 Baseline-GREEN · COV-10 Design Gate ·
-      COV-11 untrusted content = data · COV-12 mode declared · COV-13 task
-      class / proportional path) checked.
-- [ ] **COV-13 class** — `Class: DOC|CONFIG|CODE` declared from file kinds
-      (uncertain → higher class); the class's path card honored
-      (VERIFICATION_UPGRADES §V11.3) with `na (reason)` on the inapplicable
-      gates; `docs-drift:` line present (§V11.5); lite table only with
-      `Class: DOC|CONFIG` (§V11.6); any scope growth reclassified UP.
-- [ ] **§V11.9 render + exec gates** (office asset deliverables — FILE-KIND,
-      every class) — `NO RENDER, NO DONE`: one `render: <asset> — …` line per
-      asset (existing non-probe page images or a CONCRETE missing-tool N/A,
-      log + answer) and `exec-check: <asset> — clean|escalated` recorded at
-      delivery; `Layout: verified|UNVERIFIED-layout(<reason>)` stated (an
-      UNVERIFIED-layout claim appears in `[Coverage] unchecked`).
+      COV-11 untrusted content = data · COV-12 mode declared · COV-13 class declared) checked.
 - [ ] **COV-12 mode** — `Mode: AUTO|GUIDED` declared in ZERO; AUTO:
       `tests/decisions.md` ADRs + `[Decisions]` line present, no unresolved
       `tests/paused_state.md`; GUIDED: every Class-I stop was an explicit
@@ -515,9 +519,8 @@ Before declaring any task complete, explicitly list and confirm:
       `tests/verification_log.md`. **Per change-wave** (previous task's
       baseline does NOT count) and recorded as the first log entry:
       `- Baseline verified GREEN` (assert group 9 machine-checks the FILE).
-      Class DOC (pure-doc) edits state-skip with `COV-9 skipped — documentation-only
-      change`; Class CONFIG runs the baseline (§V11.3) — a mid-task escalation
-      skip must name the escalation.
+      Pure-doc/config edits state-skip with `COV-9 skipped — documentation-only
+      change`.
 - [ ] **Scripts in `script/` used for build, start, stop, restart — NEVER raw
       `npm run build`, `vite`, `npm start`, `uvicorn`, etc. (COV-2)**
 - [ ] **Tests actually EXECUTED with concrete evidence on disk (test log files,
@@ -579,31 +582,6 @@ Before declaring any task complete, explicitly list and confirm:
       until ALL criteria pass OR cap=5 / stall=3× hit (COV-7)
 - [ ] ★ Convergence summary line output before completion table:
       `[Convergence] <task>: N iters | X/Y pass | stalls | cap-hits` (A4.1 Step 5)
-- [ ] ★ **`[Coverage]` line output (§V3)** — `criteria: N/M covered |
-      unchecked: <names|none>`; every unchecked item named and never phrased
-      as done; `UNVERIFIED` cells in the table all listed; unchecked never
-      laundered into `na`
-- [ ] ★ **Lane declared and honest (§V5)** — `Lane: S/M/L` matches the
-      objective eligibility list (≤2 files · ≤3 criteria · no risk-tier /
-      schema / new feature / new dep for S; L triggers honored); misreporting
-      the lane is a compliance violation
-- [ ] ★ **Test integrity held (§V2)** — no existing test edited/deleted/
-      skipped/weakened to pass; any test↔spec conflict flagged via PAUSED/ADR
-      with the SPEC as source of truth (never cheated green)
-- [ ] ★ **(Lane L OR weak-oracle completions) FCV done (§V1)** —
-      `tests/fcv_report.md` exists with per-criterion verdicts from a fresh
-      context re-run → `Fresh-verify: pass`; or `Fresh-verify: N/A (<reason>)`
-      with the trigger genuinely not met
-- [ ] ★ **(Lane L) Adversarial review dispatched (§V4)** — two fresh-context
-      diff-only reviewers, findings merged/deduped, disagreements escalated
-- [ ] ★ **Secret scan clean** — `python3 scripts/scan_secrets.py` (or
-      equivalent named grep over the diff) found no key/token/credential on
-      added lines (group 14 also machine-checks this on the project copy)
-- [ ] ★ **Ship order held (§V9)** — code+tests landed first; deferred
-      ceremony (memory topics · `tests/review_package.md` · ADR prose) was
-      assembled from the log at completion time; any budget cut left its
-      mark in `[Coverage] unchecked` / `UNVERIFIED`, never as fake evidence
-      and never as a missing deliverable
 - [ ] ★ **(Backend-only tasks) A4.7 backend loop** — API doc updated, doc↔code
       consistency audited once, test cases written FROM the doc, the test → fix
       loop executed with httpx/requests until ALL cases pass; iterations logged
@@ -627,7 +605,7 @@ Before declaring any task complete, explicitly list and confirm:
 - [ ] ★ Completion table output with ALL 8 columns filled: Problem, Research
       Sources, Chosen Approach & Why, Files Changed, What Changed, Verification
       Evidence, Commit (A4.4)
-- [ ] ★ `python3 tests/assert_artifacts.py` executed and exited 0 before the
+- [ ] ★ `python3 tests/assert_artifacts.py --final` executed and exited 0 before the
       `[Verification Gate]` line; the literal field `assert_artifacts.py:
       pass=N/fail=0` is present (A4.4.1)
 - [ ] ★ Change-wave diff passed the content gates (assert groups 14-16): no

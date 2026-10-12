@@ -4,7 +4,7 @@
 <template>
   <div v-if="attachments && attachments.length" class="file-attachments">
     <template v-for="file in attachments" :key="attachmentKey(file)">
-      <FolderAttachment v-if="file.type === 'folder'" :folder="file" />
+      <FolderAttachment v-if="file.type === 'folder'" :folder="file" :device-id="deviceId" />
 
       <div v-else-if="kindOf(file) === 'image'" class="image-card" title="点击查看大图" @click="openLightbox(file)">
         <img :src="targetUrl(file)" :alt="file.name" class="image-preview" loading="lazy" @error="handleImgError" />
@@ -81,6 +81,7 @@ import { useToast } from '@/composables/useToast'
 
 const props = defineProps<{
   attachments: Attachment[]
+  deviceId?: string | null
 }>()
 
 const lightboxFile = ref<FileAttachment | null>(null)
@@ -105,7 +106,8 @@ function displayPath(file: FileAttachment): string {
 }
 
 function targetUrl(file: FileAttachment): string {
-  return buildDownloadUrl(file.rel_path || file.path || '')
+  // W18 G3：交付卡（provide_file/pdf_export）字节在设备工作区——设备会话走代理
+  return buildDownloadUrl(file.rel_path || file.path || '', props.deviceId)
 }
 
 function onFileCardClick(file: FileAttachment) {

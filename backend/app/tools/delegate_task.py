@@ -173,6 +173,8 @@ async def _run_child_agent(
             enable_reasoning=False,
             session_factory=AsyncSessionLocal,
         )
+        # W17 轮次门控：继承父轮激活态（缺省 True=旧行为）
+        loop.vibeweaver_active = bool(kwargs.get("_vibeweaver_active", True))
 
         assistant_content = ""
         # F3（2026-09-14）：收集子代理产物（tool_result 事件的 generated_files）

@@ -22,6 +22,41 @@ export interface SearchResult {
   url: string
   snippet: string
   published_date?: string | null
+  /** M1/M2 书目字段（引文体系改造）：古籍/书籍等规范 reference 渲染所需。 */
+  source_type?: string
+  author?: string
+  editor?: string
+  edition?: string
+  publisher_place?: string
+  publisher?: string
+  year?: string
+  volume?: string
+  page?: string
+  container?: string
+  genre?: string
+  standard_no?: string
+  site_name?: string | null
+}
+
+/** M4 出货载荷：服务端按助手 citation_style 渲染的逐条规范 reference 与
+ *  文内族形态（前端仅展示，不再本地解析/重排 —— 防双重重排错位）。 */
+export interface CitationPayloadEntry {
+  id: number
+  num: number
+  in_text?: string
+  reference: string
+  url?: string
+  title?: string
+  snippet?: string
+  author?: string
+  year?: string
+}
+
+export interface CitationsPayload {
+  style_id: string
+  family: string
+  heading: string
+  entries: CitationPayloadEntry[]
 }
 
 export interface SearchRound {
@@ -194,6 +229,7 @@ export interface ToolResultsData {
   task_plan?: TaskProgress | null
   sub_agent_outputs?: Record<string, SubAgentOutput>
   thinking_history?: SubAgentThinking[]
+  citations?: CitationsPayload
 }
 
 /** Agent tool-loop streaming events (use_tool_loop = true) */
@@ -236,6 +272,7 @@ export interface Conversation {
   updated_at: string
   last_user_message_at?: string | null
   assistant_id?: string | null
+  execution_target?: string | null
   messages?: Message[]
   deathmatch_mode?: boolean
   deathmatch_status?: string
@@ -281,6 +318,18 @@ export interface ChatRequest {
   thinking_budget?: number | null
   deathmatch_mode?: boolean
   deathmatch_action?: string | null
+  execution_target?: string | null
+}
+
+export interface ClientDevice {
+  id: string
+  device_id: string
+  name?: string | null
+  platform?: string | null
+  online: boolean
+  revoked: boolean
+  last_seen_at?: string | null
+  created_at?: string | null
 }
 
 export interface DeathmatchPlanStep {

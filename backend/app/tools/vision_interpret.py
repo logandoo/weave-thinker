@@ -50,7 +50,14 @@ async def vision_interpret(args: dict, **kwargs) -> str:
     workspace_path = kwargs.get("workspace_path") or ""
     if not workspace_path:
         return json.dumps({"error": "无工作区上下文，无法解析图片路径", "success": False}, ensure_ascii=False)
-    resolved = _resolve_workspace_path(image_path, workspace_path)
+    # W19 P1 混合：设备会话下字节由路由层经设备代理取回注入——不依赖本地盘
+    override = kwargs.get("file_bytes_override")
+    if isinstance(override, (bytes, bytearray)):
+        resolved = image_path
+        raw = bytes(override)
+    else:
+        resolved = _resolve_workspace_path(image_path, workspace_path)
+        raw = None
     if not resolved:
         return json.dumps(
             {"error": f"图片不存在或不在工作区内（路径越界会被拒绝）: {image_path}", "success": False},
@@ -76,14 +83,21 @@ async def vision_interpret(args: dict, **kwargs) -> str:
             "success": False, "configured": False, "config_error": True,
         }, ensure_ascii=False)
     try:
-        size = os.path.getsize(resolved)
-        if size > _MAX_IMAGE_BYTES:
+        if raw is None:
+            size = os.path.getsize(resolved)
+            if size > _MAX_IMAGE_BYTES:
+                return json.dumps(
+                    {"error": f"图片过大（{size} 字节 > {_MAX_IMAGE_BYTES}）", "success": False},
+                    ensure_ascii=False,
+                )
+            with open(resolved, "rb") as fh:
+                raw = fh.read()
+        if len(raw) > _MAX_IMAGE_BYTES:
             return json.dumps(
-                {"error": f"图片过大（{size} 字节 > {_MAX_IMAGE_BYTES}）", "success": False},
+                {"error": f"图片过大（{len(raw)} 字节 > {_MAX_IMAGE_BYTES}）", "success": False},
                 ensure_ascii=False,
             )
-        with open(resolved, "rb") as fh:
-            b64 = base64.b64encode(fh.read()).decode("ascii")
+        b64 = base64.b64encode(raw).decode("ascii")
     except Exception as exc:
         return json.dumps({"error": f"读取图片失败: {exc}", "success": False}, ensure_ascii=False)
 
@@ -128,7 +142,10 @@ async def vision_interpret(args: dict, **kwargs) -> str:
         return json.dumps({"error": f"视觉模型调用失败: {exc}", "success": False}, ensure_ascii=False)
     return json.dumps({
         "success": True,
-        "image_path": os.path.relpath(resolved, str(Path(workspace_path).resolve())),
+        "image_path": (
+            image_path if isinstance(kwargs.get("file_bytes_override"), (bytes, bytearray))
+            else os.path.relpath(resolved, str(Path(workspace_path).resolve()))
+        ),
         "model": ep.model_name,
         "interpretation": (text or "").strip(),
     }, ensure_ascii=False)

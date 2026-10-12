@@ -185,7 +185,7 @@ async function stopRecording() {
 <style scoped>
 .quick-note-wrapper {
   position: fixed;
-  bottom: calc(var(--mobile-tab-bar-offset, 80px) + 12px + env(safe-area-inset-bottom, 0));
+  bottom: calc(var(--mobile-tab-bar-offset, 72px) + 12px + env(safe-area-inset-bottom, 0));
   right: 20px;
   z-index: 100;
   display: flex;
@@ -288,7 +288,7 @@ async function stopRecording() {
 
 @media (max-width: 767px) {
   .quick-note-wrapper {
-    bottom: calc(var(--mobile-tab-bar-offset, 70px) + 12px + env(safe-area-inset-bottom, 0));
+    bottom: calc(var(--mobile-tab-bar-offset, 72px) + 12px + env(safe-area-inset-bottom, 0));
     right: 12px;
   }
 

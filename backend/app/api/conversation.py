@@ -267,6 +267,7 @@ def _conversation_response(
         title=conversation.title,
         group_id=conversation.group_id,
         assistant_id=conversation.assistant_id,
+        execution_target=conversation.execution_target,
         sort_order=conversation.sort_order or 0,
         created_at=_utc_iso(conversation.created_at),
         updated_at=_utc_iso(conversation.updated_at),
@@ -332,10 +333,25 @@ async def create_conversation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # W16 设备执行模式：执行环境创建即定（D-6）——校验格式+设备属主/未撤销。
+    execution_target = None
+    if conversation_data.execution_target:
+        from app.services import client_device_service as cds
+        try:
+            execution_target = cds.normalize_execution_target(
+                conversation_data.execution_target
+            )
+            if execution_target is not None:
+                await cds.assert_device_usable(db, current_user.id, execution_target)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except LookupError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     conversation = Conversation(
         user_id=current_user.id,
         title=conversation_data.title or "新对话",
-        assistant_id=conversation_data.assistant_id
+        assistant_id=conversation_data.assistant_id,
+        execution_target=execution_target,
     )
     db.add(conversation)
     await db.commit()

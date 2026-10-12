@@ -299,6 +299,12 @@ onBeforeUnmount(() => {
     margin-bottom: calc(var(--mobile-tab-bar-offset) + env(safe-area-inset-bottom, 0px));
   }
 
+  /* 语音态：wrapper 悬垂量 offset+4px，让语音条落在底 tab 上方（任务块 14 重定标：
+     verdant offset 76 时 gap=19<20 留余量；三皮肤实测 19/9/9；mobile_voice_bar_position 契约 0~20） */
+  body.voice-mode-active .chat-main :deep(.chat-input-wrapper) {
+    margin-bottom: calc(var(--mobile-tab-bar-offset) + 4px + env(safe-area-inset-bottom, 0px));
+  }
+
   .mobile-header {
     display: flex;
   }
@@ -374,53 +380,69 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 767px) {
+  /* 任务块 9（2026-10-11）：对齐三皮肤 mockup——居中浮动胶囊/方块（不再全宽底栏）。
+     皮肤级胶囊铬（背景/边框/阴影）在 styles/themes/<skin>.css 覆盖。
+     修复（遮盖/换行）：fixed + left:50% 的收缩宽度被压到 50vw（320px 屏仅 160px），
+     item 被 flex-shrink 挤压 → 「笔记」竖排换行、条撑高盖住 hint；
+     width:max-content + item 不收缩/不换行后条高恒定（verdant 52px / ink 50px / mono 46px，随皮肤铬），不再越界。 */
   .mobile-tab-bar {
     display: flex;
-    align-items: center;
+    align-items: stretch;
     position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: calc(100vw - 24px);
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     z-index: 100;
-    gap: 10px;
-    padding: 6px 12px calc(6px + env(safe-area-inset-bottom, 0px));
-    background: transparent;
-    pointer-events: none;
+    gap: 4px;
+    padding: 5px;
+    border: 1px solid var(--panel-border);
+    border-radius: 999px;
+    background: var(--surface-panel-strong);
+    box-shadow: var(--panel-shadow);
     transition: transform var(--transition-fast), opacity var(--transition-fast);
   }
 
-  .mobile-tab-bar .tab-item {
-    pointer-events: auto;
-  }
-
+  /* 微退出（skill #6）：12px 小位移 + 淡出，替代整条滑出——键盘弹起时不与输入法抢视线 */
   .mobile-tab-bar.tab-bar-hidden {
-    transform: translateY(calc(100% + 20px));
+    transform: translate(-50%, 12px);
     opacity: 0;
     pointer-events: none;
   }
 }
 
+/* fill 铺满（skill 同心圆角/等高块）：stretch + min-height 40px 使活动胶囊/黑块
+   与条内高等高（此前 line-height normal 让 CJK 行盒高出 Latin 2~3px，块填不满）；
+   40px 同时满足 skill #16 最小点击区。 */
 .tab-item {
-  flex: 1;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
   justify-content: center;
-  gap: 2px;
-  min-height: var(--mobile-tab-bar-height);
-  padding: 4px 0;
-  border: 1px solid var(--panel-border);
+  flex-shrink: 0;
+  white-space: nowrap;
+  gap: 5px;
+  padding: 8px 22px;
+  min-height: 40px;
+  border: 1px solid transparent;
   border-radius: 999px;
-  background-color: var(--surface-panel-strong);
-  box-shadow: var(--panel-shadow);
+  background-color: transparent;
+  box-shadow: none;
   color: var(--color-text-light);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
-  transition: color var(--transition-fast), border-color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast);
+  transition: color var(--transition-fast), border-color var(--transition-fast), background-color var(--transition-fast), transform var(--transition-fast), scale var(--transition-fast);
 }
 
+/* 任务块 9：对齐 mockup——文本胶囊（图标不显；墨韵线性图标前缀见主题块） */
+.tab-item svg {
+  display: none;
+}
+
+/* skill #12：按压走独立 scale 属性，不再被 :hover 的 transform 覆盖（原 transform 同槽相争） */
 .tab-item:active {
-  transform: scale(0.96);
+  scale: 0.96;
 }
 
 .tab-item.hide-on-mobile {
@@ -428,14 +450,18 @@ onBeforeUnmount(() => {
 }
 
 .tab-item.active {
-  color: var(--color-primary);
-  border-color: var(--panel-border-strong);
-  background-color: color-mix(in srgb, var(--surface-panel-strong) 82%, var(--color-primary) 18%);
+  color: var(--color-text);
+  background-color: var(--color-hover);
+  font-weight: 700;
 }
 
-.tab-item:hover {
-  color: var(--color-primary);
-  transform: translateY(-1px);
+/* 悬停抬升仅限真悬停设备（触屏粘连 :hover 会把胶囊/黑块抬起 1px：
+   黑块底露出条底白线 + 合成层分数像素 AA 侧缝——mono 硬边最显眼；任务块 15 用户报修） */
+@media (hover: hover) {
+  .tab-item:hover {
+    color: var(--color-primary);
+    transform: translateY(-1px);
+  }
 }
 
 

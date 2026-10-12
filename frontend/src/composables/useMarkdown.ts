@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { marked } from 'marked'
+import { buildDeviceDownloadUrl } from '@/api/clientDevices'
 import { buildCodeFence, collapseExtraBlankLines, encodeMathClosers, escapePuaMarkers, decodeMathClosers, stripMathFraming, mathLiteralHtml } from './snippetInsert'
 import { stableRenderCacheKey } from './stringCacheKey'
 import hljs from 'highlight.js'
@@ -73,13 +74,14 @@ export function clearRenderCache(): void {
   renderCache.clear()
 }
 
-function getRenderCacheKey(content: string): string {
+function getRenderCacheKey(content: string, deviceId?: string | null): string {
   // 全串散列键 —— 旧 len+head4+tail4 会同长同头尾碰撞串稿（wave-2 C6）。
-  return stableRenderCacheKey(content) + (endnoteEnabled.value ? '|e1' : '|e0')
+  // W18 G4：设备上下文入键——同内容在云端/设备渲染出的 src 不同，不得串缓存。
+  return stableRenderCacheKey(content) + (endnoteEnabled.value ? '|e1' : '|e0') + `|d:${deviceId ?? ''}`
 }
 
-function getCachedRender(content: string): string | undefined {
-  const key = getRenderCacheKey(content)
+function getCachedRender(content: string, deviceId?: string | null): string | undefined {
+  const key = getRenderCacheKey(content, deviceId)
   const hit = renderCache.get(key)
   if (hit !== undefined) {
     // LRU: move to end
@@ -89,8 +91,8 @@ function getCachedRender(content: string): string | undefined {
   return hit
 }
 
-function setCachedRender(content: string, html: string): void {
-  const key = getRenderCacheKey(content)
+function setCachedRender(content: string, deviceId: string | null | undefined, html: string): void {
+  const key = getRenderCacheKey(content, deviceId)
   if (renderCache.has(key)) renderCache.delete(key)
   else if (renderCache.size >= RENDER_CACHE_MAX) {
     const first = renderCache.keys().next().value
@@ -873,7 +875,18 @@ function splitOlContainingHeadings(html: string): string {
       if (!li.parentNode) continue
       const heading = li.querySelector('h1, h2, h3, h4, h5, h6') as HTMLElement | null
       if (!heading) continue
-      const newH2 = heading.cloneNode(true) as HTMLElement
+      // W12 Dx-2 修复（60 生产思考区裸文本事故）：
+      // ① 锚点宿主必须是「li 当前所属 ol 的父节点」，参照节点用该 ol 自身——
+      //    旧实现 ol.parentNode.insertBefore(newH2, li.nextSibling) 的参照节点是
+      //    ol 的子节点（marked 输出 li 后恒有 "\n" 文本节点），不是宿主的子节点，
+      //    insertBefore 必抛 NotFoundError → 被 renderMarkdownToHtml 的 catch 吞掉
+      //    → 整段 markdown 裸文本回退（`N. ### …` 大纲体 100% 触发）。
+      // ② 多标题列表：拆分会搬动后续 li，每轮按 li 的实时父 ol 重新锚定。
+      // ③ 标题 li 含其他内容时只拔标题保留余项（旧实现整 li 删除会丢文字）。
+      const curOl = li.parentElement
+      if (!curOl || curOl.tagName !== 'OL') continue
+      const host = curOl.parentNode
+      if (!host) continue
       const newOl = document.createElement('ol')
       let nextLi = li.nextElementSibling as HTMLElement | null
       while (nextLi && nextLi.tagName === 'LI') {
@@ -881,16 +894,19 @@ function splitOlContainingHeadings(html: string): string {
         nextLi = nextLi.nextElementSibling as HTMLElement | null
         newOl.appendChild(toMove)
       }
-      if (newOl.children.length === 0) {
-        ol.parentNode?.insertBefore(newH2, li.nextSibling)
-      } else {
-        ol.parentNode?.insertBefore(newH2, li.nextSibling)
-        ol.parentNode?.insertBefore(newOl, newH2.nextSibling)
+      heading.remove()
+      host.insertBefore(heading, curOl.nextSibling)
+      if (newOl.children.length > 0) {
+        host.insertBefore(newOl, heading.nextSibling)
       }
-      li.parentNode?.removeChild(li)
-    }
-    if (ol.children.length === 0) {
-      ol.parentNode?.removeChild(ol)
+      // 复审 B-M1：余项判定须媒体感知——仅剩 <img>/<iframe>/<video> 的 li
+      // textContent 为空但内容有意义，不得删。
+      if (!li.textContent?.trim() && li.querySelector('img, iframe, video, audio, svg, table') === null) {
+        li.remove()
+      }
+      if (curOl.children.length === 0) {
+        curOl.remove()
+      }
     }
   }
   return serializeFragment(container)
@@ -992,7 +1008,14 @@ function restoreSafeIframes(html: string, placeholders: Record<string, string>):
   return out
 }
 
-function rewriteImageUrls(html: string): string {
+function signedFileUrl(src: string, deviceId?: string | null): string {
+  // W18 G4：设备上下文 → 设备文件代理（PLAN §6.2）；否则云端 files 下载。
+  if (deviceId) return buildDeviceDownloadUrl(deviceId, src)
+  const token = localStorage.getItem('chatllm_token') || ''
+  return `/api/files/download?path=${encodeURIComponent(src)}&token=${encodeURIComponent(token)}`
+}
+
+function rewriteImageUrls(html: string, deviceId?: string | null): string {
   if (!html) return html
   try {
     // Parse into an INERT <template>: a plain detached <div>.innerHTML would
@@ -1017,7 +1040,7 @@ function rewriteImageUrls(html: string): string {
         if (!img.hasAttribute('data-original-src')) {
           img.setAttribute('data-original-src', src)
         }
-        img.setAttribute('src', `/api/files/download?path=${encodeURIComponent(src)}&token=${encodeURIComponent(token)}`)
+        img.setAttribute('src', signedFileUrl(src, deviceId))
         changed = true
       }
     })
@@ -1055,7 +1078,7 @@ function serializeFragment(frag: DocumentFragment): string {
  * Mirrors rewriteImageUrls. <picture> sources use srcset (never src) and
  * are left untouched.
  */
-function rewriteMediaUrls(html: string): string {
+function rewriteMediaUrls(html: string, deviceId?: string | null): string {
   if (!html) return html
   try {
     // Inert <template> parse (see rewriteImageUrls) — a detached <div> would
@@ -1074,7 +1097,7 @@ function rewriteMediaUrls(html: string): string {
         if (!el.hasAttribute('data-original-src')) {
           el.setAttribute('data-original-src', src)
         }
-        el.setAttribute(attr, `/api/files/download?path=${encodeURIComponent(src)}&token=${encodeURIComponent(token)}`)
+        el.setAttribute(attr, signedFileUrl(src, deviceId))
         changed = true
       }
     }
@@ -1238,9 +1261,13 @@ function preprocessEndnoteSyntax(md: string): { text: string; defs: EndnoteDef[]
   }
 }
 
-export function renderMarkdownToHtml(content: string): string {
+export function renderMarkdownToHtml(
+  content: string,
+  opts?: { deviceId?: string | null },
+): string {
   if (!content) return ''
-  const cached = getCachedRender(content)
+  const deviceId = opts?.deviceId ?? null
+  const cached = getCachedRender(content, deviceId)
   if (cached !== undefined) return cached
   try {
     headingAutoIdCounter = 0
@@ -1263,8 +1290,8 @@ export function renderMarkdownToHtml(content: string): string {
       ADD_TAGS: ['button'],
     })
     const withIframes = restoreSafeIframes(sanitized, iframePlaceholders)
-    const rewritten = rewriteImageUrls(withIframes)
-    const mediaRewritten = rewriteMediaUrls(rewritten)
+    const rewritten = rewriteImageUrls(withIframes, deviceId)
+    const mediaRewritten = rewriteMediaUrls(rewritten, deviceId)
     // 尾注定义段追加到文末：正文走 marked.parseInline 保格式（禁 textContent）。
     // 整体再过一次 DOMPurify（id/href 属性已转义，这里是纵深防御——A4.9 C1）。
     let endnoteHtml = ''
@@ -1288,9 +1315,12 @@ export function renderMarkdownToHtml(content: string): string {
           ADD_ATTR: ['target', 'rel', 'style'],
         })
       : mediaRewritten
-    setCachedRender(content, withEndnotes)
+    setCachedRender(content, deviceId, withEndnotes)
     return withEndnotes
-  } catch {
+  } catch (err) {
+    // W12：不再静默吞——裸回退即「格式全丢」（60 生产思考区事故根因）。
+    // 只记错误消息，绝不带 content（思考/正文属用户隐私）。
+    console.warn('[markdown] render failed, raw fallback:', (err as Error)?.message || err)
     return content
   }
 }

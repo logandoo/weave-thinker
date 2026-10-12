@@ -738,9 +738,9 @@ html[data-skin="mono-brutal"] .toolbar-btn.active {
 }
 html[data-skin="mono-brutal"] .send-btn {
   width: 42px; height: 42px;
-  border-radius: 50%;
+  border-radius: 0;
   background: var(--skin-fill);
-  border: 3px solid var(--skin-line);
+  border: 2px solid var(--skin-line);
   color: var(--skin-onfill);
   box-shadow: none;
 }
@@ -749,7 +749,7 @@ html[data-skin="mono-brutal"] .send-btn:hover:not(:disabled) {
   color: var(--skin-line);
 }
 html[data-skin="mono-brutal"] .send-btn:disabled {
-  background: var(--skin-lt);
+  background: var(--skin-wt);
   color: var(--skin-gy);
   border: 2px solid var(--skin-line);
 }
@@ -961,7 +961,22 @@ html[data-skin="mono-brutal"] .tool-pending .tool-card-icon { color: var(--tool-
     flex: none;
   }
   html[data-skin="mono-brutal"] .chat-input-wrapper {
-    padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0));
+    /* 任务块 8（2026-10-11 用户指令）：输入框距屏幕侧边距 16→10px */
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0));
+  }
+  /* 任务块 8：按钮间距收窄（gap 8→4px、行内 padding 14→8px） */
+  html[data-skin="mono-brutal"] .input-bottom-toolbar {
+    gap: 4px;
+    padding: 6px 8px 8px;
+  }
+  /* 任务块 8：语音模式切换按钮缩小（38→30px，图标 15→13px） */
+  html[data-skin="mono-brutal"] .voice-mode-toggle-btn {
+    width: 30px;
+    height: 30px;
+  }
+  html[data-skin="mono-brutal"] .voice-mode-toggle-btn svg {
+    width: 13px;
+    height: 13px;
   }
 }
 
@@ -1536,17 +1551,28 @@ html[data-skin="mono-brutal"] .chat-header {
 /* 笔记页：焦点框拉通 sidebar 全宽（去 list 侧 padding），计数红方块右留 12px 收入框内 */
 html[data-skin="mono-brutal"] .notes-panel-list { padding: 0; }
 
-/* wave-8：底部悬浮钮与 chat-input 容器背景一致（白面硬边，active 以黑字/黄边区分） */
-html[data-skin="mono-brutal"] .mobile-tab-bar .tab-item {
+/* 任务块 9（2026-10-11）：移动端底 tab 对齐 mockup——白面 3px 硬边 + 5px 偏移硬影 +
+   黑 fill 活动块；规格源 design/mockups/04-mono-brutal/mobile.html .m-tabbar */
+html[data-skin="mono-brutal"] .mobile-tab-bar {
+  gap: 0;
+  padding: 0;
   background: var(--skin-wt);
-  border: 2px solid var(--skin-line);
-  box-shadow: 3px 3px 0 var(--skin-line);
+  border: 3px solid var(--skin-line);
   border-radius: 0;
+  box-shadow: 5px 5px 0 var(--skin-line);
 }
-html[data-skin="mono-brutal"] .mobile-tab-bar .tab-item.active {
+html[data-skin="mono-brutal"] .mobile-tab-bar .tab-item {
+  padding: 10px 24px;
+  font-weight: 900;
+  font-size: 12px;
+  border: none;
+  border-radius: 0;
   background: var(--skin-wt);
   color: var(--color-text);
-  border-color: var(--skin-yl);
+}
+html[data-skin="mono-brutal"] .mobile-tab-bar .tab-item.active {
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
 }
 
 /* ════════ wave-11：登录页 / 笔记引用 / 思考菜单 item / 设置面板内部 / 列表卡片（黑白构成语言） ════════ */

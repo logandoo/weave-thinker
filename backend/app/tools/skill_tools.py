@@ -17,8 +17,9 @@ config = get_config()
 
 
 def _get_skills_dir() -> Path:
-    backend_root = config.backend_root
-    return backend_root / "skills"
+    """系统技能目录：走只读资源解析（backend_root 旁路优先，冻结包 _internal 兜底）。
+    修复（W12 P0#1）：打包态 backend_root=用户配置目录，直取会导致系统技能列表恒空。"""
+    return config.resolve_resource("skills")
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -366,9 +367,13 @@ async def skill_view(args: dict, **kwargs) -> str:
     # vibeweaver 观察通道（A4）：skill 加载事件（audit 的会话筛选信号）。
     try:
         from app.services.agent_event_bus import AgentEvent as _AebEvent, agent_event_bus as _aeb
+        # 评审修复（W12）：agent 派发 kwargs 只有 conversation 对象（无 conversation_id），
+        # 需回退对象 id——否则事件 session_id 为空，audit 永远记不到激活。
+        _conv_obj = kwargs.get("conversation")
+        _sid = str(kwargs.get("conversation_id") or getattr(_conv_obj, "id", "") or "")
         _aeb.publish_soon(_AebEvent(
             type="skill.activated",
-            session_id=str(kwargs.get("conversation_id") or ""),
+            session_id=_sid,
             data={"name": name},
         ))
     except Exception:
@@ -757,9 +762,9 @@ async def skill_run_script(args: dict, **kwargs) -> str:
 _SKILL_PROMPT_CACHE: Dict[str, tuple[float, str]] = {}
 
 
-async def build_skills_system_prompt(user: Any = None) -> str:
+async def build_skills_system_prompt(user: Any = None, include_force_inject: bool = True) -> str:
     user_id = str(user.id) if user and hasattr(user, "id") else "__no_user__"
-    cache_key = f"skills_{user_id}"
+    cache_key = f"skills_{user_id}" if include_force_inject else f"skills_noinj_{user_id}"
     now = _time.monotonic()
 
     cached = _SKILL_PROMPT_CACHE.get(cache_key)
@@ -803,20 +808,41 @@ async def build_skills_system_prompt(user: Any = None) -> str:
     lines.append("Use skill_view(name) to load a skill's full instructions. Use skill_manage(action='create', ...) to save new skills. 系统技能（source=system）只读，用户技能不可与系统技能重名。")
     result = "\n".join(lines)
 
-    # C2（vibeweaver 集成）：force-inject —— 指定 skill 的 SKILL.md 全文
-    # 直接注入（基准证明 available 自触发率不足）；{VW_DIR} 占位替换为
-    # skill 目录绝对路径。受 force_inject_max_chars 预算约束。
+    if include_force_inject:
+        block = await build_force_injected_skills_prompt(user)
+        if block:
+            result = result + "\n\n" + block
+
+    _SKILL_PROMPT_CACHE[cache_key] = (now, result)
+    return result
+
+
+async def build_force_injected_skills_prompt(user: Any = None) -> str:
+    """force-inject 段独立构建（W17 轮次门控：chat.py 按轮决定是否拼接）。
+
+    C2（vibeweaver 集成）：指定 skill 的 SKILL.md 全文直接注入（基准证明
+    available 自触发率不足）；{VW_DIR} 占位替换为 skill 目录绝对路径。
+    受 force_inject_max_chars 预算约束。返回段自带 authoritative 头；无内容
+    返回空串。"""
+    user_id = str(user.id) if user and hasattr(user, "id") else "__no_user__"
+    cache_key = f"vwinj_{user_id}"
+    now = _time.monotonic()
+    cached = _SKILL_PROMPT_CACHE.get(cache_key)
+    if cached:
+        cached_time, cached_value = cached
+        if now - cached_time < 60:
+            return cached_value
     try:
         force_list = get_config().agent_skills_force_inject
     except Exception:
         force_list = []
+    injected: List[str] = []
     if force_list:
         budget = 60000
         try:
             budget = max(0, int(get_config().agent_skills_force_inject_max_chars))
         except Exception:
             pass
-        injected: List[str] = []
         used = 0
         for fname in force_list:
             try:
@@ -848,9 +874,10 @@ async def build_skills_system_prompt(user: Any = None) -> str:
             injected.append(
                 f"<force_injected_skill name=\"{fname}\">\n{text}\n</force_injected_skill>"
             )
-        if injected:
-            result = result + "\n\n## Force-injected skill instructions (authoritative)\n\n" + "\n\n".join(injected)
-
+    result = (
+        "## Force-injected skill instructions (authoritative)\n\n" + "\n\n".join(injected)
+        if injected else ""
+    )
     _SKILL_PROMPT_CACHE[cache_key] = (now, result)
     return result
 

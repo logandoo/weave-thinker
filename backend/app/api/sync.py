@@ -8,6 +8,7 @@ cursor = sync_events.seq（全局单调）；delta 窗口内 Joplin 四规则压
 push 经 ORM 应用（触发 sync_capture，origin_device 经 ContextVar 传递）。
 """
 import hashlib
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_config
 from app.core.deps import get_current_user
+
+logger = logging.getLogger(__name__)
 from app.db.database import (
     Assistant,
     Conversation,
@@ -31,6 +34,8 @@ from app.db.database import (
     SyncBlob,
     SyncDevice,
     SyncEvent,
+    SyncPruneWatermark,
+    SyncTombstone,
     User,
     get_db,
 )
@@ -477,10 +482,30 @@ async def get_delta(
     raw = (await db.execute(q)).scalars().all()
     compressed = _compress_window(raw)
     new_cursor = raw[-1].seq if raw else cursor
+    # 项8（W7）+ 8a（W8）：保留沿 + 缺口信号（Joplin resyncRequired / smrt floor
+    # 范式）。per-user 裁剪水位（D-w8-1）补「日志被全部裁剪」态（min=None 时
+    # 仅靠保留沿判不出缺口）；零事件用户（无水位）不再恒真误报（风暴修复）。
+    min_seq = (await db.execute(
+        select(func.min(SyncEvent.seq)).where(SyncEvent.user_id == current_user.id)
+    )).scalar()
+    watermark = None
+    if cursor > 0:
+        watermark = (await db.execute(
+            select(SyncPruneWatermark.max_deleted_seq).where(
+                SyncPruneWatermark.user_id == current_user.id)
+        )).scalar()
+    resync_required = bool(
+        cursor > 0 and (
+            (min_seq is not None and cursor < min_seq - 1)
+            or (watermark is not None and cursor < watermark)
+        )
+    )
     return DeltaResponse(
         events=compressed,
         cursor=new_cursor,
         has_more=len(raw) == limit,
+        min_available_seq=min_seq,
+        resync_required=resync_required,
     )
 
 
@@ -660,61 +685,115 @@ async def resync(
 
     if config.sync_memory_enabled and _mig.PGVECTOR_AVAILABLE:
         domains.update(MEMORY_SYNC_ENTITIES)
-    entities: dict = {}
-    for entity_type, model in domains.items():
-        if entity_type in _DIRECT_USER_TYPES:
-            q = select(model).where(model.user_id == current_user.id)
-        elif entity_type == "notes":
-            q = (
-                select(Note)
-                .join(Notebook, Note.notebook_id == Notebook.id)
-                .where(Notebook.user_id == current_user.id)
-            )
-        elif entity_type == "messages":
-            q = (
-                select(Message)
-                .join(Conversation, Message.conversation_id == Conversation.id)
-                .where(Conversation.user_id == current_user.id,
-                       Message.delivery_status != "streaming")
-            )
-        elif entity_type == "skill_files":
-            # 全量保真波：skill_files 经父 user_skills 归属（此前 else=messages 会错套）
-            from app.db.database import SkillFile, UserSkill
+    allowed_types = set(domains.keys())
 
-            q = (
-                select(SkillFile)
-                .join(UserSkill, SkillFile.skill_id == UserSkill.id)
-                .where(UserSkill.user_id == current_user.id)
-            )
-        else:  # messages（兜底分支）
-            q = (
-                select(Message)
-                .join(Conversation, Message.conversation_id == Conversation.id)
-                .where(Conversation.user_id == current_user.id,
-                       Message.delivery_status != "streaming")
-            )
-        rows = (await db.execute(q)).scalars().all()
-        entities[entity_type] = [row_snapshot(r) for r in rows]
-    # user_profile：users 自行四列白名单（密码/角色/登录态永不入）
-    from app.services.sync_capture import PROFILE_COLS
+    def _user_max_stmt():
+        # 项8c（W8，UPSTREAM_TODO_20261007；A4.9 复审加固 D-w8-5）：per-user 游标
+        # ——不再取全局 max（跨用户提交会抬高游标，掩盖本用户低 seq 的在途事务）。
+        # 快照/墓碑读取前先取，轮末复查；推进则重试（≤3）——窗口内提交的实体
+        # 要么 seq > 游标（delta 补偿），要么已提交必落入下一轮墓碑/快照读取。
+        # 残留边界（同用户并发事务 seq 倒挂）见 D-w8-5，由后续 resync 收敛。
+        return select(func.max(SyncEvent.seq)).where(
+            SyncEvent.user_id == current_user.id)
 
-    snap = row_snapshot(current_user)
-    entities["user_profile"] = [
-        {k: snap.get(k) for k in (*PROFILE_COLS, "updated_at", "id")}
-    ]
-    # 模型池配置（2026-09-29 波，D-21/D-22）：服务端合并配置的模型段随 resync
-    # 下行——客户端白名单落盘 config_model.toml + 热重载 → 全端模型列表一致（D-16）。
-    # 方向单向（服务端→客户端）；[sync] model_config_enabled=false 整体关闭
-    # （多租户/开放注册部署）；model_config_include_keys=false 剥离 api_key。
+    from app.services.sync_capture import PROFILE_COLS, resolve_payload_stubs_batch
     from app.services.model_config_sync import build_model_config_payload
 
-    if config.sync_model_config_enabled:
-        mc_payload = build_model_config_payload(
-            getattr(config, "_config", {}) or {},
-            include_keys=config.sync_model_config_include_keys,
-        )
-        if mc_payload:
-            mc_payload["id"] = "model_config"
-            entities["model_config"] = [mc_payload]
-    max_seq = (await db.execute(select(func.max(SyncEvent.seq)))).scalar() or 0
-    return ResyncResponse(entities=entities, cursor=max_seq)
+    cursor = 0
+    entities: dict = {}
+    tombstones: list = []
+    for _attempt in range(3):
+        cursor = (await db.execute(_user_max_stmt())).scalar() or 0
+        # 项8b（W8）+ 复审修正（D-w8-5）：墓碑查询先于快照——墓碑在即删除已提交
+        # 于墓碑查询前，随后快照必无该行（「新墓碑 + 旧快照行」并存不可能；同 id
+        # 重建=墓碑旧/快照新，属契约态）。客户端契约=先应用墓碑再并快照。
+        tb_rows = (await db.execute(
+            select(SyncTombstone).where(SyncTombstone.user_id == current_user.id)
+        )).scalars().all()
+        tombstones = []
+        for r in tb_rows:
+            if r.entity_type not in allowed_types:
+                continue
+            entry = {
+                "entity_type": r.entity_type,
+                "entity_id": r.entity_id,
+                "deleted_at": (r.deleted_at.isoformat() + "Z") if r.deleted_at else None,
+            }
+            tb_payload = getattr(r, "payload", None)
+            if tb_payload:
+                # W9 项9（UPSTREAM_TODO_20261007）：自然键墓碑载荷随回放下发
+                # （user_model_providers 异 id 归并行——apply_change 删除兜底）；
+                # 空载荷不输出该键（体积/契约稳定）。客户端消费须转发 payload
+                # （W10 client 波配套）。
+                entry["payload"] = tb_payload
+            tombstones.append(entry)
+        entities = {}
+        for entity_type, model in domains.items():
+            if entity_type in _DIRECT_USER_TYPES:
+                q = select(model).where(model.user_id == current_user.id)
+            elif entity_type == "notes":
+                q = (
+                    select(Note)
+                    .join(Notebook, Note.notebook_id == Notebook.id)
+                    .where(Notebook.user_id == current_user.id)
+                )
+            elif entity_type == "messages":
+                q = (
+                    select(Message)
+                    .join(Conversation, Message.conversation_id == Conversation.id)
+                    .where(Conversation.user_id == current_user.id,
+                           Message.delivery_status != "streaming")
+                )
+            elif entity_type == "skill_files":
+                # 全量保真波：skill_files 经父 user_skills 归属（此前 else=messages 会错套）
+                from app.db.database import SkillFile, UserSkill
+
+                q = (
+                    select(SkillFile)
+                    .join(UserSkill, SkillFile.skill_id == UserSkill.id)
+                    .where(UserSkill.user_id == current_user.id)
+                )
+            else:  # messages（兜底分支）
+                q = (
+                    select(Message)
+                    .join(Conversation, Message.conversation_id == Conversation.id)
+                    .where(Conversation.user_id == current_user.id,
+                           Message.delivery_status != "streaming")
+                )
+            rows = (await db.execute(q)).scalars().all()
+            entities[entity_type] = [row_snapshot(r) for r in rows]
+        # 项6.1（W7，UPSTREAM_TODO_20261007）：messages 快照外置桩解析为全文
+        # （批量 + sha 校验；孤儿/完整性不符保持桩）——新设备首连 / 全量重同步
+        # 不再拿到不可展开的孤儿桩。
+        replaced = await resolve_payload_stubs_batch(db, entities.get("messages") or [])
+        if replaced:
+            logger.info("resync: resolved %d externalized payload field(s)", replaced)
+        # user_profile：users 自行四列白名单（密码/角色/登录态永不入）
+        snap = row_snapshot(current_user)
+        entities["user_profile"] = [
+            {k: snap.get(k) for k in (*PROFILE_COLS, "updated_at", "id")}
+        ]
+        # 模型池配置（2026-09-29 波，D-21/D-22）：服务端合并配置的模型段随 resync
+        # 下行——客户端白名单落盘 config_model.toml + 热重载 → 全端模型列表一致（D-16）。
+        # 方向单向（服务端→客户端）；[sync] model_config_enabled=false 整体关闭
+        # （多租户/开放注册部署）；model_config_include_keys=false 剥离 api_key。
+        if config.sync_model_config_enabled:
+            mc_payload = build_model_config_payload(
+                getattr(config, "_config", {}) or {},
+                include_keys=config.sync_model_config_include_keys,
+            )
+            if mc_payload:
+                mc_payload["id"] = "model_config"
+                entities["model_config"] = [mc_payload]
+        if ((await db.execute(_user_max_stmt())).scalar() or 0) <= cursor:
+            break  # 本轮读取窗口无推进：游标与快照/墓碑同点（受重试上限约束）
+    # 复审 Minor 收口：游标不低于 per-user 裁剪水位——水位 > 存活事件 max 时
+    # （如高 seq 的 NULL 龄行被裁剪）不设底会让 delta 恒提示 resync（重同步
+    # 死循环）；resync 已交付全量快照态，等价于已消费到水位。
+    watermark = (await db.execute(
+        select(SyncPruneWatermark.max_deleted_seq).where(
+            SyncPruneWatermark.user_id == current_user.id)
+    )).scalar() or 0
+    if watermark > cursor:
+        cursor = int(watermark)
+    return ResyncResponse(entities=entities, cursor=cursor, tombstones=tombstones)

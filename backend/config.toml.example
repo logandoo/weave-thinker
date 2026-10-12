@@ -272,6 +272,15 @@ snapshots_enabled = true
 snapshots_max_file_mb = 10
 snapshots_retention = 50
 
+[client_exec]
+enabled = true
+heartbeat_seconds = 30
+call_timeout_seconds = 120
+call_max_extension_seconds = 3600
+max_payload_mb = 10
+pairing_code_ttl_seconds = 600
+allowed_tools = ["workspace_read", "workspace_write", "workspace_edit", "workspace_glob", "grep", "diff", "word_count", "terminal", "process", "git", "execute_code", "skill_run_script", "provide_file", "provide_folder", "citation_render", "pdf_export"]
+
 [office_preview]
 enabled = true
 html_enabled = true
@@ -316,6 +325,7 @@ gate_enabled = true
 audit_enabled = true
 loop_guard_enabled = true
 red_ttl_hours = 24
+task_gating_enabled = true
 
 [code_execution]
 enabled = true

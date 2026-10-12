@@ -512,6 +512,32 @@ class AgentWorker:
                 enable_compression=config.agent_compression_enabled,
                 permission_callback=_make_background_permission_callback(),
             )
+            # W17-P1（审计 I-1）：后台任务同口径轮次门控——非代码任务不启
+            # vibeweaver 执法（gate/audit stand-down），消除「执法无指引」面。
+            # 复审 MINOR-1：整块 fail-open（异常保持默认 True=旧行为，不拖挂任务）。
+            try:
+                from app.services.vibeweaver_turn_gate import (
+                    explicit_trigger_hit as _vw_explicit,
+                    extract_recent_user_text as _vw_extract,
+                    resolve_effective_active as _vw_resolve_eff,
+                )
+                _vw_last, _vw_ctx = _vw_extract(messages)
+                try:
+                    _vw_gating = bool(config.vibeweaver_task_gating_enabled)
+                except Exception:
+                    _vw_gating = True
+                agent_loop.vibeweaver_active = _vw_resolve_eff(
+                    _vw_last, None, _vw_gating, context_text=_vw_ctx
+                )
+                logger.info(
+                    "vibeweaver turn gate active=%s explicit=%s coding=None gating=%s task=%s",
+                    agent_loop.vibeweaver_active, _vw_explicit(_vw_last), _vw_gating, task_id,
+                )
+            except Exception:
+                logger.debug(
+                    "vibeweaver turn gate wiring failed (fail-open to active=True)",
+                    exc_info=True,
+                )
             # 记忆优先级最高（与 chat.py 同）：后台任务注入的记忆进入审计
             # 证据域 [M]，不得被判「凭空编造」（2026-09-18 conv 3583d840）。
             agent_loop.injected_memory_context = _mem_block or ""

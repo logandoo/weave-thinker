@@ -230,6 +230,7 @@
               <FileAttachmentComp
                 v-if="chatStore.currentStreamingFileAttachments && chatStore.currentStreamingFileAttachments.length"
                 :attachments="chatStore.currentStreamingFileAttachments"
+                :device-id="chatStore.activeDeviceId"
               />
               <SearchResults
                 v-if="streamingSearchResults.length > 0 || chatStore.currentStreamingSearchProgress.length > 0 || chatStore.currentStreamingSearchFailed"
@@ -449,6 +450,8 @@ import { endnoteExportQuery } from '@/api/notes'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import { useChatStore } from '@/stores/chat'
 import { useNotesStore } from '@/stores/notes'
+import { useUploadStore } from '@/stores/upload'
+import { parseFileRefBlocks, restoreEditChips } from '@/utils/fileRefs'
 import { useAssistantStore } from '@/stores/assistant'
 import { liveReasoningTail } from '@/stores/streamReducer'
 import { useToast } from '@/composables/useToast'
@@ -473,6 +476,7 @@ import ExportProgressDialog from './ExportProgressDialog.vue'
 
 const chatStore = useChatStore()
 const notesStore = useNotesStore()
+const uploadStore = useUploadStore()
 const { show: showToast } = useToast()
 
 defineProps<{ zen?: boolean }>()
@@ -1212,6 +1216,17 @@ function onUserMessageSent() {
 }
 
 function handleEdit(messageId: string, content: string) {
+  // Restore [file-ref] upload blocks as input chips BEFORE stripping them from
+  // the editable text (2026-10-09: stripping without restoring silently dropped
+  // the attachments on resend — the edited message replaced the DB row, the
+  // file cards vanished, and the backend `[file-ref:` skill trigger stopped
+  // firing, so the agent fell back to reading file paths from memory).
+  const restoredChips = parseFileRefBlocks(content)
+  // Scoped to THIS edit session (A4.9 I-1, re-review round 2): ALWAYS re-seat
+  // the store — replaces chips restored by an earlier abandoned edit (even
+  // when this message carries no file-refs), keeps genuine pending uploads;
+  // a later normal send drops restored-tagged chips (ChatInput.handleSend).
+  uploadStore.setFiles(restoreEditChips(uploadStore.files, restoredChips))
   // Strip note-ref and file-ref markers from the content for editing
   const strippedContent = stripDsmlTags(content)
     .replace(/\[note-ref:[^\]]*\]\n[\s\S]*?\n\[\/note-ref\]\n*/g, '')

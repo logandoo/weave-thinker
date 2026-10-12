@@ -4036,7 +4036,7 @@ defineExpose({
 
 @media (max-width: 767px) {
   .wysiwyg-editor {
-    padding-bottom: calc(var(--mobile-tab-bar-offset, 66px) + 80px + env(safe-area-inset-bottom, 0px)) !important;
+    padding-bottom: calc(var(--mobile-tab-bar-offset, 72px) + 80px + env(safe-area-inset-bottom, 0px)) !important;
   }
 }
 

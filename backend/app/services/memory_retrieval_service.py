@@ -719,6 +719,17 @@ def _session_cache_put(key: str, value: str, meta: Optional[tuple[list, float]] 
     _session_cache[key] = (time.time(), (value, *(meta or _EMPTY_META), _cache_stats(stats)))
 
 
+def invalidate_session_cache_for_user(user_id: str) -> None:
+    """编辑/重生成裁剪删除消息后调用（2026-10-09 BUG-B）：该用户的会话级
+    检索缓存可能仍携带已删轮次摄入的记忆单元（regenerate 同 query 哈希命中
+    即重放「我已经…」）；连同 D2 跨轮去重锚一起失效——已删轮次的注入 id
+    不得压制后续合法召回。进程内字典操作，永不抛。"""
+    prefix = f"{user_id}:"
+    for key in [k for k in _session_cache if k.startswith(prefix)]:
+        _session_cache.pop(key, None)
+    _text_injected_ids.pop(user_id, None)
+
+
 # ---- §5.3.1a-2 多轮复现滑窗（per-user 5 轮） ----
 
 from collections import defaultdict, deque

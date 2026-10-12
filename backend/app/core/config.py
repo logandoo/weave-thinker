@@ -251,6 +251,40 @@ class Config:
         return self.config_path.parent
 
     @property
+    def resource_root(self) -> Path:
+        """只读打包资源根：PyInstaller 冻结时 = sys._MEIPASS（onedir 的 _internal，
+        --add-data 的目的地根）；否则 = backend_root（开发模式逐字节不回归）。"""
+        import sys
+        meipass = getattr(sys, "_MEIPASS", None)
+        if getattr(sys, "frozen", False) and meipass:
+            return Path(meipass).resolve()
+        return self.backend_root
+
+    def resolve_resource(self, *parts: str, bundled_first: bool = False) -> Path:
+        """只读打包资源解析：默认 backend_root 旁路副本优先（用户覆写/开发语义），
+        其次 resource_root（冻结包内副本）；皆无 → backend_root 派生（保留
+        开发模式的「路径不存在」错误语义）。可写运行时路径不得经此解析。
+        bundled_first=True（可执行资源：注入代码/样式表）→ 包内副本优先，
+        可写目录不具覆写能力（防数据目录投毒注入）。"""
+        for part in parts:
+            p = Path(part)
+            if p.is_absolute() or ".." in p.parts:
+                raise ValueError(f"resolve_resource: illegal part {part!r}")
+        local = (self.backend_root / Path(*parts)).resolve()
+        bundled = (self.resource_root / Path(*parts)).resolve()
+        if bundled_first:
+            if bundled.exists():
+                return bundled
+            if local.exists():
+                return local
+            return bundled
+        if local.exists():
+            return local
+        if bundled.exists():
+            return bundled
+        return local
+
+    @property
     def defaults(self) -> dict:
         return self._config.get("defaults", {})
 
@@ -1088,6 +1122,15 @@ class Config:
         return bool(self.vibeweaver.get("loop_guard_enabled", True))
 
     @property
+    def vibeweaver_task_gating_enabled(self) -> bool:
+        """W17 轮次门控：force-inject 与 gate/audit 仅对 coding/显式提及轮生效。
+        逃生口 `VIBEWEAVER_GATING=off` 或 `[vibeweaver] task_gating_enabled=false`
+        恢复无条件注入（2026-10-10 前的旧行为）。"""
+        if self._env_off("VIBEWEAVER_GATING"):
+            return False
+        return bool(self.vibeweaver.get("task_gating_enabled", True))
+
+    @property
     def vibeweaver_audit_core_path(self) -> str:
         import os
         return str(os.environ.get("VIBEWEAVER_AUDIT_CORE", "") or self.vibeweaver.get("audit_core_path", ""))
@@ -1460,6 +1503,55 @@ class Config:
     @property
     def agent_process_max_read_chars(self) -> int:
         return int(self.agent_process.get("max_read_chars", 20000))
+
+    # ---- W16 Device Execution Mode（设备执行模式）----
+
+    @property
+    def client_exec(self) -> dict:
+        return self._config.get("client_exec", {})
+
+    @property
+    def client_exec_enabled(self) -> bool:
+        return bool(self.client_exec.get("enabled", True))
+
+    @property
+    def client_exec_heartbeat_seconds(self) -> int:
+        return int(self.client_exec.get("heartbeat_seconds", 30))
+
+    @property
+    def client_exec_call_timeout_seconds(self) -> int:
+        return int(self.client_exec.get("call_timeout_seconds", 120))
+
+    @property
+    def client_exec_max_payload_mb(self) -> int:
+        return int(self.client_exec.get("max_payload_mb", 10))
+
+    @property
+    def client_exec_call_max_extension_seconds(self) -> float:
+        """progress 续期的绝对上限（自调用开始的总等待上限；0=不限制）。
+
+        D1（遗留清零, 2026-10-11）：协同式续期恢复硬界——持续 progress 也不得
+        越过该总时长；对直连 HTTP 字节端点（fs/zip·office-*）尤其重要。
+        A4.9 清理轮 B-F4：非法值（NaN/负/非数）不得静默关闭硬界——回落默认
+        3600；显式 0 才是「不限制」。
+        """
+        import math as _math
+
+        try:
+            value = float(self.client_exec.get("call_max_extension_seconds", 3600))
+        except (TypeError, ValueError):
+            return 3600.0
+        if not _math.isfinite(value) or value < 0:
+            return 3600.0
+        return value
+
+    @property
+    def client_exec_pairing_code_ttl_seconds(self) -> int:
+        return int(self.client_exec.get("pairing_code_ttl_seconds", 600))
+
+    @property
+    def client_exec_allowed_tools(self) -> list:
+        return list(self.client_exec.get("allowed_tools", []))
 
     # ---- Browser skill ----
 

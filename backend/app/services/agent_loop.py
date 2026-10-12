@@ -3849,6 +3849,11 @@ def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[Au
     ledger = getattr(state, "citation_ledger", None)
     if ledger is None or ledger.size <= 0:
         return None
+    # M5 层 2：remand 注入点重注入台账 manifest（折叠保护 + 终稿可见性）。
+    try:
+        AgentLoop._refresh_citation_manifest(state)
+    except Exception:
+        pass
     # A4.9 R1 Important-1（conv 1a24a04a，2026-09-25）：one-shot 放宽为每轮
     # 上限 2 次——remand 打回后的修复稿若仍零 [N]，第二次 remand 拦截静默
     # 出货；上限 2 保持有界（第三次起放行给 LLM 审计员，不烧预算循环）。
@@ -3865,6 +3870,19 @@ def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[Au
     report = ledger.verify(draft)
     if report.cited:
         return None
+    # M5 层 3（R4）：「本轮检索结果未被采用」声明与台账内容矛盾时否决该声明。
+    # 声明成立（草稿与台账 titles/snippets 无实质文本重合）→ 尊重逃生口放行；
+    # 声明与证据矛盾（存在显著重合）→ 不许以「未采用」脱身，按补标引用打回。
+    declaration = _find_unused_declaration(draft)
+    overlap: list = []
+    if declaration:
+        overlap = _ledger_draft_evidence_overlap(draft, ledger)
+        logger.info(
+            "audit_metric citation=unused_declaration declared=%s overlap=%d",
+            declaration, len(overlap),
+        )
+        if not overlap:
+            return None
     state.citation_remanded = True
     state.citation_remand_count = getattr(state, "citation_remand_count", 0) + 1
     logger.info(
@@ -3872,10 +3890,43 @@ def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[Au
         len(report.cited), len(report.unknown), ledger.size, len(draft),
     )
     _range = f"[1]-[{ledger.size}]"
+    # M5 层 3：id|title 映射简表（改动前的「只有范围」是 conv 68423d97 逃生口
+    # 被取用的直接原因——映射必须在 remand 注入点可见，且与台账一致）。
+    _map_lines = []
+    from app.services.citation_ledger import sanitize_manifest_text as _sanitize_field
+
+    for _e in ledger.entries[:40]:
+        _t = _sanitize_field(
+            _e.get("title") or _e.get("container") or _e.get("url") or "未题名", cap=36,
+        )
+        _node = f"[{_e.get('id')}] {_t}"
+        _auth = _sanitize_field(_e.get("author") or "", cap=24)
+        _yr = _sanitize_field(
+            str(_e.get("year") or "").strip() or (_e.get("published_date") or "").strip()[:4],
+            cap=10,
+        )
+        _who = ",".join(x for x in (_auth, _yr) if x)
+        if _who:
+            _node += f" — {_who}"
+        _map_lines.append(_node)
+    _mapping_block = ""
+    if _map_lines:
+        _mapping_block = "本轮引用编号→标题简表：\n" + "\n".join(_map_lines)
+        if ledger.size > 40:
+            _mapping_block += f"\n…（台账共 {ledger.size} 条，其余编号仍有效）"
+        _mapping_block += "\n"
     # 未知编号稿（只有越界 [N]）不得被描述为「通篇无 [N]」——文案区分两种形态，
     # 并显式列出越界编号（A4.9 R2 Minor）。
     _unknown_sorted = sorted(report.unknown)
-    if _unknown_sorted:
+    if overlap:
+        # R4：声明与证据矛盾——显式否决逃生口。
+        _ov_view = "、".join(f"「{h[:18]}」" for h in overlap[:3])
+        problem = (
+            f"草稿声明「{declaration}」与本轮检索台账矛盾：草稿包含与台账条目实质重合的"
+            f"文本（如 {_ov_view}）——该声明不成立，必须为来自检索结果的事实补标 [N]"
+        )
+        _unknown_clause = ""
+    elif _unknown_sorted:
         _unknown_view = "、".join(f"[{n}]" for n in _unknown_sorted[:10])
         problem = (
             f"本轮已检索（台账 {ledger.size} 条，有效引用编号 {_range}）但草稿未引用任何"
@@ -3892,14 +3943,16 @@ def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[Au
         _unknown_clause = ""
     guidance = (
         f"你刚才生成的回答草稿（本轮）没有标注任何本轮检索结果的 [N] 引用，"
-        f"但本轮已实际调用 web_search 并获得编号检索结果（有效引用编号范围 {_range}）。\n"
+        f"但本轮已实际调用 web_search/浏览网页并获得编号检索结果（有效引用编号范围 {_range}）。\n"
         + _unknown_clause
+        + _mapping_block
         + "【引用补标】请为草稿中来自本轮检索结果的具体事实（法规条文/数据/结论/案例等）"
         "补上对应的 [N] 编号：在每个这类事实陈述之后紧跟 [N]"
         "（只补标，其余正文逐字保留，严禁整篇重写）。\n"
         "如果草稿确实没有使用本轮检索结果（仅基于对话历史或常识），"
         "或用户已明确要求不要标注来源编号，保持无引用即可；"
-        "若属于前者，请在回答开头用一句话说明「本轮检索结果未被采用」。"
+        "若属于前者，请在回答开头用一句话说明「本轮检索结果未被采用」——"
+        "但若草稿包含与台账条目实质重合的内容，该声明将被系统否决。"
         "严禁编造编号、严禁引用未使用的来源。"
         + "\n" + _AUDIT_GUIDANCE_INDEPENDENCE_CLAUSE
     )
@@ -3909,6 +3962,91 @@ def _citation_remand_verdict(state: "AgentLoopState", draft: str) -> Optional[Au
         problem=problem,
         guidance=guidance,
     )
+
+
+# M5 层 3（R4）：「本轮检索结果未被采用」声明的矛盾否决。
+_UNUSED_DECLARATION_PATTERNS = (
+    "本轮检索结果未被采用",
+    "检索结果未被采用",
+    "本轮搜索结果未被采用",
+    "搜索结果未被采用",
+    "未采用本轮检索结果",
+    "未使用本轮检索结果",
+    "本轮检索结果未被使用",
+    "检索结果未被使用",
+)
+
+
+def _find_unused_declaration(draft: str) -> str:
+    text = draft or ""
+    for pat in _UNUSED_DECLARATION_PATTERNS:
+        if pat in text:
+            return pat
+    return ""
+
+
+def _ledger_draft_evidence_overlap(
+    draft: str,
+    ledger: "CitationLedger",
+    title_min_run: int = 8,
+    snippet_min_run: int = 12,
+    max_hits: int = 5,
+) -> list:
+    """草稿与台账条目（title/snippet）的显著连续文本重合（确定性）。
+
+    「未被采用」声明只有在草稿与台账无实质重合时才成立；存在 ≥8 字（标题）
+    或 ≥12 字（摘要）的连续 CJK 重合即视为使用了检索结果（声明矛盾）。
+    """
+    import re as _re
+
+    text = draft or ""
+    if not text:
+        return []
+    hits: list = []
+
+    def _runs(value: str):
+        return _re.findall(r"[\u4e00-\u9fff]{%d,}" % 4, value or "")
+
+    def _probe(field_text: str, min_run: int) -> str:
+        for run in _runs(field_text):
+            if len(run) < min_run:
+                continue
+            for i in range(0, len(run) - min_run + 1):
+                probe = run[i:i + min_run]
+                if probe in text:
+                    return probe
+        return ""
+
+    def _probe_ascii(field_text: str, min_words: int, min_chars: int) -> str:
+        # A4.9 B9 / C3：英文标题/摘要的复用检测（CJK 探针覆盖不到）。按词跨度切片
+        # 保留原始分隔符；最短长度护栏（标题 ≥24 / 摘要 ≥40 字符）——通用短语
+        # （"based on the results of the"）不得构成矛盾证据（误报抑制）。
+        spans = [
+            (m.start(), m.end())
+            for m in _re.finditer(r"[A-Za-z][A-Za-z0-9\-']*", field_text or "")
+        ]
+        for i in range(0, max(0, len(spans) - min_words + 1)):
+            start = spans[i][0]
+            end = spans[i + min_words - 1][1]
+            if end - start < min_chars:
+                continue
+            phrase = (field_text or "")[start:end]
+            if phrase in text:
+                return phrase
+        return ""
+
+    for e in ledger.entries:
+        for field, min_run in (("title", title_min_run), ("snippet", snippet_min_run)):
+            probe = _probe(str(e.get(field) or ""), min_run)
+            if not probe and field == "title":
+                probe = _probe_ascii(str(e.get(field) or ""), 4, 16)
+            if not probe and field == "snippet":
+                probe = _probe_ascii(str(e.get(field) or ""), 6, 40)
+            if probe and probe not in hits:
+                hits.append(probe)
+                if len(hits) >= max_hits:
+                    return hits
+    return hits
 
 
 def _npg_soft_reject_no_progress(
@@ -3930,6 +4068,59 @@ def _npg_soft_reject_no_progress(
     return (
         raws_history[-2].issubset(raws_history[-1])
         and tool_calls_history[-1] == tool_calls_history[-2]
+    )
+
+
+_URL_TOKEN_RE = _re.compile(r"`(https?://[^\s`]+)`|(https?://[^\s<>\"'\]\)）】`]+)")
+
+
+def _stamp_source_urls_in_text(text: str, url_ids: dict) -> str:
+    """在 URL token 前插入 `[N] `（M2 入账定号，token 整匹配）。
+
+    规范化感知（fragment/trailing-slash 容错）；前缀 URL 不劫持更长 URL；
+    幂等（已带编号的 token 跳过）；每 URL 只烙一次。
+    """
+    if not text or not url_ids:
+        return text
+    from app.services.citation_ledger import normalize_url
+
+    out: List[str] = []
+    pos = 0
+    for m in _URL_TOKEN_RE.finditer(text):
+        raw_url = m.group(1) or m.group(2) or ""
+        core = raw_url.rstrip(".,;、，。")
+        eid = url_ids.get(normalize_url(core))
+        if not eid:
+            continue
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_prefix = text[line_start:m.start()]
+        # A4.9 清理轮 A-F1：行锚（与 tool_history._denumber_browser_sources 互逆）
+        # ——只烙行首 ≤6 字符前缀处（【目标】/目标：/来源行）。行中正文出现不烙，
+        # 防回放时剥不净的陈旧编号（B1 类）；也顺带避开 markdown 链接场景。
+        if len(line_prefix) > 6:
+            continue
+        if line_prefix.endswith(f"[{eid}] ") or line_prefix.endswith(f"[{eid}] `"):
+            continue  # 幂等：已带同编号前缀
+        out.append(text[pos:m.start()])
+        out.append(f"[{eid}] ")
+        pos = m.start()
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _citation_manifest_suffix(state: "AgentLoopState") -> str:
+    """M5：repair/salvage 注入点的台账 manifest 重注入（映射在库，成本恒定）。"""
+    ledger = getattr(state, "citation_ledger", None)
+    if ledger is None or ledger.size <= 0:
+        return ""
+    block = ledger.format_manifest()
+    if not block:
+        return ""
+    return (
+        "\n\n" + block
+        + "\n（以上为本轮引用编号对照；来自这些来源的具体事实必须以 [N] 标注。）"
     )
 
 
@@ -3958,6 +4149,7 @@ def _build_salvage_prompt(state: "AgentLoopState", last_user_msg: str) -> str:
         "（如“我没有可查证的更新记录”），严禁编造具体细节"
         "（日期、数字、版本号、提交记录、功能名等）。"
     )
+    prompt += _citation_manifest_suffix(state)
     return prompt
 
 
@@ -4054,7 +4246,9 @@ def _build_selection_prompt(state: "AgentLoopState", last_user_msg: str, stash: 
         "如实并列各来源及数值并说明差异——这是合格回答，不得单方面取舍或杜撰统一值；\n"
         "- 严禁提及质检、审计、草稿或任何内部过程。"
     )
+    prompt += _citation_manifest_suffix(state)
     return prompt
+
 
 class AgentLoop:
     #: Default reasoning effort for the iteration LLM when the user or
@@ -4131,6 +4325,9 @@ class AgentLoop:
         # 见 AgentLoopState.injected_memory_context：调用方（chat.py /
         # agent_worker）在 run() 之前赋值，run() 带入 state。
         self.injected_memory_context: str = ""
+        # W17 vibeweaver 轮次门控：chat.py 在 run() 前按轮赋值（默认 True=旧常开）。
+        # False → gate/audit 钩子本 run 全部 stand-down（loop-guard 观察不受影响）。
+        self.vibeweaver_active: bool = True
         if tool_schemas is not None:
             # Explicitly-provided schemas (sub-agent loops, PTC bridges) are
             # already curated by the caller — the global visible filter must
@@ -4351,6 +4548,84 @@ class AgentLoop:
             logger.warning("Spike guard failed (non-blocking)", exc_info=True)
             return None
 
+    async def _completion_guardrails_tail(
+        self,
+        state: AgentLoopState,
+        conversation: Any,
+        user: Any,
+        assistant_content: str = "",
+        reasoning_content: str = "",
+    ) -> Tuple[List[dict], bool]:
+        """收尾门禁（W12 P1#9 抽取共用）：loop_guard 未消费反馈 + vibeweaver stop hooks。
+
+        返回 (events, blocked)。blocked=True 表示已注入纠正反馈，调用方必须继续
+        循环（不得收尾）；events 由调用方 yield/emit。死亡磕模式由自身 judge 收尾。
+        """
+        events: List[dict] = []
+        if state.loop_guard_feedback and not self._skip_guardrails():
+            _lg_feedback = state.loop_guard_feedback
+            state.loop_guard_feedback = ""
+            events.append({
+                "agent_step": {
+                    "name": "loop_guard",
+                    "title": "生成退化中断",
+                    "content": "检测到生成退化，收尾被中断并注入纠正指令。",
+                    "step_type": "system",
+                }
+            })
+            _prune_guardrail_pairs(state)
+            if assistant_content and not any(
+                m.get("role") == "assistant" and m.get("content") == assistant_content
+                for m in state.messages[-3:]
+            ):
+                _rejected_append(self, state, assistant_content, reasoning_content)
+            state.turn_content_segments.clear()
+            _inject_directive(state, _lg_feedback, _ephemeral="loop_guard")
+            return events, True
+        if not self._skip_guardrails():
+            try:
+                from app.services import hook_service as _hs
+                _stop_ctx = _hs.StopContext(
+                    session_id=str(getattr(state, "session_id", "") or ""),
+                    conversation_id=str(getattr(conversation, "id", "") or ""),
+                    user_id=str(getattr(user, "id", "") or ""),
+                    workspace_path=self.workspace_path or "",
+                    assistant_content=assistant_content or "",
+                    vibeweaver_active=self.vibeweaver_active,
+                    iterations=state.iterations,
+                    stop_hook_blocks_this_turn=state.stop_hook_blocks,
+                )
+                _stop_decision = await _hs.run_stop_hooks(_stop_ctx)
+            except Exception:
+                logger.exception("stop hook failed-open")
+                _stop_decision = None
+            if _stop_decision is not None and not _stop_decision.allow and _stop_decision.feedback:
+                state.stop_hook_blocks += 1
+                logger.info(
+                    "stop hook blocks completion (conv=%s turn_blocks=%d): %s",
+                    getattr(conversation, "id", ""), state.stop_hook_blocks,
+                    (_stop_decision.reason or "")[:120],
+                )
+                events.append({
+                    "agent_step": {
+                        "name": "stop_hook",
+                        "title": "收尾门禁",
+                        "content": _stop_decision.reason or "验证证据未过收尾门禁，继续修复后重新收尾。",
+                        "step_type": "system",
+                    }
+                })
+                if assistant_content:
+                    _prune_guardrail_pairs(state)
+                    if not any(
+                        m.get("role") == "assistant" and m.get("content") == assistant_content
+                        for m in state.messages[-3:]
+                    ):
+                        _rejected_append(self, state, assistant_content, reasoning_content)
+                    state.turn_content_segments.clear()
+                _inject_directive(state, _stop_decision.feedback, _ephemeral="stop_hook")
+                return events, True
+        return events, False
+
     def _skip_guardrails(self) -> bool:
         """In deathmatch mode, skip force_final_answer, max_consecutive_iterations,
         and web_search limit guards. The judge alone decides when to stop."""
@@ -4444,8 +4719,9 @@ class AgentLoop:
 
     @staticmethod
     def _apply_citation_ledger(state: AgentLoopState, results: List[ToolCallResult]) -> None:
-        """Register web_search hits into the turn-level citation ledger and
-        RENUMBER the result's `formatted` text with GLOBAL ids.
+        """Register web_search hits + browser sources into the turn-level
+        citation ledger and RENUMBER the result's `formatted` text with
+        GLOBAL ids.
 
         Grounded-citations port (hermes-agent): the system owns the
         url → [N] mapping, so the model only ever emits integers it was
@@ -4457,6 +4733,11 @@ class AgentLoop:
         sees (and what the digest envelope / persistence embeds), keeping
         the numbering the model cites consistent with the flattened
         results[] the UI maps [N] against.
+
+        M2（引文体系改造）：browser 来源按**同一调用顺序**入账（id 在结果到手
+        时即分配），digest 后由 `_stamp_browser_citation_ids` 把编号烙进信封/
+        JSON——「编号与内容同生死」；persistence 端（chat._transform）以同序
+        注册，编号逐位对齐（编号可见性与检索深度解耦）。
         """
         if not results:
             return
@@ -4464,7 +4745,41 @@ class AgentLoop:
         if state.citation_ledger is None:
             state.citation_ledger = CitationLedger()
         for r in results:
-            if r.name != "web_search" or r.error:
+            if r.error:
+                continue
+            if r.name == "browser":
+                try:
+                    from app.services.citation_sources import extract_browser_sources
+
+                    for url, b_title, b_snippet, biblio in extract_browser_sources(r.result or ""):
+                        if not url:
+                            continue
+                        # biblio 的 title 与形参 title 撞名（A4.9 Critical-1）：
+                        # 抽出为 title 提示，其余字段（type/source_type/…）透传。
+                        from app.services.citation_ledger import BIBLIO_FIELDS
+
+                        # 先取出 title（不在 BIBLIO_FIELDS）再过滤其余书目键——
+                        # C5：书目题名优先于页面题名，与 persistence 同优先级。
+                        biblio = dict(biblio or {})
+                        title_hint = biblio.pop("title", "") or b_title
+                        biblio = {
+                            k: v for k, v in biblio.items()
+                            if k in BIBLIO_FIELDS and v
+                        }
+                        try:
+                            state.citation_ledger.register(
+                                url, title=title_hint, snippet=b_snippet, **biblio,
+                            )
+                        except TypeError:
+                            # 与 persistence 侧同口径过滤后不应再触发；若触发说明
+                            # 字段集漂移——记录并跳过该来源（编号对齐风险最小化）。
+                            logger.exception(
+                                "browser source register failed for %s (skipping source)", url,
+                            )
+                except Exception:
+                    logger.exception("browser citation registration failed (fail-open)")
+                continue
+            if r.name != "web_search":
                 continue
             try:
                 payload = json.loads(r.result or "")
@@ -4496,6 +4811,84 @@ class AgentLoop:
                 )
             payload["formatted"] = formatted
             r.result = json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _refresh_citation_manifest(state: AgentLoopState) -> None:
+        """M5 层 2：维护唯一「引用台账 manifest」系统消息（折叠保护面）。
+
+        - 台账增长后（digest 结束）/remand 注入点调用：删旧建新，映射来自
+          台账本体（成本恒定，与检索深度无关）；
+        - 标记 `_citation_manifest: True`：enforce_turn_budget 跳过、
+          context_compressor 摘出后挂回（与 canary 同级折叠保护）。
+        效果：编号可见性由 manifest 恒定保证，切断「检索越深→编号越不可见」。
+        """
+        ledger = getattr(state, "citation_ledger", None)
+        try:
+            state.messages = [
+                m for m in state.messages
+                if not (isinstance(m, dict) and m.get("_citation_manifest"))
+            ]
+        except Exception:
+            return
+        if ledger is None or ledger.size == 0:
+            return
+        block = ledger.format_manifest()
+        if not block:
+            return
+        state.messages.append({
+            "role": "system",
+            "synthetic": True,
+            "_citation_manifest": True,
+            "content": block,
+        })
+
+    @staticmethod
+    def _stamp_browser_citation_ids(state: AgentLoopState, results: List[ToolCallResult]) -> None:
+        """把台账编号烙进 browser 结果（digest 后调用）——M2「入账即定号」。
+
+        - `<tool-digest>` 信封：URL token（`## 来源` 行/【目标】行）前插 `[N] `；
+        - JSON pages：每个 page 加 `citation_id`（规范化为准）。
+        幂等、规范化感知、token 整匹配（前缀 URL 不劫持更长 URL 行）。只使用
+        台账既有编号（注册发生在 digest 前），不在此处新增注册。
+        """
+        ledger = getattr(state, "citation_ledger", None)
+        if ledger is None or ledger.size == 0 or not results:
+            return
+        url_ids = {
+            (e.get("url") or ""): e["id"]
+            for e in ledger.entries
+            if e.get("url")
+        }
+        if not url_ids:
+            return
+        for r in results:
+            if getattr(r, "name", "") != "browser" or getattr(r, "error", False):
+                continue
+            text = r.result or ""
+            if not text:
+                continue
+            if text.startswith("<tool-digest>"):
+                r.result = _stamp_source_urls_in_text(text, url_ids)
+                continue
+            try:
+                data = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            pages = data.get("pages") if isinstance(data, dict) else None
+            if not isinstance(pages, list):
+                continue
+            from app.services.citation_ledger import normalize_url as _norm
+
+            changed = False
+            for p in pages:
+                if not isinstance(p, dict):
+                    continue
+                eid = url_ids.get(_norm(p.get("url") or ""))
+                if eid and p.get("citation_id") != eid:
+                    p["citation_id"] = eid
+                    changed = True
+            if changed:
+                r.result = json.dumps(data, ensure_ascii=False)
 
     @staticmethod
     def _check_inactivity(state: AgentLoopState) -> bool:
@@ -4654,7 +5047,9 @@ class AgentLoop:
                 handoff = ""
             kept = [
                 m for m in state.messages
-                if m.get("role") == "system" and not m.get("synthetic")
+                if m.get("role") == "system" and (
+                    not m.get("synthetic") or m.get("_citation_manifest")
+                )
             ]
             state.messages = kept + (
                 [{"role": "user", "content": (
@@ -4899,6 +5294,14 @@ class AgentLoop:
         "事实性内容，不是创意写作——回答必须忠于事实，必须走正常审计，creative_turn 应为 false"
         "（conv 8074c1c5：'给孩子讲地名故事'被豁免审计，编造的传说直接出货）。"
         "创意写作仅指内容本身为虚构文学创作的情况。\n\n"
+        "【coding_task 判断（用于 vibeweaver 工程纪律轮次门控）】\n"
+        "用户最新消息是否要求软件工程工作：编写/修改/重构/调试代码、编写测试、修复报错、"
+        "构建/部署/环境配置、git/依赖/数据库操作、API/脚本/命令行工具开发？\n"
+        "- 是 → coding_task: true\n"
+        "- 否 → coding_task: false。特别注意：撰写/修改文档（Word/Excel/PPT/报告/文章/案例）、"
+        "知识问答、翻译、检索整理类任务不是 coding 任务——即使完成它们可能需要执行代码工具"
+        "（如用 python-docx 生成 Word 文件）；判据是任务目标本身是否软件工程，"
+        "而不是会不会用到代码工具（conv dd3b2408：掼蛋 Word 文档任务被误当工程任务）。\n\n"
         "【笔记写入控制】\n"
         "重要：除非用户最新消息明确表达了保存/修改/新增/删除笔记的意图"
         "（如\u201c记下来\u201d\u201c保存到笔记\u201d\u201c修改笔记\u201d\u201c删除笔记\u201d"
@@ -4911,7 +5314,7 @@ class AgentLoop:
         "输出JSON格式（只输出分类JSON，不要加markdown代码块，不要输出JSON以外的任何内容）：\n"
         '{{"route": "direct_reply" 或 "tool_loop", '
         '"expects_tools": true 或 false, "search_required": true 或 false, '
-        '"creative_turn": true 或 false, '
+        '"creative_turn": true 或 false, "coding_task": true 或 false, '
         '"focus": "本轮意图聚焦"}}\n\n'
         "注意：\n"
         "- 你是分类器，不是回答者——严禁输出任何非JSON内容，不要输出回答。\n"
@@ -6950,6 +7353,8 @@ class AgentLoop:
                     "expects_tools": False,
                     "search_required": False,
                     "creative_turn": False,
+                    # 纯对话直答轮=非工程轮（显式提及在调用方 OR 兜底）
+                    "coding_task": False,
                     "focus": "",
                 }
             logger.warning("Coordinator returned non-JSON: %s", raw[:200])
@@ -6963,6 +7368,7 @@ class AgentLoop:
                 _exp_m = _re.search(r'"expects_tools"\s*:\s*(true|false)', raw)
                 _search_m = _re.search(r'"search_required"\s*:\s*(true|false)', raw)
                 _creative_m = _re.search(r'"creative_turn"\s*:\s*(true|false)', raw)
+                _coding_m = _re.search(r'"coding_task"\s*:\s*(true|false)', raw)
                 if _route_m:
                     logger.warning(
                         "Salvaging truncated coordinator JSON: route=%s expects_tools=%s search_required=%s",
@@ -6986,6 +7392,10 @@ class AgentLoop:
                         "creative_turn": (
                             _creative_m.group(1) == "true" if _creative_m else False
                         ),
+                        # 截断可能吃掉本字段——缺省 None 让轮次门控回退启发式
+                        "coding_task": (
+                            _coding_m.group(1) == "true" if _coding_m else None
+                        ),
                         "focus": "",
                     }
             return None
@@ -7000,11 +7410,16 @@ class AgentLoop:
         creative_turn = result.get("creative_turn")
         if not isinstance(creative_turn, bool):
             creative_turn = False
+        # W17 轮次门控主判据：三态（True/False/None）。None=未给出结论
+        # （旧模板/怪值），调用方回退 vibeweaver_turn_gate 启发式。
+        coding_task = result.get("coding_task")
+        if not isinstance(coding_task, bool):
+            coding_task = None
         focus = str(result.get("focus", "") or "").strip()[:600]
 
         logger.info(
-            "Coordinator route=%s expects_tools=%s search_required=%s creative_turn=%s focus=%s",
-            route, expects_tools, search_required, creative_turn, focus[:80],
+            "Coordinator route=%s expects_tools=%s search_required=%s creative_turn=%s coding_task=%s focus=%s",
+            route, expects_tools, search_required, creative_turn, coding_task, focus[:80],
         )
         return {
             "route": route,
@@ -7012,6 +7427,7 @@ class AgentLoop:
             "expects_tools": expects_tools,
             "search_required": search_required,
             "creative_turn": creative_turn,
+            "coding_task": coding_task,
             "focus": focus,
         }
 
@@ -7039,6 +7455,16 @@ class AgentLoop:
             )
         else:
             identity_clause = "没有用户自定义名称时就以'Weave Thinker'自称。严禁编造不存在的名称。\n"
+        # W12 Dx-1（复审 B-I1）：身份问题恰恰走 direct_reply——主提示词的
+        # 3a/4c 消歧/视角条款必须同步到此路径，否则记忆里「用户=Weave Thinker」的
+        # 错误归属在此无任何对冲。
+        identity_clause += (
+            "“Weave Thinker”是你（助手自己）的名字，不是用户的名字；除非用户明确自称Weave Thinker，"
+            "不要把用户当成Weave Thinker，也不要把用户的观点或经历归到“Weave Thinker”名下；"
+            "若下方记忆信息把用户称为Weave Thinker，视为错误记忆。\n"
+            "复述或确认用户的经历与感受时保持用户的视角（用“你”），"
+            "不要把用户的经历说成你自己的。\n"
+        )
 
         # The direct reply must NOT reuse the coordinator's routing template:
         # it is full of "output JSON only" instructions, and thinking models
@@ -7367,12 +7793,38 @@ class AgentLoop:
                             "Coordinator direct_reply overridden to tool_loop (search_required=True)"
                         )
                     else:
+                        _dr_content = ""
+                        _dr_reasoning = ""
                         async for event in self._stream_direct_reply(state):
+                            if isinstance(event.get("content"), str):
+                                _dr_content += event["content"]
+                            elif isinstance(event.get("reasoning_content"), str):
+                                _dr_reasoning += event["reasoning_content"]
                             try:
                                 await event_queue.put(event)
                             except asyncio.QueueFull:
                                 pass
-                        return
+                        # W12 P1#9：direct_reply 快捷路径同样过收尾门禁；
+                        # 被拦（gate/audit 红）→ 注入反馈落入主循环续跑（预算内）。
+                        # 评审修复：传入已流出的正文（audit 终局声明核对/拒绝草稿均需要）。
+                        _g_events, _g_blocked = await self._completion_guardrails_tail(
+                            state, conversation, user, _dr_content, _dr_reasoning
+                        )
+                        if _g_blocked:
+                            # 复审 A-I2：直答已全文流出，落主循环续跑会再产一份正式
+                            # 回答——先 audit_reset 清屏（conv efaf8f9c 叠影教训），
+                            # 再发门禁事件，保证用户只见一份终稿。
+                            try:
+                                await event_queue.put({"audit_reset": True})
+                            except asyncio.QueueFull:
+                                pass
+                        for _g_ev in _g_events:
+                            try:
+                                await event_queue.put(_g_ev)
+                            except asyncio.QueueFull:
+                                pass
+                        if not _g_blocked:
+                            return
                 # Inject the coordinator's intent focus so the main agent does
                 # not get anchored on the previous conversation topic (short
                 # follow-ups were getting long off-topic repeats of earlier
@@ -8663,6 +9115,11 @@ class AgentLoop:
                                     else:
                                         yield _digest_ev
                                 results = _digest_out
+                                # M2 入账定号：digest 后把编号烙进 browser 来源行
+                                # （信封 [N]/JSON citation_id），与持久化同序编号。
+                                self._stamp_browser_citation_ids(state, results)
+                                # M5 层 2：刷新台账 manifest（折叠保护，编号与检索深度解耦）
+                                self._refresh_citation_manifest(state)
                                 tool_messages = []
                                 for (tc, tool_args, _), result in zip(coros, results):
                                     state.tool_results.append(result)
@@ -8832,6 +9289,10 @@ class AgentLoop:
                                 else:
                                     yield _digest_ev
                             results_digested = _digest_out
+                            # M2 入账定号（串行路径同款）：digest 后烙编号。
+                            self._stamp_browser_citation_ids(state, results_digested)
+                            # M5 层 2：刷新台账 manifest（串行路径同款）
+                            self._refresh_citation_manifest(state)
                             tool_results_map = {
                                 r.call_id: r for r in results_digested
                             }
@@ -9697,70 +10158,14 @@ class AgentLoop:
                 # 由自己的 judge 收尾，不重复设门。fail-open。
                 # A4.9 I4：迭代中途武装但未被消费的 loop_guard 纠正指令在此
                 # 同样生效（退化终稿不得静默收尾）。
-                if state.loop_guard_feedback and not self._skip_guardrails():
-                    _lg_feedback = state.loop_guard_feedback
-                    state.loop_guard_feedback = ""
-                    yield {
-                        "agent_step": {
-                            "name": "loop_guard",
-                            "title": "生成退化中断",
-                            "content": "检测到生成退化，收尾被中断并注入纠正指令。",
-                            "step_type": "system",
-                        }
-                    }
-                    _prune_guardrail_pairs(state)
-                    # A4.9 I4 残余：合成路径已把草稿提交为 live 消息时不得
-                    # 再 _rejected_append 重复（与 loop-top I3 守卫同款）。
-                    if not any(
-                        m.get("role") == "assistant" and m.get("content") == assistant_content
-                        for m in state.messages[-3:]
-                    ):
-                        _rejected_append(self, state, assistant_content, reasoning_content)
-                    state.turn_content_segments.clear()
-                    _inject_directive(state, _lg_feedback, _ephemeral="loop_guard")
+                # W12 P1#9：收尾门禁（与 coord direct_reply 快捷路径共用同一实现）
+                _g_events, _g_blocked = await self._completion_guardrails_tail(
+                    state, conversation, user, assistant_content, reasoning_content
+                )
+                for _g_ev in _g_events:
+                    yield _g_ev
+                if _g_blocked:
                     continue
-                if not self._skip_guardrails():
-                    try:
-                        from app.services import hook_service as _hs
-                        _stop_ctx = _hs.StopContext(
-                            session_id=str(getattr(state, "session_id", "") or ""),
-                            conversation_id=str(getattr(conversation, "id", "") or ""),
-                            user_id=str(getattr(user, "id", "") or ""),
-                            workspace_path=self.workspace_path or "",
-                            assistant_content=assistant_content or "",
-                            iterations=state.iterations,
-                            stop_hook_blocks_this_turn=state.stop_hook_blocks,
-                        )
-                        _stop_decision = await _hs.run_stop_hooks(_stop_ctx)
-                    except Exception:
-                        logger.exception("stop hook failed-open")
-                        _stop_decision = None
-                    if _stop_decision is not None and not _stop_decision.allow and _stop_decision.feedback:
-                        state.stop_hook_blocks += 1
-                        logger.info(
-                            "stop hook blocks completion (conv=%s turn_blocks=%d): %s",
-                            getattr(conversation, "id", ""), state.stop_hook_blocks,
-                            (_stop_decision.reason or "")[:120],
-                        )
-                        yield {
-                            "agent_step": {
-                                "name": "stop_hook",
-                                "title": "收尾门禁",
-                                "content": _stop_decision.reason or "验证证据未过收尾门禁，继续修复后重新收尾。",
-                                "step_type": "system",
-                            }
-                        }
-                        if assistant_content:
-                            _prune_guardrail_pairs(state)
-                            # A4.9 I4 残余：已提交草稿不重复拒绝（同 I3 守卫）
-                            if not any(
-                                m.get("role") == "assistant" and m.get("content") == assistant_content
-                                for m in state.messages[-3:]
-                            ):
-                                _rejected_append(self, state, assistant_content, reasoning_content)
-                            state.turn_content_segments.clear()
-                        _inject_directive(state, _stop_decision.feedback, _ephemeral="stop_hook")
-                        continue
 
                 state.completed_normally = True
                 break
@@ -10867,6 +11272,7 @@ class AgentLoop:
                 conversation_id=str(getattr(conversation, "id", "") or ""),
                 user_id=str(getattr(user, "id", "") or ""),
                 workspace_path=self.workspace_path or "",
+                vibeweaver_active=self.vibeweaver_active,
             )
             _before = await _hs.run_tool_hooks("before", _hook_ctx)
         except Exception:
@@ -11077,6 +11483,9 @@ class AgentLoop:
                 )
                 if tool_name == "delegate_task" and self.delegation_depth > 0:
                     dispatch_kwargs["_delegation_depth"] = self.delegation_depth
+                if tool_name == "delegate_task":
+                    # W17：子代理继承父轮门控（非激活轮经委派路径不触发 gate/audit）
+                    dispatch_kwargs["_vibeweaver_active"] = self.vibeweaver_active
                 if current_turn_content:
                     dispatch_kwargs["current_turn_content"] = current_turn_content
                 if current_turn_tool_results:

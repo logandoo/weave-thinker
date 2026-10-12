@@ -59,6 +59,54 @@ def normalize_url(url: str) -> str:
     return stripped or u
 
 
+# 台账条目书目字段（M1 升格，全部 Optional，向后兼容——空值不写入条目）。
+BIBLIO_FIELDS = (
+    "type", "source_type", "author", "editor", "edition", "publisher_place",
+    "publisher", "year", "volume", "page", "container", "genre", "standard_no",
+)
+
+
+_MANIFEST_WS_RE = re.compile(r"\s+")
+# C2（遗留清零）：仅中和**空白定界**的 `[N]` token（伪条目前缀形，如 " [99] 恶意"）；
+# 正文式方括号数字（图[3]、[123]页、[3]个要点）保持原样（外观保真）。
+_MANIFEST_BRACKET_RE = re.compile(r"(?<!\S)\[(\d{1,3})\](?=\s|$)")
+
+
+def sanitize_manifest_text(value: Any, cap: int = 50) -> str:
+    """manifest/映射表字段消毒：换行折叠为空格；`[N]` 中和为全角括号
+    （不可模仿为引用标记——与 neutralize 同一思路），防宿主网页向折叠保护的
+    system 消息注入伪造条目行（A4.9 B3）。"""
+    v = _MANIFEST_WS_RE.sub(" ", str(value or "")).strip()
+    v = _MANIFEST_BRACKET_RE.sub(r"（\1）", v)
+    return v[:cap]
+
+
+def ledger_key(
+    url: str,
+    title: str = "",
+    author: str = "",
+    year: str = "",
+    edition: str = "",
+    volume: str = "",
+    container: str = "",
+) -> str:
+    """台账身份键：URL 存在 → normalize_url(url)；无 URL → title+author+year+
+    edition+volume+container 派生（M1：古籍/书籍类来源可无链接，仍须可去重；
+    C1 遗留清零：同题的**不同卷次/版本/丛书**不得合并）。全空 → ""（调用方不去重）。"""
+    u = normalize_url(url)
+    if u:
+        return u
+    t = (title or "").strip()
+    a = (author or "").strip()
+    y = str(year or "").strip()
+    ed = (edition or "").strip()
+    vol = (volume or "").strip()
+    c = (container or "").strip()
+    if not (t or a or y or ed or vol or c):
+        return ""
+    return "\x00".join(("derived", t, a, y, ed, vol, c))
+
+
 @dataclass
 class CitationReport:
     cited: Set[int] = field(default_factory=set)    # valid ids referenced in prose
@@ -89,27 +137,71 @@ class CitationLedger:
         snippet: str = "",
         query: Optional[str] = None,
         published_date: Optional[str] = None,
+        *,
+        type: Optional[str] = None,
+        source_type: Optional[str] = None,
+        author: Optional[str] = None,
+        editor: Optional[str] = None,
+        edition: Optional[str] = None,
+        publisher_place: Optional[str] = None,
+        publisher: Optional[str] = None,
+        year: Optional[str] = None,
+        volume: Optional[str] = None,
+        page: Optional[str] = None,
+        container: Optional[str] = None,
+        genre: Optional[str] = None,
+        standard_no: Optional[str] = None,
+        site_name: Optional[str] = None,
     ) -> int:
-        key = normalize_url(url)
-        existing = self.url_to_id.get(key)
-        if existing is not None:
-            entry = self.entries[existing - 1]
-            if title and not entry.get("title"):
-                entry["title"] = title
-            cleaned = (published_date or "").strip()
-            if cleaned and not entry.get("published_date"):
-                entry["published_date"] = cleaned
-            return existing
+        """Register a source; returns its turn-global id.
+
+        M1（引文体系改造）：条目升格为文献条目——URL 存在时键=normalize_url；
+        无 URL（古籍/书籍）用 title+author+year 派生键（ledger_key）。全部书目
+        字段 Optional，空值不写入（向后兼容旧条目）。"""
+        biblio = {
+            "type": type,
+            "source_type": source_type, "author": author, "editor": editor,
+            "edition": edition, "publisher_place": publisher_place,
+            "publisher": publisher, "year": year, "volume": volume,
+            "page": page, "container": container, "genre": genre,
+            "standard_no": standard_no, "site_name": site_name,
+        }
+        biblio = {k: str(v).strip() for k, v in biblio.items() if v and str(v).strip()}
+        key = ledger_key(
+            url,
+            title=title,
+            author=biblio.get("author", ""),
+            year=biblio.get("year", ""),
+            edition=biblio.get("edition", ""),
+            volume=biblio.get("volume", ""),
+            container=biblio.get("container", ""),
+        )
+        if key:
+            existing = self.url_to_id.get(key)
+            if existing is not None:
+                entry = self.entries[existing - 1]
+                if title and not entry.get("title"):
+                    entry["title"] = title.strip()
+                cleaned = (published_date or "").strip()
+                if cleaned and not entry.get("published_date"):
+                    entry["published_date"] = cleaned
+                for k, v in biblio.items():
+                    if v and not entry.get(k):
+                        entry[k] = v
+                return existing
         entry_id = len(self.entries) + 1
-        self.entries.append({
+        entry: Dict[str, Any] = {
             "id": entry_id,
-            "url": key,
+            "url": normalize_url(url),
             "title": (title or "").strip(),
             "snippet": (snippet or "").strip(),
             "query": query,
             "published_date": (published_date or "").strip(),
-        })
-        self.url_to_id[key] = entry_id
+        }
+        entry.update(biblio)
+        self.entries.append(entry)
+        if key:
+            self.url_to_id[key] = entry_id
         return entry_id
 
     def register_hits(
@@ -126,12 +218,17 @@ class CitationLedger:
             url = h.get("url") or ""
             if not url:
                 continue
+            extra = {
+                k: h.get(k) for k in BIBLIO_FIELDS if h.get(k)
+            }
             ids.append(self.register(
                 url,
                 title=h.get("title") or "",
                 snippet=h.get("snippet") or "",
                 query=query,
                 published_date=h.get("published_date") or "",
+                site_name=h.get("site_name") or None,
+                **extra,
             ))
         return ids
 
@@ -149,6 +246,41 @@ class CitationLedger:
             line += f"摘要: {entry['snippet']}"
             lines.append(line)
         return "\n\n".join(lines)
+
+    def format_manifest(self, max_entries: int = 120) -> str:
+        """紧凑引用台账块（M5 免折叠 manifest）。
+
+        每条 `[N] 标题 — 作者,年 | 卷页`——约 75 条约 3KB；由 agent_loop 在
+        台账增长/压缩后重注入并要求折叠保护（编号可见性与检索深度解耦）。
+        字段经 sanitize_manifest_text（换行折叠 + 方括号编号中和）——hostile
+        网页元数据不得向折叠保护的 system 消息注入伪造条目行（A4.9 B3）。
+        """
+        if not self.entries:
+            return ""
+        lines = ["【引用台账（系统维护）——本轮 [N] 编号对应下表；引用时使用表内编号，禁止编造】"]
+        for e in self.entries[:max_entries]:
+            title = sanitize_manifest_text(
+                e.get("title") or e.get("container") or e.get("url") or "未题名", cap=50,
+            )
+            author = sanitize_manifest_text(e.get("author") or "", cap=30)
+            year = sanitize_manifest_text(
+                str(e.get("year") or "").strip() or (e.get("published_date") or "").strip()[:4],
+                cap=10,
+            )
+            head = f"[{e.get('id')}] {title}"
+            who = ",".join(x for x in (author, year) if x)
+            if who:
+                head += f" — {who}"
+            loc = " ".join(
+                sanitize_manifest_text(x, cap=20)
+                for x in (e.get("volume"), e.get("page")) if x
+            )
+            if loc:
+                head += f" | {loc}"
+            lines.append(head)
+        if len(self.entries) > max_entries:
+            lines.append(f"…（台账共 {len(self.entries)} 条，其余条目仍有效可引用，编号范围 [1]-[{self.size}]）")
+        return "\n".join(lines)
 
     @staticmethod
     def _cited_ids_from_text(text: str) -> Set[int]:

@@ -29,14 +29,31 @@ export async function fetchSkinCatalog(): Promise<SkinCatalogResponse> {
   return response.data
 }
 
-export async function getSkinPreference(): Promise<{ skin_id: string }> {
-  const response = await api.get<{ skin_id: string }>('/users/me/preferences')
+export interface UiPreferences {
+  skin_id: string
+  default_execution_target?: string | null
+}
+
+export async function getUiPreferences(): Promise<UiPreferences> {
+  const response = await api.get<UiPreferences>('/users/me/preferences')
   return response.data
 }
 
-export async function saveSkinPreference(skinId: string): Promise<{ skin_id: string }> {
-  const response = await api.put<{ skin_id: string }>('/users/me/preferences', { skin_id: skinId })
+// W18 G7：PUT 为合并语义（只覆盖提交的键）——皮肤更新不抹执行环境默认值
+export async function saveUiPreferences(patch: {
+  skin_id?: string
+  default_execution_target?: string | null
+}): Promise<UiPreferences> {
+  const response = await api.put<UiPreferences>('/users/me/preferences', patch)
   return response.data
+}
+
+export async function getSkinPreference(): Promise<{ skin_id: string }> {
+  return getUiPreferences()
+}
+
+export async function saveSkinPreference(skinId: string): Promise<{ skin_id: string }> {
+  return saveUiPreferences({ skin_id: skinId })
 }
 
 export async function uploadSkin(

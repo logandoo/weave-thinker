@@ -81,6 +81,33 @@ class SessionObservation:
 _observations: Dict[str, SessionObservation] = {}
 _active_runs: Dict[str, Any] = {}  # conversation_id -> AgentLoopState（中断用）
 _MAX_OBSERVATIONS = 200
+# W12 P1#7/#8：观察性跟踪（不阻断）——技能激活 / C17 / terminal 写
+_skill_activations: Dict[str, str] = {}
+_c17_warned: set = set()
+_terminal_write_warned: set = set()
+_TRACKING_CAP = 500
+# 保守写模式（含项目路径/名才告警；避免全局噪音）
+_TERMINAL_WRITE_RE = re.compile(r"(>>?|\btee\b|\bcp\b|\bmv\b|\bdd\b|\btruncate\b|\binstall\b)")
+
+
+def _bounded_add(target: set, key: str) -> None:
+    if len(target) >= _TRACKING_CAP and key not in target:
+        for k in list(target)[:100]:
+            target.discard(k)
+    target.add(key)
+
+
+def skill_activation_for(session_id: str) -> Optional[str]:
+    return _skill_activations.get(session_id or "")
+
+
+def _remember_skill_activation(session_id: str, name: str) -> None:
+    if not session_id or not name:
+        return
+    if len(_skill_activations) >= _TRACKING_CAP and session_id not in _skill_activations:
+        for k in list(_skill_activations.keys())[:100]:
+            _skill_activations.pop(k, None)
+    _skill_activations[session_id] = name
 
 
 def _obs(session_id: str) -> SessionObservation:
@@ -518,11 +545,17 @@ def observe_tool_call(session_id: str, tool_name: str, command: str, truncated: 
 async def _audit_tool_before(ctx: hook_service.ToolHookContext) -> Optional[hook_service.HookDecision]:
     """RED latch 封写（证据修复路径除外）。A4.9 I1：仅写类工具设门——
     终端/搜索/只读/脚本执行不封（修复路径需要它们跑 assert_artifacts）。"""
+    if not ctx.vibeweaver_active:
+        return None  # W17 轮次门控：非激活轮不封写（RED latch 对新轮不生效）
     if ctx.tool_name not in ("workspace_write", "workspace_edit", "git"):
         return None
-    root = None
-    from app.services.vibeweaver_gate_service import find_project_root
-    root = find_project_root([ctx.workspace_path], bound=ctx.workspace_path)
+    from app.services.vibeweaver_gate_service import resolve_session_root
+    root = resolve_session_root(
+        ctx.workspace_path,
+        ctx.conversation_id or ctx.session_id,
+        starts=[(ctx.args or {}).get("file_path"), (ctx.args or {}).get("path")],
+        prefer_hints=True,
+    )
     if root is None:
         return None
     from app.services.vibeweaver_gate_service import is_evidence_path
@@ -552,16 +585,49 @@ async def _audit_tool_after(ctx: hook_service.ToolHookContext) -> Optional[hook_
     if finding:
         fb = _intervention_text(finding, "tools")
         request_interrupt(obs_key, ctx.conversation_id, fb, "tools")
+    # W12 P1#8：terminal 写观察（设计边界：bash 写不设门）——保守模式且会话有
+    # active 项目且命令提及项目路径/名 → 每会话一次告警日志（不阻断、不影响结果）。
+    try:
+        from app.services.vibeweaver_gate_service import find_project_root, recent_project_root
+        root = recent_project_root(obs_key)
+        if root is None and ctx.workspace_path:
+            # 兜底：工作区根本身即 active 项目（terminal 首次触达场景）
+            root = find_project_root([ctx.workspace_path], bound=ctx.workspace_path)
+        if root is not None and obs_key not in _terminal_write_warned:
+            if _TERMINAL_WRITE_RE.search(command) and (
+                root.as_posix() in command or f"{root.name}/" in command
+            ):
+                _bounded_add(_terminal_write_warned, obs_key)
+                logger.info(
+                    "terminal write into vibeweaver-active project bypasses the gate "
+                    "(documented boundary; prefer workspace_write) conv=%s cmd=%s",
+                    obs_key, command[:80],
+                )
+    except Exception:
+        pass
     return None
 
 
 async def _audit_stop_hook(ctx: hook_service.StopContext) -> Optional[hook_service.StopDecision]:
     """终局 claim 校验：BAD → RED latch（不拦本 stop，封锁后续写）。"""
-    root = None
-    from app.services.vibeweaver_gate_service import find_project_root
-    root = find_project_root([ctx.workspace_path], bound=ctx.workspace_path)
+    if not ctx.vibeweaver_active:
+        return None  # W17 轮次门控：非激活轮不做 claim 校验（不产新 latch）
+    from app.services.vibeweaver_gate_service import resolve_session_root, recent_project_root
+    key = ctx.conversation_id or ctx.session_id
+    root = resolve_session_root(ctx.workspace_path, key)
     if root is None:
         return None
+    # W12 P1#7：C17 观察——vibeweaver-active 项目被写（注册表有记录）但技能未激活。
+    if (
+        recent_project_root(key) is not None
+        and skill_activation_for(key) != "vibeweaver"
+        and key not in _c17_warned
+    ):
+        _bounded_add(_c17_warned, key)
+        logger.warning(
+            "vibeweaver-active project touched without loading the skill (C17) conv=%s root=%s",
+            key, root,
+        )
     verdict = audit_final_output(ctx.assistant_content, root)
     if verdict.get("verdict") == "bad":
         latch_red(root, ctx.conversation_id or ctx.session_id, verdict["reasons"])
@@ -571,6 +637,11 @@ async def _audit_stop_hook(ctx: hook_service.StopContext) -> Optional[hook_servi
 
 async def _event_listener(event: AgentEvent) -> None:
     try:
+        # W12 P1#7：技能激活信号（skill_view 发布）——C17 判定与审计会话筛选信号。
+        if event.type == "skill.activated":
+            name = str((getattr(event, "data", None) or {}).get("name") or "")
+            _remember_skill_activation(str(getattr(event, "session_id", "") or ""), name)
+            return
         if event.type == "message.delta":
             finding = observe_text_delta(event.session_id, str(event.data.get("delta") or ""))
             if finding:

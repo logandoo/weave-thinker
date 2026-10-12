@@ -168,7 +168,13 @@ let officeHtmlLoadId = 0
 let unmounted = false
 
 const renderedHtml = computed(() =>
-  kind.value === 'markdown' ? renderMarkdownToHtml(textContent.value) : ''
+  kind.value === 'markdown'
+    ? renderMarkdownToHtml(textContent.value, {
+        deviceId: props.url.startsWith('/api/devices/')
+          ? props.url.split('/api/devices/')[1].split('/')[0]
+          : null,
+      })
+    : ''
 )
 
 async function loadText() {
@@ -204,11 +210,16 @@ async function loadOfficeComponent(): Promise<Component> {
  */
 async function loadOffice() {
   const source = officeSource.value
+  // W19 P1：设备上下文走设备端 LibreOffice 转换代理（fs/office-* RPC）；
+  // 失败仍回退客户端渲染器（fetch(props.url) 取设备字节）。
+  const deviceId = props.url.startsWith('/api/devices/')
+    ? decodeURIComponent(props.url.split('/api/devices/')[1].split('/')[0])
+    : null
   if (source) {
     if (kind.value === 'excel') {
       const loadId = ++officeHtmlLoadId
       try {
-        const res = await fetch(buildOfficeHtmlUrl(source))
+        const res = await fetch(buildOfficeHtmlUrl(source, deviceId))
         if (res.ok) {
           const html = await res.text()
           if (unmounted || loadId !== officeHtmlLoadId) return
@@ -226,7 +237,7 @@ async function loadOffice() {
       if (unmounted || loadId !== officeHtmlLoadId) return
     }
     try {
-      const res = await fetch(buildOfficePdfUrl(source))
+      const res = await fetch(buildOfficePdfUrl(source, deviceId))
       if (res.ok) {
         pdfBytes.value = await res.arrayBuffer()
         officeMode.value = 'server'

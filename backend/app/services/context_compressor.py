@@ -274,6 +274,18 @@ Target ~{summary_budget} tokens. Be CONCRETE.
     return prompt
 
 
+def _split_citation_manifests(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """拆分引用台账 manifest 消息（M5 折叠保护面，与 canary 同级）。"""
+    manifests: List[Dict[str, Any]] = []
+    rest: List[Dict[str, Any]] = []
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("_citation_manifest"):
+            manifests.append(m)
+        else:
+            rest.append(m)
+    return rest, manifests
+
+
 class ContextCompressor:
     def __init__(
         self,
@@ -341,6 +353,19 @@ class ContextCompressor:
         messages: List[Dict[str, Any]],
         current_tokens: int = None,
     ) -> List[Dict[str, Any]]:
+        """M5 折叠保护：引用台账 manifest 消息与 canary/系统提示同级，
+        压缩不吞噬——摘出后压缩，末尾挂回（映射在库，成本恒定）。"""
+        rest, manifests = _split_citation_manifests(messages)
+        out = self._compress_impl(rest, current_tokens)
+        if manifests:
+            out = list(out) + [manifests[-1]]
+        return out
+
+    def _compress_impl(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+    ) -> List[Dict[str, Any]]:
         n = len(messages)
         if n <= self.protect_first_n + 4:
             return messages
@@ -396,6 +421,19 @@ class ContextCompressor:
         return compressed
 
     async def compress_async(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+    ) -> List[Dict[str, Any]]:
+        """M5 折叠保护：manifest 消息不进入压缩面，压完挂回尾部。"""
+        rest, manifests = _split_citation_manifests(messages)
+        out = await self._compress_async_impl(rest, current_tokens, focus_topic)
+        if manifests:
+            out = list(out) + [manifests[-1]]
+        return out
+
+    async def _compress_async_impl(
         self,
         messages: List[Dict[str, Any]],
         current_tokens: int = None,

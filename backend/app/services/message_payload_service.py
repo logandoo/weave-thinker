@@ -254,6 +254,11 @@ def should_externalize(value: str | None, max_chars: int | None = None) -> bool:
 # 评审 I5/voice 修复：tool_calls 不外置（voice/回放按结构解析 call id，桩会打断）。
 _EXTERNALIZED_FIELDS = ("tool_results", "reasoning_content")
 _RESOLVE_FIELDS = ("tool_results", "reasoning_content", "tool_calls")  # 读侧仍兼容历史桩
+# 项7（W7，UPSTREAM_TODO_20261007）：per-flush 外置内容缓存——hook 写入、
+# sync_capture 解析器 O(1) 读取（单 session 批量应用时消除 identity_map 全扫，
+# 即 resync 应用面的 O(S×N) 退化）。键=(message_id, field)，值=全文；每次
+# before_flush 重置（生命周期=单个 flush）。
+FLUSH_PAYLOAD_CACHE_KEY = "wt_message_payload_flush_cache"
 _hook_installed = False
 # resolve 期间挂起 hook：否则 lookup 的 autoflush 会把刚还原的肥字段再次换回 stub。
 # 评审 M2 修复：ContextVar（任务隔离），非进程级全局标志。
@@ -271,20 +276,26 @@ class _HookSuspension:
 
 def uninstall_message_payload_hook():
     """Remove the hook (test hygiene — prevents cross-file flush contamination)."""
-    global _hook_installed, _hook_handler
+    global _hook_installed, _hook_handler, _after_flush_handler
     if not _hook_installed:
         return
     from sqlalchemy import event
     from sqlalchemy.orm import Session as _Sess
-    try:
-        event.remove(_Sess, "before_flush", _hook_handler)
-    except Exception:
-        pass
+    for name, handler in (("before_flush", _hook_handler),
+                          ("after_flush", _after_flush_handler)):
+        if handler is None:
+            continue
+        try:
+            event.remove(_Sess, name, handler)
+        except Exception:
+            pass
     _hook_installed = False
     _hook_handler = None
+    _after_flush_handler = None
 
 
 _hook_handler = None
+_after_flush_handler = None
 
 
 def install_message_payload_hook():
@@ -306,6 +317,9 @@ def install_message_payload_hook():
     def _before_flush(session, flush_context, instances):
         if _hook_suspended_ctx.get():
             return
+        # 项7：per-flush 外置缓存（每次 flush 重置——解析器 O(1) 命中，不再全扫）。
+        flush_cache: dict = {}
+        session.info[FLUSH_PAYLOAD_CACHE_KEY] = flush_cache
         targets = list(session.new) + [s for s in session.dirty if session.is_modified(s)]
         for obj in targets:
             if not isinstance(obj, Message):
@@ -343,11 +357,21 @@ def install_message_payload_hook():
                     existing.content = val
                     existing.size_bytes = len(val.encode("utf-8"))
                     existing.sha256 = sha
+                flush_cache[(str(obj.id), field)] = val
                 setattr(obj, field, build_field_stub(field, val))
 
     event.listen(_Sess, "before_flush", _before_flush)
-    global _hook_handler
+
+    def _after_flush(session, flush_context):
+        # 项8d（W8，UPSTREAM_TODO_20261007）：per-flush 缓存生命周期=单 flush——
+        # 结束后清除，避免长生命周期会话滞留全文字符串引用（解析器只在 flush
+        # 内读取；sha 复核语义不依赖缓存存续）。
+        session.info.pop(FLUSH_PAYLOAD_CACHE_KEY, None)
+
+    event.listen(_Sess, "after_flush", _after_flush)
+    global _hook_handler, _after_flush_handler
     _hook_handler = _before_flush
+    _after_flush_handler = _after_flush
     _hook_installed = True
 
 

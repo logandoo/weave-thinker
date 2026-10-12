@@ -23,9 +23,15 @@ from app.services.title_generator import TitleGeneratorService
 from app.services.workspace_service import ensure_user_workspace
 from app.services.agent_loop import AgentLoop, _strip_dsml_all, _strip_leading_orphan_punct
 from app.services.citation_ledger import CitationLedger, normalize_url
+from app.services.citation_sources import extract_browser_sources
 from app.services.reasoning_sanitizer import scrub_reasoning_meta, scrub_reasoning_streaming
 from app.services.deathmatch_service import DeathmatchManager, MARKER_RE
-from app.tools.skill_tools import build_skills_system_prompt, resolve_skill, is_system_skill
+from app.tools.skill_tools import (
+    build_skills_system_prompt,
+    build_force_injected_skills_prompt,
+    resolve_skill,
+    is_system_skill,
+)
 from app.tools.registry import registry
 
 from app.services.stream_buffer import stream_buffer_manager
@@ -175,6 +181,8 @@ async def _persist_deathmatch_failure(
 
 _DIGEST_ARCHIVE_RE = _re.compile(r"【全文存档】(\S+)")
 _DIGEST_TEXT_RE = _re.compile(r"<digest>([\s\S]*?)</digest>")
+# <persisted-output> 包装（budget 层）：Full output saved to: <path>
+_PERSISTED_ARCHIVE_RE = _re.compile(r"Full output saved to:\s*([^\n]+)")
 
 
 def _recover_digested_search(envelope: str) -> str | None:
@@ -190,12 +198,44 @@ def _recover_digested_search(envelope: str) -> str | None:
     """
     m = _DIGEST_ARCHIVE_RE.search(envelope)
     if not m:
-        return None
-    fpath = m.group(1).strip()
+        # budget 层 <persisted-output> 包装（未走 digest 的大结果）同样按指针恢复
+        pm = _PERSISTED_ARCHIVE_RE.search(envelope)
+        if not pm:
+            return None
+        fpath = pm.group(1).strip()
+    else:
+        fpath = m.group(1).strip()
     try:
-        with open(fpath, "r", encoding="utf-8") as f:
+        with open(fpath.strip(), "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and ("results" in data or "formatted" in data):
+            return json.dumps(data, ensure_ascii=False)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _recover_digested_browser(envelope: str) -> str | None:
+    """Return the original browser result JSON from the digest archive.
+
+    M2：live 台账在 digest 之前从原始 JSON pages 注册 browser 来源；持久化
+    端从全文存档恢复同一原始 JSON → 同一 URL 序列 → 编号逐位对齐。
+    """
+    m = _DIGEST_ARCHIVE_RE.search(envelope)
+    if not m:
+        # budget 层 <persisted-output> 包装（digest 关闭/失败时的大结果）：
+        # live 注册发生在 budget 包装之前（原始 JSON），此处按指针恢复同源
+        # JSON —— 编号逐位对齐（A4.9 Important-3）。
+        pm = _PERSISTED_ARCHIVE_RE.search(envelope)
+        if not pm:
+            return None
+        fpath = pm.group(1).strip()
+    else:
+        fpath = m.group(1).strip()
+    try:
+        with open(fpath.strip(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("pages"), list):
             return json.dumps(data, ensure_ascii=False)
     except (OSError, ValueError):
         pass
@@ -315,107 +355,12 @@ def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[
     return list(seen_names.values()) + list(seen_folders.values())
 
 
-def _derive_title_from_url(url: str) -> str:
-    """Best-effort display title for a source URL without a page title
-    (browser digest envelopes carry no <title>): the last path segment,
-    else the network location."""
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        seg = [s for s in (parsed.path or "").split("/") if s]
-        if seg:
-            return seg[-1]
-        return parsed.netloc or url
-    except Exception:
-        return url
-
-
-_BROWSER_URL_RE = _re.compile(r"https?://[^\s<>\"'\]\)）】]+")
-_DIGEST_HEADER_RE = _re.compile(r"<tool-digest>([\s\S]*?)<digest>", _re.IGNORECASE)
-# conv 3b58af5b wave-2: real browser digests carry their fetched targets in a
-# `## 来源` section INSIDE the digest body as backticked URLs with titles
-# (`https://host/path` (标题)) — that declaration is deterministic evidence,
-# unlike arbitrary links elsewhere in the body.
-_DIGEST_SOURCES_RE = _re.compile(r"##\s*来源\s*\n([\s\S]*?)(?=\n##\s|\Z)")
-_SOURCE_LINE_RE = _re.compile(r"`(https?://[^\s`]+)`(?:\s*[（(]([^）)]*)[）)])?")
-
-
+# M2（引文体系改造）：browser 来源抽取迁至 app.services.citation_sources
+# （live 注册与持久化共用同一解析器/同一顺序 —— 编号逐位对齐）。
 def _extract_browser_sources(raw_result: str):
-    """Yield (url, title, snippet) citation candidates from a browser tool
-    result. conv 3b58af5b (R3a): browser-fetched pages are real sources the
-    model reads and reasons over — they must join results[] like web_search
-    hits or the persisted answer has dangling [N] markers with no badge to
-    resolve them.
-
-    Two result shapes exist:
-      - JSON: {"pages": [{url, title, text}, ...]} — full fidelity.
-      - <tool-digest> envelope: URLs live in the header block (来源/目标
-        lines); the digest body may embed arbitrary content links, so ONLY
-        the header is scanned. No title/text available → derived title,
-        empty snippet.
-    """
-    raw = raw_result or ""
-    if not raw:
-        return
-    if raw.startswith("<tool-digest>"):
-        m = _DIGEST_HEADER_RE.search(raw)
-        if not m:
-            # A4.9 Minor-1: malformed envelope (no <digest> marker) — the
-            # body may embed arbitrary content links, so scanning it would
-            # violate the header-only contract. Register nothing.
-            return
-        seen: set[str] = set()
-
-        def _collect_url(u: str, title: str = ""):
-            u = u.rstrip(".,;、，。")
-            key = normalize_url(u)
-            if not u or key in seen:
-                return
-            seen.add(key)
-            collected.append((u, title or _derive_title_from_url(u), ""))
-
-        collected: list[tuple[str, str, str]] = []
-        # A) envelope header 【目标】 line(s) — single/multi declared targets.
-        for line in m.group(1).splitlines():
-            if "【目标】" in line:
-                for u in _BROWSER_URL_RE.findall(line):
-                    _collect_url(u)
-        # B) digest body `## 来源` section — the summarizer's own declared
-        # fetched targets. Two observed layouts: backticked URLs with
-        # optional (标题), and plain `目标：<url>` lines (older summaries).
-        sm = _DIGEST_SOURCES_RE.search(raw[m.end():])
-        if sm:
-            for line in sm.group(1).splitlines():
-                if "`http" in line:
-                    for bm in _SOURCE_LINE_RE.finditer(line):
-                        _collect_url(bm.group(1), (bm.group(2) or "").strip())
-                elif "目标" in line:
-                    for u in _BROWSER_URL_RE.findall(line):
-                        _collect_url(u)
-        yield from collected
-        return
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return
-    pages = parsed.get("pages") if isinstance(parsed, dict) else None
-    if not isinstance(pages, list):
-        return
-    for p in pages:
-        if not isinstance(p, dict):
-            continue
-        url = p.get("url") or ""
-        if not url.startswith("http"):
-            continue
-        # A4.9 Minor-2: errored pages ({url, error} entries) are dead links —
-        # they must not become citation badge sources.
-        if p.get("error"):
-            continue
-        yield (
-            url,
-            (p.get("title") or "").strip() or _derive_title_from_url(url),
-            ((p.get("text") or "").strip())[:300],
-        )
+    """向后兼容包装：返回 (url, title, snippet) 三元组迭代器。"""
+    for url, title, snippet, _biblio in extract_browser_sources(raw_result):
+        yield url, title, snippet
 
 
 def _transform_tool_loop_results(
@@ -467,7 +412,8 @@ def _transform_tool_loop_results(
             # keeps its rounds/results/tool card. Otherwise the entire search
             # evidence silently vanishes from the final answer (conv
             # 149ce886, 2026-08-01).
-            if raw_result.startswith("<tool-digest>"):
+            if raw_result.startswith("<tool-digest>") or raw_result.startswith("<persisted-output>"):
+                # A4.9 r2：budget 包装的大搜索结果同样按指针恢复（与 browser 同款）
                 recovered = _recover_digested_search(raw_result)
                 if recovered:
                     raw_result = recovered
@@ -550,6 +496,36 @@ def _transform_tool_loop_results(
                 "content": raw_result if raw_result else "(无内容)",
                 "step_type": "tool",
             })
+            # M2（引文体系改造）：browser 来源按**调用顺序**入账（与 live ledger
+            # 同序 —— results[id-1] == 模型 [id] 指向的 URL）。digest 信封用
+            # 全文存档恢复原始 JSON（与 live 注册同源，保证 URL 序列一致）；
+            # 书目字段随条目落库，供规范 reference 渲染。
+            if not is_error:
+                source_text = raw_result or ""
+                if source_text.startswith("<tool-digest>") or source_text.startswith("<persisted-output>"):
+                    recovered = _recover_digested_browser(source_text)
+                    if recovered:
+                        source_text = recovered
+                for url, _btitle, _bsnippet, _biblio in extract_browser_sources(source_text):
+                    _entry_key = normalize_url(url) or f"{_btitle}\x00{_bsnippet[:50]}"
+                    if not url or _entry_key in _cite_seen:
+                        continue
+                    _cite_seen.add(_entry_key)
+                    # C5（遗留清零）：与 live 注册同优先级——biblio 书目题名 > 页面 title
+                    _biblio_title = (_biblio or {}).get("title") or ""
+                    _entry: dict = {
+                        "id": len(results_list) + 1,
+                        "title": ((_biblio_title or _btitle) or "")[:200],
+                        "url": url,
+                        "snippet": _bsnippet,
+                        "published_date": None,
+                    }
+                    from app.services.citation_ledger import BIBLIO_FIELDS as _BIBLIO
+
+                    for _k, _v in (_biblio or {}).items():
+                        if _v and _k in _BIBLIO and not _entry.get(_k):
+                            _entry[_k] = _v
+                    results_list.append(_entry)
 
         elif name in ("context7_resolve_library_id", "context7_query_docs"):
             step_title = "查找库文档ID" if "resolve" in name else "查询库文档"
@@ -610,26 +586,6 @@ def _transform_tool_loop_results(
             })
 
     search_failed = _search_call_count > 0 and _search_success_count == 0
-
-    # conv 3b58af5b (R3a): browser-fetched pages are real sources — append
-    # them AFTER the web_search hits so the live ledger's web_search-only
-    # numbering (ids 1..K) stays aligned with results[0..K-1]; browser ids
-    # continue K+1..M. Dedupe mirrors the ledger (same normalize_url).
-    for tr in tool_results_accumulated:
-        if tr.get("name") != "browser" or tr.get("error"):
-            continue
-        for url, title, snippet in _extract_browser_sources(tr.get("result") or ""):
-            _cite_key = normalize_url(url)
-            if _cite_key in _cite_seen:
-                continue
-            _cite_seen.add(_cite_key)
-            results_list.append({
-                "id": len(results_list) + 1,
-                "title": title[:200],
-                "url": url,
-                "snippet": snippet,
-                "published_date": None,
-            })
 
     payload: dict = {
         "rounds": rounds_list,
@@ -835,6 +791,112 @@ def _display_sequence_keep_evidence(seq):
     return kept
 
 
+async def _render_answer_citations(
+    content: str,
+    tool_results_json: str | None,
+    style_id: str | None = None,
+) -> tuple[str, str | None]:
+    """M4：终稿出货时产出 citations 载荷（服务端样式化 reference + in_text 映射）。
+
+    - content 保持 [N] 撰写语法（ADR D-1：neutralize_historical_citations /
+      sanitize / 前端重排链路不变）；载荷携带逐条规范 reference 与文内族形态
+      （由 render_citations 的 CSL 输出提取），前端按载荷展示（卡片=reference、
+      四族角标），杜绝双重重排。
+    - style_id 取助手级 citation_style → 全局默认（resolve_style_id）。
+    - 零引用不产出载荷（F3）；tr_json 已有 citations 时直接返回（幂等，防
+      多路径重复渲染）。
+    """
+    if not tool_results_json:
+        return content, tool_results_json
+    try:
+        tr_obj = json.loads(tool_results_json)
+    except (json.JSONDecodeError, TypeError):
+        return content, tool_results_json
+    if not isinstance(tr_obj, dict) or tr_obj.get("citations"):
+        return content, tool_results_json
+    results = tr_obj.get("results") or []
+    if not isinstance(results, list) or not results:
+        return content, tool_results_json
+
+    def _sync() -> tuple[str, str | None]:
+        from app.services.citation_style_service import (
+            STYLE_REGISTRY,
+            render_citations,
+            render_entry_references,
+            resolve_style_id,
+        )
+
+        sid = resolve_style_id(style_id)
+
+        def _id_key(v):
+            # A4.9 ⑤：render_citations 接受数字字符串 id（_is_int_id）——载荷键
+            # 与之对齐，避免 string id 条目被静默丢弃。
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+            return v
+
+        # C4（遗留清零）：重复 id（畸形数据）首见胜——防 last-wins 串用他人
+        # reference；生产 _transform 顺序编号不可能重复，此为防御层。
+        _seen_ids: set = set()
+        deduped: list = []
+        for _e in results:
+            if not isinstance(_e, dict):
+                continue
+            _k = _id_key(_e.get("id"))
+            if _k is None:
+                continue
+            if _k in _seen_ids:
+                logger.warning(
+                    "answer citations: duplicate tool_results id %r — keeping first entry", _k,
+                )
+                continue
+            _seen_ids.add(_k)
+            deduped.append(_e)
+        if not deduped:
+            return content, tool_results_json
+
+        rendered = render_citations(content or "", deduped, style_id=sid)
+        used = rendered.used_ids
+        if not used:
+            return content, tool_results_json
+        by_id = {
+            _id_key(e.get("id")): e
+            for e in deduped
+            if isinstance(e, dict) and e.get("id") is not None
+        }
+        ordered = [by_id[i] for i in used if i in by_id]
+        refs = render_entry_references(ordered, style_id=sid)
+        ref_by_id = {_id_key(r.get("id")): r for r in refs}
+        entries = []
+        for idx, e in enumerate(ordered):
+            eid = _id_key(e.get("id"))
+            ref = ref_by_id.get(eid) or {}
+            entries.append({
+                "id": eid,
+                "num": idx + 1,
+                "in_text": rendered.old_to_new.get(eid) or "",
+                "reference": ref.get("reference") or "",
+                "url": e.get("url") or "",
+                "title": e.get("title") or "",
+                "snippet": (e.get("snippet") or "")[:300],
+                "author": e.get("author") or "",
+                "year": str(e.get("year") or ""),
+            })
+        tr_obj["citations"] = {
+            "style_id": sid,
+            "family": rendered.family,
+            "heading": (STYLE_REGISTRY.get(sid) or {}).get("heading") or "参考文献",
+            "entries": entries,
+        }
+        return content, json.dumps(tr_obj, ensure_ascii=False)
+
+    try:
+        return await asyncio.to_thread(_sync)
+    except Exception:
+        logger.exception("answer citation payload failed (keeping original)")
+        return content, tool_results_json
+
+
 def _build_content_fallback(joined_content: str, tool_results_json: str | None) -> str:
     if joined_content:
         return joined_content
@@ -899,13 +961,22 @@ async def _sanitize_cited_content(
         if not has_activity:
             return content, tool_results_json
         ledger = CitationLedger()
+        # A4.9 Important-4（引文改造 M4）：无 URL 条目（古籍/书籍）必须同序注册，
+        # 否则 ledger.size < len(results)、[N] 校验错位（合法引用被剥/越界误判）。
         for r in results:
-            if isinstance(r, dict) and r.get("url"):
-                ledger.register(
-                    r["url"],
-                    title=r.get("title") or "",
-                    snippet=r.get("snippet") or "",
-                )
+            if not isinstance(r, dict):
+                continue
+            ledger.register(
+                r.get("url") or "",
+                title=r.get("title") or "",
+                snippet=r.get("snippet") or "",
+                author=r.get("author") or None,
+                year=str(r.get("year") or "") or None,
+                # C1：与入账侧同参派生键（多卷/多版本不合并、位置不位移）
+                edition=r.get("edition") or None,
+                volume=r.get("volume") or None,
+                container=r.get("container") or None,
+            )
 
         # Collect every text surface in one shot, keeping the SAME order as
         # the write-back loop below (content first, then content_segments,
@@ -1089,6 +1160,7 @@ async def _trim_messages_for_regeneration(
     *,
     conversation_id: str,
     regenerate_from_message_id: str,
+    user_id: str | None = None,
 ):
     conversation_messages = await _load_conversation_messages(db, conversation_id)
     target_index = next(
@@ -1102,11 +1174,11 @@ async def _trim_messages_for_regeneration(
     if target_message.role != "assistant":
         raise HTTPException(status_code=400, detail="只能重新生成助手消息")
 
-    await _delete_message_slice(db, conversation_messages[target_index:])
+    await _delete_message_slice(db, conversation_messages[target_index:], user_id=user_id)
     return conversation_messages[:target_index]
 
 
-async def _delete_message_slice(db: AsyncSession, slice_rows) -> None:
+async def _delete_message_slice(db: AsyncSession, slice_rows, user_id: str | None = None) -> None:
     """按 id 批量删除消息切片——不碰 ORM 实例、不自带 commit。
 
     2026-10-04 conv 4e159a79 编辑重发 500：conv-open 波后 `_load_conversation_messages`
@@ -1126,6 +1198,31 @@ async def _delete_message_slice(db: AsyncSession, slice_rows) -> None:
     # 分块 IN：超长会话编辑头消息时单语句参数量撞 PG 绑定上限（65535）。
     for i in range(0, len(ids), 500):
         await db.execute(sa_delete(Message).where(Message.id.in_(ids[i:i + 500])))
+    if user_id:
+        # BUG-B（2026-10-09 用户报告「编辑/重发后新回答仍称我已经…」）：DB 切片
+        # 删除正确，但 subconscious_log 已摄入的「用户+助手各 500 字」原始单元不随
+        # 消息删除失效（调度器 15min 水位摄入），检索层随即将已删轮次重放进新尝试
+        # 的上下文。source_ids 记录来源消息 id（JSON 文本）——按引用同源 purge，
+        # LIKE '%"{id}"%' 引号定界防子串误伤；仅同用户，file_memory/无关行不动。
+        # 与消息删除同事务（不自带 commit），回滚即完整恢复。
+        from app.db.database import SubconsciousLog
+        from sqlalchemy import or_ as _or
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            await db.execute(
+                sa_delete(SubconsciousLog).where(
+                    SubconsciousLog.user_id == user_id,
+                    _or(*[SubconsciousLog.source_ids.like(f'%"{mid}"%') for mid in chunk]),
+                )
+            )
+        # 检索会话缓存（5min TTL，key=最近 3 user query 哈希）：regenerate 同 key
+        # 命中会重放删除前的记忆上下文——随切片删除一起失效。进程内字典操作，
+        # 失败不阻断删除主路径。
+        try:
+            from app.services.memory_retrieval_service import invalidate_session_cache_for_user
+            invalidate_session_cache_for_user(user_id)
+        except Exception:
+            logger.debug("invalidate_session_cache_for_user failed for user=%s", user_id, exc_info=True)
 
 
 async def _trim_messages_for_edit(
@@ -1133,6 +1230,7 @@ async def _trim_messages_for_edit(
     *,
     conversation_id: str,
     edit_message_id: str,
+    user_id: str | None = None,
 ):
     """Delete the target user message and all subsequent messages for edit-and-resend.
 
@@ -1149,8 +1247,40 @@ async def _trim_messages_for_edit(
     if target_message.role != "user":
         raise HTTPException(status_code=400, detail="只能编辑用户消息")
 
-    await _delete_message_slice(db, conversation_messages[target_index:])
+    await _delete_message_slice(db, conversation_messages[target_index:], user_id=user_id)
     return conversation_messages[:target_index]
+
+
+async def _resolve_execution_target_for_conversation(
+    db: AsyncSession, current_user, conversation, request_target
+) -> None:
+    """W16 设备执行模式：执行环境创建即定（D-6）。
+
+    无值首设 adopt；已有值与请求不一致 → 400（切换=新建会话）；
+    device:<id> 须属主+未撤销（IDOR fail-closed）。"""
+    from fastapi import HTTPException as _HTTPException
+
+    from app.services import client_device_service as _cds
+
+    req_target = None
+    if request_target:
+        try:
+            req_target = _cds.normalize_execution_target(request_target)
+        except ValueError as exc:
+            raise _HTTPException(status_code=422, detail=str(exc))
+    conv_target = getattr(conversation, "execution_target", None)
+    if req_target and conv_target and req_target != conv_target:
+        raise _HTTPException(
+            status_code=400,
+            detail="执行环境已固定：切换云端/客户端执行环境请新建会话",
+        )
+    if req_target and not conv_target:
+        try:
+            await _cds.assert_device_usable(db, current_user.id, req_target)
+        except LookupError as exc:
+            raise _HTTPException(status_code=400, detail=str(exc))
+        conversation.execution_target = req_target
+        await db.commit()
 
 
 @router.post("/stream")
@@ -1246,6 +1376,11 @@ async def chat_stream(
     chat_session.conversation_id = conversation_id
     await db.commit()
 
+    # W16 设备执行模式：执行环境创建即定（D-6，docs/PLAN_device_execution_mode.md §6.1）。
+    await _resolve_execution_target_for_conversation(
+        db, current_user, conversation, getattr(request, "execution_target", None)
+    )
+
     # 4.8 session lock: at most one active agent per conversation. A second
     # POST while an agent is still running would spawn a concurrent loop
     # writing to the same conversation (double-saved messages, polluted
@@ -1291,6 +1426,7 @@ async def chat_stream(
                 db,
                 conversation_id=conversation_id,
                 regenerate_from_message_id=request.regenerate_from_message_id,
+                user_id=current_user.id,
             )
             # 重新生成 = 该会话的最新操作（2026-09-26 用户指令）：解除拖拽钉住
             # （sort_order 置 0），使其在 (sort_order asc, 最近活动 desc) 排序下回到
@@ -1321,6 +1457,7 @@ async def chat_stream(
                 db,
                 conversation_id=conversation_id,
                 edit_message_id=request.edit_message_id,
+                user_id=current_user.id,
             )
             # Save the new user message
             user_message = Message(
@@ -1961,6 +2098,13 @@ async def chat_stream(
                     )
             messages_for_model = sanitize_api_messages(messages_for_model)
 
+            # W17-P1/P2（复审 IMPORTANT-1，2026-10-10）：轮次门控文本抽取必须在
+            # deathmatch 合成注入（build_context_messages 跨轮摘要 / 计划指令，
+            # 均为 user 角色）**之前**——否则合成文本混入近 3 条 ctx，非代码死磕
+            # 任务可被伪激活（dd3b2408 同类危害的新通道）。
+            from app.services.vibeweaver_turn_gate import extract_recent_user_text as _vw_extract
+            _vw_text, _vw_ctx = _vw_extract(messages_for_model)
+
             # PHASE 3: build the iteration (sub-task) LLM. If the assistant
             # has subtask_custom_* fields populated, spin up a separate
             # cheaper client for tool-calling iterations; otherwise reuse
@@ -2185,7 +2329,7 @@ async def chat_stream(
             async for _hb_item in _aiter_hb(asyncio.gather(
                 _memory_ctx(),
                 _workspace_ctx(),
-                build_skills_system_prompt(current_user),
+                build_skills_system_prompt(current_user, include_force_inject=False),
                 _coord_prepass(),
             ), interval=10.0):
                 if _hb_item is _HB:
@@ -2210,6 +2354,37 @@ async def chat_stream(
                     _setup_result = _hb_item
             memory_context, workspace, skills_sys_prompt, coord_result = _setup_result
             agent_loop.workspace_path = str(workspace.root_path)
+
+            # W17 vibeweaver 轮次门控：force-inject 全文与 gate/audit 执法仅对
+            # coding 任务或显式提及 vibeweaver 的轮次激活（生产 conv dd3b2408：
+            # 非代码任务被无条件注入拖入工程仪式直至空回答）。coordinator 缺位
+            # （死亡模式/显式技能调用/解析失败）→ coding_task None → 关键词兜底。
+            from app.services.vibeweaver_turn_gate import (
+                explicit_trigger_hit as _vw_explicit,
+                resolve_effective_active as _vw_resolve_eff,
+            )
+            # 门控文本/ctx 已于 messages_for_model 定稿后、deathmatch 合成注入前
+            # 抽取（见上方 IMPORTANT-1 注释）。coordinator 缺位（死亡模式/技能调用）
+            # 时启发式兜底吃近 3 条 ctx——「继续」类跟帖不丢工程上下文；
+            # explicit 仍只看末条（防历史提及对无关新话题过度激活）。
+            _vw_coding = coord_result.get("coding_task") if isinstance(coord_result, dict) else None
+            _vw_explicit_hit = _vw_explicit(_vw_text)
+            try:
+                _vw_gating = get_config().vibeweaver_task_gating_enabled
+            except Exception:
+                _vw_gating = True
+            _vw_active = _vw_resolve_eff(_vw_text, _vw_coding, _vw_gating, context_text=_vw_ctx)
+            agent_loop.vibeweaver_active = _vw_active
+            if _vw_active:
+                _vw_block = await build_force_injected_skills_prompt(current_user)
+                if _vw_block:
+                    skills_sys_prompt = (
+                        (skills_sys_prompt + "\n\n" + _vw_block) if skills_sys_prompt else _vw_block
+                    )
+            logger.info(
+                "vibeweaver turn gate active=%s explicit=%s coding=%s gating=%s conv=%s",
+                _vw_active, _vw_explicit_hit, _vw_coding, _vw_gating, conversation_id,
+            )
 
             from types import SimpleNamespace
             if memory_context is not None and memory_context.strip():
@@ -3608,6 +3783,11 @@ async def chat_stream(
                     _cap_content, tr_json = await _sanitize_cited_content(
                         _cap_content, tr_json,
                     )
+                    # M4：出货 citations 载荷（服务端样式化 reference + in_text）
+                    _cap_content, tr_json = await _render_answer_citations(
+                        _cap_content, tr_json,
+                        getattr(_cap_assistant, "citation_style", None),
+                    )
                     if _cap_content:
                         joined_content = _cap_content
                     # Localize remote media BEFORE persisting/broadcasting so
@@ -3718,6 +3898,10 @@ async def chat_stream(
                             return
                         _cap_content = _build_content_fallback(joined_content, tr_json)
                         _cap_content, tr_json = await _sanitize_cited_content(_cap_content, tr_json)
+                        _cap_content, tr_json = await _render_answer_citations(
+                            _cap_content, tr_json,
+                            getattr(_cap_assistant, "citation_style", None),
+                        )
                         # Localize remote media (same as the finalize path —
                         # the self-save path persists the FULL final answer
                         # when SSE is cancelled after loop completion, so it
@@ -4093,6 +4277,10 @@ async def chat_stream(
                         # display_sequence text surfaces in one judgment.
                         _cap_content, _cap_tool_results = await _sanitize_cited_content(
                             _cap_content, completed.get("tool_results_json"),
+                        )
+                        _cap_content, _cap_tool_results = await _render_answer_citations(
+                            _cap_content, _cap_tool_results,
+                            getattr(_cap_assistant, "citation_style", None),
                         )
                         _cap_reasoning = completed["full_reasoning"]
                         _cap_tool_calls = completed.get("tool_calls_json")
@@ -5005,6 +5193,11 @@ async def resume_stream(
                     # in display_sequence when only content was sanitized).
                     _cap_content, _cap_tr_json = await _sanitize_cited_content(
                         _cap_content, completed.get("tool_results_json"),
+                    )
+                    # M4：legacy resume 路径无 assistant 上下文 → 全局默认样式；
+                    # 载荷已存在时 _render_answer_citations 幂等跳过（保留产出方版本）。
+                    _cap_content, _cap_tr_json = await _render_answer_citations(
+                        _cap_content, _cap_tr_json, None,
                     )
 
                     # Guard: never persist a completely empty bubble from the

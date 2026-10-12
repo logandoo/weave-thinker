@@ -138,6 +138,39 @@ def _denumber_search_formatted(content: Optional[str]) -> str:
     return "\n\n".join(out_blocks)
 
 
+def _denumber_browser_sources(content: Optional[str]) -> str:
+    """De-number a historical browser tool result (M2 stamp逆操作，A4.9 B1).
+
+    M2 把本轮台账编号 `[N] ` 烙进 browser 的 <tool-digest> 来源行/【目标】行与
+    JSON 的 citation_id（编号可见性）。历史轮回放时这些编号属于已死台账——与
+    web_search formatted 同一失效类（conv a040c24e）：模型会复读旧编号对号
+    入座。回放前剥掉编号（内容事实原样保留）。
+    """
+    if not content:
+        return content or ""
+    # A-F2（清理轮）：**解析优先**——JSON pages 形态直接 pop citation_id 再序列化
+    # （正则先删会留下尾逗号 → 非法 JSON 回放；r2 的 parse-first 语义）。
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict) and isinstance(data.get("pages"), list):
+            changed = False
+            for p in data["pages"]:
+                if isinstance(p, dict) and "citation_id" in p:
+                    p.pop("citation_id", None)
+                    changed = True
+            if changed:
+                return json.dumps(data, ensure_ascii=False)
+            return content
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # 非 JSON（信封/包装预览）：行锚剥编号——只剥「行首（≤6 字符前缀）+ [N] + URL」
+    # 的**我们烙的**形态；正文中段「Evidence: [7] https://…」原文编号不误剥。
+    text = re.sub(r"(?m)^([^\n]{0,6}?)\[\d{1,3}\]\s+(`?https?://)", r"\1\2", content)
+    # budget 包装预览里的 citation_id 片段兜底（非可解析 JSON）
+    text = re.sub(r'"citation_id"\s*:\s*\d+\s*,?', '', text)
+    return text
+
+
 def _unique_tool_call_id() -> str:
     """Generate a unique id for a tool call when deduplicating history."""
     return f"fix_{uuid.uuid4().hex[:8]}"
@@ -265,6 +298,9 @@ def rebuild_structured_history(
             # Historical search lists carry their own turn's ledger ids —
             # strip the numbers so the model can't re-cite them (a040c24e).
             result_content = _denumber_search_formatted(result_content)
+        elif name == "browser":
+            # M2 尾注编号同属旧台账——回放前剥离（A4.9 B1）。
+            result_content = _denumber_browser_sources(result_content)
         messages.append({
             "role": "tool",
             "tool_call_id": cid,

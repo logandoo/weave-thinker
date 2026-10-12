@@ -1355,16 +1355,47 @@ html[data-skin="ink-paper"][data-theme="dark"] .skill-popup-item:hover { backgro
 html[data-skin="ink-paper"][data-theme="dark"] .skill-popup-item.active { background: rgba(201, 80, 63, 0.12); }
 html[data-skin="ink-paper"][data-theme="dark"] .skill-popup-item.system-skill .skill-item-name { color: #7fa9b0; }
 
-/* wave-8：底部悬浮钮与 chat-input 容器背景一致（纸卡，active 以朱砂文字/边色区分） */
+/* 任务块 9（2026-10-11）：移动端底 tab 对齐 mockup——纸卡胶囊 + 线性 SVG 前缀 +
+   朱砂活动 pill + 衬线字距；规格源 design/mockups/02-ink-paper/mobile.html .m-tabbar
+   （mockup 的 ✎/📖 彩色 emoji 会溢出胶囊且与皮肤单色图标语言冲突，改用内联 SVG） */
+html[data-skin="ink-paper"] .mobile-tab-bar {
+  gap: 4px;
+  padding: 4px;
+  background: #fbf7ec;
+  border-color: rgba(42, 37, 33, 0.22);
+  box-shadow: 0 6px 18px rgba(60, 50, 30, 0.2);
+}
 html[data-skin="ink-paper"] .mobile-tab-bar .tab-item {
-  background: var(--surface-panel-strong);
-  border-color: var(--skin-line-soft);
+  gap: 5px;
+  padding: 7px 18px 7px 16px;
+  font-size: 11px;
+  color: #7a7264;
+  background: transparent;
+  border-color: transparent;
+}
+html[data-skin="ink-paper"] .mobile-tab-bar .tab-item::before {
+  content: none;
+}
+html[data-skin="ink-paper"] .mobile-tab-bar .tab-item svg {
+  display: block;
+  width: 14px;
+  height: 14px;
+  flex: none;
 }
 html[data-skin="ink-paper"] .mobile-tab-bar .tab-item.active {
-  background: var(--surface-panel-strong);
-  color: var(--color-primary);
-  border-color: rgba(178, 59, 46, 0.4);
+  background: #b23b2e;
+  color: #fdf8ec;
+  font-family: "Noto Serif SC", "Songti SC", "STSong", Georgia, serif;
+  letter-spacing: 1px;
+  font-weight: 400;
 }
+html[data-skin="ink-paper"][data-theme="dark"] .mobile-tab-bar {
+  background: var(--surface-panel-strong);
+  border-color: var(--skin-line-soft);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+}
+html[data-skin="ink-paper"][data-theme="dark"] .mobile-tab-bar .tab-item { color: #b0a68f; }
+html[data-skin="ink-paper"][data-theme="dark"] .mobile-tab-bar .tab-item.active { color: #241f1a; }
 
 /* ════════ wave-11：登录页 / 笔记引用 / 设置面板内部 / 列表卡片（墨韵发丝线语言） ════════ */
 

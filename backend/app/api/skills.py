@@ -68,6 +68,14 @@ DANGEROUS_PATTERNS = [
 ]
 
 
+def _parse_skill_md(content: str) -> tuple[Optional[str], str]:
+    """SKILL.md 解析：(description, body)。frontmatter 走 skill_tools 的块标量解析器
+    （W12 P0#3：修 `description: |` 被存成字面 "|" 的缺陷）。"""
+    from app.tools.skill_tools import _parse_frontmatter
+    meta, body = _parse_frontmatter(content)
+    desc = meta.get("description")
+    return (desc if isinstance(desc, str) and desc.strip() else None), body
+
 def _get_file_type(file_path: str) -> str:
     """Determine file type based on extension."""
     ext = os.path.splitext(file_path)[1].lower()
@@ -178,16 +186,7 @@ async def _process_skill_folder(
     except UnicodeDecodeError:
         return None
 
-    description = None
-    if skill_content.startswith('---'):
-        end = skill_content.find('\n---', 3)
-        if end != -1:
-            frontmatter = skill_content[3:end].strip()
-            for line in frontmatter.split('\n'):
-                if line.startswith('description:'):
-                    description = line.split(':', 1)[1].strip()
-                    break
-            skill_content = skill_content[end + 4:].lstrip('\n')
+    description, skill_content = _parse_skill_md(skill_content)
 
     existing = await db.execute(
         select(UserSkill).where(
@@ -493,16 +492,7 @@ async def upload_skills(
         if not skill_name:
             skill_name = 'uploaded_skill'
 
-        description = None
-        if content.startswith('---'):
-            end = content.find('\n---', 3)
-            if end != -1:
-                frontmatter = content[3:end].strip()
-                for line in frontmatter.split('\n'):
-                    if line.startswith('description:'):
-                        description = line.split(':', 1)[1].strip()
-                        break
-                content = content[end + 4:].lstrip('\n')
+        description, content = _parse_skill_md(content)
 
         existing = await db.execute(
             select(UserSkill).where(

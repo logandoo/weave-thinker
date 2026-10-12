@@ -211,7 +211,14 @@ function asText(v: unknown): string {
 }
 
 export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
-  if (data.error) {
+  // A tool_result frame carries a PER-TOOL boolean `error` flag (flattened
+  // wire shape: {call_id, name, result, error}). A failed tool call (e.g. a
+  // gate-blocked workspace write) is not a stream-fatal error — routing it
+  // into the fatal branch coerced `true` to '未知错误', killed the SSE read,
+  // and wiped the whole streaming bubble (2026-10-09). Exclude the shape here;
+  // the router below delivers it to onToolResult.
+  const isToolResult = data.call_id !== undefined && data.name !== undefined && 'result' in data
+  if (data.error && !isToolResult) {
     if (data.code === 'conversation_busy' && h.onConversationBusy) {
       h.onConversationBusy(data.conversation_id)
       return true
@@ -263,7 +270,7 @@ export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
   if (data.call_id !== undefined && data.name !== undefined && data.arguments !== undefined && h.onToolCall) {
     h.onToolCall(data as ToolCallEvent)
   }
-  if (data.call_id !== undefined && data.name !== undefined && 'result' in data && h.onToolResult) {
+  if (isToolResult && h.onToolResult) {
     h.onToolResult(data as ToolResultEvent)
   }
   if (data.current !== undefined && data.max !== undefined && h.onIteration) {

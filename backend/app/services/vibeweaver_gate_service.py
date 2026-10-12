@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -108,6 +109,87 @@ def find_project_root(starts: List[Optional[str]], bound: Optional[str] = None) 
     return None
 
 
+# ---------- 会话项目根注册表（W12 P1#6） ----------
+# 子目录项目在工作区内不会被「仅从 workspace_path 出发」的 stop/RED-latch 搜索发现；
+# tool.after 命中项目根时登记，stop/audit 优先复用（bound 校验 + 失活失效）。
+_RECENT_ROOTS: Dict[str, Path] = {}
+_RECENT_ROOTS_CAP = 200
+
+
+def remember_project_root(key: str, root: Path) -> None:
+    if not key:
+        return
+    if len(_RECENT_ROOTS) >= _RECENT_ROOTS_CAP and key not in _RECENT_ROOTS:
+        for k in list(_RECENT_ROOTS.keys())[:50]:
+            _RECENT_ROOTS.pop(k, None)
+    _RECENT_ROOTS[key] = root
+
+
+def recent_project_root(key: str) -> Optional[Path]:
+    root = _RECENT_ROOTS.get(key or "")
+    if root is None:
+        return None
+    if not (root / "tests" / "verification_log.md").exists():
+        _RECENT_ROOTS.pop(key, None)
+        return None
+    return root
+
+
+def resolve_session_root(
+    workspace_path: Optional[str],
+    key: str,
+    starts: Optional[List[Optional[str]]] = None,
+    prefer_hints: bool = False,
+) -> Optional[Path]:
+    """会话项目根解析（W12；评审修复：hint 优先）。
+
+    - ``prefer_hints=True``（tool 调用，带写入文件路径提示）：按提示路径在 bound
+      内搜索并登记——多项目工作区必须按**本次写入归属**裁决（注册表仅在无提示时
+      兜底）；提示无命中 → None（不属于任何 active 项目 = 不设门，保持旧语义）。
+    - ``prefer_hints=False``（stop / RED-latch 检查，无路径提示）：注册表优先，
+      兜底从 workspace_path 向上搜索。bound 缺失 → fail-closed None。
+    """
+    bound = workspace_path or None
+    if prefer_hints:
+        # 相对路径按 bound 归一（tool schema 允许工作区相对路径；否则会按服务进程
+        # CWD 解析而被 bound 过滤，静默绕过门禁——复评审 N1）。
+        hint_paths: List[Optional[str]] = []
+        for _s in (starts or []):
+            if not _s:
+                continue
+            try:
+                _p = Path(_s).expanduser()
+                if not _p.is_absolute() and bound:
+                    _p = Path(bound) / _p
+                hint_paths.append(str(_p))
+            except (OSError, ValueError):
+                continue
+        hinted = find_project_root(hint_paths, bound=bound)
+        if hinted is not None:
+            remember_project_root(key, hinted)
+            return hinted
+        if hint_paths:
+            # 复审 A-I1：hint 可解析但不属于任何 active 项目 → None（不设门，
+            # 保持旧语义）。不得回退注册表——否则 A 项目的 RED-latch/证据面会把
+            # 尚未建档的 B 项目的首次协议写入误判拦截。
+            return None
+        # 无任何可用提示（git 等无路径类写工具）→ 回退注册表/工作区根（复评审 N1）。
+    if not bound:
+        return None
+    root = recent_project_root(key)
+    if root is not None:
+        try:
+            b = Path(bound).resolve()
+            if root == b or b in root.parents:
+                return root
+        except OSError:
+            pass
+    root = find_project_root([bound], bound=bound)
+    if root is not None:
+        remember_project_root(key, root)
+    return root
+
+
 # ---------- assert_artifacts.py 驱动 ----------
 
 def _ensure_assert_script(root: Path) -> Optional[Path]:
@@ -117,10 +199,13 @@ def _ensure_assert_script(root: Path) -> Optional[Path]:
     if target.exists():
         return target
     try:
-        backend_root = get_config().backend_root
+        # W12 P0#2：冻结包资源根解析（bundled_first——可执行资产不得被数据目录副本投毒；
+        # 旧实现直取 backend_root=用户配置目录，打包态物化恒失败）。
+        src = get_config().resolve_resource(
+            "skills", "vibeweaver", "scripts", "assert_artifacts.py", bundled_first=True
+        )
     except Exception:
         return None
-    src = Path(backend_root) / "skills" / "vibeweaver" / "scripts" / "assert_artifacts.py"
     if not src.is_file():
         return None
     try:
@@ -133,14 +218,14 @@ def _ensure_assert_script(root: Path) -> Optional[Path]:
         return None
 
 
-async def run_assert(root: Path) -> Tuple[bool, List[Dict[str, Any]]]:
-    """跑正典断言脚本（4 flag 组合），返回 (ok, attempts)。"""
+async def run_assert(root: Path, runner: str) -> Tuple[bool, List[Dict[str, Any]]]:
+    """跑正典断言脚本（4 flag 组合），返回 (ok, attempts)。runner=python3 绝对路径。"""
     attempts: List[Dict[str, Any]] = []
     script = root / "tests" / "assert_artifacts.py"
     for flags in FLAG_COMBOS:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "python3", str(script), *flags,
+                runner, str(script), *flags,
                 cwd=str(root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -210,8 +295,9 @@ def inline_check(root: Path) -> List[str]:
 
 async def check_gate_async(root: Path) -> Optional[Dict[str, Any]]:
     _ensure_assert_script(root)
-    if (root / "tests" / "assert_artifacts.py").exists():
-        ok, attempts = await run_assert(root)
+    runner = shutil.which("python3")
+    if (root / "tests" / "assert_artifacts.py").exists() and runner:
+        ok, attempts = await run_assert(root, runner)
         if ok:
             return None
         blocking, warnings = _classify(_failure_messages(attempts))
@@ -304,7 +390,12 @@ def is_evidence_path(root: Path, file_path: Optional[str]) -> bool:
     if not file_path:
         return False
     try:
-        rel = Path(file_path).resolve().relative_to(root.resolve())
+        # 复审 A-I3：tool schema 允许工作区相对路径——相对路径必须按项目根归一，
+        # 否则按服务进程 CWD 解析 → relative_to 必失败 → 证据修复写被 RED 误封。
+        p = Path(file_path).expanduser()
+        if not p.is_absolute():
+            p = Path(root) / p
+        rel = p.resolve().relative_to(root.resolve())
     except (OSError, ValueError):
         return False
     if not rel.parts:
@@ -358,11 +449,19 @@ async def gate_idle_check_async(root: Path) -> Optional[Dict[str, Any]]:
 # ---------- hook 安装 ----------
 
 async def _tool_after_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_service.HookDecision]:
+    if not ctx.vibeweaver_active:
+        # W17 轮次门控：非激活轮（非代码任务）不设门——证据面/项目根解析都不做
+        return None
     if ctx.tool_name not in _GATED_TOOLS:
         return None
-    root = find_project_root(
-        [ctx.workspace_path, (ctx.args or {}).get("file_path"), (ctx.args or {}).get("path")],
-        bound=ctx.workspace_path,
+    key = ctx.conversation_id or ctx.session_id
+    # 评审修复：tool 调用必须按本次写入路径归属裁决（hint 优先于注册表），
+    # 否则 A 项目先被触达后，写 B 项目会被按 A 的证据/封禁误判。
+    root = resolve_session_root(
+        ctx.workspace_path,
+        key,
+        starts=[(ctx.args or {}).get("file_path"), (ctx.args or {}).get("path")],
+        prefer_hints=True,
     )
     if root is None:
         return None
@@ -377,7 +476,9 @@ async def _tool_after_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_s
 
 async def _stop_hook(ctx: hook_service.StopContext) -> Optional[hook_service.StopDecision]:
     """stop 语义：证据红 → 拦下收尾 + 纠正反馈续跑（预算由 hook_service 执行）。"""
-    root = find_project_root([ctx.workspace_path], bound=ctx.workspace_path)
+    if not ctx.vibeweaver_active:
+        return None  # W17 轮次门控：非激活轮不拦收尾
+    root = resolve_session_root(ctx.workspace_path, ctx.conversation_id or ctx.session_id)
     if root is None:
         return None
     out = await gate_idle_check_async(root)

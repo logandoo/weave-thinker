@@ -16,7 +16,7 @@
 
 - **Base URL**：`http(s)://<host>:8158`（默认端口，见 `backend/config.toml [server]`）
 - **交互式文档**：运行时 `/docs`（Swagger UI）
-- **接口规模**：142 个 HTTP operations（21 个业务模块 + main.py 根路由）+ 2 条 WebSocket
+- **接口规模**：178 个 HTTP operations / 141 条 path（26 个业务模块 + main.py 根路由）+ 3 条 WebSocket（voice / asr / device，见第二、三部分）
 - **认证**：JWT Bearer Token（请求头 `Authorization: Bearer <token>`）。`POST /api/auth/login` 获取，
   有效期 `[security] token_expire_days`（默认 7 天）；`POST /api/auth/refresh` 用仍有效的 Token 滑动续期
   （单条原子 CAS 轮换，登出后其 token 永久不可续期——详见二.1）。WebSocket 以 `?token=<jwt>` 或
@@ -394,6 +394,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `thinking_budget` | ∪int|null | 否（可空） |  |
 | `deathmatch_mode` | bool | 否 | （默认 False） |
 | `deathmatch_action` | ∪string|null | 否（可空） |  |
+| `execution_target` | ∪string|null | 否（可空） |  |
 
 **输出**
 
@@ -404,7 +405,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 **请求示例**
 
 ```bash
-curl -k -X POST "https://<host>:8158/api/chat/stream" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"conversation_id": "string", "assistant_id": "string", "messages": [{"role": "user", "content": "string"}], "enable_web_search": false, "regenerate_from_message_id": "string", "edit_message_id": "string", "force_search_results": "string", "temperature": 0.0, "top_p": 0.0, "top_k": 0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": 0, "enable_reasoning": false, "reasoning_effort": "string", "thinking_budget": 0, "deathmatch_mode": false, "deathmatch_action": "string"}
+curl -k -X POST "https://<host>:8158/api/chat/stream" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"conversation_id": "string", "assistant_id": "string", "messages": [{"role": "user", "content": "string"}], "enable_web_search": false, "regenerate_from_message_id": "string", "edit_message_id": "string", "force_search_results": "string", "temperature": 0.0, "top_p": 0.0, "top_k": 0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "max_tokens": 0, "enable_reasoning": false, "reasoning_effort": "string", "thinking_budget": 0, "deathmatch_mode": false, "deathmatch_action": "string", "execution_target": "string"}
 ```
 
 **返回示例**
@@ -464,6 +465,9 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 > Accepts JSON body: 
 > Uses subscribe_with_snapshot() for atomic replay + subscribe —
 > no duplication gap between replay and live deltas.
+> 
+> 部署排空扩面（D-12，2026-10-06）：drain 中拒收 resume——排空窗口不接入
+> 新客户端流（重连请等新进程），先于任何 buffer 访问。
 
 认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/chat.py`
 
@@ -584,6 +588,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `title` | string | 是 |  |
 | `group_id` | ∪string|null | 否（可空） |  |
 | `assistant_id` | ∪string|null | 否（可空） |  |
+| `execution_target` | ∪string|null | 否（可空） |  |
 | `sort_order` | int | 否 | （默认 0） |
 | `created_at` | string | 是 |  |
 | `updated_at` | string | 是 |  |
@@ -622,6 +627,7 @@ curl -k -X GET "https://<host>:8158/api/conversations" -H "Authorization: Bearer
     "title": "string",
     "group_id": "string",
     "assistant_id": "string",
+    "execution_target": "string",
     "sort_order": 0,
     "created_at": "string",
     "updated_at": "string",
@@ -659,6 +665,7 @@ curl -k -X GET "https://<host>:8158/api/conversations" -H "Authorization: Bearer
 |---|---|---|---|
 | `title` | ∪string|null | 否（可空） |  |
 | `assistant_id` | ∪string|null | 否（可空） |  |
+| `execution_target` | ∪string|null | 否（可空） |  |
 
 **输出**
 
@@ -669,6 +676,7 @@ curl -k -X GET "https://<host>:8158/api/conversations" -H "Authorization: Bearer
 | `title` | string | 是 |  |
 | `group_id` | ∪string|null | 否（可空） |  |
 | `assistant_id` | ∪string|null | 否（可空） |  |
+| `execution_target` | ∪string|null | 否（可空） |  |
 | `sort_order` | int | 否 | （默认 0） |
 | `created_at` | string | 是 |  |
 | `updated_at` | string | 是 |  |
@@ -695,7 +703,7 @@ curl -k -X GET "https://<host>:8158/api/conversations" -H "Authorization: Bearer
 **请求示例**
 
 ```bash
-curl -k -X POST "https://<host>:8158/api/conversations" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"title": "string", "assistant_id": "string"}
+curl -k -X POST "https://<host>:8158/api/conversations" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"title": "string", "assistant_id": "string", "execution_target": "string"}
 ```
 
 **返回示例**
@@ -706,6 +714,7 @@ curl -k -X POST "https://<host>:8158/api/conversations" -H "Authorization: Beare
   "title": "string",
   "group_id": "string",
   "assistant_id": "string",
+  "execution_target": "string",
   "sort_order": 0,
   "created_at": "string",
   "updated_at": "string",
@@ -812,6 +821,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 |---|---|---|---|
 | `items` | ExportMessagesPDFRequest[] | 是 |  |
 | `action` | string | 否 | （默认 'single'） |
+| `endnote_enabled` | bool | 否 | （默认 True） |
 
 **输出**
 
@@ -822,7 +832,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 **请求示例**
 
 ```bash
-curl -k -X POST "https://<host>:8158/api/conversations/export-pdf" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"items": [{"title": "string", "content": "string", "role": "string"}], "action": "string"}
+curl -k -X POST "https://<host>:8158/api/conversations/export-pdf" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"items": [{"title": "string", "content": "string", "role": "string"}], "action": "string", "endnote_enabled": true}
 ```
 
 **返回示例**
@@ -1133,6 +1143,42 @@ curl -k -X PUT "https://<host>:8158/api/conversations/groups/{group_id}/move" -H
 
 ---
 
+### POST `/api/conversations/import`
+**Import Conversations**
+
+> Batch-import conversations from exported `.csv` / `.zip` files.
+> 
+> Each CSV becomes one conversation under *assistant_id*; `part=k/n`
+> continuation rows are merged back losslessly. Per-file failures are
+> reported in `errors` without aborting the rest.
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/conversation.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `form.assistant_id` | string | 是 |  |
+| `form.files` | str(binary) — 文件 | 是 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/conversations/import" -H "Authorization: Bearer $TOKEN" -F "assistant_id=<value>" -F "files=<value>"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
 ### PUT `/api/conversations/reorder`
 **Reorder Conversations**
 
@@ -1247,6 +1293,8 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | 字段 | 位置 | 类型 | 必填 | 说明 |
 |---|---|---|---|---|
 | `conversation_id` | path | string | 是 |  |
+| `include` | query | string | 否 |  |
+| `message_limit` | query | int|null | 否 |  |
 
 **输出**
 
@@ -1257,6 +1305,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `title` | string | 是 |  |
 | `group_id` | ∪string|null | 否（可空） |  |
 | `assistant_id` | ∪string|null | 否（可空） |  |
+| `execution_target` | ∪string|null | 否（可空） |  |
 | `sort_order` | int | 否 | （默认 0） |
 | `created_at` | string | 是 |  |
 | `updated_at` | string | 是 |  |
@@ -1278,6 +1327,8 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `deathmatch_plan` | ∪object|null | 否（可空） |  |
 | `deathmatch_plan_version` | int | 否 | （默认 0） |
 | `messages` | MessageResponse[] | 否 | （默认 []） |
+| `has_more_messages` | bool | 否 | （默认 False） |
+| `oldest_message_id` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -1295,6 +1346,7 @@ curl -k -X GET "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
   "title": "string",
   "group_id": "string",
   "assistant_id": "string",
+  "execution_target": "string",
   "sort_order": 0,
   "created_at": "string",
   "updated_at": "string",
@@ -1325,9 +1377,12 @@ curl -k -X GET "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
       "tool_calls": null,
       "tool_results": null,
       "context_info": null,
+      "delivery_status": null,
       "created_at": null
     }
-  ]
+  ],
+  "has_more_messages": false,
+  "oldest_message_id": "string"
 }
 ```
 
@@ -1358,6 +1413,7 @@ curl -k -X GET "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
 | `title` | string | 是 |  |
 | `group_id` | ∪string|null | 否（可空） |  |
 | `assistant_id` | ∪string|null | 否（可空） |  |
+| `execution_target` | ∪string|null | 否（可空） |  |
 | `sort_order` | int | 否 | （默认 0） |
 | `created_at` | string | 是 |  |
 | `updated_at` | string | 是 |  |
@@ -1395,6 +1451,7 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
   "title": "string",
   "group_id": "string",
   "assistant_id": "string",
+  "execution_target": "string",
   "sort_order": 0,
   "created_at": "string",
   "updated_at": "string",
@@ -1432,6 +1489,7 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
 | `conversation_id` | path | string | 是 |  |
 | `before_id` | query | string|null | 否 |  |
 | `limit` | query | int|null | 否 |  |
+| `include` | query | string | 否 |  |
 
 **输出**
 
@@ -1446,6 +1504,7 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}" -H "Aut
 | `tool_calls` | ∪string|null | 否（可空） |  |
 | `tool_results` | ∪string|null | 否（可空） |  |
 | `context_info` | ∪string|null | 否（可空） |  |
+| `delivery_status` | string | 否 | （默认 'final'） |
 | `created_at` | string | 是 |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
@@ -1469,6 +1528,7 @@ curl -k -X GET "https://<host>:8158/api/conversations/{conversation_id}/messages
     "tool_calls": "string",
     "tool_results": "string",
     "context_info": "string",
+    "delivery_status": "string",
     "created_at": "string"
   }
 ]
@@ -1501,6 +1561,7 @@ curl -k -X GET "https://<host>:8158/api/conversations/{conversation_id}/messages
 | `title` | string | 是 |  |
 | `group_id` | ∪string|null | 否（可空） |  |
 | `assistant_id` | ∪string|null | 否（可空） |  |
+| `execution_target` | ∪string|null | 否（可空） |  |
 | `sort_order` | int | 否 | （默认 0） |
 | `created_at` | string | 是 |  |
 | `updated_at` | string | 是 |  |
@@ -1538,6 +1599,7 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}/move" -H
   "title": "string",
   "group_id": "string",
   "assistant_id": "string",
+  "execution_target": "string",
   "sort_order": 0,
   "created_at": "string",
   "updated_at": "string",
@@ -1584,6 +1646,7 @@ curl -k -X PUT "https://<host>:8158/api/conversations/{conversation_id}/move" -H
 | `system_prompt` | string | 否 | （默认 ''） |
 | `model_alias` | string | 否 | （默认 ''） |
 | `subtask_model_alias` | string | 否 | （默认 ''） |
+| `citation_style` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1606,6 +1669,7 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
     "system_prompt": "string",
     "model_alias": "string",
     "subtask_model_alias": "string",
+    "citation_style": "string",
     "id": "string",
     "user_id": "string",
     "created_at": "string",
@@ -1629,6 +1693,7 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
 | `system_prompt` | string | 否 | （默认 ''） |
 | `model_alias` | string | 否 | （默认 'deepseek'） |
 | `subtask_model_alias` | string | 否 | （默认 ''） |
+| `citation_style` | string | 否 | （默认 ''） |
 
 **输出**
 
@@ -1639,6 +1704,7 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
 | `system_prompt` | string | 否 | （默认 ''） |
 | `model_alias` | string | 否 | （默认 ''） |
 | `subtask_model_alias` | string | 否 | （默认 ''） |
+| `citation_style` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1649,7 +1715,7 @@ curl -k -X GET "https://<host>:8158/api/assistants" -H "Authorization: Bearer $T
 **请求示例**
 
 ```bash
-curl -k -X POST "https://<host>:8158/api/assistants" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "model_alias": "string", "subtask_model_alias": "string"}
+curl -k -X POST "https://<host>:8158/api/assistants" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "model_alias": "string", "subtask_model_alias": "string", "citation_style": "string"}
 ```
 
 **返回示例**
@@ -1660,6 +1726,7 @@ curl -k -X POST "https://<host>:8158/api/assistants" -H "Authorization: Bearer $
   "system_prompt": "string",
   "model_alias": "string",
   "subtask_model_alias": "string",
+  "citation_style": "string",
   "id": "string",
   "user_id": "string",
   "created_at": "string",
@@ -1718,6 +1785,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | `system_prompt` | string | 否 | （默认 ''） |
 | `model_alias` | string | 否 | （默认 ''） |
 | `subtask_model_alias` | string | 否 | （默认 ''） |
+| `citation_style` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1739,6 +1807,7 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
   "system_prompt": "string",
   "model_alias": "string",
   "subtask_model_alias": "string",
+  "citation_style": "string",
   "id": "string",
   "user_id": "string",
   "created_at": "string",
@@ -1765,6 +1834,7 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 | `system_prompt` | ∪string|null | 否（可空） |  |
 | `model_alias` | ∪string|null | 否（可空） |  |
 | `subtask_model_alias` | ∪string|null | 否（可空） |  |
+| `citation_style` | ∪string|null | 否（可空） |  |
 
 **输出**
 
@@ -1775,6 +1845,7 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 | `system_prompt` | string | 否 | （默认 ''） |
 | `model_alias` | string | 否 | （默认 ''） |
 | `subtask_model_alias` | string | 否 | （默认 ''） |
+| `citation_style` | string | 否 | （默认 ''） |
 | `id` | string | 是 |  |
 | `user_id` | string | 是 |  |
 | `created_at` | string | 是 |  |
@@ -1785,7 +1856,7 @@ curl -k -X GET "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
 **请求示例**
 
 ```bash
-curl -k -X PUT "https://<host>:8158/api/assistants/{assistant_id}" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "model_alias": "string", "subtask_model_alias": "string"}
+curl -k -X PUT "https://<host>:8158/api/assistants/{assistant_id}" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"name": "string", "system_prompt": "string", "model_alias": "string", "subtask_model_alias": "string", "citation_style": "string"}
 ```
 
 **返回示例**
@@ -1796,6 +1867,7 @@ curl -k -X PUT "https://<host>:8158/api/assistants/{assistant_id}" -H "Authoriza
   "system_prompt": "string",
   "model_alias": "string",
   "subtask_model_alias": "string",
+  "citation_style": "string",
   "id": "string",
   "user_id": "string",
   "created_at": "string",
@@ -2186,6 +2258,7 @@ curl -k -X PUT "https://<host>:8158/api/notes/notebooks/{notebook_id}/default" -
 | 字段 | 位置 | 类型 | 必填 | 说明 |
 |---|---|---|---|---|
 | `notebook_id` | path | string | 是 |  |
+| `endnote_enabled` | query | bool | 否 |  |
 
 **输出**
 
@@ -2357,6 +2430,10 @@ curl -k -X POST "https://<host>:8158/api/notes/notes/bulk-delete" -H "Authorizat
 认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/notes.py`
 
 **输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `endnote_enabled` | query | bool | 否 |  |
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -2563,6 +2640,7 @@ curl -k -X PUT "https://<host>:8158/api/notes/notes/{note_id}" -H "Authorization
 |---|---|---|---|---|
 | `note_id` | path | string | 是 |  |
 | `format` | query | string | 否 |  |
+| `endnote_enabled` | query | bool | 否 |  |
 
 **输出**
 
@@ -3496,6 +3574,7 @@ curl -k -X GET "https://<host>:8158/api/export-tasks" -H "Authorization: Bearer 
 | `format` | string | 否 | （默认 'pdf'） |
 | `note_id` | ∪string|null | 否（可空） |  |
 | `note_ids` | ∪string[]|null | 否（可空） |  |
+| `endnote_enabled` | bool | 否 | （默认 True） |
 
 **输出**
 
@@ -3519,7 +3598,7 @@ curl -k -X GET "https://<host>:8158/api/export-tasks" -H "Authorization: Bearer 
 **请求示例**
 
 ```bash
-curl -k -X POST "https://<host>:8158/api/export-tasks" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"task_type": "string", "format": "string", "note_id": "string", "note_ids": ["string"]}
+curl -k -X POST "https://<host>:8158/api/export-tasks" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"task_type": "string", "format": "string", "note_id": "string", "note_ids": ["string"], "endnote_enabled": true}
 ```
 
 **返回示例**
@@ -4724,6 +4803,9 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 > Download a file from the user's workspace.
 > 
 > Auth: Bearer header (standard), or ?token= query param (for <img> tags).
+> Path resolution is the shared workspace resolver (no filename-walk around
+> the containment/symlink rules — A4.9 Critical 2026-09-19); the response is
+> pinned to the validated file descriptor.
 
 认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/file_upload.py + app/api/files.py`
 
@@ -4731,7 +4813,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 | 字段 | 位置 | 类型 | 必填 | 说明 |
 |---|---|---|---|---|
-| `path` | query | string | 是 | Absolute path to the file |
+| `path` | query | string | 是 | Absolute path or workspace-relative path to the file |
 | `token` | query | string|null | 否 | JWT token for <img> tag auth |
 
 **输出**
@@ -4744,6 +4826,114 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 ```bash
 curl -k -X GET "https://<host>:8158/api/files/download?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/files/list`
+**List Files**
+
+> List one directory inside the user's workspace (folder manager).
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/file_upload.py + app/api/files.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `path` | query | string | 是 | Workspace-relative or in-workspace directory path |
+| `token` | query | string|null | 否 | JWT token for link-based auth |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/files/list?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/files/office-html`
+**Office Html**
+
+> Convert a spreadsheet to a sanitized, self-contained HTML preview.
+> 
+> 2026-09-21: PDF pagination split wide tables across pages and clipped
+> long cell text at page boundaries; the Calc HTML export keeps every sheet
+> as one natural-width table (horizontal scroll in the viewer) with wrapped
+> text and charts inlined as images. The document is sanitized server-side
+> and served to a sandboxed iframe. ``400`` for non-spreadsheets, ``501``
+> when LibreOffice/preview is unavailable and ``422`` on conversion failure
+> — the frontend then falls back to ``/office-pdf`` and finally to its
+> client-s
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/file_upload.py + app/api/files.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `path` | query | string | 是 | Workspace-relative or in-workspace spreadsheet path |
+| `token` | query | string|null | 否 | JWT token for link-based auth |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/files/office-html?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/files/office-pdf`
+**Office Pdf**
+
+> Convert an Office file to PDF for inline preview (server-side.
+> 
+> ``501 office_preview_unavailable`` when LibreOffice is missing — the
+> frontend then falls back to its client-side renderers.
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/file_upload.py + app/api/files.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `path` | query | string | 是 | Workspace-relative or in-workspace office file path |
+| `token` | query | string|null | 否 | JWT token for link-based auth |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/files/office-pdf?path=<value>" -H "Authorization: Bearer $TOKEN"
 ```
 
 **返回示例**
@@ -4797,6 +4987,7 @@ curl -k -X POST "https://<host>:8158/api/files/upload" -H "Authorization: Bearer
       "file_type": null,
       "filename": null,
       "file_path": null,
+      "rel_path": null,
       "size": null
     }
   ],
@@ -4804,6 +4995,38 @@ curl -k -X POST "https://<host>:8158/api/files/upload" -H "Authorization: Bearer
   "notebook_name": "string"
 }
 ```
+
+---
+
+### GET `/api/files/zip`
+**Download Zip**
+
+> Zip one folder inside the user's workspace and stream it as a download.
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/file_upload.py + app/api/files.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `path` | query | string | 是 | Workspace-relative or in-workspace directory path |
+| `token` | query | string|null | 否 | JWT token for link-based auth |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/files/zip?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
 
 ---
 
@@ -5580,6 +5803,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 | 字段 | 类型 | 必填* | 说明 |
 |---|---|---|---|
 | `skin_id` | string | 是 |  |
+| `default_execution_target` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -5593,7 +5817,8 @@ curl -k -X GET "https://<host>:8158/api/users/me/preferences" -H "Authorization:
 
 ```json
 {
-  "skin_id": "string"
+  "skin_id": "string",
+  "default_execution_target": "string"
 }
 ```
 
@@ -5608,7 +5833,8 @@ curl -k -X GET "https://<host>:8158/api/users/me/preferences" -H "Authorization:
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `skin_id` | string | 是 |  |
+| `skin_id` | ∪string|null | 否（可空） |  |
+| `default_execution_target` | ∪string|null | 否（可空） |  |
 
 **输出**
 
@@ -5616,20 +5842,22 @@ curl -k -X GET "https://<host>:8158/api/users/me/preferences" -H "Authorization:
 | 字段 | 类型 | 必填* | 说明 |
 |---|---|---|---|
 | `skin_id` | string | 是 |  |
+| `default_execution_target` | ∪string|null | 否（可空） |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
 **请求示例**
 
 ```bash
-curl -k -X PUT "https://<host>:8158/api/users/me/preferences" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"skin_id": "string"}
+curl -k -X PUT "https://<host>:8158/api/users/me/preferences" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d {"skin_id": "string", "default_execution_target": "string"}
 ```
 
 **返回示例**
 
 ```json
 {
-  "skin_id": "string"
+  "skin_id": "string",
+  "default_execution_target": "string"
 }
 ```
 
@@ -5867,6 +6095,419 @@ HTTP 200
 
 ---
 
+
+## 设备执行 Device Executor（W16 云端/客户端执行切换：配对/管理/文件代理）
+
+前缀 `/api/devices`（`app/api/client_devices.py + app/api/device_ws.py`）
+
+### GET `/api/devices`
+**List Devices**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+**输出**
+
+`200` 字段：`List[DeviceInfo]`（数组，每项字段如下）
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `id` | string | 是 |  |
+| `device_id` | string | 是 |  |
+| `name` | ∪string|null | 否（可空） |  |
+| `platform` | ∪string|null | 否（可空） |  |
+| `online` | bool | 否 | （默认 False） |
+| `revoked` | bool | 否 | （默认 False） |
+| `last_seen_at` | ∪string|null | 否（可空） |  |
+| `created_at` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+[
+  {
+    "id": "string",
+    "device_id": "string",
+    "name": "string",
+    "platform": "string",
+    "online": false,
+    "revoked": false,
+    "last_seen_at": "string",
+    "created_at": "string"
+  }
+]
+```
+
+---
+
+### GET `/api/devices/executions`
+**List Executions**
+
+> W19 P3：远端执行审计（用户维度倒序）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `limit` | query | int | 否 |  |
+
+**输出**
+
+`200` 字段：`List[ExecAuditItem]`（数组，每项字段如下）
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `id` | string | 是 |  |
+| `device_id` | string | 是 |  |
+| `conversation_id` | ∪string|null | 否（可空） |  |
+| `tool` | string | 是 |  |
+| `ok` | bool | 是 |  |
+| `error` | ∪string|null | 否（可空） |  |
+| `duration_ms` | int | 否 | （默认 0） |
+| `created_at` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices/executions" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+[
+  {
+    "id": "string",
+    "device_id": "string",
+    "conversation_id": "string",
+    "tool": "string",
+    "ok": true,
+    "error": "string",
+    "duration_ms": 0,
+    "created_at": "string"
+  }
+]
+```
+
+---
+
+### POST `/api/devices/pair`
+**Pair Device**
+
+> 设备凭配对码注册（PLAN §8.1 ②③）：token 仅此一次明文回传。
+
+认证：公开　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `code` | string | 是 |  |
+| `name` | ∪string|null | 否（可空） |  |
+| `platform` | ∪string|null | 否（可空） |  |
+| `device_id` | ∪string|null | 否（可空） |  |
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `device_id` | string | 是 |  |
+| `token` | string | 是 |  |
+| `name` | ∪string|null | 否（可空） |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/devices/pair" -H "Content-Type: application/json" -d {"code": "string", "name": "string", "platform": "string", "device_id": "string"}
+```
+
+**返回示例**
+
+```json
+{
+  "device_id": "string",
+  "token": "string",
+  "name": "string"
+}
+```
+
+---
+
+### POST `/api/devices/pairing-code`
+**Create Pairing Code**
+
+> 用户 JWT 签发一次性短 TTL 配对码（PLAN §8.1 ①）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+**输出**
+
+`200` 字段：
+| 字段 | 类型 | 必填* | 说明 |
+|---|---|---|---|
+| `code` | string | 是 |  |
+| `expires_in_seconds` | int | 是 |  |
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/devices/pairing-code" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+```json
+{
+  "code": "string",
+  "expires_in_seconds": 0
+}
+```
+
+---
+
+### GET `/api/devices/{device_id}/fs/download`
+**Fs Download**
+
+> 设备文件字节代理（下载卡/预览用）。data_b64 单包或 transfer_id+chunk 分块。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+| `path` | query | string | 是 |  |
+| `token` | query | string|null | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices/{device_id}/fs/download?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/devices/{device_id}/fs/list`
+**Fs List**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+| `path` | query | string | 否 |  |
+| `token` | query | string|null | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices/{device_id}/fs/list" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/devices/{device_id}/fs/office-html`
+**Fs Office Html**
+
+> W19 P1：设备端 Office→HTML 转换（设备侧 LibreOffice，字节回传）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+| `path` | query | string | 是 |  |
+| `token` | query | string|null | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices/{device_id}/fs/office-html?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/devices/{device_id}/fs/office-pdf`
+**Fs Office Pdf**
+
+> W19 P1：设备端 Office→PDF 转换（设备侧 LibreOffice，字节回传）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+| `path` | query | string | 是 |  |
+| `token` | query | string|null | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices/{device_id}/fs/office-pdf?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/devices/{device_id}/fs/read`
+**Fs Read**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+| `path` | query | string | 是 |  |
+| `offset` | query | int | 否 |  |
+| `limit` | query | int | 否 |  |
+| `token` | query | string|null | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices/{device_id}/fs/read?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### GET `/api/devices/{device_id}/fs/zip`
+**Fs Zip**
+
+> W19 P1：设备端目录打包（fs/zip RPC 在设备生成 zip 后回传字节）。
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+| `path` | query | string | 是 |  |
+| `token` | query | string|null | 否 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X GET "https://<host>:8158/api/devices/{device_id}/fs/zip?path=<value>" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
+### POST `/api/devices/{device_id}/revoke`
+**Revoke Device**
+
+认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
+
+**输入**
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+|---|---|---|---|---|
+| `device_id` | path | string | 是 |  |
+
+**输出**
+
+- `200` — 响应体类型 `any`（Successful Response）
+
+> \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
+
+**请求示例**
+
+```bash
+curl -k -X POST "https://<host>:8158/api/devices/{device_id}/revoke" -H "Authorization: Bearer $TOKEN"
+```
+
+**返回示例**
+
+HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理）。
+
+---
+
 ## 其他（main.py / 根路由）
 
 ### GET `/`
@@ -6051,6 +6692,9 @@ temperature 1.0 / top_p 0.95 / top_k 20 / min_p 0.0 / presence_penalty 0.0 / rep
 - `GET /api/files/list`：工作区目录列表（文件夹管理器）——`path` 为工作区相对/工作区内目录路径；
   目录优先、名称不区分大小写排序；单次最多 1000 条（`truncated=true` 表示被截断），符号链接
   不列出；越界/不存在 404。
+- `GET /api/files/zip` / `/api/files/office-html` / `/api/files/office-pdf`：目录打包与 Office 服务端
+  转换（xlsx/xls/ods 优先转 HTML 表格，其余转 PDF）；未安装 LibreOffice 或转换失败时前端自动回退
+  浏览器端渲染，能力不缺失。
 - `GET /api/images/serve`：路径逃逸工作区 403；不存在 404。
 - 笔记导出 PDF 走 `POST /api/export-tasks` 异步（WeasyPrint，Markdown→HTML→PDF，支持 Mermaid/LaTeX、
   本地图片 base64 内嵌），`/download` 取件。
@@ -6220,6 +6864,42 @@ login/refresh/me/profile 四处统一携带 `nickname` 与 `avatar_data`。
   填写的 Key，缺省则不发送）调用；实时语音对话仅支持 DashScope/MiMo 引擎——设置自定义 ASR URL
   后该用户的语音对话不可用（设置面板已提示此限制）。
 
+## 13. 设备执行（Device Executor，2026-10-09）
+
+**目标**：把会话的本地类工具（文件读写 / 搜索 / 终端 / Git / 代码执行 / 技能脚本等）交给用户已配对的
+客户端设备本机执行——Agent 循环、模型调用、会话与审计全部保留在云端（`conversations.execution_target`
+为 `device:<device_id>` 时生效；创建后不可变，切换执行环境 = 新建会话）。
+
+**配对**（一次性短时效码换长效设备凭据）：
+
+1. 已登录用户在 Web 端 `POST /api/devices/pairing-code` 取一次性配对码（短 TTL，绑定当前用户）；
+2. 客户端软件 `POST /api/devices/pair` 凭码注册，换取长效设备 token（明文仅此一次回传，云端只存
+   `sha256(token)`）；
+3. 设备以出站长连接连 `WS /api/device/ws`——鉴权**仅** `Authorization: Bearer <device token>` 头
+   （query token 一律拒绝，长效凭据不进 URL/访问日志）；未知/已撤销 token 拒绝握手；
+4. 用户可 `GET /api/devices` 查看设备与在线状态，`POST /api/devices/{id}/revoke` 解绑（即刻踢线并
+   拒绝新调用）；`GET /api/devices/executions` 查看最近远端执行审计。
+
+**WS 协议（JSON-RPC 2.0 风格信封）**：请求 `{"jsonrpc":"2.0","id":<hex>,"method":<name>,"params":{…}}`，
+响应 `{"id":<hex>,"result":{…}}` 或 `{"id":<hex>,"error":{"code":…,"message":…}}`。
+云端→设备方法：`tools/call {tool,args,workspace_ctx,timeout_seconds,script?,script_ext?}`、
+`tools/cancel {call_id}`、`fs/list{path}`、`fs/read{path,offset,limit}`、`fs/download{path}`、
+`fs/zip{path}`、`fs/office-html{path}`、`fs/office-pdf{path}`。设备→云端通知：`heartbeat`（保活，
+云端按 heartbeat×2+2s 判半开离线）、`chunk {transfer_id,seq,data_b64,sha256?,last?}`（大文件分块回传，
+逐块 sha256 + 序号连续性校验）、`progress {call_id,note}`（长打包/转换续期等待窗——按原窗前移截止，
+受 `[client_exec] call_max_extension_seconds` 绝对上限钳制，默认 3600s、0=不限制）。
+
+**工具路由三态**（云端路由与设备侧白名单镜像双侧 fail-closed）：远端白名单（workspace_* / grep /
+diff / word_count / terminal / process / git / execute_code / skill_run_script / provide_file /
+provide_folder / citation_render / pdf_export）走设备；服务端自有工具（web_search / notes / memory /
+schedule / delegate_task / MCP 等）留云端；`browser_*` / `job_*` / `workspace_snapshot` 暂缓拒绝
+（P1/P2 分期）。`skill_run_script` 由云端解析技能脚本内容随 RPC 内联下发（设备不依赖云端技能库）。
+
+**可靠性**：at-most-once——断线不重放写操作（在途调用判失败）；设备离线/已解绑 fail-fast（明确报错，
+**不静默回退云端执行**，避免同一会话文件散落双环境）；RPC 等待上限 = max(该工具云端超时,
+`[client_exec] call_timeout_seconds`)。**部署约束**：单进程（内存注册表与配对码）；检测到多 worker
+部署时启动自检自动禁用设备执行并告警。
+
 ---
 
-*文档版本：详版（2026-09-14）。OpenAPI 快照 diff 即接口变更清单；`tools/gen_api_md.py` 可重放。*
+*文档版本：详版（2026-10-12）。OpenAPI 快照 diff 即接口变更清单；`tools/gen_api_md.py` 可重放。*

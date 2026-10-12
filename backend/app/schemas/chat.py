@@ -29,11 +29,15 @@ class ChatRequest(BaseModel):
     thinking_budget: Optional[int] = None
     deathmatch_mode: bool = False
     deathmatch_action: Optional[str] = None  # "start", "stop", "pause", "resume"
+    # W16 设备执行模式：执行环境（None=云端；device:<id>=配对设备）。
+    # 会话已有目标时必须一致（D-6 不可变）；无目标时首设 adopt。
+    execution_target: Optional[str] = None
 
 
 class ConversationCreate(BaseModel):
     title: Optional[str] = None
     assistant_id: Optional[str] = None
+    execution_target: Optional[str] = None
 
 
 class ConversationUpdate(BaseModel):
@@ -46,6 +50,7 @@ class ConversationResponse(BaseModel):
     title: str
     group_id: Optional[str] = None
     assistant_id: Optional[str] = None
+    execution_target: Optional[str] = None
     sort_order: int = 0
     created_at: str
     updated_at: str

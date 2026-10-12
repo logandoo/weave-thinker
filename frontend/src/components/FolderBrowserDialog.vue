@@ -79,7 +79,7 @@
         <FilePreviewDialog
           v-if="previewing"
           :filename="previewing.name"
-          :url="buildDownloadUrl(previewing.rel_path)"
+          :url="buildDownloadUrl(previewing.rel_path, deviceId)"
           :rel-path="previewing.rel_path"
           :source-path="previewing.rel_path"
           :type="previewing.type"
@@ -99,7 +99,7 @@ import { classifyFile, fileIcon, fileTypeLabel, formatSize } from '@/composables
 import { downloadUrl } from '@/composables/useDownload'
 import FilePreviewDialog from './FilePreviewDialog.vue'
 
-const props = defineProps<{ folder: FolderAttachment }>()
+const props = defineProps<{ folder: FolderAttachment; deviceId?: string | null }>()
 const emit = defineEmits<{ close: [] }>()
 
 const rootPath = computed(() => props.folder.rel_path || props.folder.path || '')
@@ -138,7 +138,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    listing.value = await fetchDirectory(currentPath.value, abortController.signal)
+    listing.value = await fetchDirectory(currentPath.value, abortController.signal, props.deviceId)
   } catch (e: any) {
     if (e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED') return
     error.value = e?.response?.status === 404 ? '文件夹不存在或无权限' : '加载失败'
@@ -166,11 +166,12 @@ function onEntryClick(entry: WorkspaceEntry) {
 }
 
 async function downloadEntry(entry: WorkspaceEntry) {
-  await downloadUrl(buildDownloadUrl(entry.rel_path), entry.name)
+  await downloadUrl(buildDownloadUrl(entry.rel_path, props.deviceId), entry.name)
 }
 
 async function downloadFolder() {
-  await downloadUrl(buildZipUrl(currentPath.value), `${props.folder.name || 'folder'}.zip`)
+  // W19 P1：设备端 fs/zip 代理已通——两态同链
+  await downloadUrl(buildZipUrl(currentPath.value, props.deviceId), `${props.folder.name || 'folder'}.zip`)
 }
 
 function close() {

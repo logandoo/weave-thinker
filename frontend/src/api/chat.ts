@@ -55,8 +55,16 @@ async function readSseStream(
 }
 
 export const chatApi = {
-  async createConversation(title?: string, assistantId?: string | null): Promise<Conversation> {
-    const { data } = await api.post('/conversations', { title, assistant_id: assistantId })
+  async createConversation(
+    title?: string,
+    assistantId?: string | null,
+    executionTarget?: string | null,
+  ): Promise<Conversation> {
+    const { data } = await api.post('/conversations', {
+      title,
+      assistant_id: assistantId,
+      execution_target: executionTarget ?? null,
+    })
     return data
   },
 

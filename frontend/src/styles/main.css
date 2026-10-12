@@ -17,6 +17,14 @@
    - 其他皮肤见 styles/themes/*.css（[data-skin="<id>"] 覆盖块）
    - 皮肤契约文档：docs/SKINS.md；目录 API：GET /api/skins
    ========================================================================== */
+/* 任务块 13/14：slabGap=offset−12−barH 随皮肤条高（52/50/46）漂移——
+   任务块 14 按用户裁定解耦：verdant 胶囊在绿区居中（slabGap=下隙12 → offset 76）；
+   ink 保持 hint 等距最小（offset 64）；mono 保持 hint 阴影参照居中（offset 60）。
+   必须在 :root 块外：嵌套写法会编译成 :root html[data-skin] 永不命中 */
+html[data-skin="verdant-flat"] { --mobile-tab-bar-offset: 76px; }
+html[data-skin="ink-paper"] { --mobile-tab-bar-offset: 64px; }
+html[data-skin="mono-brutal"] { --mobile-tab-bar-offset: 60px; }
+
 :root {
   --color-primary: #7AA35A;
   --color-primary-dark: #6B8F4D;
@@ -185,7 +193,7 @@
   --shell-workbench-radius: 28px;
   --shell-card-gap: 18px;
   --mobile-tab-bar-height: 44px;
-  --mobile-tab-bar-offset: 56px; /* wave-8：hint 与底部悬浮钮间距降低（66→56） */
+  --mobile-tab-bar-offset: 72px; /* 基座默认（无 data-skin 时=verdant 基线）；三皮肤精确值见下方 html[data-skin] 覆写 */
 
   --transition-fast: 150ms ease;
   --transition-normal: 250ms ease;

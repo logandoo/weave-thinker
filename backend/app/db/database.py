@@ -1017,6 +1017,16 @@ class ClientExecutorDevice(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ClientExecutorDeviceTombstone(Base):
+    """设备墓碑（2026-10-12 遗留清偿）：revoke=删行后 device_id 不裸放——仅原属主
+    可认领（重配对连续性），他户认领拒绝（防抢占 DoS/劫持纵深第二道）。"""
+    __tablename__ = "client_executor_device_tombstones"
+
+    device_id = Column(String(64), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    deleted_at = Column(DateTime, default=datetime.utcnow)
+
+
 class ClientExecAudit(Base):
     """W19 P3：远端执行审计——每次设备工具调用一条（ok/err/duration），
     用户维度查询入口 GET /api/devices/executions。"""

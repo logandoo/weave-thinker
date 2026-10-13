@@ -40,7 +40,12 @@ class DeviceCallTimeoutError(Exception):
 
 
 class DeviceCallError(Exception):
-    pass
+    """设备调用错误。code=wire 结构化错误码（error_code 字段）——消费面
+    classify_wire_error(code=...) 优先用它，防错误文本伪装前缀（评审 r3/r4 I-b）。"""
+
+    def __init__(self, message: str = "", code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class DeviceOversizeError(DeviceCallError):
@@ -70,41 +75,53 @@ class DeviceSessionManager:
     def __init__(self) -> None:
         self._sessions: Dict[str, DeviceSession] = {}
 
+    def device_user_id(self, device_id: str) -> Optional[str]:
+        """在线会话的属主 user_id（无会话=None）。C1 属主栅栏用：派发按 device_id
+        盲路由，硬删释放的 id 被他人抢占时靠此拦截劫持。"""
+        sess = self._sessions.get(device_id)
+        return getattr(sess, "user_id", None) if sess is not None else None
+
     def register(self, device_id: str, user_id: str, ws: Any) -> DeviceSession:
         old = self._sessions.pop(device_id, None)
         if old is not None and not old.closed:
             old.closed = True
             self._fail_pending(old, DeviceOfflineError("设备连接被新连接取代"))
             # A4.9 C-1：关旧 socket，避免僵尸 receive loop 继续往会话写
-            try:
-                close = getattr(old.ws, "close", None)
-                if close is not None:
-                    res = close(code=1012)
-                    if asyncio.iscoroutine(res):
-                        try:
-                            asyncio.get_running_loop().create_task(res)
-                        except RuntimeError:
-                            res.close()
-            except Exception:
-                pass
+            self._close_ws(old.ws)
         sess = DeviceSession(device_id=device_id, user_id=user_id, ws=ws)
         self._sessions[device_id] = sess
         logger.info("device executor connected: %s (user=%s)", device_id, user_id)
         return sess
 
+    @staticmethod
+    def _close_ws(ws: Any) -> None:
+        try:
+            close = getattr(ws, "close", None)
+            if close is not None:
+                res = close(code=1012)
+                if asyncio.iscoroutine(res):
+                    try:
+                        asyncio.get_running_loop().create_task(res)
+                    except RuntimeError:
+                        res.close()
+        except Exception:
+            pass
+
     def unregister(self, device_id: str, session: Optional[DeviceSession] = None) -> None:
         """A4.9 C-1：传入 session 时只拆该会话（身份校验），迟到的旧连接 finally
-        不得误拆新连接。"""
+        不得误拆新连接。r4 NEW-M2：拆会话同时关 socket（僵尸 receive loop 不滞留）。"""
         current = self._sessions.get(device_id)
         if session is not None and current is not session:
             if session is not None and not session.closed:
                 session.closed = True
                 self._fail_pending(session, DeviceOfflineError("设备连接已被新连接取代"))
+                self._close_ws(session.ws)
             return
         if current is not None:
             current.closed = True
             self._sessions.pop(device_id, None)
             self._fail_pending(current, DeviceOfflineError("设备已断开"))
+            self._close_ws(current.ws)
             logger.info("device executor disconnected: %s", device_id)
 
     def is_online(self, device_id: str) -> bool:
@@ -135,12 +152,17 @@ class DeviceSessionManager:
         method: str,
         params: Dict[str, Any],
         timeout: Optional[float] = None,
+        expected_user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         sess = self._sessions.get(device_id)
         if sess is None or sess.closed:
             raise DeviceOfflineError("设备已离线")
         if not self._fresh(sess):
             raise DeviceOfflineError("设备心跳超时（连接疑似半开）")
+        # NEW-I2（r4）：send 时原子复核会话属主——栅栏读到 send 之间的
+        # check-then-act 窗（skill_run_script 解析可达 10-50ms）在此闭合。
+        if expected_user_id is not None and getattr(sess, "user_id", None) != expected_user_id:
+            raise DeviceCallError("设备身份不匹配（安全拦截）", code="device_owner_mismatch")
         call_id = uuid.uuid4().hex
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         sess.pending[call_id] = fut
@@ -341,6 +363,7 @@ class DeviceSessionManager:
         params: Dict[str, Any],
         max_bytes: Optional[int] = None,
         timeout: Optional[float] = None,
+        expected_user_id: Optional[str] = None,
     ) -> bytes:
         """W19 通用设备字节通道：fs/download|fs/zip|fs/office-* 共用。
 
@@ -361,9 +384,14 @@ class DeviceSessionManager:
         except Exception:
             max_bytes = max_bytes or 10 * 1024 * 1024
             timeout = timeout or 120.0
-        result = await self.rpc_call(device_id, method, params, timeout=timeout)
+        result = await self.rpc_call(
+            device_id, method, params, timeout=timeout, expected_user_id=expected_user_id
+        )
         if not isinstance(result, dict) or result.get("ok") is False:
-            raise DeviceCallError(str((result or {}).get("error") or "设备读取失败"))
+            raise DeviceCallError(
+                str((result or {}).get("error") or "设备读取失败"),
+                code=(result or {}).get("error_code"),
+            )
         data_b64 = result.get("data_b64")
         if isinstance(data_b64, str):
             if len(data_b64) > (max_bytes * 4 // 3 + 64):

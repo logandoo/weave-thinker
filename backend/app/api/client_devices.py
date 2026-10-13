@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_config
@@ -55,6 +56,11 @@ class DevicePairResponse(BaseModel):
     device_id: str
     token: str
     name: str | None = None
+    # handoff ①（2026-10-12）：配对即交换属主云端身份——客户端 client_exec.pair
+    # 直接读 user_id/username 落盘为名门期望值来源，不再依赖 sync 回填/过渡态。
+    # 评审 A-I3：username 必填——owner 缺失时拒绝配对（403），不发毒值。
+    user_id: str
+    username: str
 
 
 class DeviceInfo(BaseModel):
@@ -128,7 +134,21 @@ async def pair_device(
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
-    return DevicePairResponse(device_id=row.device_id, token=token, name=row.name)
+    owner_result = await db.execute(select(User).where(User.id == row.user_id))
+    owner = owner_result.scalar_one_or_none()
+    username = getattr(owner, "username", None)
+    if owner is None or not username:
+        # 评审 r3/r4 I-b：此处为纯防御（register_device 已前置校验）——不得回滚删行
+        # （adopt 路径会误杀既有注册+已转 token）。文案区分两类。
+        detail = "属主用户不存在，配对已拒绝" if owner is None else "属主身份异常，配对已拒绝"
+        raise HTTPException(status_code=403, detail=detail)
+    return DevicePairResponse(
+        device_id=row.device_id,
+        token=token,
+        name=row.name,
+        user_id=row.user_id,
+        username=username,
+    )
 
 
 @router.get("", response_model=list[DeviceInfo])
@@ -163,18 +183,11 @@ async def revoke_device(
 
     from app.db.database import ClientExecutorDevice
 
-    result = await db.execute(
-        select(ClientExecutorDevice).where(
-            ClientExecutorDevice.device_id == device_id,
-            ClientExecutorDevice.user_id == current_user.id,
-        )
-    )
-    row = result.scalar_one_or_none()
-    if row is None:
+    # 解绑=删设备行（用户裁定 2026-10-12）+ 即刻踢线（PLAN §8.3：unregister 已按
+    # 会话身份 fail pending）。审计 client_exec_audit 独立留痕。
+    ok = await cds.revoke_device(db, current_user.id, device_id)
+    if not ok:
         raise HTTPException(status_code=404, detail="设备不存在")
-    row.revoked = True
-    await db.commit()
-    # revoke 即踢线（PLAN §8.3）：unregister 已按会话身份 fail pending
     device_session_manager.unregister(device_id)
     return {"ok": True, "revoked": True}
 
@@ -194,19 +207,34 @@ async def _require_owned_device(db: AsyncSession, user_id: str, device_id: str):
     row = result.scalar_one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="设备不存在或已解绑")
+    # r4 fs 面竞态：DB 行属主 ≠ 在线会话属主（握手建连与换绑竞态残留）→ 拒
+    sess_user = device_session_manager.device_user_id(device_id)
+    if sess_user is not None and sess_user != user_id:
+        raise HTTPException(status_code=409, detail="设备在线会话与绑定身份不一致，请重新配对")
     return row
 
 
 async def _device_rpc(device_id: str, method: str, params: dict) -> dict:
     timeout = float(get_config().client_exec_call_timeout_seconds)
     try:
-        return await device_session_manager.rpc_call(device_id, method, params, timeout=timeout)
+        res = await device_session_manager.rpc_call(device_id, method, params, timeout=timeout)
+        # 评审 r4 I-b：fs/list|read 的 {"ok":false,"error"} 信封曾随 200 原样外漏 wire 码
+        if isinstance(res, dict) and res.get("ok") is False and res.get("error"):
+            from app.services.client_device_service import classify_wire_error
+
+            hint = classify_wire_error(str(res.get("error")), code=res.get("error_code"))
+            if hint:
+                res = {**res, "error": hint}
+        return res
     except DeviceOfflineError:
         raise HTTPException(status_code=502, detail="设备已离线")
     except DeviceCallTimeoutError:
         raise HTTPException(status_code=504, detail="设备执行超时")
-    except DeviceCallError:
-        raise HTTPException(status_code=502, detail="设备执行失败")
+    except DeviceCallError as exc:
+        from app.services.client_device_service import classify_wire_error
+
+        hint = classify_wire_error(str(exc), code=getattr(exc, "code", None))
+        raise HTTPException(status_code=502, detail=hint or "设备执行失败")
 
 
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -295,7 +323,10 @@ async def _device_fetch_bytes(device_id: str, method: str, params: dict) -> byte
     except DeviceOversizeError as exc:
         raise HTTPException(status_code=413, detail=str(exc))
     except DeviceCallError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        from app.services.client_device_service import classify_wire_error
+
+        hint = classify_wire_error(str(exc), code=getattr(exc, "code", None))
+        raise HTTPException(status_code=502, detail=hint or str(exc))
 
 
 @router.get("/{device_id}/fs/download")

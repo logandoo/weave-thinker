@@ -1099,9 +1099,28 @@ class Config:
         import os
         return str(os.environ.get(name, "")).strip().lower() == "off"
 
+    _VIBEWEAVER_MODES = ("off", "auto", "always")
+
+    @property
+    def vibeweaver_mode(self) -> str:
+        """D9/H15 单一 owner：`off`=不注入+不装钩子（含 force-inject 短路）；
+        `auto`=W17 轮次门控（现状）；`always`=旧行为（无条件注入）。
+
+        `mode` 缺省时从 enabled + task_gating_enabled **推导**（向后兼容：现有
+        config 不带 mode 键 → enabled 默认 true + gating 默认 true → auto）。
+        """
+        raw = str(self.vibeweaver.get("mode", "") or "").strip().lower()
+        if raw in self._VIBEWEAVER_MODES:
+            return raw
+        if not bool(self.vibeweaver.get("enabled", True)):
+            return "off"
+        if not bool(self.vibeweaver.get("task_gating_enabled", True)):
+            return "always"
+        return "auto"
+
     @property
     def vibeweaver_enabled(self) -> bool:
-        return bool(self.vibeweaver.get("enabled", True))
+        return self.vibeweaver_mode != "off"
 
     @property
     def vibeweaver_gate_enabled(self) -> bool:
@@ -1122,13 +1141,26 @@ class Config:
         return bool(self.vibeweaver.get("loop_guard_enabled", True))
 
     @property
+    def vibeweaver_stop_guard_enabled(self) -> bool:
+        """D3/§V12 stop-guard（伪停检测）。逃生口 VIBEWEAVER_STOPGUARD=off。"""
+        if self._env_off("VIBEWEAVER_STOPGUARD"):
+            return False
+        return bool(self.vibeweaver.get("stop_guard_enabled", True))
+
+    @property
     def vibeweaver_task_gating_enabled(self) -> bool:
         """W17 轮次门控：force-inject 与 gate/audit 仅对 coding/显式提及轮生效。
-        逃生口 `VIBEWEAVER_GATING=off` 或 `[vibeweaver] task_gating_enabled=false`
-        恢复无条件注入（2026-10-10 前的旧行为）。"""
+        D9 归口：= (mode == "auto")。逃生口 `VIBEWEAVER_GATING=off`（旧行为=always）。"""
         if self._env_off("VIBEWEAVER_GATING"):
             return False
-        return bool(self.vibeweaver.get("task_gating_enabled", True))
+        return self.vibeweaver_mode == "auto"
+
+    @property
+    def vibeweaver_c8_enabled(self) -> bool:
+        """D7/H14：C8 禁止裸命令检测（note 不拦截）。`VIBEWEAVER_C8=off` 逃生。"""
+        if self._env_off("VIBEWEAVER_C8"):
+            return False
+        return bool(self.vibeweaver.get("c8_enabled", True))
 
     @property
     def vibeweaver_audit_core_path(self) -> str:

@@ -146,6 +146,8 @@ def resolve_execution_target(kwargs: Dict[str, Any]) -> Optional[str]:
 
 
 def _workspace_ctx(kwargs: Dict[str, Any]) -> Optional[str]:
+    """名门期望值（与设备侧 expected 同源公式）；None=不可算——调用方必须
+    fail-closed（算不出即不派发，永不发 null/空键，r1-F2）。"""
     user = kwargs.get("user")
     if user is None:
         return None
@@ -153,6 +155,8 @@ def _workspace_ctx(kwargs: Dict[str, Any]) -> Optional[str]:
         from app.services.workspace_service import _slugify
         username = getattr(user, "username", None) or ""
         user_id = str(getattr(user, "id", "") or "")
+        if not user_id:
+            return None
         return f"{_slugify(username)}-{user_id[:8]}"
     except Exception:
         return None
@@ -164,19 +168,33 @@ _HYBRID_BYTE_TOOLS = {
     "asr_transcribe": "audio_path",
 }
 
+def _friendly_call_error(err: str, code: Optional[str] = None) -> Optional[str]:
+    """wire 错误码→友好提示（Hub 文案在 client_device_service.WIRE_ERROR_HINTS）；
+    未识别返回 None（走原样/既有分类）。code=结构化 error_code 字段，优先防伪装。"""
+    from app.services.client_device_service import classify_wire_error
+
+    hint = classify_wire_error(err, code=code)
+    return tool_error(hint) if hint else None
+
 
 async def fetch_file_bytes(
-    device_id: str, method: str, params: Dict[str, Any], max_bytes: Optional[int] = None
+    device_id: str, method: str, params: Dict[str, Any], max_bytes: Optional[int] = None,
+    expected_user_id: Optional[str] = None,
 ):
     from app.services.device_session_service import device_session_manager
     return await device_session_manager.fetch_file_bytes(
-        device_id, method, params, max_bytes=max_bytes
+        device_id, method, params, max_bytes=max_bytes, expected_user_id=expected_user_id
     )
 
 
-async def rpc_call(device_id: str, method: str, params: Dict[str, Any], timeout: Optional[float] = None):
+async def rpc_call(
+    device_id: str, method: str, params: Dict[str, Any], timeout: Optional[float] = None,
+    expected_user_id: Optional[str] = None,
+):
     from app.services.device_session_service import device_session_manager
-    return await device_session_manager.rpc_call(device_id, method, params, timeout=timeout)
+    return await device_session_manager.rpc_call(
+        device_id, method, params, timeout=timeout, expected_user_id=expected_user_id
+    )
 
 
 async def record_exec_audit(kwargs, device_id, tool, ok, error, duration_ms):
@@ -310,6 +328,21 @@ async def _try_remote_dispatch_inner(
     if not target or not target.startswith("device:"):
         return None
     device_id = target.split(":", 1)[1]
+    # C1 属主栅栏（评审 r3/r4 Critical）：派发按 device_id 盲路由——在线会话属主必须
+    # 与会话用户一致。硬删释放的 device_id 被他人抢占=劫持不可变会话执行通道（波前
+    # 软删占槽不可达）；栅栏后抢占者会话无法收到受害会话的派发。
+    from app.services.device_session_service import device_session_manager as _dsm
+
+    _sess_user = _dsm.device_user_id(device_id)
+    _acting = str(getattr(kwargs.get("user"), "id", "") or "")
+    if _sess_user is not None and _acting and _sess_user != _acting:
+        await record_exec_audit(
+            kwargs, device_id, tool_name, False, "device-owner-mismatch", 0
+        )
+        return tool_error(
+            "设备身份不匹配（安全拦截）：该设备当前绑定其他账号，已拒绝派发。"
+            "请重新配对设备，或改用云端执行环境（新建会话）。"
+        )
     if not _feature_enabled():
         return tool_error(
             "设备执行已停用（client_exec.enabled=false）：该会话执行环境为客户端设备，"
@@ -318,6 +351,13 @@ async def _try_remote_dispatch_inner(
 
     # W19 P1 混合工具：文件字节经设备代理取回注入本地 handler（网关留云端）
     if tool_name in _HYBRID_BYTE_TOOLS:
+        # NEW-I1（r4）：字节面无 ws_ctx 兜底——缺用户上下文即 fail-closed（栅栏同责）
+        if not _acting:
+            await record_exec_audit(kwargs, device_id, f"{tool_name}:bytes", False, "no-user-context", 0)
+            return tool_error(
+                "无法确认执行身份（缺用户上下文）：已按 fail-closed 拒绝派发，"
+                "不回退云端执行。请重新登录后重试。"
+            )
         rel = str(args.get(_HYBRID_BYTE_TOOLS[tool_name]) or "").strip()
         if rel:
             # A4.9 I-2：云端先硬化路径（防御纵深——不全信设备侧包含性）
@@ -336,12 +376,14 @@ async def _try_remote_dispatch_inner(
                 return int((_time.monotonic() - _t0) * 1000)
 
             try:
-                data = await fetch_file_bytes(device_id, "fs/download", {"path": rel})
+                data = await fetch_file_bytes(
+                    device_id, "fs/download", {"path": rel}, expected_user_id=_acting or None
+                )
             except DeviceOfflineError:
                 await record_exec_audit(kwargs, device_id, f"{tool_name}:bytes", False, "offline", _ms())
                 return tool_error(
-                    "设备已离线：该文件位于客户端设备工作区，无法取回字节。"
-                    "请保持客户端在线，或改用云端执行环境（新建会话）。"
+                    "设备已离线或已解绑：该文件位于客户端设备工作区，无法取回字节。"
+                    "请确认客户端在线；若已解绑/换绑请重新配对，或改用云端执行环境（新建会话）。"
                 )
             except DeviceCallTimeoutError:
                 await record_exec_audit(kwargs, device_id, f"{tool_name}:bytes", False, "timeout", _ms())
@@ -349,6 +391,9 @@ async def _try_remote_dispatch_inner(
             except DeviceCallError as exc:
                 msg = str(exc)
                 await record_exec_audit(kwargs, device_id, f"{tool_name}:bytes", False, msg[:200], _ms())
+                friendly = _friendly_call_error(msg, code=getattr(exc, "code", None))
+                if friendly is not None:
+                    return friendly
                 if "超过" in msg:
                     return tool_error("设备文件过大，超出取回上限：请改用更小的文件。")
                 return tool_error("设备文件取回失败：请检查设备状态后重试。")
@@ -357,11 +402,28 @@ async def _try_remote_dispatch_inner(
         return None  # 继续本地执行（模型网关在云端）
 
     if tool_name in _remote_allowed_tools():
+        # r1-F2 fail-closed：名门期望值算不出即不派发（永不发 null/空 workspace_ctx
+        # 键——设备侧新名门「键在但空」直接拒绝，null 键只会把失败推迟到设备端）。
+        ws_ctx = _workspace_ctx(kwargs)
+        if not ws_ctx:
+            # 评审 A-I2：user 缺失/空 id 时 record_exec_audit 会静默跳过（无 user_id 不落
+            # 行）——补 logger.warning 保证主触发面在日志留痕。
+            logger.warning(
+                "device-exec fail-closed: workspace_ctx unavailable tool=%s device=%s",
+                tool_name, device_id,
+            )
+            await record_exec_audit(
+                kwargs, device_id, tool_name, False, "workspace-ctx-unavailable", 0
+            )
+            return tool_error(
+                "无法计算设备执行身份（workspace_ctx 缺失用户上下文）：已按 fail-closed "
+                "拒绝派发，不回退云端执行。请重新登录后重试，或改用云端执行环境（新建会话）。"
+            )
         timeout = _tool_timeout(tool_name)
         params = {
             "tool": tool_name,
             "args": strip_internal_args(args),
-            "workspace_ctx": _workspace_ctx(kwargs),
+            "workspace_ctx": ws_ctx,
             "timeout_seconds": timeout,
         }
         if tool_name == "skill_run_script":
@@ -378,24 +440,38 @@ async def _try_remote_dispatch_inner(
         def _ms() -> int:
             return int((_time.monotonic() - _t0) * 1000)
 
+        _recheck = _dsm.device_user_id(device_id)
+        if _recheck is not None and _acting and _recheck != _acting:
+            await record_exec_audit(kwargs, device_id, tool_name, False, "device-owner-mismatch", 0)
+            return tool_error("设备身份不匹配（安全拦截）：该设备当前绑定其他账号，已拒绝派发。")
         try:
-            result = await rpc_call(device_id, "tools/call", params, timeout=timeout)
+            result = await rpc_call(
+                device_id, "tools/call", params, timeout=timeout, expected_user_id=_acting or None
+            )
         except DeviceOfflineError:
             await record_exec_audit(kwargs, device_id, tool_name, False, "offline", _ms())
             return tool_error(
-                "设备已离线：执行环境为客户端设备但当前未连接。"
-                "请保持客户端在线，或改用云端执行环境（新建会话）。"
+                "设备已离线或已解绑：执行环境为客户端设备但当前未连接。"
+                "请确认客户端在线；若已解绑/换绑请重新配对，或改用云端执行环境（新建会话）。"
             )
         except DeviceCallTimeoutError:
             await record_exec_audit(kwargs, device_id, tool_name, False, "timeout", _ms())
             return tool_error("设备执行超时：请检查设备负载后重试。")
         except DeviceCallError as exc:
             await record_exec_audit(kwargs, device_id, tool_name, False, str(exc)[:200], _ms())
-            return tool_error(f"设备执行失败: {str(exc)[:200]}")
+            # 评审 B-I1：JSON-RPC error 信封同样以 DeviceCallError 抵达（device_session_
+            # service:252-255）——码前缀映射必须与 result.error 面一致，不得漏第三个消费面。
+            friendly = _friendly_call_error(str(exc))
+            return (
+                friendly
+                if friendly is not None
+                else tool_error(f"设备执行失败: {str(exc)[:200]}")
+            )
         if isinstance(result, dict) and result.get("ok") is False:
             _err = str(result.get("error") or "设备执行失败")[:200]
             await record_exec_audit(kwargs, device_id, tool_name, False, _err, _ms())
-            return tool_error(_err)
+            friendly = _friendly_call_error(_err, code=result.get("error_code"))
+            return friendly if friendly is not None else tool_error(_err)
         if isinstance(result, dict) and isinstance(result.get("content"), str):
             await record_exec_audit(kwargs, device_id, tool_name, True, None, _ms())
             return result["content"]

@@ -47,6 +47,18 @@ async def device_exec_ws(
 
     await websocket.accept()
     session = device_session_manager.register(device.device_id, device.user_id, websocket)
+    # r4 握手建连复核：token 校验(T0)→register(T1) 窗口内发生 revoke+他户重配对时
+    # 会话属主与现行行失配——复核不合即拆（会话-行竞态闭合）。
+    try:
+        again = await cds.verify_device_token(db, presented)
+    except Exception:
+        again = None
+    if again is None or again.device_id != session.device_id or again.user_id != session.user_id:
+        device_session_manager.unregister(session.device_id, session)
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION, reason="device binding changed"
+        )
+        return
     try:
         while True:
             msg = await websocket.receive_json()

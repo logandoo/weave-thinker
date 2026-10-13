@@ -526,9 +526,13 @@ class AgentWorker:
                     _vw_gating = bool(config.vibeweaver_task_gating_enabled)
                 except Exception:
                     _vw_gating = True
-                agent_loop.vibeweaver_active = _vw_resolve_eff(
-                    _vw_last, None, _vw_gating, context_text=_vw_ctx
-                )
+                try:
+                    _vw_off = str(getattr(config, "vibeweaver_mode", "auto") or "auto") == "off"
+                except Exception:
+                    _vw_off = False
+                agent_loop.vibeweaver_active = _vw_resolve_eff(_vw_last, None, _vw_gating, context_text=_vw_ctx)
+                if _vw_off:
+                    agent_loop.vibeweaver_active = False  # D9：mode=off 全关（含后台/定时面）
                 logger.info(
                     "vibeweaver turn gate active=%s explicit=%s coding=None gating=%s task=%s",
                     agent_loop.vibeweaver_active, _vw_explicit(_vw_last), _vw_gating, task_id,

@@ -301,7 +301,7 @@
                 class="reasoning-menu-overlay"
                 @click="closeExecMenu"
               >
-                <div class="reasoning-menu" :style="execMenuStyle" @click.stop>
+                <div class="reasoning-menu exec-menu" :style="execMenuStyle" @click.stop>
                   <div class="reasoning-menu-title">执行环境</div>
                   <button
                     class="reasoning-menu-item"
@@ -347,18 +347,6 @@
                     <div v-if="pairingCode" class="exec-pair-code">
                       <code>{{ pairingCode }}</code>
                       <span class="reasoning-menu-desc">{{ pairingHint }}</span>
-                    </div>
-                  </div>
-                  <div v-if="execAuditItems.length" class="exec-pair-section">
-                    <div class="reasoning-menu-title">最近远端执行</div>
-                    <div
-                      v-for="item in execAuditItems"
-                      :key="item.id"
-                      class="exec-audit-row"
-                    >
-                      <span class="exec-online-dot" :class="{ online: item.ok }"></span>
-                      <span class="exec-audit-tool">{{ item.tool }}</span>
-                      <span class="exec-audit-meta">{{ item.ok ? `${item.duration_ms}ms` : (item.error || '失败') }}</span>
                     </div>
                   </div>
                 </div>
@@ -519,7 +507,6 @@ import { notesApi } from '@/api/notes'
 import { clientDevicesApi } from '@/api/clientDevices'
 import { saveUiPreferences, getUiPreferences } from '@/api/skins'
 import type { ClientDevice } from '@/types'
-import type { ClientExecAuditItem } from '@/api/clientDevices'
 import { renderMarkdownToHtml } from '@/composables/useMarkdown'
 import { useAsrStreaming } from '@/composables/useAsrStreaming'
 import { useAsrHotwords } from '@/composables/useAsrHotwords'
@@ -822,8 +809,6 @@ const pairingCode = ref<string | null>(null)
 const pairingBusy = ref(false)
 const pairingHint = ref('在客户端「设备执行」面板输入此码（短时有效，一次性）')
 const revokeArmId = ref<string | null>(null)
-// W19 P3：最近远端执行审计（菜单打开时拉取）
-const execAuditItems = ref<ClientExecAuditItem[]>([])
 // A4.9 I-3：用户显式选择标记——偏好恢复竞态护栏
 const execUserSelected = ref(false)
 
@@ -863,11 +848,6 @@ async function openExecMenu() {
     execDevices.value = await clientDevicesApi.list()
   } catch {
     // 列表拉取失败保持空态提示，允许重开菜单重试
-  }
-  try {
-    execAuditItems.value = await clientDevicesApi.listExecutions(8)
-  } catch {
-    execAuditItems.value = []
   }
 }
 
@@ -940,7 +920,12 @@ async function execPreSendCheck(): Promise<boolean> {
     return true
   }
   const dev = execDevices.value.find(d => `device:${d.device_id}` === t)
-  if (dev && dev.revoked) {
+  if (!dev) {
+    // 评审 r4 I-b：目标设备已删（解绑即删）——不得 fail-open 放行，D-8 不静默改道
+    showToast('设备已解绑或不存在：请重新配对设备，或改用云端执行环境', 'error')
+    return false
+  }
+  if (dev.revoked) {
     showToast('设备已解绑：请改用云端新建会话', 'error')
     return false
   }
@@ -1791,6 +1776,13 @@ onMounted(() => {
         && !chatStore.currentConversationId
       ) {
         chatStore.executionTarget = t
+        // 遗留清偿 #6（P2 显式提示）：静默采纳默认执行环境=用户不知情进入设备模式
+        // （conv e8e9494f 事故触发条件之一）——采纳即提示。评审 r4 M1：每标签页会话
+        // 只提示一次（reload 重放不复读）。
+        if (!sessionStorage.getItem('wt-default-exec-toast')) {
+          sessionStorage.setItem('wt-default-exec-toast', '1')
+          showToast('新会话已按你的默认设置使用设备执行', 'info')
+        }
       }
     })
     .catch(() => {})
@@ -2248,6 +2240,12 @@ defineExpose({ setEditContent })
   animation: menu-pop-up 0.15s ease-out;
 }
 
+/* 执行环境菜单：设备多时防越出视口（底部锚定向上生长）——内部滚动 */
+.exec-menu {
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+}
+
 @keyframes menu-pop-up {
   from {
     opacity: 0;
@@ -2430,26 +2428,6 @@ defineExpose({ setEditContent })
 
 .exec-env-btn.offline {
   opacity: 0.55;
-}
-
-/* W19 P3：最近远端执行审计行 */
-.exec-audit-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 12px;
-  font-size: 12px;
-  color: var(--color-text-light);
-}
-
-.exec-audit-tool {
-  font-weight: 600;
-  color: var(--color-text);
-}
-
-.exec-audit-meta {
-  margin-left: auto;
-  opacity: 0.8;
 }
 
 .reasoning-menu-item {

@@ -4585,6 +4585,15 @@ class AgentLoop:
         if not self._skip_guardrails():
             try:
                 from app.services import hook_service as _hs
+                # D3 stop-guard：末条真实用户消息（跳过 _ephemeral 注入面）供
+                # 用户停令白名单；工具调用事实供 taskActive 判定。取**最后一条**
+                # user（内容非 str 则空串——不得回退更旧消息污染白名单，评审 A-m4）。
+                _last_user_text = ""
+                for _m in reversed(state.messages):
+                    if _m.get("role") == "user" and not _m.get("_ephemeral"):
+                        _uc = _m.get("content")
+                        _last_user_text = _uc if isinstance(_uc, str) else ""
+                        break
                 _stop_ctx = _hs.StopContext(
                     session_id=str(getattr(state, "session_id", "") or ""),
                     conversation_id=str(getattr(conversation, "id", "") or ""),
@@ -4593,6 +4602,8 @@ class AgentLoop:
                     assistant_content=assistant_content or "",
                     vibeweaver_active=self.vibeweaver_active,
                     iterations=state.iterations,
+                    last_user_text=_last_user_text,
+                    had_tool_calls=bool(getattr(state, "total_tool_calls", 0)),
                     stop_hook_blocks_this_turn=state.stop_hook_blocks,
                 )
                 _stop_decision = await _hs.run_stop_hooks(_stop_ctx)
@@ -7929,6 +7940,22 @@ class AgentLoop:
         if self.deathmatch_manager and self.deathmatch_manager.is_goal_active:
             self._compressor.threshold_percent = min(self._compressor.threshold_percent, 0.5)
             self._compressor.protect_last_tokens = max(self._compressor.protect_last_tokens, 30000)
+        self._attach_compressor_delivery(self._compressor)
+
+    def _attach_compressor_delivery(self, compressor: Any) -> None:
+        """D4：给 compressor 挂 vibeweaver 投递根/会话（压缩完成点投递）。
+
+        根 = workspace_path（投递服务自会做 vibeweaver-active 判定）；会话键供
+        pendingResume 的下一轮一次性消费。fail-open。
+        """
+        try:
+            if not getattr(compressor, "delivery_root", None) and self.workspace_path:
+                compressor.delivery_root = self.workspace_path
+            if not getattr(compressor, "delivery_conv_id", ""):
+                compressor.delivery_conv_id = getattr(self, "_delivery_conv_id", "") or ""
+            compressor.delivery_active = bool(getattr(self, "vibeweaver_active", True))
+        except Exception:
+            pass
 
     def _drain_interjections(self, state: AgentLoopState) -> List[dict]:
         """Drain pending user interjections into the live message list.
@@ -7972,6 +7999,13 @@ class AgentLoop:
         assistant_content = ""
         # vibeweaver loop-guard：注册活跃 run（观察器请求中断的落点）。
         _lg_conv_id = str(getattr(conversation, "id", "") or "")
+        self._delivery_conv_id = _lg_conv_id
+        # D3 stop-guard 会话锚：在任何回合写入之前建立 first_seen（白名单 mtime 比较）。
+        try:
+            from app.services.vibeweaver_stop_guard import touch_session as _sg_touch
+            _sg_touch(_lg_conv_id)
+        except Exception:
+            pass
         try:
             from app.services.vibeweaver_audit_service import register_run as _lg_register
             _lg_register(_lg_conv_id, state)
@@ -8377,6 +8411,26 @@ class AgentLoop:
                     if event_type == "reasoning":
                         reasoning_content += event_data
                         self._mark_activity(state)
+                        # vibeweaver loop-guard 观察通道（D1.1）：reasoning 增量单独
+                        # 发布（channel=reasoning）——仅 content 观测不住 reasoning
+                        # 独有的墙（hermes #97630 形态：reasoning 里 "!!!!" 无 content）。
+                        try:
+                            from app.services.agent_event_bus import (
+                                AgentEvent as _AebEvent,
+                                agent_event_bus as _aeb,
+                            )
+                            if event_data:
+                                _aeb.publish_soon(_AebEvent(
+                                    type="message.delta",
+                                    session_id=_lg_conv_id,
+                                    data={
+                                        "delta": event_data,
+                                        "channel": "reasoning",
+                                        "msg_id": f"iter-{state.iterations}",
+                                    },
+                                ))
+                        except Exception:
+                            pass
                         # PHASE 4: cap runaway reasoning streams from thinking-
                         # by-default sub-task models. Once we hit the cap we
                         # stop accepting more reasoning chars and break out so
@@ -8459,7 +8513,11 @@ class AgentLoop:
                                 _aeb.publish_soon(_AebEvent(
                                     type="message.delta",
                                     session_id=_lg_conv_id,
-                                    data={"delta": content_text},
+                                    data={
+                                        "delta": content_text,
+                                        "channel": "content",
+                                        "msg_id": f"iter-{state.iterations}",
+                                    },
                                 ))
                             except Exception:
                                 pass
@@ -10671,6 +10729,28 @@ class AgentLoop:
                         # PHASE 5: final_thinking is THE user-visible reasoning
                         # phase. Tag the event so frontend can render it under
                         # the 💭 "思考过程" panel exclusively.
+                        # vibeweaver loop-guard（D1.1）：final_thinking 的 reasoning
+                        # 独立发布（channel=reasoning，msg 键 final-* = 新 turn）。
+                        try:
+                            from app.services.agent_event_bus import (
+                                AgentEvent as _AebEvent,
+                                agent_event_bus as _aeb,
+                            )
+                            if event_data:
+                                _aeb.publish_soon(_AebEvent(
+                                    type="message.delta",
+                                    session_id=(
+                                        getattr(self, "_delivery_conv_id", "")
+                                        or str(getattr(state, "session_id", "") or "")
+                                    ),
+                                    data={
+                                        "delta": event_data,
+                                        "channel": "reasoning",
+                                        "msg_id": f"final-{state.iterations}",
+                                    },
+                                ))
+                        except Exception:
+                            pass
                         yield {"reasoning_content": event_data, "phase": "final"}
                     elif event_type == "content":
                         content_text = event_data
@@ -10827,6 +10907,7 @@ class AgentLoop:
                         _ctx_len = _resolve_context_length(self.llm)
                         if _ctx_len > 0:
                             self._compressor.update_context_length(_ctx_len)
+                        self._attach_compressor_delivery(self._compressor)
                     from app.services.context_compressor import estimate_request_tokens_rough
                     _before = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
                     state.messages = await self._compressor.compress_async(state.messages)
@@ -11273,6 +11354,7 @@ class AgentLoop:
                 user_id=str(getattr(user, "id", "") or ""),
                 workspace_path=self.workspace_path or "",
                 vibeweaver_active=self.vibeweaver_active,
+                turn_key=f"iter-{state.iterations}",
             )
             _before = await _hs.run_tool_hooks("before", _hook_ctx)
         except Exception:

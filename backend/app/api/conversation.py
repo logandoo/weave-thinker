@@ -988,6 +988,7 @@ async def get_conversation(
         title=conversation.title,
         group_id=conversation.group_id,
         assistant_id=conversation.assistant_id,
+        execution_target=conversation.execution_target,
         sort_order=conversation.sort_order or 0,
         created_at=_utc_iso(conversation.created_at),
         updated_at=_utc_iso(conversation.updated_at),

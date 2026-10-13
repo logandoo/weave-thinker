@@ -2371,9 +2371,15 @@ async def chat_stream(
             _vw_explicit_hit = _vw_explicit(_vw_text)
             try:
                 _vw_gating = get_config().vibeweaver_task_gating_enabled
+                # D9/H15：mode=off = 不注入 + 不装钩子（单一 owner；kill-switch 全关，
+                # 含 force-inject 短路——round-6 三接缝之一）。
+                _vw_mode = get_config().vibeweaver_mode
             except Exception:
-                _vw_gating = True
-            _vw_active = _vw_resolve_eff(_vw_text, _vw_coding, _vw_gating, context_text=_vw_ctx)
+                _vw_gating, _vw_mode = True, "auto"
+            if _vw_mode == "off":
+                _vw_active = False
+            else:
+                _vw_active = _vw_resolve_eff(_vw_text, _vw_coding, _vw_gating, context_text=_vw_ctx)
             agent_loop.vibeweaver_active = _vw_active
             if _vw_active:
                 _vw_block = await build_force_injected_skills_prompt(current_user)
@@ -2382,9 +2388,32 @@ async def chat_stream(
                         (skills_sys_prompt + "\n\n" + _vw_block) if skills_sys_prompt else _vw_block
                     )
             logger.info(
-                "vibeweaver turn gate active=%s explicit=%s coding=%s gating=%s conv=%s",
-                _vw_active, _vw_explicit_hit, _vw_coding, _vw_gating, conversation_id,
+                "vibeweaver turn gate active=%s explicit=%s coding=%s gating=%s mode=%s conv=%s",
+                _vw_active, _vw_explicit_hit, _vw_coding, _vw_gating, _vw_mode, conversation_id,
             )
+
+            # D4 compactResume：压缩发生后的**下一轮** system 装配一次性注入恢复包
+            # （会话级 pending 标记；消费即清，绝不重复注入）。fail-open。
+            try:
+                if _vw_mode != "off":
+                    from app.services import vibeweaver_delivery_service as _vw_delivery
+                    from app.services.vibeweaver_gate_service import (
+                        find_project_root as _vw_find_root,
+                        resolve_session_root as _vw_resolve_root,
+                    )
+                    _vw_ws = str(workspace.root_path)
+                    _vw_root = _vw_resolve_root(_vw_ws, str(conversation_id))
+                    if _vw_root is None:
+                        _vw_root = _vw_find_root([_vw_ws], bound=_vw_ws)
+                    if _vw_root is not None:
+                        _vw_resume = _vw_delivery.consume_pending_resume(_vw_root, str(conversation_id))
+                        if _vw_resume:
+                            skills_sys_prompt = (
+                                (skills_sys_prompt + "\n\n" + _vw_resume) if skills_sys_prompt else _vw_resume
+                            )
+                            logger.info("vibeweaver compact-resume injected (conv=%s)", conversation_id)
+            except Exception:
+                logger.debug("vibeweaver compact-resume injection failed-open", exc_info=True)
 
             from types import SimpleNamespace
             if memory_context is not None and memory_context.strip():

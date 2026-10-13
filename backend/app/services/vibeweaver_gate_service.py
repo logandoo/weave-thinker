@@ -320,36 +320,44 @@ def count_passes(root: Path) -> int:
 # ---------- 停顿观察器（事实报告，非裁决） ----------
 
 def stall_observation(root: Path, file_rel: str) -> Optional[str]:
+    """同文件 3 连写且无新 PASS → STALL 事实报告（D2：once-per-signature latch）。
+
+    wave17 语义：`firedKey = "<file>@<pass_count>"` 同签名只报一次（每次命中都
+    报是告警洪水，训练出告警盲视）；新 PASS 落地改变签名 → 自动重武装。
+    走 `vibeweaver_state.mutate_state` 共享锁（评审 r1-A #2：与本进程其它
+    state.json 写者同锁）；未知字段保留（wave21 教训：禁止整体重置）。
+    """
     try:
-        p = root / STATE_DIR / STATE_FILE
-        st: Dict[str, Any] = {"ops": []}
-        if p.exists():
-            try:
-                st = json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                st = {"ops": []}
-        if not isinstance(st.get("ops"), list):
-            st["ops"] = []
-        st["ops"].append({"f": file_rel, "p": count_passes(root), "t": int(time.time() * 1000)})
-        st["ops"] = st["ops"][-MAX_OPS:]
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, p)
-        run = st["ops"][-STALL_RUN:]
-        if len(run) < STALL_RUN:
-            return None
-        same_file = all(o.get("f") == run[0].get("f") for o in run)
-        no_new_pass = run[0].get("p") == run[-1].get("p")
-        if same_file and no_new_pass:
-            return (
+        from app.services import vibeweaver_state as _vst
+
+        out: Dict[str, Optional[str]] = {"msg": None}
+
+        def _m(st: Dict[str, Any]) -> None:
+            ops = st.get("ops") if isinstance(st.get("ops"), list) else []
+            ops.append({"f": file_rel, "p": count_passes(root), "t": int(time.time() * 1000)})
+            st["ops"] = ops[-MAX_OPS:]
+            run = st["ops"][-STALL_RUN:]
+            if len(run) < STALL_RUN:
+                return
+            same_file = all(o.get("f") == run[0].get("f") for o in run)
+            no_new_pass = run[0].get("p") == run[-1].get("p")
+            if not (same_file and no_new_pass):
+                return
+            fired_key = f"{run[0].get('f')}@{run[0].get('p')}"
+            stall_state = st.get("stall") if isinstance(st.get("stall"), dict) else {}
+            if stall_state.get("firedKey") == fired_key:
+                return  # 同签名只报一次（新 PASS → 签名变化 → 自动重武装）
+            st["stall"] = {"firedKey": fired_key, "ts": int(time.time() * 1000)}
+            out["msg"] = (
                 f'STALL observed (machine-counted): "{run[0].get("f")}" modified {STALL_RUN}x '
                 "with no new \"iter N PASS\" entry in tests/verification_log.md in between — "
                 "COV-7 stall=3x is likely reached. Do not retry the same direction: parameterize "
                 "(finite candidate set + cheapest refuting test) or shift the abstraction/strategy "
                 "— TESTING_PROTOCOLS.md §A4.10."
             )
-        return None
+
+        _vst.mutate_state(root, _m)
+        return out["msg"]
     except Exception:
         return None
 
@@ -466,12 +474,39 @@ async def _tool_after_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_s
     if root is None:
         return None
     file_path = (ctx.args or {}).get("file_path") or (ctx.args or {}).get("path")
+    from app.services import vibeweaver_delivery_service as _delivery
+
     out = await gate_check_write_async(root, file_path)
-    if not out:
-        return None
-    if out.get("block"):
-        return hook_service.HookDecision(block=out["block"])
-    return hook_service.HookDecision(notes=list(out.get("notes") or []))
+    if out and out.get("block"):
+        # D5：证据红时 cue 也必须到达（JS 同款：投递不依赖门禁为绿）
+        try:
+            cues = _delivery.cue_notes(root, file_path)
+        except Exception:
+            cues = []
+        block = out["block"]
+        if cues:
+            block = block + "\n" + "\n".join(cues)
+        return hook_service.HookDecision(block=block)
+    notes: List[str] = list((out or {}).get("notes") or [])
+    try:
+        # 逃生口一致性（评审 A-m3）：gate_enabled=False 时投递/快照/cue 同步关闭
+        # （JS 参考：cueNotes 在 VIBEWEAVER_GATE=off 的早退之后）。
+        gate_on = True
+        try:
+            gate_on = bool(get_config().vibeweaver_gate_enabled)
+        except Exception:
+            gate_on = False
+        if gate_on:
+            # D5 cue triggers（编辑路径命中记忆主题）→ D4 快照刷新（working_note 写入）
+            # → D4 首触 cue（每会话一次，快照先行）
+            notes.extend(_delivery.cue_notes(root, file_path))
+            _delivery.note_note_write(root, _delivery.rel_posix(root, file_path))
+            touch = _delivery.first_touch_cue(root, key)
+            if touch:
+                notes.append(touch)
+    except Exception:
+        pass
+    return hook_service.HookDecision(notes=notes) if notes else None
 
 
 async def _stop_hook(ctx: hook_service.StopContext) -> Optional[hook_service.StopDecision]:

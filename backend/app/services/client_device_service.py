@@ -25,6 +25,24 @@ from app.db.database import ClientExecutorDevice
 
 _DEVICE_TARGET_RE = re.compile(r"^device:[A-Za-z0-9_-]{4,64}$")
 _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+
+# wire 错误码 → 用户可读提示（Consistency Hub 唯一定义点；消费面：remote_dispatch_router
+# tools/call/字节通道 + client_devices fs-proxy HTTP 面）。
+WIRE_ERROR_HINTS = {
+    "identity_unbound": "设备未绑定执行身份，请在客户端重新配对设备后重试。",
+}
+
+
+def classify_wire_error(error: str, code: Optional[str] = None) -> Optional[str]:
+    """wire 错误码→友好提示；None=未识别（调用方原样/既有分类）。
+
+    code（结构化 error_code 字段）优先于首段前缀解析——防工具输出伪装前缀
+    （评审 B-m2：result.error 可嵌模型/用户可控文本）。前缀路径为旧 wire 兼容。"""
+    if code is not None:
+        seg = str(code).strip()
+    else:
+        seg = str(error or "").split(":", 1)[0].strip()
+    return WIRE_ERROR_HINTS.get(seg)
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -155,7 +173,60 @@ async def register_device(
         raise PermissionError("配对码无效或已过期")
     if device_id is not None and not _DEVICE_ID_RE.match(str(device_id)):
         raise PermissionError("device_id 格式非法")
+    # 身份前置校验（评审 r4 I-b：adopt 路径先转 token 后查身份=换 token 进退两难，
+    # 回滚删行更会误杀既有注册）——先验属主再动 token/行。
+    from app.db.database import User
+
+    owner_result = await db.execute(select(User).where(User.id == user_id))
+    owner = owner_result.scalar_one_or_none()
+    if owner is None:
+        raise PermissionError("属主用户不存在，配对已拒绝")
+    if not (getattr(owner, "username", None) or ""):
+        raise PermissionError("属主身份异常，配对已拒绝")
     token, token_hash = generate_device_token()
+    # device_id 连续性（遗留清偿 #1）：同属主同 id 重配对=同行换 token 保身份
+    # （conv execution_target 不孤儿化）；异属主拒（防劫持）；已撤销同属主=复活。
+    existing = None
+    if device_id is not None:
+        # 墓碑闸（遗留清偿：抢占 DoS/劫持纵深第二道）——他户认领已释放 id 一律拒绝；
+        # 原属主认领=清墓碑继续（重配对连续性）。
+        from app.db.database import ClientExecutorDeviceTombstone
+
+        tomb = (
+            await db.execute(
+                select(ClientExecutorDeviceTombstone).where(
+                    ClientExecutorDeviceTombstone.device_id == str(device_id)
+                )
+            )
+        ).scalar_one_or_none()
+        if tomb is not None and tomb.user_id != user_id:
+            raise PermissionError("device_id 已被其他用户使用，不可注册")
+        if tomb is not None:
+            await db.delete(tomb)
+        result = await db.execute(
+            select(ClientExecutorDevice).where(
+                ClientExecutorDevice.device_id == str(device_id)
+            )
+        )
+        existing = result.scalar_one_or_none()
+        if existing is not None and existing.user_id != user_id:
+            raise PermissionError("device_id 已被其他用户注册")
+    if existing is not None:
+        existing.token_hash = token_hash
+        existing.revoked = False
+        existing.name = (name or existing.name or "client-device")[:255]
+        if platform:
+            existing.platform = platform[:40]
+        await db.commit()
+        await db.refresh(existing)
+        # 评审 r3 I-c：换 token 必须踢旧会话（泄漏 token 换绑即断，rpc 只按 device_id 路由）
+        try:
+            from app.services.device_session_service import device_session_manager
+
+            device_session_manager.unregister(device_id)
+        except Exception:
+            logger.exception("device re-register kick failed")
+        return existing, token
     row = ClientExecutorDevice(
         user_id=user_id,
         device_id=device_id or secrets.token_hex(16),
@@ -164,7 +235,14 @@ async def register_device(
         token_hash=token_hash,
     )
     db.add(row)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as exc:
+        # 评审 r3 M2：并发同 id 两码竞态撞 UNIQUE——403 而非 500
+        await db.rollback()
+        if "unique" in str(exc).lower():
+            raise PermissionError("device_id 已被占用，请重试")
+        raise
     await db.refresh(row)
     return row, token
 
@@ -185,13 +263,21 @@ async def verify_device_token(db: AsyncSession, token: str) -> Optional[ClientEx
 async def list_devices(db: AsyncSession, user_id: str) -> list:
     result = await db.execute(
         select(ClientExecutorDevice)
-        .where(ClientExecutorDevice.user_id == user_id)
+        .where(
+            ClientExecutorDevice.user_id == user_id,
+            ClientExecutorDevice.revoked.is_(False),  # 存量残留防御（新语义=解绑即删）
+        )
         .order_by(ClientExecutorDevice.created_at.desc())
     )
     return list(result.scalars().all())
 
 
 async def revoke_device(db: AsyncSession, user_id: str, device_id: str) -> bool:
+    """解绑=删设备行（用户裁定 2026-10-12：解绑设备不留列表）+ 写墓碑。
+    墓碑=释放的 device_id 不裸放：仅原属主可认领（重配对连续），他户认领拒绝。
+    执行审计 client_exec_audit 独立留痕（device_id 无 FK，不受删除影响）。"""
+    from app.db.database import ClientExecutorDeviceTombstone
+
     result = await db.execute(
         select(ClientExecutorDevice).where(
             ClientExecutorDevice.device_id == device_id,
@@ -201,7 +287,13 @@ async def revoke_device(db: AsyncSession, user_id: str, device_id: str) -> bool:
     row = result.scalar_one_or_none()
     if row is None:
         return False
-    row.revoked = True
+    await db.delete(row)
+    await db.execute(
+        __import__("sqlalchemy").delete(ClientExecutorDeviceTombstone).where(
+            ClientExecutorDeviceTombstone.device_id == device_id
+        )
+    )
+    db.add(ClientExecutorDeviceTombstone(device_id=device_id, user_id=user_id))
     await db.commit()
     return True
 

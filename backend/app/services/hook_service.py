@@ -45,6 +45,8 @@ class ToolHookContext:
     # after 阶段填充
     result: str = ""
     is_error: bool = False
+    # 本工具调用所属 turn 键（如 "iter-3"；loop-guard 工具通道 message 边界重武装）
+    turn_key: str = ""
 
 
 @dataclass
@@ -67,6 +69,10 @@ class StopContext:
     vibeweaver_active: bool = True
     turn_tool_names: List[str] = field(default_factory=list)
     iterations: int = 0
+    # D3 stop-guard：末条用户消息（用户停令白名单）与本会话是否发生过工具调用
+    # （taskActive 判定；acceptance.md 存在 + ≥1 工具调用 + 当前块无 final-run）。
+    last_user_text: str = ""
+    had_tool_calls: bool = False
     # 防递归：本次收尾已因 stop hook 续跑过（同 stop 序列只拦一次语义由
     # 预算与本标志共同承担）
     stop_hook_active: bool = False

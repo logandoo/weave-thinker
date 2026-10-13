@@ -53,6 +53,11 @@
                     <path d="M12 2a7 7 0 0 0-7 7c0 2.4 1.2 4.5 3 5.7V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.3c1.8-1.2 3-3.3 3-5.7a7 7 0 0 0-7-7z"/>
                     <line x1="9" y1="22" x2="15" y2="22"/>
                   </template>
+                  <template v-else-if="tab.key === 'device-exec'">
+                    <rect x="2" y="3" width="20" height="14" rx="2"/>
+                    <line x1="8" y1="21" x2="16" y2="21"/>
+                    <line x1="12" y1="17" x2="12" y2="21"/>
+                  </template>
                   <template v-else-if="tab.key === 'editor'">
                     <path d="M12 20h9"/>
                     <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
@@ -112,6 +117,10 @@
                 />
               </div>
 
+              <div v-else-if="activeTab === 'device-exec'" class="tab-panel">
+                <DeviceExecutionPanel embedded />
+              </div>
+
               <div v-else-if="activeTab === 'editor'" class="tab-panel">
                 <div class="editor-prefs-panel">
                   <div class="editor-pref-row">
@@ -154,6 +163,7 @@
 import { ref } from 'vue'
 import { useEditorPrefsStore } from '@/stores/editorPrefs'
 import AsrHotwordsPanel from './AsrHotwordsPanel.vue'
+import DeviceExecutionPanel from './DeviceExecutionPanel.vue'
 import PermissionSettingsPanel from './PermissionSettingsPanel.vue'
 import SkillsPanel from './SkillsPanel.vue'
 import MemoryPanel from './MemoryPanel.vue'
@@ -197,6 +207,7 @@ const tabs = [
   { key: 'skills', label: '技能管理' },
   { key: 'memory', label: '记忆管理' },
   { key: 'skins', label: '皮肤选择' },
+  { key: 'device-exec', label: '设备执行' },
   { key: 'editor', label: '编辑器' },
 ]
 

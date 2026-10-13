@@ -6891,7 +6891,7 @@ curl -k -X GET "https://<host>:8158/api/devices/executions" -H "Authorization: B
 ### POST `/api/devices/pair`
 **Pair Device**
 
-> 设备凭配对码注册（PLAN §8.1 ②③）：token 仅此一次明文回传。
+> 设备凭配对码注册（PLAN §8.1 ②③）：token 仅此一次明文回传。同 device_id 重配对=同行换 token 保身份（历史会话 execution_target 连续，不新建设备行）；device_id 属其他用户=403。
 
 认证：公开　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
 
@@ -6912,6 +6912,8 @@ curl -k -X GET "https://<host>:8158/api/devices/executions" -H "Authorization: B
 | `device_id` | string | 是 |  |
 | `token` | string | 是 |  |
 | `name` | ∪string|null | 否（可空） |  |
+| `user_id` | string | 是 |  |
+| `username` | string | 是 |  |
 
 > \* 输出「必填」列 = 该字段是否总在响应中出现（Pydantic required）；对象字段深层行以 `.` 前缀展开。
 
@@ -6927,7 +6929,9 @@ curl -k -X POST "https://<host>:8158/api/devices/pair" -H "Content-Type: applica
 {
   "device_id": "string",
   "token": "string",
-  "name": "string"
+  "name": "string",
+  "user_id": "string",
+  "username": "string"
 }
 ```
 
@@ -7167,6 +7171,8 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 
 ### POST `/api/devices/{device_id}/revoke`
 **Revoke Device**
+
+> 解绑=即刻踢线并**删除设备记录**（2026-10-12 起：列表不再显示解绑设备；执行审计 client_exec_audit 独立留痕不受影响）。释放的 device_id 进**墓碑**（仅原属主可认领，他户认领 403）；同 device_id 重新配对=同 id 新插入（历史会话目标连续）；行在时重配对=同行换 token。
 
 认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/client_devices.py + app/api/device_ws.py`
 
@@ -7560,11 +7566,12 @@ login/refresh/me/profile 四处统一携带 `nickname` 与 `avatar_data`。
 
 1. 已登录用户在 Web 端 `POST /api/devices/pairing-code` 取一次性配对码（短 TTL，绑定当前用户）；
 2. 客户端软件 `POST /api/devices/pair` 凭码注册，换取长效设备 token（明文仅此一次回传，云端只存
-   `sha256(token)`）；
+   `sha256(token)`）；响应同时携带属主云端身份 `user_id`/`username`（设备侧直接落盘为执行身份
+   名门期望值来源，不再依赖 sync 回填/过渡态）；
 3. 设备以出站长连接连 `WS /api/device/ws`——鉴权**仅** `Authorization: Bearer <device token>` 头
    （query token 一律拒绝，长效凭据不进 URL/访问日志）；未知/已撤销 token 拒绝握手；
 4. 用户可 `GET /api/devices` 查看设备与在线状态，`POST /api/devices/{id}/revoke` 解绑（即刻踢线并
-   拒绝新调用）；`GET /api/devices/executions` 查看最近远端执行审计。
+   **删除设备记录**——解绑设备不留列表，执行审计独立留痕）；`GET /api/devices/executions` 查看最近远端执行审计。
 
 **WS 协议（JSON-RPC 2.0 风格信封）**：请求 `{"jsonrpc":"2.0","id":<hex>,"method":<name>,"params":{…}}`，
 响应 `{"id":<hex>,"result":{…}}` 或 `{"id":<hex>,"error":{"code":…,"message":…}}`。

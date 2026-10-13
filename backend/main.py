@@ -309,6 +309,10 @@ async def startup_event():
         from app.services.vibeweaver_audit_service import install_hooks as _vw_audit_install
         _vw_audit_summary = _vw_audit_install()
         logger.info("vibeweaver audit hooks: %s", _vw_audit_summary)
+        # D3：stop-guard 第三只 stop 钩子（gate/audit 之后 = when-would-allow）
+        from app.services.vibeweaver_stop_guard import install_hooks as _vw_sg_install
+        _vw_sg_summary = _vw_sg_install()
+        logger.info("vibeweaver stop-guard hooks: %s", _vw_sg_summary)
     except Exception:
         logger.exception("vibeweaver hook installation failed (fail-open)")
 

@@ -324,6 +324,8 @@ enabled = true
 gate_enabled = true
 audit_enabled = true
 loop_guard_enabled = true
+stop_guard_enabled = true
+c8_enabled = true
 red_ttl_hours = 24
 task_gating_enabled = true
 

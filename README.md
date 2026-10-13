@@ -8,7 +8,7 @@
 
 # Weave Thinker
 
-自托管个人 AI Agent 平台：给一个目标，它自己拆步骤、调工具、逐步验证并交付结果。
+可自行部署的 Personal Agent：代码与行为规则完全由你掌控。给一个目标，它自己拆步骤、调工具、逐步验证并交付结果。
 
 <p align="center"><strong>记得住你 · 做得完事 · 句句有据</strong><br/>FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用台账 · 三层仿生记忆</p>
 

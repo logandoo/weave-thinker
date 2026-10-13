@@ -39,6 +39,12 @@ async def create_user(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # 遗留清偿 #4：对齐注册路径 2–50（空/超长曾直进 DB——空串更会污染配对身份链）
+    if len(username) < 2 or len(username) > 50:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="用户名长度必须在2-50个字符之间"
+        )
     result = await db.execute(select(User).where(User.username == username))
     existing = result.scalar_one_or_none()
     if existing:
@@ -89,6 +95,12 @@ async def update_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     if username:
+        # 遗留清偿 #4（r4 M3）：update 同样守 2–50（身份毒值不止 create 一条路）
+        if len(username) < 2 or len(username) > 50:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="用户名长度必须在2-50个字符之间"
+            )
         check_result = await db.execute(select(User).where(User.username == username, User.id != user_id))
         if check_result.scalar_one_or_none():
             raise HTTPException(

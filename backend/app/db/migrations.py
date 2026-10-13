@@ -642,6 +642,22 @@ $$"""),
         "CREATE INDEX IF NOT EXISTS idx_client_exec_audit_user_created "
         "ON client_exec_audit(user_id, created_at DESC)"
     )),
+    # 遗留清偿 #7（2026-10-12）：revoke 语义=解绑即删——墓碑表 + 清存量 revoked
+    # 残留行并写墓碑（CTE 单语句；非 memory 迁移，置于 pgvector_extension 之前）
+    ("client_exec_device_tombstones", (
+        "CREATE TABLE IF NOT EXISTS client_executor_device_tombstones ("
+        "device_id VARCHAR(64) PRIMARY KEY, "
+        "user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE NOT NULL, "
+        "deleted_at TIMESTAMP DEFAULT NOW())"
+    )),
+    ("client_exec_revoke_cleanup", (
+        "WITH purged AS ("
+        "DELETE FROM client_executor_devices WHERE revoked = true OR revoked IS NULL "
+        "RETURNING device_id, user_id) "
+        "INSERT INTO client_executor_device_tombstones (device_id, user_id) "
+        "SELECT device_id, user_id FROM purged "
+        "ON CONFLICT (device_id) DO NOTHING"
+    )),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (

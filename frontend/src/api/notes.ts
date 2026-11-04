@@ -88,11 +88,6 @@ export const notesApi = {
     return data
   },
 
-  async createQuickNote(transcription: string, notebookId?: string): Promise<Note> {
-    const { data } = await api.post<Note>('/notes/quick', { transcription, notebook_id: notebookId })
-    return data
-  },
-
   async getDefaultNotebook(): Promise<Notebook> {
     const { data } = await api.get<Notebook>('/notes/default-notebook')
     return data

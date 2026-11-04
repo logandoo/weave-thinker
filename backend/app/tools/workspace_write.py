@@ -60,7 +60,18 @@ async def _resolve_workspace(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Opt
     from app.services.workspace_service import ensure_user_workspace
 
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
-    return str(Path(workspace.root_path).resolve()), None
+    user_root = Path(workspace.root_path).resolve()
+    override = str(kwargs.get("workspace_path") or "").strip()
+    if override:
+        # Worktree/scratch tasks set AgentLoop.workspace_path to a task-scoped
+        # directory. Honor it, but only when it stays inside the user root.
+        candidate = Path(override).resolve()
+        try:
+            candidate.relative_to(user_root)
+            return str(candidate), None
+        except ValueError:
+            return None, "任务工作区路径超出用户工作区，禁止写入。"
+    return str(user_root), None
 
 
 def _unified_diff(old: str, new: str, name: str) -> Tuple[str, str]:

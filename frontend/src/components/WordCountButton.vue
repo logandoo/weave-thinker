@@ -81,6 +81,7 @@ onUnmounted(() => {
     @mousedown.prevent
     @click="toggle"
     title="字数统计"
+    aria-label="字数统计"
   >
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
       <line x1="4" y1="9" x2="20" y2="9"/>
@@ -109,6 +110,14 @@ onUnmounted(() => {
   z-index: 2;
   background-color: var(--color-white);
   box-shadow: -8px 0 8px -8px color-mix(in srgb, var(--color-text) 22%, transparent);
+}
+
+/* 窄屏工具栏会横向滚动：sticky 按钮会盖住最后一个一级入口，改为随内容滚动 */
+@media (max-width: 430px) {
+  .word-count-btn {
+    position: static;
+    box-shadow: none;
+  }
 }
 
 .word-count-teleport {

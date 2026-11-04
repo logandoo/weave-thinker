@@ -9,6 +9,7 @@ import './styles/main.css'
 // 皮肤令牌覆盖层：必须在 main.css 之后引入（同优先级按序覆盖）
 import './styles/themes/index.css'
 import { installGlobalCodeBlockCopy } from '@/composables/useCodeBlockCopy'
+import { installGlobalCleanCopy } from '@/composables/cleanCopy'
 import Sortable from 'sortablejs'
 // Tab-恢复重连监听器（模块副作用注册）
 import '@/stores/chatVisibility'
@@ -30,4 +31,6 @@ app.use(createPinia())
 app.use(router)
 // One-click copy buttons inside markdown code blocks (delegated listener).
 installGlobalCodeBlockCopy()
+// 笔记复制净化（判据 #28/#31）：作用域内 copy 事件写入 Word 友好 HTML。
+installGlobalCleanCopy()
 app.mount('#app')

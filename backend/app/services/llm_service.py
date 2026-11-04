@@ -177,6 +177,10 @@ class LLMService:
                     msg = {k: v for k, v in msg.items() if k != "reasoning_content"}
             if any(k.startswith("_") for k in msg.keys()):
                 msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+            # P1 observability metadata is bookkeeping, never a provider field.
+            _meta_keys = ("prompt_id", "prompt_version", "prompt_hash")
+            if any(k in msg for k in _meta_keys):
+                msg = {k: v for k, v in msg.items() if k not in _meta_keys}
             if "synthetic" in msg:
                 # Internal marker for harness-injected directives (4.8) —
                 # never leak bookkeeping keys into provider payloads.
@@ -195,6 +199,26 @@ class LLMService:
             if msg.get("role") == "assistant" and not msg.get("content") and not msg.get("tool_calls"):
                 msg = {**msg, "content": "[...]"}
             validated.append(msg)
+        # P3.5: provider-aware cache breakpoint.  Anthropic/Claude gets a
+        # content-block cache_control; automatic-cache providers are unchanged.
+        _provider_type = str(getattr(getattr(self, "endpoint", None), "provider_type", "") or "")
+        if _provider_type.lower() in ("anthropic", "claude"):
+            try:
+                from app.services.prompt_caching import apply_prompt_cache_control_sync
+
+                validated = apply_prompt_cache_control_sync(
+                    validated, provider_type=_provider_type)
+            except Exception:
+                logger.debug("prompt cache control skipped", exc_info=True)
+        # C-06 (2026-10-18): one wire-boundary choke point for untrusted tool
+        # output (web/browser/file/MCP/raw).  Wrapping happens on the copy
+        # above, so persisted/replayed history keeps the original bytes.
+        from app.prompts.fragments import apply_tool_spotlight
+
+        _spotlight_enabled = bool(
+            getattr(self.config, "agent_tool_result_spotlight", True))
+        validated = apply_tool_spotlight(
+            validated, enabled=_spotlight_enabled)
         params = {"model": model, "messages": validated}
 
         response_format = kwargs.get("response_format")
@@ -303,6 +327,49 @@ class LLMService:
         elif _sdk_extra:
             params["extra_body"] = _sdk_extra
 
+        # Vendor wire hygiene (2026-10-18): DeepSeek thinking mode ignores
+        # temperature/penalties and clamps top_p; the profile removes
+        # parameters the vendor documents as ineffective so the wire matches
+        # real semantics. No-op for every other provider.
+        try:
+            from app.model_gateway.profiles import (
+                get_thinking_profile, sniff_thinking_profile,
+            )
+            _provider_type = str(getattr(self.endpoint, "provider_type", "") or "")
+            _profile = (
+                get_thinking_profile(_provider_type)
+                if _provider_type
+                else sniff_thinking_profile(
+                    str(self.client.base_url or ""),
+                    self.custom_model_name or self.config.model_name or "",
+                )
+            )
+            _extra_body = params.get("extra_body") or {}
+            _thinking = not self._extra_body_disables_thinking(_extra_body)
+            params = _profile.sanitize_request(params, _thinking)
+        except Exception:
+            logger.debug("thinking profile sanitize skipped", exc_info=True)
+
+        # P0.2/P1 (2026-10-18): prompt observability metadata. Hash the actual
+        # system text on the wire; attach to usage events/logs. No provider
+        # param is added.
+        try:
+            from app.prompts.observability import prompt_meta as _prompt_meta
+            _meta_params = {
+                k: v for k, v in params.items() if k not in ("messages", "tools")
+            }
+            _meta_params["tool_spotlight"] = _spotlight_enabled
+            self._last_prompt_meta = _prompt_meta(
+                messages,
+                kwargs.get("tools"),
+                model,
+                prompt_id=str(kwargs.get("prompt_id") or ""),
+                params=_meta_params,
+                model_alias=str(getattr(self.endpoint, "alias", "") or ""),
+                provider_type=str(getattr(self.endpoint, "provider_type", "") or ""),
+            )
+        except Exception:
+            self._last_prompt_meta = {}
         return params
 
     async def complete_chat(self, messages: list, **kwargs) -> str:
@@ -314,6 +381,7 @@ class LLMService:
         logger.info("complete_chat called: model=%s, base_url=%s, is_custom=%s",
                      params.get("model"), self.client.base_url, self.is_custom_provider)
         response = await self.client.chat.completions.create(**params)
+        logger.warning("[SETUP-TRACE] complete_chat create() returned choices=%s", len(getattr(response, "choices", None) or []))
         if not response.choices:
             return "", ""
 
@@ -475,11 +543,19 @@ class LLMService:
                     # 遗留①：prompt_tokens 缺失/0（null-usage 供应商）不发事件，
                     # 前端保留估算徽章——绝不出 measured tokens:0。
                     # DeepSeek: usage 随最后一个 content chunk；OpenAI: 独立空 choices 块。
+                    _cache = {}
+                    try:
+                        from app.prompts.observability import usage_cache_metrics as _ucm
+                        _cache = _ucm(_usage)
+                    except Exception:
+                        _cache = {}
                     yield {"type": "usage", "data": {
                         "prompt_tokens": _pt,
                         "completion_tokens": getattr(_usage, "completion_tokens", 0) or 0,
                         "prompt_cache_hit_tokens": getattr(_usage, "prompt_cache_hit_tokens", 0) or 0,
                         "prompt_cache_miss_tokens": getattr(_usage, "prompt_cache_miss_tokens", 0) or 0,
+                        **_cache,
+                        **(getattr(self, "_last_prompt_meta", {}) or {}),
                     }}
                 if chunk.choices and getattr(chunk.choices[0], "finish_reason", None) is not None:
                     _last_finish_reason = chunk.choices[0].finish_reason

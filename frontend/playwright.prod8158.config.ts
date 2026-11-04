@@ -8,6 +8,7 @@ import { defineConfig } from '@playwright/test';
 // 8158 被旧进程占用时用 scripts/stop.sh + start.sh 重启。
 export default defineConfig({
   testDir: './e2e',
+  testIgnore: ['**/_archive/**'],
   globalSetup: './e2e/global-setup.ts',
   timeout: 300000,
   use: {

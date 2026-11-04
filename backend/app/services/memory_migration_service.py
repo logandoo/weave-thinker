@@ -410,7 +410,17 @@ async def _migrate_agent_memories(db: AsyncSession, user_id: str, state: dict, p
 
 async def _migrate_file_memories(db: AsyncSession, user_id: str, progress: dict) -> None:
     from app.tools.memory import _get_memory_dir
-    memory_dir = _get_memory_dir() / str(user_id)
+    from app.services.tenant_service import TenantConfigError
+
+    try:
+        memory_dir = _get_memory_dir() / str(user_id)
+    except TenantConfigError:
+        progress["steps"]["file_memory"] = {
+            "status": "skipped",
+            "reason": "tenant_misconfigured",
+            "at": datetime.utcnow().isoformat(),
+        }
+        return
     if not memory_dir.exists():
         progress["steps"]["file_memory"] = {"status": "skipped", "at": datetime.utcnow().isoformat()}
         return

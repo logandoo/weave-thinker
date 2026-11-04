@@ -1,11 +1,14 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import os
 import toml
 from pathlib import Path
 from typing import List, Optional
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_int(value) -> Optional[int]:
@@ -131,6 +134,10 @@ class Config:
         return f"postgresql+asyncpg://{username}:{password}@{host}:{port}/{name}"
 
     @property
+    def database_host(self) -> str:
+        return str(self._config.get("database", {}).get("host", "localhost") or "").strip().lower()
+
+    @property
     def database_pool_size(self) -> int:
         return int(self._config.get("database", {}).get("pool_size", 20))
 
@@ -209,6 +216,114 @@ class Config:
     @property
     def super_admin_bypass(self) -> bool:
         return bool(self.security.get("super_admin_bypass", False))
+
+    @property
+    def memory_provenance_strict(self) -> bool:
+        """P0 TMA-NM: quarantine unverified file-memory entries on read.
+
+        Default false keeps the historical annotate-only read contract;
+        enabling it removes unverified entries from the memory payload and
+        surfaces them under ``quarantined_entries`` instead.
+        """
+        return bool(self.security.get("memory_provenance_strict", False))
+
+    @property
+    def multi_tenant_experimental(self) -> bool:
+        """P0/P2: filesystem-namespace tenant mode requires explicit opt-in.
+
+        No DB columns/RLS exist, so this flag only enables the path segment;
+        the startup guard refuses a tenant id without it.
+        """
+        return bool(self.security.get("multi_tenant_experimental", False))
+
+    @property
+    def tma_mode(self) -> str:
+        """P1a TMA-NM act gate: off | shadow (default) | enforce."""
+        raw = str(self.security.get("tma_mode", "shadow") or "shadow").strip().lower()
+        return raw if raw in {"off", "shadow", "enforce"} else "shadow"
+
+    @property
+    def verdict_reason_redaction(self) -> bool:
+        """P2: mask credential-shaped substrings in verdict reasons before signing."""
+        return bool(self.security.get("verdict_reason_redaction", True))
+
+    @property
+    def injection_detector_mode(self) -> str:
+        """P3: off (default) | shadow (telemetry only) | enforce (quarantine)."""
+        raw = str(
+            self.security.get("injection_detector_mode", "off") or "off"
+        ).strip().lower()
+        return raw if raw in {"off", "shadow", "enforce"} else "off"
+
+    @property
+    def injection_detector_target_fpr(self) -> float:
+        """P3: benign false-positive budget used for threshold calibration."""
+        try:
+            value = float(self.security.get("injection_detector_target_fpr", 0.01))
+        except (TypeError, ValueError):
+            return 0.01
+        return min(1.0, max(0.0, value))
+
+    @property
+    def injection_detector_threshold(self) -> float:
+        """P3: runtime score threshold (0 = structural detector default)."""
+        try:
+            value = float(self.security.get("injection_detector_threshold", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return min(1.0, max(0.0, value))
+
+    @property
+    def injection_detector_external_url(self) -> str:
+        """P3: optional external classifier endpoint (no model is assumed)."""
+        return str(self.security.get("injection_detector_external_url", "") or "").strip()
+
+    @property
+    def tma_verdict_keyring(self) -> dict[str, str]:
+        """P1c: optional ``kid -> key`` map for verdict-key rotation."""
+        raw = self.security.get("tma_verdict_keyring") or {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(kid).strip(): str(material).strip()
+            for kid, material in raw.items()
+            if str(kid).strip() and str(material).strip()
+        }
+
+    @property
+    def tma_verdict_key_id(self) -> str:
+        raw = str(self.security.get("tma_verdict_key_id", "v1") or "v1").strip()
+        return raw or "v1"
+
+    @property
+    def tma_checkpoint_interval(self) -> int:
+        """Write a Merkle checkpoint every N verdicts; 0 disables automatic ones."""
+        try:
+            value = int(self.security.get("tma_checkpoint_interval", 64))
+        except (TypeError, ValueError):
+            value = 64
+        return max(0, value)
+
+    @property
+    def memory_authority_key_ready(self) -> bool:
+        """True when file-memory authority has a non-dev, >=32-char key source.
+
+        A dedicated ``memory_hmac_key`` wins; otherwise the JWT secret is used
+        with domain separation.  Enabling ``memory_provenance_strict`` or
+        tenant mode with the tracked dev JWT would let anyone holding the repo
+        forge ``origin=user``, so startup refuses that combination.
+        """
+        markers = ("dev-secret", "change-in-production", "changeme",
+                   "placeholder", "weave-memory-provenance-dev")
+        key = str(self.security.get("memory_hmac_key", "") or "").strip()
+        if key:
+            low = key.casefold()
+            return len(key) >= 32 and not any(marker in low for marker in markers)
+        jwt = str(self.security_jwt_secret_key or "")
+        if len(jwt) < 32:
+            return False
+        low = jwt.casefold()
+        return not any(marker in low for marker in markers)
 
     @property
     def model_name(self) -> Optional[str]:
@@ -1178,6 +1293,14 @@ class Config:
         return bool(self.agent.get("inline_tool_images", True))
 
     @property
+    def agent_tool_result_spotlight(self) -> bool:
+        """C-06：工具结果在 LLM 线上请求边界统一包 `<untrusted-data>`。
+
+        默认开启；置 false 回滚为原始 tool 消息。结构性分隔是 rate
+        reducer，不是权限边界（工具权限仍在执行侧 fail-closed）。"""
+        return bool(self.agent.get("tool_result_spotlight", True))
+
+    @property
     def agent_memory_max_items(self) -> int:
         return int(self.agent.get("memory_max_items", 12))
 
@@ -1198,8 +1321,33 @@ class Config:
         return int(self.agent.get("note_context_limit", 12))
 
     @property
+    def agent_conversation_max_tokens(self) -> int:
+        """P1 S3: optional token cap for the chat history window (0=off)."""
+        try:
+            return max(0, int(self.agent.get("conversation_context_max_tokens", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
     def agent_conversation_context_limit(self) -> int:
         return int(self.agent.get("conversation_context_limit", 40))
+
+    @property
+    def agent_conversation_context_budget_ratio(self) -> float:
+        """P4: history token budget as a fraction of the resolved model window."""
+        try:
+            value = float(self.agent.get("conversation_context_budget_ratio", 0.45))
+        except (TypeError, ValueError):
+            return 0.45
+        return min(1.0, max(0.0, value))
+
+    @property
+    def agent_conversation_context_budget_cap_tokens(self) -> int:
+        """P4: absolute ceiling for the auto budget (0 = no ceiling)."""
+        try:
+            return max(0, int(self.agent.get("conversation_context_budget_cap_tokens", 300000)))
+        except (TypeError, ValueError):
+            return 300000
 
     @property
     def agent_memory_refresh_note_limit(self) -> int:
@@ -1330,9 +1478,33 @@ class Config:
         return value or None
 
     @property
-    def web_search_bocha_api_key(self) -> Optional[str]:
-        value = self.web_search.get("bocha_api_key", "") or self._secret("bocha_api_key")
+    def web_search_deepseek_api_key(self) -> Optional[str]:
+        """DeepSeek Search/Fetch key.
+
+        Dedicated slot first; when unset the search leg reuses the DeepSeek LLM
+        endpoint key from the model registry (same account, same Bearer auth)
+        so operators do not duplicate the secret across two files.
+        """
+        value = (
+            self.web_search.get("deepseek_api_key", "")
+            or self._secret("deepseek_api_key")
+        )
+        return str(value).strip() or None
+
+    @property
+    def web_search_deepseek_api_url(self) -> Optional[str]:
+        value = self.web_search.get("deepseek_api_url", "")
         return value or None
+
+    @property
+    def web_search_bing_api_url(self) -> Optional[str]:
+        value = self.web_search.get("bing_api_url", "")
+        return value or None
+
+    @property
+    def web_search_bing_api_key(self) -> Optional[str]:
+        value = self.web_search.get("bing_api_key", "") or self._secret("bing_api_key")
+        return str(value).strip() or None
 
     @property
     def web_search_firecrawl_api_key(self) -> Optional[str]:
@@ -1391,6 +1563,30 @@ class Config:
     @property
     def mcp(self) -> dict:
         return self._config.get("mcp", {})
+
+    @property
+    def mcp_hot_reload_enabled(self) -> bool:
+        """2026-11-01: watch config.toml [mcp.servers.*] and apply diffs
+        without a process restart (default on; false = explicit-reload only)."""
+        return bool(self.mcp.get("hot_reload_enabled", True))
+
+    @property
+    def user_mcp_stdio_enabled(self) -> bool:
+        """User-level stdio MCP = server-side process execution; opt-in only."""
+        return bool(self.security.get("user_mcp_stdio_enabled", False))
+
+    @property
+    def user_mcp_allow_private_hosts(self) -> bool:
+        """Allow user HTTP MCP to reach loopback/private/link-local (SSRF)."""
+        return bool(self.security.get("user_mcp_allow_private_hosts", False))
+
+    @property
+    def mcp_hot_reload_interval_seconds(self) -> float:
+        try:
+            value = float(self.mcp.get("hot_reload_interval_seconds", 5))
+        except (TypeError, ValueError):
+            value = 5.0
+        return max(1.0, min(value, 60.0))
 
     @property
     def scheduler_enabled(self) -> bool:
@@ -1609,6 +1805,12 @@ class Config:
         return int(self.browser.get("max_images_per_page", 12))
 
     @property
+    def browser_shared_browsers_path(self) -> str:
+        """沙箱共享 playwright 浏览器注册表（F1 2026-10-26）：
+        空=自动解析（服务 env > 平台默认）；显式路径=覆盖；``"off"``=不注入。"""
+        return str(self.browser.get("shared_browsers_path", ""))
+
+    @property
     def browser_interaction(self) -> dict:
         return self.browser.get("interaction", {})
 
@@ -1623,6 +1825,24 @@ class Config:
     @property
     def browser_interaction_max_concurrent(self) -> int:
         return int(self.browser_interaction.get("max_concurrent_sessions", 5))
+
+    @property
+    def browser_interaction_close_on_turn_end(self) -> bool:
+        """2026-11-03: 交互回合结束即关闭浏览器/录像进程（默认开）。
+
+        Playwright 的 record_video_dir 只有 context.close() 才会停止编码；
+        会话若按 5 小时 idle 超时存活，录像进程会在 agent loop 结束后继续
+        占用 CPU/内存/磁盘（生产 60 机 23:52 实例：1.3GB RSS、260MB/s 读）。
+        """
+        return bool(self.browser_interaction.get("close_on_turn_end", True))
+
+    @property
+    def browser_interaction_max_lifetime(self) -> int:
+        """2026-11-03: 单会话硬上限（秒，0=不限制），兜底后台/异常路径。"""
+        try:
+            return max(0, int(self.browser_interaction.get("max_lifetime_seconds", 1800)))
+        except (TypeError, ValueError):
+            return 1800
 
     @property
     def terminal(self) -> dict:
@@ -1709,6 +1929,35 @@ class Config:
     def agent_tool_loop(self) -> dict:
         return self.agent.get("tool_loop", {})
 
+    # ---- Vision frames (P0.5.1) ----
+
+    @property
+    def agent_vision(self) -> dict:
+        value = self.agent.get("vision", {}) or {}
+        return value if isinstance(value, dict) else {}
+
+    def _vision_frame_limit(self, key: str, default: int) -> int:
+        """0 = keep none (kill switch); clamp to 0..8; bad/missing → default."""
+        raw = self.agent_vision.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            if key in self.agent_vision:
+                logger.warning(
+                    "invalid [agent.vision].%s=%r; using default %d",
+                    key, raw, default,
+                )
+            value = default
+        return max(0, min(8, value))
+
+    @property
+    def agent_vision_max_history_image_frames(self) -> int:
+        return self._vision_frame_limit("max_history_image_frames", 2)
+
+    @property
+    def agent_vision_max_current_turn_image_frames(self) -> int:
+        return self._vision_frame_limit("max_current_turn_image_frames", 4)
+
     @property
     def agent_background_tasks(self) -> dict:
         return self.agent.get("background_tasks", {})
@@ -1767,6 +2016,84 @@ class Config:
     def agent_background_tasks_progress_update_interval(self) -> int:
         return int(self.agent_background_tasks.get("progress_update_interval_seconds", 2))
 
+    # ---- Voice delegation (separate_v1 execution mode, 2026-11-04) ----
+
+    @property
+    def voice_delegation(self) -> dict:
+        return self._config.get("voice_delegation", {}) or {}
+
+    @property
+    def voice_delegation_enabled(self) -> bool:
+        """Feature flag: default OFF (staged rollout, §15.3)."""
+        return bool(self.voice_delegation.get("enabled", False))
+
+    @property
+    def voice_delegation_reasoning_policy(self) -> str:
+        return str(self.voice_delegation.get("reasoning_policy", "strict_highest") or "strict_highest")
+
+    @property
+    def voice_delegation_max_running_per_user(self) -> int:
+        return max(1, int(self.voice_delegation.get("max_running_per_user", 1)))
+
+    @property
+    def voice_delegation_max_pending_per_user(self) -> int:
+        return max(0, int(self.voice_delegation.get("max_pending_per_user", 3)))
+
+    @property
+    def voice_delegation_iterations_cap(self) -> int:
+        return max(1, int(self.voice_delegation.get("iterations_max_cap", 60)))
+
+    @property
+    def voice_delegation_wall_time_seconds(self) -> int:
+        return max(0, int(self.voice_delegation.get("wall_time_seconds", 0)))
+
+    @property
+    def voice_delegation_lease_seconds(self) -> int:
+        return max(30, int(self.voice_delegation.get("lease_seconds", 180)))
+
+    @property
+    def voice_delegation_heartbeat_seconds(self) -> int:
+        return max(5, int(self.voice_delegation.get("heartbeat_seconds", 30)))
+
+    @property
+    def voice_delegation_notification_replay_seconds(self) -> int:
+        return max(5, int(self.voice_delegation.get("notification_replay_seconds", 15)))
+
+    # ── Wave 2 (2026-11-04): summary / budget / batching / worktree ────────
+
+    @property
+    def voice_delegation_summary_enabled(self) -> bool:
+        return bool(self.voice_delegation.get("summary_enabled", True))
+
+    @property
+    def voice_delegation_summary_max_chars(self) -> int:
+        return max(200, int(self.voice_delegation.get("summary_max_chars", 1200)))
+
+    @property
+    def voice_delegation_summary_part_chars(self) -> int:
+        return max(500, int(self.voice_delegation.get("summary_part_chars", 6000)))
+
+    @property
+    def voice_delegation_budget_pause_enabled(self) -> bool:
+        return bool(self.voice_delegation.get("budget_pause_enabled", True))
+
+    @property
+    def voice_delegation_budget_resume_seconds(self) -> int:
+        return max(0, int(self.voice_delegation.get("budget_resume_seconds", 1800)))
+
+    @property
+    def voice_delegation_max_daily_wall_time_seconds_per_user(self) -> int:
+        return max(0, int(self.voice_delegation.get(
+            "max_daily_wall_time_seconds_per_user", 0)))
+
+    @property
+    def voice_delegation_notification_batch_max(self) -> int:
+        return max(1, int(self.voice_delegation.get("notification_batch_max", 5)))
+
+    @property
+    def voice_delegation_worktree_enabled(self) -> bool:
+        return bool(self.voice_delegation.get("worktree_enabled", True))
+
     @property
     def agent_tool_loop_conversation_timeout(self) -> float:
         """Maximum seconds without activity (content/tool output) before an
@@ -1776,12 +2103,96 @@ class Config:
         return float(self.agent_tool_loop.get("inactivity_timeout_seconds", 300))
 
     @property
+    def agent_tool_loop_memory_read_budget(self) -> int:
+        """P0 R3: max distinct memory read targets per turn (default 2)."""
+        try:
+            return max(0, int(self.agent_tool_loop.get("memory_read_budget", 2)))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
     def agent_tool_loop_max_iterations(self) -> int:
         return int(self.agent_tool_loop.get("max_iterations", 50))
 
     @property
     def agent_tool_loop_max_consecutive_iterations(self) -> int:
-        return int(self.agent_tool_loop.get("max_consecutive_iterations", 999))
+        """连续工具迭代达此数即强制终答。2026-10-25 审计 F4：默认 999→60
+        （999 名义上界在 execute_code 退款族下几乎不可达；配置可回改）。"""
+        return int(self.agent_tool_loop.get("max_consecutive_iterations", 60))
+
+    # ---- 循环 Governor v2（设计 docs/DESIGN_20261025_loop_guard_v2.md §A4/§A6）----
+
+    @property
+    def agent_loop_governor(self) -> dict:
+        # R2-#127：坏配置段（非 dict）兜底空 dict——.get 调用面不再 AttributeError。
+        v = self.agent.get("loop_governor", {}) or {}
+        return v if isinstance(v, dict) else {}
+
+    @property
+    def agent_loop_governor_mode(self) -> str:
+        """off | shadow | enforce。进程级逃生口 env WT_LOOP_GOVERNOR=off
+        无条件短路 off（kill switch 优先级高于配置）。"""
+        if self._env_off("WT_LOOP_GOVERNOR"):
+            return "off"
+        mode = str(self.agent_loop_governor.get("mode", "shadow")).strip().lower()
+        return mode if mode in ("off", "shadow", "enforce") else "shadow"
+
+    @property
+    def agent_loop_governor_turn_interventions(self) -> int:
+        return self._gov_int("turn_interventions", 2)
+
+    @property
+    def agent_loop_governor_session_interventions(self) -> int:
+        return self._gov_int("session_interventions", 8)
+
+    def _gov_int(self, key: str, default: int) -> int:
+        try:
+            return int(self.agent_loop_governor[key])
+        except (KeyError, TypeError, ValueError):
+            return default
+
+    @property
+    def agent_loop_governor_turn_wall_time_seconds(self) -> float:
+        """chat 回合墙钟（秒）。0=关（默认）；不可关硬顶 3600s 由
+        loop_governor_service.effective_turn_wall 兜底（配置只能调小不能调没）。
+        坏值回退 0（关）而非抛异常——观察者 fail-open。"""
+        try:
+            v = float(self.agent_loop_governor["turn_wall_time_seconds"])
+            return v if v >= 0 else 0.0
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
+    @property
+    def agent_loop_governor_refund_max_per_turn(self) -> int:
+        return self._gov_int("refund_max_per_turn", 10)
+
+    @property
+    def agent_loop_governor_max_total_iterations(self) -> int:
+        return self._gov_int("max_total_iterations", 150)
+
+    @property
+    def agent_loop_governor_cycle_period_max(self) -> int:
+        return self._gov_int("cycle_period_max", 128)
+
+    @property
+    def agent_loop_governor_cycle_min_copies(self) -> int:
+        return self._gov_int("cycle_min_copies", 3)
+
+    @property
+    def agent_loop_governor_semantic_enabled(self) -> bool:
+        return bool(self.agent_loop_governor.get("semantic_enabled", False))
+
+    def _gov_list(self, key: str) -> list:
+        v = self.agent_loop_governor.get(key, [])
+        return list(v) if isinstance(v, (list, tuple)) else []
+
+    @property
+    def agent_loop_governor_polling_tools(self) -> list:
+        return self._gov_list("polling_tools")
+
+    @property
+    def agent_loop_governor_exempt_tools(self) -> list:
+        return self._gov_list("exempt_tools")
 
     @property
     def agent_tool_loop_max_empty_answer_retries(self) -> int:
@@ -1995,6 +2406,21 @@ class Config:
         return bool(self.deathmatch.get("autonomy_enabled", True))
 
     @property
+    def deathmatch_consensus_challenger_enabled(self) -> bool:
+        """D2a（论文 2610.00972 VeriHarness，2026-10-13 W1）：完成前共识挑战者。
+        judge 判 done 且 reconcile 之前追加一次 fresh-context LLM 挑战
+        （无证据支撑的验收标准 + 未受挑战主张），结果注入 reconcile 证据
+        （fail-open，无新硬闸）。默认关（A/B 后定默认值）。"""
+        return bool(self.deathmatch.get("consensus_challenger_enabled", False))
+
+    @property
+    def deathmatch_reflection_retract_enabled(self) -> bool:
+        """M3b①（论文 2610.12668 ReHarness 线，2026-10-13 W1）：反思撤回。
+        同签名 ×3 升级发生时自动把该路线反思标 retracted + 修正指令，渲染为
+        「避免」块。默认关（D-960 先例：记忆自动回写须保守/用户拍板）。"""
+        return bool(self.deathmatch.get("reflection_retract_enabled", False))
+
+    @property
     def deathmatch_verify_enabled(self) -> bool:
         return bool(self.deathmatch.get("verify_enabled", False))
 
@@ -2169,6 +2595,29 @@ class Config:
         return bool(self.deathmatch.get("judge_evidence_enabled", True))
 
     @property
+    def deathmatch_evidence_units_enabled(self) -> bool:
+        """W2 D1（ACG 2609.32754）需求锚定证据视图 v1：judge evidence + verifier
+        链的 <evidence_units> 块注入（续跑链二期）。默认关（A/B 后开）。关闭时
+        注入块为空；证据单元归档写点照记（归档不注入——W2 v1 钉死语义）。"""
+        return bool(self.deathmatch.get("evidence_units_enabled", False))
+
+    @property
+    def deathmatch_write_through_enabled(self) -> bool:
+        """B-8/D-15 数据列写-through 开关（fix-round I1）。默认 True——步骤
+        状态/事件/台账/反思/证据单元不依赖 merge 通道落库。False = 完全回退
+        旧 merge-only 落库面（kill switch）。"""
+        return bool(self.deathmatch.get("write_through_enabled", True))
+
+    @property
+    def deathmatch_evidence_units_budget(self) -> int:
+        """W2 D1 块级预算准入（ACG §3.5 整块入或整体弃）：<evidence_units> 块
+        总长超过该字符数时整块弃换 1 行省略提示——不半截截断。默认 800。
+        fix-round Minors：显式 is None 判断（缺省/None→800；0=无预算，不设
+        上限——`or 800` 会把合法 0 卷回 800）。"""
+        raw = self.deathmatch.get("evidence_units_budget", 800)
+        return 800 if raw is None else int(raw)
+
+    @property
     def deathmatch_visual_critic_enabled(self) -> bool:
         """B4c (AutoDesign visual critic): let the verifier run a VLM layout
         check on visual deliverables (.html/.svg) when a multimodal endpoint
@@ -2243,6 +2692,48 @@ class Config:
     @property
     def agent_compression_enabled(self) -> bool:
         return bool(self.agent_compression.get("enabled", False))
+
+    @property
+    def agent_context_window_mode(self) -> str:
+        """P4: legacy (content-only 40-message cut) | 2d (messages + tokens)."""
+        raw = str(self.agent.get("context_window_mode", "2d") or "2d").strip().lower()
+        return raw if raw in {"legacy", "2d"} else "2d"
+
+    @property
+    def agent_conversation_min_messages(self) -> int:
+        """P4: minimum retained window size in 2d mode (0 = no floor)."""
+        try:
+            return max(0, int(self.agent.get("conversation_context_min_messages", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def agent_history_tool_result_max_tokens(self) -> int:
+        """P4: per-tool-result cap when building history (0 = off)."""
+        try:
+            return max(0, int(self.agent.get("history_tool_result_max_tokens", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def agent_compression_verified_context(self) -> bool:
+        """P4: verify key-fact recall after summarization (default on)."""
+        return bool(self.agent_compression.get("verified_context", True))
+
+    @property
+    def agent_compression_fact_recall_floor(self) -> float:
+        try:
+            value = float(self.agent_compression.get("fact_recall_floor", 0.8))
+        except (TypeError, ValueError):
+            return 0.8
+        return min(1.0, max(0.0, value))
+
+    @property
+    def agent_compression_max_verbatim_facts(self) -> int:
+        try:
+            return max(1, int(self.agent_compression.get("max_verbatim_facts", 20)))
+        except (TypeError, ValueError):
+            return 20
 
     @property
     def agent_compression_context_length(self) -> int:
@@ -2713,6 +3204,36 @@ class Config:
         the user role. Set False to restore the legacy role="user" behavior."""
         return bool(self.agent.get("synthetic_directives_enabled", True))
 
+    @property
+    def agent_prompt_compact_enabled(self) -> bool:
+        """P3.3 (2026-10-18): opt-in compact system-prompt variant.
+
+        Default False: the production prompt is unchanged. When True, verbose
+        tool/identity/math guidance is replaced by a compact rule set (target
+        >=20% token reduction) while all safety/tool/citation red lines remain.
+        Enable only after the live golden set is non-inferior.
+        """
+        return bool(self.agent.get("prompt_compact_enabled", False))
+
+    @property
+    def agent_prompt_conditional_enabled(self) -> bool:
+        """P3.2: drop task-irrelevant static blocks (e.g. research register
+        for a coding turn). Default True; set False for full-prompt rollback."""
+        return bool(self.agent.get("conditional_prompt_sections", True))
+
+    @property
+    def agent_prompt_compact_ratio(self) -> float:
+        """P3.3 canary: deterministic fraction of conversations on compact.
+
+        0.0 default (off). Set 0.05–0.10 for a canary; 1.0 for full rollout.
+        Bucketing uses conversation_id, so a conversation never flips mid-turn.
+        """
+        try:
+            value = float(self.agent.get("prompt_compact_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, value))
+
     # ---- Session search ----
 
     @property
@@ -2902,6 +3423,11 @@ class Config:
         return self._config.get("memory", {})
 
     @property
+    def memory_semantic_guard_enabled(self) -> bool:
+        """P2 I1: optional LLM semantic guard for memory writes (default off)."""
+        return bool(self.memory.get("semantic_guard_enabled", False))
+
+    @property
     def memory_interest_extract_timeout_seconds(self) -> float:
         """兴趣画像提取（proactive_learning extract_interests → judge_json
         interest_extract）的 LLM 判定超时秒数。默认 40：DeepSeek 拥塞时
@@ -2939,6 +3465,89 @@ class Config:
         [memory.retrieval.strategy.<profile>] 覆盖，默认档
         entity_dense（关键词密度≥0.4：关系扩展加深）/narrative（收紧））。"""
         return self.memory.get("retrieval", {})
+
+    @property
+    def memory_constraints(self) -> dict:
+        """[memory.constraints] —— W1-2 约束固定（2026-10-23，PLAN W1-2/B1）。
+        mode: off|shadow|enforce（默认 enforce——最小可验证安全修复口径；
+        shadow=只记录不重放，off=全关，B16 逐项回滚面）·
+        max_pins（默认 20，每会话活跃约束上限，B1 pin 滥用面）·
+        llm_fallback_enabled（默认 false——规则抽取精确优先，LLM 兜底另立 A/B）。"""
+        return self.memory.get("constraints", {}) or {}
+
+    @property
+    def memory_constraints_mode(self) -> str:
+        return str(self.memory_constraints.get("mode", "enforce")).strip().lower()
+
+    @property
+    def memory_constraints_max_pins(self) -> int:
+        try:
+            return int(self.memory_constraints.get("max_pins", 20))
+        except (TypeError, ValueError):
+            return 20
+
+    @property
+    def memory_evidence_view_shadow_enabled(self) -> bool:
+        """[memory] evidence_view_shadow_enabled —— W2-1 A1 shadow 接线
+        （2026-10-23，判据 #48/#49，默认 true）。
+
+        true=检索注入装配处消费证据视图（build_evidence_units +
+        adjudicate_conflicts + detect_implicit_conflict），稀有事件落
+        memory_eval_runs（suite=evidence_view_shadow /
+        implicit_conflict_shadow，仅元数据 unit_id/validity/conflict_group/
+        kind/计数，不含事实正文）；false=零调用零落档。
+        **shadow 只记录不改注入集合**（A/B 后另波换注入集）；落档
+        fire-and-forget fail-open，不影响检索返回值。
+        布尔解析 fail-safe：字符串 "false"/"0"/"no"/"off" → False
+        （误拼字符串不会把关闭开关变开启——B 评审 Minor）。"""
+        raw = self.memory.get("evidence_view_shadow_enabled", True)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("true", "1", "yes", "on")
+        return bool(raw)
+
+    @property
+    def memory_implicit_conflict_llm_fallback(self) -> bool:
+        """[memory] implicit_conflict_llm_fallback —— W2-2 A2 LLM 兜底键
+        （2026-10-23，判据 #51，**预留**，默认 false）。
+
+        false（默认）=纯规则检测（detect_implicit_conflict 三维度，零 LLM
+        调用）。true 为预留值：本波不实现 LLM 兜底路径，检测仍纯规则——
+        报告字段 llm_fallback 只回显该键供 A/B 台账分臂，**开启≠增强**。
+        布尔解析同 evidence_view_shadow_enabled（字符串 fail-safe）。"""
+        raw = self.memory.get("implicit_conflict_llm_fallback", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("true", "1", "yes", "on")
+        return bool(raw)
+
+    @property
+    def memory_dream_repair_enabled(self) -> bool:
+        """[memory] dream_repair_enabled —— W3-3/W3-4 A3 dream probe/repair
+        运行时触发门（2026-10-24，判据 #54/#57，**默认 false**，P3）。
+
+        true=consolidation clean-pass 尾部跑 probe→只修 miss→
+        dream_repair_reports 落库（hit@k before/after）+ check_stop_rule
+        （14 天无正收益落 stop 标记=回退方案 B 决策记录，此后短路——
+        面板只展示不注入）。false=零调用零落库。接线经本属性（单一真源），
+        字符串布尔 fail-safe（"false"→False）。
+        **翻 true 前置（D-20261024-a3b）**：hit@k_after 恒真 / repair 通胀
+        无上限 / memory_eval_runs 用户词逃逸擦除面——三项先清（见
+        docs/TODO_memory_v2_20261023.md D11-D13），否则修复面不可信。"""
+        raw = self.memory.get("dream_repair_enabled", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("true", "1", "yes", "on")
+        return bool(raw)
+
+    @property
+    def memory_provider_routing_enabled(self) -> bool:
+        """[memory] provider_routing_enabled —— W3 M1a 注入层路由开关（默认关）。
+
+        MemAgent（2609.32521）零训练 Begin 门（勘正 A1/A2：复用既有管线、
+        正名「注入层选择」）：开启后检索出口按确定性门重组注入段顺序（时间型
+        →episodic 先行 / 偏好型→profile·concept 先行 / 近事→subconscious 先行），
+        只动注入顺序——不省 stage1-4 计算、不改注入集合与预算；recall log
+        providers_queried 追加 route:<name> 供 A/B（tests/memory_evals/ 矩阵）。
+        默认关=逐字节现状。"""
+        return bool(self.memory.get("provider_routing_enabled", False))
 
     @property
     def memory_subconscious(self) -> dict:
@@ -3027,6 +3636,52 @@ class Config:
             "api_key": cfg.get("api_key", ""),
             "model_name": cfg.get("model_name", ""),
         }
+
+
+_PRODUCTION_ENVS = {"production", "prod", "public"}
+
+
+def production_security_errors(cfg: Config) -> List[str]:
+    """P0 S2: fail closed on unsafe config when explicitly in production.
+
+    Local development (WT_ENV unset/development) is deliberately untouched —
+    the tracked dev config keeps its single-user bypass choice.  A public
+    deployment opts in with ``WT_ENV=production``, at which point a template
+    copied from the public example must not start with host-level bypass,
+    the known dev JWT, or a loopback database.
+    """
+    if os.environ.get("WT_ENV", "").strip().lower() not in _PRODUCTION_ENVS:
+        return []
+    errors: List[str] = []
+    if cfg.super_admin_bypass:
+        errors.append(
+            "super_admin_bypass=true is forbidden in production "
+            "(host-level no-confirmation access); set it false and grant per-tool permissions"
+        )
+    jwt = str(cfg.security_jwt_secret_key or "")
+    jwt_low = jwt.casefold()
+    if (
+        len(jwt) < 32
+        or "dev-secret" in jwt_low
+        or "change-in-production" in jwt_low
+        or "changeme" in jwt_low
+        or "placeholder" in jwt_low
+    ):
+        errors.append(
+            "jwt_secret_key is missing/weak/known-dev; generate a random >=32-char secret"
+        )
+    memory_key = str(cfg.security.get("memory_hmac_key", "") or "").strip()
+    if memory_key and len(memory_key) < 32:
+        errors.append(
+            "memory_hmac_key is too short; use a random >=32-char key "
+            "(or leave it empty to derive from jwt_secret_key)"
+        )
+    host = (cfg.database_host or "").casefold()
+    if host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or host.startswith("127."):
+        errors.append(
+            f"database.host={host!r} is loopback; production must use an explicit database host"
+        )
+    return errors
 
 
 @lru_cache()

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -58,6 +59,8 @@ class DeviceSession:
     device_id: str
     user_id: str
     ws: Any
+    # Per-authenticated-connection grant key; never persisted or logged.
+    pairing_secret: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     pending: Dict[str, asyncio.Future] = field(default_factory=dict)
     last_seen: datetime = field(default_factory=datetime.utcnow)
     closed: bool = False
@@ -139,6 +142,13 @@ class DeviceSessionManager:
 
     def get(self, device_id: str) -> Optional[DeviceSession]:
         return self._sessions.get(device_id)
+
+    def pairing_secret_for(self, device_id: str) -> Optional[str]:
+        """Current live session key only; offline/replaced sessions fail closed."""
+        sess = self._sessions.get(device_id)
+        if sess is None or sess.closed or not self._fresh(sess):
+            return None
+        return sess.pairing_secret
 
     def online_device_ids(self) -> set:
         return {

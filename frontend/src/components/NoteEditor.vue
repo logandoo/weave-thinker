@@ -35,193 +35,116 @@
       </div>
     </div>
 
-    <div class="editor-toolbar">
-      <button class="toolbar-btn" :class="{ active: isBold }" @mousedown.prevent @click="execCommand('bold')" data-tip="粗体" aria-label="粗体">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/>
-          <path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/>
-        </svg>
-      </button>
-      <button class="toolbar-btn" :class="{ active: isItalic }" @mousedown.prevent @click="execCommand('italic')" data-tip="斜体" aria-label="斜体">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="19" y1="4" x2="10" y2="4"/>
-          <line x1="14" y1="20" x2="5" y2="20"/>
-          <line x1="15" y1="4" x2="9" y2="20"/>
-        </svg>
-      </button>
+    <div class="editor-toolbar" role="toolbar" aria-label="文本格式" @keydown="onPrimaryToolbarKeydown">
       <div class="heading-dropdown-wrap">
         <button
-          class="toolbar-btn"
+          class="toolbar-btn toolbar-primary-btn"
+          data-primary-tool="heading"
           :class="{ active: currentHeadingLevel }"
           ref="headingBtnRef"
           @mousedown.prevent
           @click="toggleHeadingMenu"
-          :aria-label="currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '标题'" :data-tip="currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '标题'"
+          aria-haspopup="dialog"
+          :aria-expanded="showHeadingMenu"
+          tabindex="0"
+          :aria-label="currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '正文'" :data-tip="currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '正文'"
         >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M4 12h8"/>
-            <path d="M4 18V6"/>
-            <path d="M12 18V6"/>
-          </svg>
+          <NoteToolbarIcon name="heading" />
+          <span class="toolbar-primary-label">{{ currentHeadingLevel ? currentHeadingLevel.toUpperCase() : '正文' }}</span>
         </button>
       </div>
-      <button class="toolbar-btn" :class="{ active: isQuote }" @mousedown.prevent @click="handleBlockquoteCommand" data-tip="引用" aria-label="引用">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="3" y1="10" x2="3" y2="14"/>
-          <line x1="7" y1="6" x2="21" y2="6"/>
-          <line x1="7" y1="12" x2="21" y2="12"/>
-          <line x1="7" y1="18" x2="21" y2="18"/>
-        </svg>
+      <button class="toolbar-btn toolbar-primary-btn" data-primary-tool="bold" tabindex="-1" :class="{ active: isBold }" @mousedown.prevent @click="execCommand('bold')" data-tip="黑体" aria-label="黑体" :aria-pressed="isBold">
+        <NoteToolbarIcon name="bold" /><span class="toolbar-primary-label">黑体</span>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="handleListCommand('insertUnorderedList')" data-tip="项目符号列表" aria-label="项目符号列表">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="9" y1="6" x2="21" y2="6"/>
-          <line x1="9" y1="12" x2="21" y2="12"/>
-          <line x1="9" y1="18" x2="21" y2="18"/>
-          <circle cx="4.5" cy="6" r="1.5" fill="currentColor" stroke="none"/>
-          <circle cx="4.5" cy="12" r="1.5" fill="currentColor" stroke="none"/>
-          <circle cx="4.5" cy="18" r="1.5" fill="currentColor" stroke="none"/>
-        </svg>
+      <button class="toolbar-btn toolbar-primary-btn" data-primary-tool="italic" tabindex="-1" :class="{ active: isItalic }" @mousedown.prevent @click="execCommand('italic')" data-tip="斜体" aria-label="斜体" :aria-pressed="isItalic">
+        <NoteToolbarIcon name="italic" /><span class="toolbar-primary-label">斜体</span>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="handleListCommand('insertOrderedList')" data-tip="编号列表" aria-label="编号列表">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="10" y1="6" x2="21" y2="6"/>
-          <line x1="10" y1="12" x2="21" y2="12"/>
-          <line x1="10" y1="18" x2="21" y2="18"/>
-          <path d="M4 7V5"/>
-          <path d="M4 11h2v5"/>
-          <path d="M4 19h3"/>
-        </svg>
+      <button ref="charBtnRef" class="toolbar-btn toolbar-primary-btn" data-primary-tool="character" tabindex="-1" @mousedown.prevent @click="toggleCharacterMenu" data-tip="字符" aria-label="字符" aria-haspopup="dialog" :aria-expanded="showCharacterMenu">
+        <NoteToolbarIcon name="character" /><span class="toolbar-primary-label">字符</span>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="handleRestartNumbering()" data-tip="重新编号" aria-label="重新编号">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M1 4v6h6"/>
-          <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
-          <text x="12" y="16" font-size="8" fill="currentColor" stroke="none" text-anchor="middle" font-weight="bold">1</text>
-        </svg>
+      <button ref="paragraphBtnRef" class="toolbar-btn toolbar-primary-btn" data-primary-tool="paragraph" tabindex="-1" @mousedown.prevent @click="toggleParagraphMenu" data-tip="段落" aria-label="段落" aria-haspopup="dialog" :aria-expanded="showParagraphMenu">
+        <NoteToolbarIcon name="paragraph" /><span class="toolbar-primary-label">段落</span>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('left')" data-tip="左对齐" aria-label="左对齐">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="3" y1="6" x2="21" y2="6"/><rect x="3" y="9" width="10" height="6" rx="1"/><line x1="3" y1="18" x2="21" y2="18"/>
-        </svg>
+      <button ref="toolsBtnRef" class="toolbar-btn toolbar-primary-btn" data-primary-tool="tools" tabindex="-1" @mousedown.prevent @click="toggleToolsMenu" data-tip="编辑" aria-label="编辑" aria-haspopup="dialog" :aria-expanded="showToolsMenu">
+        <NoteToolbarIcon name="tools" />
+        <span class="toolbar-primary-label">编辑</span>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('center')" data-tip="居中" aria-label="居中">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="3" y1="6" x2="21" y2="6"/><rect x="7" y="9" width="10" height="6" rx="1"/><line x1="3" y1="18" x2="21" y2="18"/>
-        </svg>
+      <button ref="listBtnRef" class="toolbar-btn toolbar-primary-btn" data-primary-tool="list" tabindex="-1" @mousedown.prevent @click="toggleListMenu" data-tip="列表" aria-label="列表" aria-haspopup="dialog" :aria-expanded="showListMenu">
+        <NoteToolbarIcon name="list" />
+        <span class="toolbar-primary-label">列表</span>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="onObjectAlign('right')" data-tip="右对齐" aria-label="右对齐">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="3" y1="6" x2="21" y2="6"/><rect x="11" y="9" width="10" height="6" rx="1"/><line x1="3" y1="18" x2="21" y2="18"/>
-        </svg>
+      <button ref="insertBtnRef" class="toolbar-btn toolbar-primary-btn" data-primary-tool="insert" tabindex="-1" @mousedown.prevent @click="toggleInsertMenu" data-tip="插入" aria-label="插入" aria-haspopup="dialog" :aria-expanded="showInsertMenu">
+        <NoteToolbarIcon name="insert" />
+        <span class="toolbar-primary-label">插入</span>
       </button>
-      <div class="table-picker-wrap">
-        <button class="toolbar-btn" ref="tableBtnRef" @mousedown.prevent @click="toggleTablePicker" data-tip="插入表格" aria-label="插入表格">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <rect x="3" y="3" width="18" height="18" rx="2"/>
-            <line x1="3" y1="9" x2="21" y2="9"/>
-            <line x1="3" y1="15" x2="21" y2="15"/>
-            <line x1="9" y1="3" x2="9" y2="21"/>
-            <line x1="15" y1="3" x2="15" y2="21"/>
-          </svg>
-        </button>
-      </div>
-      <button class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="openMathInsertDialog" data-tip="插入公式" aria-label="插入公式">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M5 20c2-8 4-12 7-16"/>
-          <path d="M9 12h6"/>
-          <text x="14" y="18" font-size="9" fill="currentColor" stroke="none" text-anchor="middle" font-style="italic">x²</text>
-        </svg>
+      <button ref="tocBtnRef" class="toolbar-btn toolbar-primary-btn" data-primary-tool="toc" tabindex="-1" :class="{ active: showToc }" @mousedown.prevent @click="toggleToc" data-tip="目录" aria-label="目录" aria-controls="note-toc-panel" :aria-expanded="showToc">
+        <NoteToolbarIcon name="toc" />
+        <span class="toolbar-primary-label">目录</span>
       </button>
-      <button class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="openCodeInsertDialog" data-tip="插入代码块" aria-label="插入代码块">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="8 6 3 12 8 18"/>
-          <polyline points="16 6 21 12 16 18"/>
-          <line x1="14" y1="4" x2="10" y2="20"/>
-        </svg>
-      </button>
-      <div class="toolbar-divider"></div>
-      <div class="color-picker-wrap">
-        <button class="toolbar-btn highlight-btn" ref="highlightBtnRef" @mousedown.prevent @click="toggleHighlightColorPicker" data-tip="高亮" aria-label="高亮">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 20h9"/>
-            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
-          </svg>
-        </button>
-      </div>
-      <div class="color-picker-wrap">
-        <button class="toolbar-btn font-color-btn" ref="fontColorBtnRef" @mousedown.prevent @click="toggleFontColorPicker" data-tip="字体" aria-label="字体">
-          <span class="font-color-text">A</span>
-        </button>
-      </div>
-      <button class="toolbar-btn" :class="{ active: isSup }" @mousedown.prevent @click="applySuperscript" data-tip="上标" aria-label="上标">
-        <span class="script-btn-text">A<sup>2</sup></span>
-      </button>
-      <button class="toolbar-btn" :class="{ active: isSub }" @mousedown.prevent @click="applySubscript" data-tip="下标" aria-label="下标">
-        <span class="script-btn-text">A<sub>2</sub></span>
-      </button>
-      <button v-if="editorPrefs.endnoteEnabled" class="toolbar-btn" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="insertEndnote" data-tip="尾注" aria-label="尾注">
-        <span class="script-btn-text">注<sup>1</sup></span>
-      </button>
-      <div class="toolbar-divider"></div>
-      <button class="toolbar-btn" @click="openFindBar(false)" data-tip="查找" aria-label="查找">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="8"/>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-        </svg>
-      </button>
-      <button class="toolbar-btn" @click="openFindBar(true)" data-tip="查找替换" aria-label="查找替换">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M17 1l4 4-4 4"/>
-          <path d="M3 11V9a4 4 0 0 1 4-4h14"/>
-          <path d="M7 23l-4-4 4-4"/>
-          <path d="M21 13v2a4 4 0 0 1-4 4H3"/>
-        </svg>
-      </button>
-      <div class="toolbar-divider"></div>
-      <button class="toolbar-btn" :class="{ active: showToc }" @click="showToc = !showToc" data-tip="目录" aria-label="目录">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-          <line x1="8" y1="13" x2="16" y2="13"/>
-          <line x1="8" y1="17" x2="13" y2="17"/>
-        </svg>
-      </button>
-      <button class="toolbar-btn" @click="startVoiceNote" :disabled="isProcessing" data-tip="语音输入" aria-label="语音输入">
-        <svg v-if="!isRecording" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-          <line x1="12" y1="19" x2="12" y2="23"/>
-          <line x1="8" y1="23" x2="16" y2="23"/>
-        </svg>
-        <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="recording-icon">
-          <rect x="6" y="6" width="12" height="12" rx="2"/>
-        </svg>
-      </button>
-      <div class="toolbar-divider"></div>
-      <button class="toolbar-btn" @mousedown.prevent @click="triggerImageUpload" data-tip="插入图片" aria-label="插入图片">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-          <circle cx="8.5" cy="8.5" r="1.5"/>
-          <polyline points="21 15 16 10 5 21"/>
-        </svg>
-      </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="triggerAudioUpload" data-tip="插入音频" aria-label="插入音频">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M9 18V5l12-2v13"/>
-          <circle cx="6" cy="18" r="3"/>
-          <circle cx="18" cy="16" r="3"/>
-        </svg>
-      </button>
-      <button class="toolbar-btn" @mousedown.prevent @click="triggerVideoUpload" data-tip="插入视频" aria-label="插入视频">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M22.54 6.42a2.78 2.78 0 0 0-1.94-2C18.88 4 12 4 12 4s-6.88 0-8.6.46a2.78 2.78 0 0 0-1.94 2A29 29 0 0 0 1 11.75a29 29 0 0 0 .46 5.33A2.78 2.78 0 0 0 3.4 19c1.72.46 8.6.46 8.6.46s6.88 0 8.6-.46a2.78 2.78 0 0 0 1.94-2 29 29 0 0 0 .46-5.25 29 29 0 0 0-.46-5.33z"/>
-          <polygon points="9.75 15.02 15.5 11.75 9.75 8.48 9.75 15.02"/>
-        </svg>
+      <button class="toolbar-btn toolbar-voice-btn" data-primary-tool="voice" tabindex="-1" :class="{ active: isRecording, recording: isRecording }" @mousedown.prevent @click="startVoiceNote" :disabled="isProcessing" :data-tip="isRecording ? '停止语音输入' : '语音输入'" :aria-label="isRecording ? '停止语音输入' : '语音输入'" :aria-pressed="isRecording">
+        <NoteToolbarIcon :name="isRecording ? 'stop' : 'voice'" />
       </button>
       <div class="toolbar-spacer"></div>
       <WordCountButton ref="wordCountRef" :get-text="wordCountSourceText" />
     </div>
+
+    <NoteToolbarPanel v-model="showListMenu" menu-id="list" title="列表" :anchor="listBtnRef">
+      <button class="note-toolbar-menu-item" @mousedown.prevent @click="handleListCommand('insertUnorderedList')"><NoteToolbarIcon name="list" /><span>项目符号列表</span></button>
+      <button class="note-toolbar-menu-item" @mousedown.prevent @click="handleListCommand('insertOrderedList')"><NoteToolbarIcon name="orderedList" /><span>编号列表</span></button>
+      <button class="note-toolbar-menu-item" @mousedown.prevent="wysiwygEditorRef?.saveEditorSelection()" @click="handleRestartNumbering()"><NoteToolbarIcon name="restartNumbering" /><span>从这里重新编号</span></button>
+    </NoteToolbarPanel>
+
+    <NoteToolbarPanel v-model="showInsertMenu" menu-id="insert" title="插入" :anchor="insertBtnRef">
+      <div class="note-toolbar-group-label">内容</div>
+      <div class="note-toolbar-menu-grid">
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="insertLink"><NoteToolbarIcon name="link" /><span>插入链接</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="openMathInsertDialog"><NoteToolbarIcon name="math" /><span>公式</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="openCodeInsertDialog"><NoteToolbarIcon name="code" /><span>代码块</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="triggerImageUpload"><NoteToolbarIcon name="image" /><span>图片</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="triggerAudioUpload"><NoteToolbarIcon name="audio" /><span>音频</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="triggerVideoUpload"><NoteToolbarIcon name="video" /><span>视频</span></button>
+        <button v-if="editorPrefs.endnoteEnabled" class="note-toolbar-menu-item" @mousedown.prevent @click="insertEndnote"><NoteToolbarIcon name="endnote" /><span>尾注</span></button>
+      </div>
+      <div class="note-toolbar-group-label">表格</div>
+      <div class="note-toolbar-table-grid" role="group" aria-label="选择表格大小">
+        <button
+          v-for="cell in 36"
+          :key="'nt-' + cell"
+          class="note-toolbar-table-cell"
+          :class="{ active: Math.ceil(cell / 6) <= tablePickerHoverRow && ((cell - 1) % 6) + 1 <= tablePickerHoverCol }"
+          :aria-label="`插入 ${Math.ceil(cell / 6)} 行 ${((cell - 1) % 6) + 1} 列表格`"
+          @mouseenter="onTablePickerHover(Math.ceil(cell / 6), ((cell - 1) % 6) + 1)"
+          @focus="onTablePickerHover(Math.ceil(cell / 6), ((cell - 1) % 6) + 1)"
+          @click="onTablePickerHover(Math.ceil(cell / 6), ((cell - 1) % 6) + 1); insertTableFromMenu()"
+        />
+      </div>
+    </NoteToolbarPanel>
+
+    <NoteToolbarPanel v-model="showCharacterMenu" menu-id="character" title="字符" :anchor="charBtnRef">
+      <div class="note-toolbar-menu-grid">
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="toggleHighlightColorPicker"><NoteToolbarIcon name="highlight" /><span>高亮</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="toggleFontColorPicker"><NoteToolbarIcon name="fontColor" /><span>字号与颜色</span></button>
+        <button class="note-toolbar-menu-item" :class="{ active: isSup }" @mousedown.prevent @click="applySuperscript"><NoteToolbarIcon name="superscript" /><span>上标</span></button>
+        <button class="note-toolbar-menu-item" :class="{ active: isSub }" @mousedown.prevent @click="applySubscript"><NoteToolbarIcon name="subscript" /><span>下标</span></button>
+        <button class="note-toolbar-menu-item" @pointerdown="wysiwygEditorRef?.saveClearTarget()" @mousedown.prevent @click="handleClearFormatting"><NoteToolbarIcon name="clearFormat" /><span>清除格式</span></button>
+      </div>
+    </NoteToolbarPanel>
+
+    <NoteToolbarPanel v-model="showParagraphMenu" menu-id="paragraph" title="段落" :anchor="paragraphBtnRef">
+      <div class="note-toolbar-menu-grid">
+        <button class="note-toolbar-menu-item" :class="{ active: isQuote }" @mousedown.prevent @click="handleBlockquoteCommand"><NoteToolbarIcon name="quote" /><span>引用</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="onObjectAlign('left')"><NoteToolbarIcon name="alignLeft" /><span>左对齐</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="onObjectAlign('center')"><NoteToolbarIcon name="alignCenter" /><span>居中</span></button>
+        <button class="note-toolbar-menu-item" @mousedown.prevent @click="onObjectAlign('right')"><NoteToolbarIcon name="alignRight" /><span>右对齐</span></button>
+      </div>
+    </NoteToolbarPanel>
+
+    <NoteToolbarPanel v-model="showToolsMenu" menu-id="tools" title="编辑" :anchor="toolsBtnRef">
+      <div class="note-toolbar-menu-grid">
+        <button class="note-toolbar-menu-item" @click="openFindBar(false)"><NoteToolbarIcon name="search" /><span>查找</span></button>
+        <button class="note-toolbar-menu-item" @click="openFindBar(true)"><NoteToolbarIcon name="replace" /><span>查找替换</span></button>
+        </div>
+    </NoteToolbarPanel>
 
     <div v-if="showFindBar" class="find-replace-bar">
       <div class="find-row">
@@ -257,10 +180,10 @@
     </div>
 
       <div class="editor-content">
-      <div v-if="showToc" class="toc-panel">
+      <div v-if="showToc" id="note-toc-panel" ref="tocPanelRef" class="toc-panel" role="dialog" aria-label="目录">
         <div class="toc-header">
           <span>目录</span>
-          <button class="toc-close-btn" @click="showToc = false">
+          <button class="toc-close-btn" aria-label="关闭目录" @click="closeToc">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <line x1="18" y1="6" x2="6" y2="18"/>
               <line x1="6" y1="6" x2="18" y2="18"/>
@@ -273,15 +196,20 @@
             :key="item.id"
             class="toc-item"
             :style="{ paddingLeft: (item.level * 16) + 'px' }"
-            @click="scrollToHeading(item.id)"
           >
-            <span v-if="item.hasChildren" class="toc-toggle" @click.stop="toggleTocCollapse(item.index)">
+            <button
+              v-if="item.hasChildren"
+              class="toc-toggle"
+              :aria-label="collapsedToc.has(item.index) ? '展开子标题' : '收起子标题'"
+              :aria-expanded="!collapsedToc.has(item.index)"
+              @click.stop="toggleTocCollapse(item.index)"
+            >
               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" :class="{ 'toc-toggle-collapsed': collapsedToc.has(item.index) }">
                 <polyline points="6 9 12 15 18 9"/>
               </svg>
-            </span>
+            </button>
             <span v-else class="toc-toggle-spacer"></span>
-            {{ item.text }}
+            <button class="toc-link" @click="scrollToHeading(item.id)">{{ item.text }}</button>
           </div>
         </div>
         <div v-else class="toc-empty">暂无标题</div>
@@ -350,7 +278,7 @@
       />
     </Teleport>
     <Teleport to="body">
-      <div v-if="showFontColorPicker" class="font-color-picker-teleport" :style="fontColorPickerStyle" @click.stop>
+      <div v-if="showFontColorPicker" class="font-color-picker-teleport" :style="fontColorPickerStyle" @click.stop @keydown.esc.stop.prevent="closeFontColorPickerFromKeyboard">
         <div class="font-size-row">
           <label class="font-size-label">字号</label>
           <select v-model="selectedFontSize" class="font-size-select" @change="applyFontSize">
@@ -387,7 +315,7 @@
       </div>
     </Teleport>
     <Teleport to="body">
-      <div v-if="showHighlightColorPicker" class="font-color-picker-teleport" :style="highlightColorPickerStyle" @click.stop>
+      <div v-if="showHighlightColorPicker" class="font-color-picker-teleport" :style="highlightColorPickerStyle" @click.stop @keydown.esc.stop.prevent="closeHighlightPickerFromKeyboard">
         <div class="color-grid">
           <button
             v-for="c in highlightColors"
@@ -409,32 +337,14 @@
         </div>
       </div>
     </Teleport>
-    <Teleport to="body">
-      <div v-if="showHeadingMenu" class="heading-dropdown-teleport" :style="headingMenuStyle" @click.stop>
-        <button class="heading-dropdown-item" :class="{ 'heading-active': !currentHeadingLevel }" @click="applyHeading('p')"><span class="heading-icon">正文</span></button>
-        <button class="heading-dropdown-item" :class="{ 'heading-active': currentHeadingLevel === 'h1' }" @click="applyHeading('h1')"><span class="heading-icon">H1</span></button>
-        <button class="heading-dropdown-item" :class="{ 'heading-active': currentHeadingLevel === 'h2' }" @click="applyHeading('h2')"><span class="heading-icon">H2</span></button>
-        <button class="heading-dropdown-item" :class="{ 'heading-active': currentHeadingLevel === 'h3' }" @click="applyHeading('h3')"><span class="heading-icon">H3</span></button>
-        <button class="heading-dropdown-item" :class="{ 'heading-active': currentHeadingLevel === 'h4' }" @click="applyHeading('h4')"><span class="heading-icon">H4</span></button>
-      </div>
-    </Teleport>
-    <Teleport to="body">
-      <div v-if="showTablePicker" class="table-picker-teleport" :style="tablePickerStyle" @click.stop>
-        <div class="table-picker-grid">
-          <div v-for="r in 6" :key="r" class="table-picker-row">
-            <button
-              v-for="c in 6" :key="c"
-              class="table-picker-cell"
-              :class="{ active: r <= tablePickerHoverRow && c <= tablePickerHoverCol }"
-              @mouseenter="onTablePickerHover(r, c)"
-              @click="confirmTablePicker"
-            ></button>
-          </div>
-        </div>
-        <div class="table-picker-label">{{ tablePickerHoverRow > 0 ? `${tablePickerHoverRow} × ${tablePickerHoverCol}` : '选择大小' }}</div>
-      </div>
-    </Teleport>
-    <Teleport to="body">
+    <NoteToolbarPanel v-model="showHeadingMenu" menu-id="heading" title="正文" :anchor="headingBtnRef">
+      <button class="note-toolbar-menu-item" :class="{ active: !currentHeadingLevel }" @mousedown.prevent @click="applyHeading('p')"><NoteToolbarIcon name="paragraph" /><span>正文</span></button>
+      <button class="note-toolbar-menu-item" :class="{ active: currentHeadingLevel === 'h1' }" @mousedown.prevent @click="applyHeading('h1')"><span class="heading-icon">H1</span><span>标题 1</span></button>
+      <button class="note-toolbar-menu-item" :class="{ active: currentHeadingLevel === 'h2' }" @mousedown.prevent @click="applyHeading('h2')"><span class="heading-icon">H2</span><span>标题 2</span></button>
+      <button class="note-toolbar-menu-item" :class="{ active: currentHeadingLevel === 'h3' }" @mousedown.prevent @click="applyHeading('h3')"><span class="heading-icon">H3</span><span>标题 3</span></button>
+      <button class="note-toolbar-menu-item" :class="{ active: currentHeadingLevel === 'h4' }" @mousedown.prevent @click="applyHeading('h4')"><span class="heading-icon">H4</span><span>标题 4</span></button>
+    </NoteToolbarPanel>
+        <Teleport to="body">
       <div v-if="showMermaidEditDialog" class="mermaid-dialog-overlay" @click="closeMermaidEditDialog">
         <div class="mermaid-dialog" @click.stop>
           <div class="mermaid-dialog-header">
@@ -573,7 +483,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, nextTick, type CSSProperties } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router'
 import { useNotesStore } from '@/stores/notes'
 import { useAsrStreaming } from '@/composables/useAsrStreaming'
@@ -591,6 +501,8 @@ import { renderMarkdownToHtml, renderMermaidBlocks, renderSingleMermaidBlock, fi
 import ExportProgressDialog from './ExportProgressDialog.vue'
 import WysiwygEditor from './WysiwygEditor.vue'
 import WordCountButton from './WordCountButton.vue'
+import NoteToolbarPanel from './NoteToolbarPanel.vue'
+import NoteToolbarIcon from './NoteToolbarIcon.vue'
 import { resolveImageUrl, uploadImage, uploadMedia } from '@/api/imageUpload'
 import { visibleEditorText } from '@/utils/noteWordCount'
 
@@ -710,21 +622,7 @@ function onObjectAlign(align: 'left' | 'center' | 'right') {
     editor.setImageAlignment(img, align)
     return
   }
-  const multiSels = editor.getMultiSelections?.()
-  if (multiSels && multiSels.size > 0) {
-    const editorEl = editor.editorRef
-    if (editorEl) {
-      const blocks = editorEl.querySelectorAll('.multi-selected') as NodeListOf<HTMLElement>
-      blocks.forEach(block => {
-        if (block.tagName === 'IMG') {
-          editor.setImageAlignment(block as unknown as HTMLImageElement, align)
-        } else {
-          editor.setBlockAlignment(block, align)
-        }
-      })
-    }
-    return
-  }
+  // 块多选已删除（判据 #5）：对齐作用于原生主选区所在块
   const block = editor.getCurrentBlockElement()
   if (block) {
     editor.setBlockAlignment(block, align)
@@ -732,17 +630,25 @@ function onObjectAlign(align: 'left' | 'center' | 'right') {
 }
 
 const showHeadingMenu = ref(false)
+const showListMenu = ref(false)
+const showInsertMenu = ref(false)
+const showCharacterMenu = ref(false)
+const showParagraphMenu = ref(false)
+const showToolsMenu = ref(false)
+const listBtnRef = ref<HTMLButtonElement | null>(null)
+const insertBtnRef = ref<HTMLButtonElement | null>(null)
+const charBtnRef = ref<HTMLButtonElement | null>(null)
+const paragraphBtnRef = ref<HTMLButtonElement | null>(null)
+const toolsBtnRef = ref<HTMLButtonElement | null>(null)
 const currentHeadingLevel = ref<string | null>(null)
 const showToc = ref(false)
+const tocBtnRef = ref<HTMLButtonElement | null>(null)
+const tocPanelRef = ref<HTMLElement | null>(null)
 const showFontColorPicker = ref(false)
-const fontColorBtnRef = ref<HTMLButtonElement | null>(null)
 const customFontColor = ref('#ff0000')
 const selectedFontSize = ref('')
 const showHighlightColorPicker = ref(false)
-const highlightBtnRef = ref<HTMLButtonElement | null>(null)
 const customHighlightColor = ref('#ffff00')
-const showTablePicker = ref(false)
-const tableBtnRef = ref<HTMLButtonElement | null>(null)
 const tablePickerHoverRow = ref(0)
 const tablePickerHoverCol = ref(0)
 const showMermaidEditDialog = ref(false)
@@ -803,35 +709,17 @@ const codeInsertText = ref('')
 // 依赖是模板 ref（挂载时赋值一次、之后不变），getBoundingClientRect 又不是
 // 响应式的，于是首次求值的矩形被永久缓存：面板拖宽/窗口改比例后按钮已经移位，
 // 菜单仍开在按钮的旧位置（16:9 上恰好没移过所以看着是对的）。
-const headingMenuStyle = ref<CSSProperties>({})
 
-function measureMenuStyle(btn: HTMLElement | null): CSSProperties {
-  if (!btn) return {}
-  const rect = btn.getBoundingClientRect()
-  const left = Math.max(8, Math.min(rect.left, window.innerWidth - 280 - 8))
-  const top = Math.min(rect.bottom + 4, Math.max(8, window.innerHeight - 80))
-  return {
-    position: 'fixed',
-    top: `${top}px`,
-    left: `${left}px`,
-    zIndex: 9999,
-  }
-}
-
-function refreshHeadingMenuStyle() {
-  if (!showHeadingMenu.value) return
-  headingMenuStyle.value = measureMenuStyle(headingBtnRef.value)
-}
 
 // 字体/高亮拾取器定位：共用 useAnchoredPickerStyle（打开瞬间测量 + 视口钳制）。
 // 旧实现是 computed 包 getBoundingClientRect（矩形被永久缓存 + 右侧工具栏浮层
 // 溢出视口）—— 与 ZenNotePanel 同步替换。
 const { pickerStyle: fontColorPickerStyle, refreshPickerStyle: refreshFontColorPickerStyle } =
-  useAnchoredPickerStyle(fontColorBtnRef)
+  useAnchoredPickerStyle(charBtnRef)
 const { onTipPointer } = useToolbarTip()
 const editorPrefs = useEditorPrefsStore()
 const { pickerStyle: highlightColorPickerStyle, refreshPickerStyle: refreshHighlightColorPickerStyle } =
-  useAnchoredPickerStyle(highlightBtnRef)
+  useAnchoredPickerStyle(charBtnRef)
 
 const fontColors = [
   '#000000', '#e60000', '#ff9900', '#ffff00', '#008a00', '#0066cc',
@@ -866,20 +754,84 @@ const visibleTocItems = computed(() => {
 
 function closeAllToolbarMenus() {
   showHeadingMenu.value = false
-  showTablePicker.value = false
   showHighlightColorPicker.value = false
   showFontColorPicker.value = false
+  showListMenu.value = false
+  showInsertMenu.value = false
+  showCharacterMenu.value = false
+  showParagraphMenu.value = false
+  showToolsMenu.value = false
+}
+
+function toggleListMenu() {
+  const next = !showListMenu.value
+  closeAllToolbarMenus()
+  showListMenu.value = next
+}
+
+function toggleInsertMenu() {
+  const next = !showInsertMenu.value
+  closeAllToolbarMenus()
+  if (next) wysiwygEditorRef.value?.saveEditorSelection?.()
+  showInsertMenu.value = next
+}
+
+function toggleCharacterMenu() {
+  const next = !showCharacterMenu.value
+  closeAllToolbarMenus()
+  showCharacterMenu.value = next
+}
+
+function toggleParagraphMenu() {
+  const next = !showParagraphMenu.value
+  closeAllToolbarMenus()
+  showParagraphMenu.value = next
+}
+
+function toggleToolsMenu() {
+  const next = !showToolsMenu.value
+  closeAllToolbarMenus()
+  showToolsMenu.value = next
+}
+
+function onPrimaryToolbarKeydown(event: KeyboardEvent) {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+  const root = event.currentTarget as HTMLElement
+  const tools = Array.from(root.querySelectorAll<HTMLElement>('[data-primary-tool]'))
+    .filter((el) => !(el as HTMLButtonElement).disabled)
+    .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)
+  const current = tools.indexOf(document.activeElement as HTMLElement)
+  if (current < 0) return
+  event.preventDefault()
+  let next = current
+  if (event.key === 'ArrowRight') next = (current + 1) % tools.length
+  if (event.key === 'ArrowLeft') next = (current - 1 + tools.length) % tools.length
+  if (event.key === 'Home') next = 0
+  if (event.key === 'End') next = tools.length - 1
+  tools.forEach((tool) => { tool.tabIndex = -1 })
+  tools[next].tabIndex = 0
+  tools[next].focus()
+}
+
+function insertTableFromMenu() {
+  const rows = tablePickerHoverRow.value
+  const cols = tablePickerHoverCol.value
+  if (rows < 1 || cols < 1) return
+  closeAllToolbarMenus()
+  wysiwygEditorRef.value?.restoreEditorSelection?.()
+  wysiwygEditorRef.value?.insertTable(rows, cols)
+}
+
+function insertLink() {
+  wysiwygEditorRef.value?.saveEditorSelection?.()
+  wysiwygEditorRef.value?.insertLink?.()
 }
 
 function toggleHeadingMenu() {
-  if (showHeadingMenu.value) {
-    showHeadingMenu.value = false
-    return
-  }
+  const next = !showHeadingMenu.value
   closeAllToolbarMenus()
   updateHeadingButtonState()
-  headingMenuStyle.value = measureMenuStyle(headingBtnRef.value)
-  showHeadingMenu.value = true
+  showHeadingMenu.value = next
 }
 
 const isBold = ref(false)
@@ -906,16 +858,25 @@ function updateFormatStates() {
     isBold.value = isItalic.value = isQuote.value = isSup.value = isSub.value = false
     return
   }
-  let bold = false, italic = false
-  try { bold = document.queryCommandState('bold') } catch {}
-  try { italic = document.queryCommandState('italic') } catch {}
+  let bold = false, italic = false, stateKnown = false
+  try {
+    bold = document.queryCommandState('bold')
+    italic = document.queryCommandState('italic')
+    stateKnown = true
+  } catch {}
+  // With a collapsed caret the command state is the pending typing style:
+  // after toggling bold OFF inside a <strong>, the ancestor walk must not
+  // force the button back to pressed.
+  const trustAncestor = !stateKnown || !sel.isCollapsed
   let node: Node | null = sel.anchorNode
   let quote = false, sup = false, sub = false
   while (node && node !== editorEl) {
     if (node.nodeType === Node.ELEMENT_NODE) {
       const tag = (node as HTMLElement).tagName
-      if (tag === 'B' || tag === 'STRONG') bold = true
-      if (tag === 'I' || tag === 'EM') italic = true
+      if (trustAncestor) {
+        if (tag === 'B' || tag === 'STRONG') bold = true
+        if (tag === 'I' || tag === 'EM') italic = true
+      }
       if (tag === 'BLOCKQUOTE') quote = true
       if (tag === 'SUP') sup = true
       if (tag === 'SUB') sub = true
@@ -937,10 +898,25 @@ function toggleHighlightColorPicker() {
   if (showHighlightColorPicker.value) {
     showHighlightColorPicker.value = false
   } else {
-    closeAllToolbarMenus()
     refreshHighlightColorPickerStyle()
+    closeAllToolbarMenus()
     showHighlightColorPicker.value = true
+    nextTick(() => focusFirstSwatch('.font-color-picker-teleport'))
   }
+}
+
+function focusFirstSwatch(selector: string) {
+  document.querySelector<HTMLElement>(selector + ' .color-swatch')?.focus()
+}
+
+function closeHighlightPickerFromKeyboard() {
+  showHighlightColorPicker.value = false
+  charBtnRef.value?.focus()
+}
+
+function closeFontColorPickerFromKeyboard() {
+  showFontColorPicker.value = false
+  charBtnRef.value?.focus()
 }
 
 function applyHighlightColor(color: string) {
@@ -975,43 +951,11 @@ function removeHighlight() {
   }
 }
 
-const { pickerStyle: tablePickerStyle, refreshPickerStyle: refreshTablePickerStyle } =
-  useAnchoredPickerStyle(tableBtnRef)
-
-function toggleTablePicker() {
-  const editor = wysiwygEditorRef.value
-  if (editor && editor.saveEditorSelection) {
-    editor.saveEditorSelection()
-  }
-  if (showTablePicker.value) {
-    showTablePicker.value = false
-  } else {
-    closeAllToolbarMenus()
-    refreshTablePickerStyle()
-    showTablePicker.value = true
-  }
-  tablePickerHoverRow.value = 0
-  tablePickerHoverCol.value = 0
-}
-
 function onTablePickerHover(row: number, col: number) {
   tablePickerHoverRow.value = row
   tablePickerHoverCol.value = col
 }
 
-function confirmTablePicker() {
-  const rows = tablePickerHoverRow.value
-  const cols = tablePickerHoverCol.value
-  if (rows < 1 || cols < 1) return
-  showTablePicker.value = false
-  const editor = wysiwygEditorRef.value
-  if (editor) {
-    if (editor.restoreEditorSelection) {
-      editor.restoreEditorSelection()
-    }
-    editor.insertTable(rows, cols)
-  }
-}
 
 
 let pinchStartDistance = 0
@@ -1382,8 +1326,22 @@ onBeforeRouteUpdate(async (_to, _from, next) => {
   next()
 })
 
-async function saveNote() {
-  if (saving.value) return
+let saveInFlight: Promise<boolean> | null = null
+
+async function saveNote(): Promise<boolean> {
+  // Share an in-flight save instead of failing: export/autosave can overlap and
+  // must not report a false "保存失败" while the save is still running.
+  if (saveInFlight) return saveInFlight
+  const task = runSave()
+  saveInFlight = task
+  try {
+    return await task
+  } finally {
+    if (saveInFlight === task) saveInFlight = null
+  }
+}
+
+async function runSave(): Promise<boolean> {
   saving.value = true
   try {
     // Pasted images upload in the background; saving before they finish would
@@ -1397,8 +1355,10 @@ async function saveNote() {
     })
     hasChanges.value = false
     clearDraft()
+    return true
   } catch (e) {
     console.error('Failed to save note:', e)
+    return false
   } finally {
     saving.value = false
   }
@@ -1419,6 +1379,13 @@ async function confirmDelete() {
 
 async function handleExport(format: 'md' | 'pdf') {
   showExportPicker.value = false
+  if (hasChanges.value || saving.value) {
+    const saved = await saveNote()
+    if (!saved || hasChanges.value) {
+      showToast('保存失败，已取消导出', 'error')
+      return
+    }
+  }
   exportFormat.value = format
   exportStatus.value = 'exporting'
   exporting.value = true
@@ -1762,19 +1729,14 @@ function applyHeading(heading: string) {
 function execCommand(command: string, value?: string) {
   if (wysiwygEditorRef.value) {
     wysiwygEditorRef.value.execCommand(command, value)
+    // Collapsed-caret bold/italic only sets a pending typing state; no DOM
+    // mutation fires selectionchange, so refresh the pressed state explicitly.
+    nextTick(() => updateFormatStates())
   }
 }
 
 function handleListCommand(command: string) {
   const editor = wysiwygEditorRef.value
-  if (editor && editor.getMultiSelections && editor.getMultiSelections() && editor.getMultiSelections().size > 0) {
-    if (command === 'insertUnorderedList') {
-      editor.applyToListSelections('ul')
-    } else {
-      editor.applyToListSelections('ol')
-    }
-    return
-  }
   if (command === 'insertOrderedList') {
     const sel = window.getSelection()
     if (sel && sel.rangeCount > 0) {
@@ -1809,23 +1771,25 @@ function handleListCommand(command: string) {
 
 function handleRestartNumbering() {
   const editor = wysiwygEditorRef.value
-  if (editor && editor.restartOlNumbering && editor.findCurrentOl) {
-    if (editor.saveEditorSelection) editor.saveEditorSelection()
-    if (editor.restoreEditorSelection) editor.restoreEditorSelection()
-    const ol = editor.findCurrentOl()
-    if (ol) {
-      if (editor.restoreEditorSelection) editor.restoreEditorSelection()
-      editor.restartOlNumbering(ol)
-    }
+  if (!editor || !editor.restartOlNumbering || !editor.findCurrentOl) return
+  if (editor.saveEditorSelection) editor.saveEditorSelection()
+  if (editor.restoreEditorSelection) editor.restoreEditorSelection()
+  const ol = editor.findCurrentOl()
+  // 判据 #7：不再静默无操作 —— 无列表上下文/已在首项都给明确反馈
+  if (!ol) {
+    showToast('请先将光标点到编号列表内，再点「重新编号」', 'error')
+    return
+  }
+  const res = editor.restartOlNumbering(ol)
+  if (res === 'already-first') {
+    showToast('该项编号已是从 1 开始', 'info')
+  } else if (res === 'none') {
+    showToast('请先将光标点到编号列表内，再点「重新编号」', 'error')
   }
 }
 
 function handleBlockquoteCommand() {
-  const editor = wysiwygEditorRef.value
-  if (editor && editor.getMultiSelections && editor.getMultiSelections() && editor.getMultiSelections().size > 0) {
-    editor.applyBlockquoteToSelections()
-    return
-  }
+  // 块多选已删除（判据 #5）：引用作用于原生主选区所在块
   execCommand('formatBlock', 'blockquote')
 }
 
@@ -1855,9 +1819,10 @@ function toggleFontColorPicker() {
     if (editor && editor.saveEditorSelection) {
       editor.saveEditorSelection()
     }
-    closeAllToolbarMenus()
     refreshFontColorPickerStyle()
+    closeAllToolbarMenus()
     showFontColorPicker.value = true
+    nextTick(() => focusFirstSwatch('.font-color-picker-teleport'))
   }
 }
 
@@ -1907,6 +1872,34 @@ function applySuperscript() {
   }
 }
 
+/**
+ * 清除格式（遗留 #1 方案 A）：有选区清选区；折叠光标清整篇（先确认）。
+ * 数据载体（引文/尾注/公式/图表）与结构（链接/代码/图片/表格）由编辑器侧白名单保留。
+ */
+async function handleClearFormatting() {
+  const editor = wysiwygEditorRef.value
+  if (!editor || typeof editor.clearFormatting !== 'function') return
+  if (editor.isEditorComposing?.()) {
+    showToast('输入法组合中，请稍后再试', 'error')
+    return
+  }
+  // 浏览器/移动端可能在按下与 click 之间折叠选区 —— 用按钮按下瞬间的缓存找回选区，
+  // 保证「选了文字 → 只清选中部分」；只有确实没选文字才询问整篇。
+  if (!editor.hasTextSelection?.()) editor.restoreClearTarget?.()
+  const scope = editor.hasTextSelection?.() ? 'selection' : 'document'
+  if (scope === 'document') {
+    const ok = await showConfirm({
+      message: '未选中文字，将清除整篇笔记的格式（可撤销）。是否继续？',
+      confirmText: '清除整篇',
+    })
+    if (!ok) return
+  }
+  const done = editor.clearFormatting(scope)
+  editor.clearClearTarget?.()
+  if (done === 'busy') showToast('输入法组合中，请稍后再试', 'error')
+  else if (done) showToast(done === 'selection' ? '已清除选中格式' : '已清除整篇格式', 'success')
+}
+
 function applySubscript() {
   const editor = wysiwygEditorRef.value
   if (editor && editor.applySubscript) {
@@ -1943,6 +1936,22 @@ function computeTocItems() {
     items[i].hasChildren = next ? next.level > items[i].level : false
   }
   tocItems.value = items
+}
+
+function toggleToc() {
+  if (showToc.value) {
+    closeToc()
+  } else {
+    showToc.value = true
+    nextTick(() => {
+      tocPanelRef.value?.querySelector<HTMLElement>('.toc-link, .toc-close-btn')?.focus()
+    })
+  }
+}
+
+function closeToc() {
+  showToc.value = false
+  nextTick(() => tocBtnRef.value?.focus())
 }
 
 function toggleTocCollapse(index: number) {
@@ -2117,6 +2126,8 @@ function saveMermaidEdit() {
     block.setAttribute('data-mermaid-source', mermaidEditSource.value)
     block.classList.remove('mermaid-rendered')
     block.innerHTML = ''
+    // 编辑器外直接改树（评审 N1）：显式结束虚拟多 range 会话
+    wysiwygEditorRef.value?.clearMultiRanges?.()
     nextTick(() => renderSingleMermaidBlock(block as HTMLElement))
   }
   
@@ -2211,6 +2222,8 @@ function saveMathEdit() {
   const newEl = wrapper.firstElementChild as HTMLElement
   if (newEl) {
     el.replaceWith(newEl)
+    // 编辑器外直接改树（评审 N1）：显式结束虚拟多 range 会话
+    wysiwygEditorRef.value?.clearMultiRanges?.()
     nextTick(() => {
       const container = wysiwygEditorRef.value?.editorRef || previewRef.value
       if (container) {
@@ -2226,10 +2239,13 @@ function closeMathEditDialog() {
 }
 
 function onDocumentClick(e: MouseEvent) {
-  if (!showHeadingMenu.value && !showFontColorPicker.value && !showHighlightColorPicker.value && !showTablePicker.value) return
+  if (!showHeadingMenu.value && !showFontColorPicker.value && !showHighlightColorPicker.value) return
   const target = e.target as HTMLElement
   // Don't close menus when clicking TOC button (TOC is not mutually exclusive)
   if (target.closest('button[data-tip="目录"]')) return
+  // 拾取器的触发入口在「字符」二级菜单内：该次点击只负责打开拾取器，
+  // 不能在同一事件的冒泡阶段把它又关掉（面板是 Teleport，旧 wrap 守卫不覆盖）。
+  if (target.closest('.note-toolbar-panel[data-menu="character"]')) return
   if (showHeadingMenu.value) {
     if (target.closest('.heading-dropdown-teleport') || target.closest('.heading-dropdown-wrap')) return
     showHeadingMenu.value = false
@@ -2241,10 +2257,6 @@ function onDocumentClick(e: MouseEvent) {
   if (showHighlightColorPicker.value) {
     if (target.closest('.font-color-picker-teleport') || target.closest('.color-picker-wrap')) return
     showHighlightColorPicker.value = false
-  }
-  if (showTablePicker.value) {
-    if (target.closest('.table-picker-teleport') || target.closest('.table-picker-wrap')) return
-    showTablePicker.value = false
   }
 }
 
@@ -2263,6 +2275,9 @@ function onGlobalKeydown(e: KeyboardEvent) {
       showCodeInsertDialog.value = false
       e.preventDefault()
       wysiwygEditorRef.value?.focus()
+    } else if (showToc.value) {
+      closeToc()
+      e.preventDefault()
     }
   }
 }
@@ -2418,7 +2433,7 @@ async function stopRecording() {
   justify-content: space-between;
   gap: 8px;
   padding: 12px 16px;
-  background-color: var(--color-white);
+  background-color: var(--surface-panel-strong, var(--color-white));
   border-bottom: 1px solid var(--color-border);
 }
 
@@ -2549,7 +2564,7 @@ async function stopRecording() {
   align-items: center;
   gap: 4px;
   padding: 8px 12px;
-  background-color: var(--color-white);
+  background-color: var(--surface-panel-strong, var(--color-white));
   border-bottom: 1px solid var(--color-border);
   flex-wrap: nowrap;
   overflow-x: auto;
@@ -2568,11 +2583,25 @@ async function stopRecording() {
   min-width: 8px;
 }
 
+/* 工具栏按钮尺寸统一（判据 #1）：固定 36×36 方盒（border-box）+ 内容居中。
+   此前 svg/文字/字体按钮各按内容撑尺寸（实测同栏 44x35 / 36x30 / 43x30 三档）；
+   皮肤层只保留配色/边框/圆角，尺寸以本盒为准（皮肤覆写见 themes/*.css 同值规则）。 */
 .toolbar-btn {
-  padding: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0;
+  box-sizing: border-box;
   color: var(--color-text-light);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: 13px;
   flex-shrink: 0;
+  transition: background-color .16s ease, border-color .16s ease, color .16s ease;
 }
 
 .toolbar-btn:hover {
@@ -2589,6 +2618,29 @@ async function stopRecording() {
   opacity: 0.5;
 }
 
+.toolbar-btn:focus-visible {
+  outline: 2px solid var(--color-text);
+  outline-offset: 1px;
+}
+
+/* 图标 + 文字的一级入口：横向留白由皮肤最终裁决（见 themes/*.css） */
+.toolbar-primary-btn {
+  width: 60px !important;
+  min-width: 60px;
+  gap: 5px;
+  padding: 0;
+  justify-content: center;
+}
+.toolbar-primary-label {
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.toolbar-voice-btn.recording {
+  color: var(--color-danger, #c0392b);
+}
+/* 工具栏 DOM 顺序即视觉顺序（禁止用 flex order 反排，避免 Tab/读屏顺序与视觉不一致） */
 .heading-dropdown-wrap {
   flex-shrink: 0;
 }
@@ -2674,62 +2726,13 @@ async function stopRecording() {
   flex-shrink: 0;
 }
 
-.table-picker-wrap {
-  flex-shrink: 0;
-}
-
-.color-picker-wrap {
-  flex-shrink: 0;
-}
-
-.table-picker-teleport {
-  background: var(--color-white);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  box-shadow: 0 4px 12px rgba(90, 130, 60, 0.12);
-  padding: 8px;
-}
-
-.table-picker-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.table-picker-row {
-  display: flex;
-  gap: 2px;
-}
-
-.table-picker-cell {
-  width: 20px;
-  height: 20px;
-  border: 1px solid var(--color-border);
-  border-radius: 2px;
-  background: var(--color-white);
-  cursor: pointer;
-  padding: 0;
-}
-
-.table-picker-cell.active {
-  background-color: var(--color-primary);
-  border-color: var(--color-primary);
-  opacity: 0.7;
-}
-
-.table-picker-label {
-  text-align: center;
-  font-size: 12px;
-  color: var(--color-text-light);
-  margin-top: 6px;
-}
 
 .find-replace-bar {
   display: flex;
   flex-direction: column;
   gap: 4px;
   padding: 6px 12px;
-  background-color: var(--color-white);
+  background-color: var(--surface-panel-strong, var(--color-white));
   border-bottom: 1px solid var(--color-border);
 }
 
@@ -3154,6 +3157,8 @@ async function stopRecording() {
   }
 
   .editor-toolbar {
+    gap: 4px;
+    padding: 6px 4px;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
@@ -3161,6 +3166,21 @@ async function stopRecording() {
   }
 
   .editor-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .editor-toolbar .toolbar-btn,
+  .editor-toolbar .toolbar-primary-btn,
+  .zen-note-toolbar .toolbar-btn,
+  .zen-note-toolbar .toolbar-primary-btn {
+    width: 32px !important;
+    min-width: 32px !important;
+    height: 32px !important;
+    padding: 0 !important;
+    gap: 0;
+  }
+
+  .toolbar-primary-label {
     display: none;
   }
 
@@ -3188,6 +3208,14 @@ async function stopRecording() {
 
   .find-input {
     min-width: 60px;
+  }
+
+  /* 9 个一级入口 + 字数统计在 390px 必须不横向溢出：收紧间距而不是缩小命中区 */
+  @media (max-width: 430px) {
+    .editor-toolbar {
+      gap: 2px;
+      padding: 6px 2px;
+    }
   }
 }
 
@@ -3718,35 +3746,41 @@ async function stopRecording() {
 
 .toc-panel {
   position: absolute;
-  top: 0;
-  right: 0;
-  width: 240px;
-  max-height: 100%;
-  background: var(--color-white);
-  border-left: 1px solid var(--color-border);
-  box-shadow: -2px 0 8px rgba(90, 130, 60, 0.05);
-  z-index: 100;
+  top: 12px;
+  right: 12px;
+  width: 232px;
+  max-height: calc(100% - 24px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  background: var(--surface-panel-strong, var(--color-white));
+  border: 1px solid var(--panel-border-strong, var(--color-border));
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: 100;
 }
 
 .toc-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
-  font-size: 14px;
+  padding: 8px 8px 8px 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--color-text);
-  border-bottom: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--panel-border, var(--color-border));
   flex-shrink: 0;
 }
 
 .toc-close-btn {
-  padding: 4px;
-  color: var(--color-text-light);
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
+  color: var(--color-text-light);
 }
 
 .toc-close-btn:hover {
@@ -3755,29 +3789,30 @@ async function stopRecording() {
 }
 
 .toc-list {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
-  padding: 8px 0;
+  padding: 6px;
 }
 
 .toc-item {
-  padding: 6px 14px;
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
   font-size: 13px;
+  line-height: 1.4;
   color: var(--color-text);
   cursor: pointer;
   white-space: normal;
   overflow-wrap: break-word;
   word-break: break-word;
-  transition: all var(--transition-fast);
-  display: flex;
-  align-items: flex-start;
-  gap: 4px;
-  line-height: 1.4;
 }
 
 .toc-item:hover {
   background-color: var(--color-hover);
-  color: var(--color-primary);
+  color: var(--color-text);
 }
 
 .toc-toggle {
@@ -3787,9 +3822,30 @@ async function stopRecording() {
   flex-shrink: 0;
   width: 16px;
   height: 18px;
-  cursor: pointer;
-  border-radius: 3px;
   margin-top: 1px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.toc-toggle:focus-visible,
+.toc-link:focus-visible {
+  outline: 2px solid var(--color-text);
+  outline-offset: 1px;
+}
+.toc-link {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 
 .toc-toggle:hover {
@@ -3811,7 +3867,7 @@ async function stopRecording() {
 }
 
 .toc-empty {
-  padding: 20px 14px;
+  padding: 18px 12px;
   font-size: 13px;
   color: var(--color-text-light);
   text-align: center;
@@ -3925,7 +3981,6 @@ async function stopRecording() {
 .font-color-btn {
   font-weight: bold;
   font-size: 14px;
-  padding: 4px 6px;
 }
 
 .font-color-text {
@@ -3952,5 +4007,24 @@ async function stopRecording() {
 
 .script-btn-text sub {
   vertical-align: sub;
+}
+
+@media (max-width: 400px) {
+  .editor-toolbar .toolbar-btn,
+  .editor-toolbar .toolbar-primary-btn {
+    width: 30px !important;
+    min-width: 30px !important;
+    height: 30px !important;
+  }
+  .editor-toolbar { gap: 2px; }
+}
+@media (max-width: 365px) {
+  .editor-toolbar .toolbar-btn,
+  .editor-toolbar .toolbar-primary-btn {
+    width: 27px !important;
+    min-width: 27px !important;
+    height: 27px !important;
+  }
+  .editor-toolbar { gap: 1px; padding: 6px 2px; }
 }
 </style>

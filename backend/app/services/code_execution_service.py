@@ -133,6 +133,10 @@ class ExecutionResult:
     return_code: int
     error: Optional[str] = None
     timed_out: bool = False
+    # F5/M4（2026-11-01 审计）：本次真正生效的超时（caller 可覆盖默认值，
+    # 回执必须回报实际值而不是全局配置）。
+    timeout_effective: Optional[float] = None
+    killed_by: str = ""
 
 
 def _set_memory_limit() -> None:
@@ -144,6 +148,30 @@ def _set_memory_limit() -> None:
         resource.setrlimit(resource.RLIMIT_AS, (min(limit, hard), hard))
     except Exception:
         pass
+
+
+def _build_env(home: str, exec_path: Optional[str] = None, extra_env: Optional[dict] = None) -> dict:
+    """代码执行沙箱 env（F1 2026-10-26）：HOME 隔离进工作区的同时，把 playwright
+    浏览器注册表钉到服务端共享目录（避免每工作区复制 641M 浏览器）。"""
+    from app.services.sandbox_env import playwright_browsers_env
+    return {
+        "PATH": exec_path or "/usr/local/bin:/usr/bin:/bin",
+        "HOME": home,
+        "TMPDIR": str(Path(home) / ".exec_tmp"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        # F1/F2（2026-11-01 审计）：stdout 接管道时 Python 默认块缓冲，进程被
+        # SIGKILL 时用户态缓冲来不及落盘 —— 超时的"部分输出"会静默为空，且
+        # execute_code 的唯一存活信号（输出 chunk）整段消失，健康长任务会被
+        # stall watchdog 误杀。强制不缓冲，让"print 进度 = 存活信号"成立。
+        "PYTHONUNBUFFERED": "1",
+        "TZ": "Asia/Shanghai",
+        "WAVETHINKER_MML2OMML_XSL": str(
+            config.backend_root / "skills" / "docx_manipulation" / "MML2OMML.XSL"
+        ),
+        **playwright_browsers_env(),
+        **(extra_env or {}),
+    }
 
 
 class CodeExecutionService:
@@ -221,18 +249,7 @@ class CodeExecutionService:
             except Exception:
                 logger.warning("failed to write omml_helper.py", exc_info=True)
 
-        env = {
-            "PATH": _exec_path,
-            "HOME": str(cwd_path),
-            "TMPDIR": str(tmp_dir),
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONIOENCODING": "utf-8",
-            "TZ": "Asia/Shanghai",
-            "WAVETHINKER_MML2OMML_XSL": str(
-                config.backend_root / "skills" / "docx_manipulation" / "MML2OMML.XSL"
-            ),
-            **(extra_env or {}),
-        }
+        env = _build_env(str(cwd_path), _exec_path, extra_env)
 
         proc_kwargs = {
             "cwd": str(cwd_path),
@@ -247,10 +264,28 @@ class CodeExecutionService:
         try:
             proc = await asyncio.create_subprocess_exec(
                 python_exec,
+                # F1（2026-11-01 审计）：-u 兜底，即使调用方剥掉 env 也不缓冲
+                "-u",
                 "-c",
                 code,
                 **proc_kwargs,
             )
+            # F2（2026-10-26）：登记子进程组，后台子孙在关停/重启清扫时可回收
+            # A4.9 I1：登记已知命令串 + pgid 兜底 proc.pid
+            try:
+                import os as _os
+                from app.services.spawn_registry import (
+                    register as _spawn_register,
+                    unregister as _spawn_unregister,
+                    unregister_if_empty as _spawn_unreg_if_empty,
+                )
+                try:
+                    _pgid = _os.getpgid(proc.pid)
+                except Exception:
+                    _pgid = proc.pid
+                _spawn_register(_pgid, f"{python_exec} -c {code}", str(cwd_path), "code_execution")
+            except Exception:
+                _pgid = proc.pid
 
             # Read stdout/stderr via background tasks so partial output is
             # preserved on timeout. The previous code used
@@ -293,10 +328,28 @@ class CodeExecutionService:
                 await asyncio.wait_for(proc.wait(), timeout=timeout)
                 return_code = proc.returncode or 0
                 _timed_out = False
+                # A4.9 I2：自然结束且组内无幸存后台子孙 → 销记
+                try:
+                    _spawn_unreg_if_empty(_pgid)
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
-                proc.kill()
+                # A4.9 I2：超时回收整组（原 proc.kill() 只杀 leader，后台子孙漏网）
+                try:
+                    import os as _os
+                    _os.killpg(_pgid, 15)
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
                 await proc.wait()
                 _timed_out = True
+                try:
+                    _spawn_unregister(_pgid)
+                except Exception:
+                    pass
 
             # Collect output from reading tasks (they finish after pipe close).
             stdout_bytes = b""
@@ -321,6 +374,10 @@ class CodeExecutionService:
                     return_code=-1,
                     error=f"Execution timed out after {timeout}s",
                     timed_out=True,
+                    timeout_effective=float(timeout),
+                    # 先 killpg(SIGTERM) 再 proc.kill()：领导进程通常先死于
+                    # SIGTERM，所以回执如实写 SIGTERM+SIGKILL（I4）。
+                    killed_by="SIGTERM+SIGKILL",
                 )
 
             raw_stdout = stdout_bytes.decode("utf-8", errors="replace")

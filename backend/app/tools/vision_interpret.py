@@ -1,17 +1,17 @@
 # Copyright (c) 2026 Weave Thinker Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""vision_interpret tool — 视觉模型（VLM）能力开放给 agent（2026-08-31）.
+"""vision_interpret tool — 视觉能力开放给 agent（2026-08-31）.
 
-The multimodal endpoint (registry purpose "vlm") is callable BY THE AGENT
-anywhere vision is needed — screenshots, error dialogs, charts, UI mockups,
-scanned documents, uploaded images. The calling model never changes: the
-image bytes go only to the vision endpoint and the text answer comes back
-as the tool result. The deathmatch visual critic and the memory multimodal
-service use the same purpose route.
+The endpoint is resolved at call time: **the current conversation's main model
+first** (behavioral probe), `[endpoints.vlm]` only as the fallback. The calling
+model never changes: the image bytes go only to the resolved vision endpoint
+and the text answer comes back as the tool result. The deathmatch visual critic
+uses the same resolver.
 
-2026-09-15 视觉能力探针：`[endpoints.vlm]` 未单独配置时，先对当前主模型
-（助手端点优先）做行为探针——有视觉 → 主模型充当视觉模型；无视觉 → 返回
+2026-09-15 视觉能力探针 / 2026-11-01 优先顺序反转：**视觉能力优先使用当前
+调用的主模型**——先对助手端点（或调用方显式持有点）做行为探针；有视觉 → 主模型
+充当视觉模型；探针不通过 → 才回落到系统 `[endpoints.vlm]`；两者都不可用 → 返回
 明确的「无视觉能力」错误（绝不假装看过图片）。见 model_gateway.vision_probe。
 """
 import base64
@@ -35,7 +35,7 @@ _MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 async def _resolve_vision(assistant=None):
-    """视觉端点解析（vlm 已配置 → 用它；未配置 → 主模型能力探针）。
+    """视觉端点解析（2026-11-01：主模型探针优先 → 探针不通过才回落 vlm）。
 
     返回 (ep | None, reason)；reason ∈ configured / main_model / no_vision / error:<msg>。"""
     from app.model_gateway.vision_probe import resolve_vision_endpoint
@@ -58,6 +58,28 @@ async def vision_interpret(args: dict, **kwargs) -> str:
     else:
         resolved = _resolve_workspace_path(image_path, workspace_path)
         raw = None
+        if not resolved:
+            # P0-2（2026-10-14）：browser_screenshot 落 backend/app/output_files——
+            # 工具描述宣称可读浏览器截图，路径解析却限工作区（描述/实现断链）。
+            # I6（A4.9）：output_files 多租户共享——仅放行**本会话**截图
+            # （文件名 screenshot_{conv_id}_*），无会话上下文即拒绝（fail-closed）。
+            try:
+                import os as _os
+                _out_dir = _os.path.realpath(
+                    _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "output_files")
+                )
+                _cand = _os.path.realpath(_os.path.join(_out_dir, _os.path.basename(image_path)))
+                _conv = kwargs.get("conversation")
+                _conv_id = str(getattr(_conv, "id", "") or "") if _conv is not None else ""
+                if (
+                    _conv_id
+                    and _os.path.basename(_cand).startswith(f"screenshot_{_conv_id}")
+                    and _cand.startswith(_out_dir + _os.sep)
+                    and _os.path.isfile(_cand)
+                ):
+                    resolved = _cand
+            except Exception:
+                resolved = None
     if not resolved:
         return json.dumps(
             {"error": f"图片不存在或不在工作区内（路径越界会被拒绝）: {image_path}", "success": False},
@@ -69,18 +91,21 @@ async def vision_interpret(args: dict, **kwargs) -> str:
             {"error": f"不支持的图片类型 {ext}（支持: {', '.join(sorted(_IMAGE_EXTS))}）", "success": False},
             ensure_ascii=False,
         )
-    ep, vlm_err = await _resolve_vision(kwargs.get("assistant"))
+    ep, vision_reason = await _resolve_vision(kwargs.get("assistant"))
     if ep is None:
-        if vlm_err == "no_vision":
+        if vision_reason == "no_vision":
             return json.dumps({
-                "error": "当前主模型不具备视觉能力，且未配置独立视觉模型（vlm）："
+                "error": "当前主模型无法用于视觉（未配置 / 不具备视觉能力 / 调用失败），"
+                         "且没有可用的独立视觉模型（vlm 未配置、配置不完整，或与主模型为同一端点）："
                          "请在模型配置的 [endpoints.vlm] 填入 base_url/api_key/model_name，"
                          "或切换到支持视觉的主模型后重试。",
                 "success": False, "configured": False, "vision_capable": False,
+                "vision_source": "no_vision",
             }, ensure_ascii=False)
         return json.dumps({
-            "error": f"视觉模型配置加载失败：{str(vlm_err)[6:]}（请检查模型配置文件后重试）",
+            "error": f"视觉模型配置加载失败：{str(vision_reason)[6:]}（请检查模型配置文件后重试）",
             "success": False, "configured": False, "config_error": True,
+            "vision_source": vision_reason,
         }, ensure_ascii=False)
     try:
         if raw is None:
@@ -117,8 +142,10 @@ async def vision_interpret(args: dict, **kwargs) -> str:
         # A4.9 W2-I1 (Security): an empty vlm api_key must NOT fall back to
         # the main provider key on the wire (a keyless local vLLM endpoint
         # would otherwise receive the main credentials). Same "no-key"
-        # convention as visual_critic.py.
-        ep_wired = ep.with_overrides(api_key=ep.api_key or "no-key")
+        # convention as visual_critic.py. is_custom=True (A4.9 R2-I4): always
+        # call THIS endpoint's base_url — is_custom=False would silently route
+        # to the global [api] host.
+        ep_wired = ep.with_overrides(api_key=ep.api_key or "no-key", is_custom=True)
         llm = factory.build_llm_service(ep_wired)
         # 2026-09-03 (conv 827a6f78): STREAMING VLM call — each chunk is a
         # real liveness signal fed to the agent loop's stall watchdog
@@ -138,8 +165,14 @@ async def vision_interpret(args: dict, **kwargs) -> str:
                 raise RuntimeError(str(event.get("data") or "vlm stream error"))
         text = "".join(parts)
     except Exception as exc:
-        logger.warning("vision_interpret vlm call failed: %s", exc)
-        return json.dumps({"error": f"视觉模型调用失败: {exc}", "success": False}, ensure_ascii=False)
+        logger.warning("vision_interpret vlm call failed (%s via %s): %s",
+                       ep.model_name, vision_reason, exc)
+        return json.dumps({
+            "error": f"视觉模型调用失败: {exc}",
+            "success": False,
+            "model": ep.model_name,
+            "vision_source": vision_reason,
+        }, ensure_ascii=False)
     return json.dumps({
         "success": True,
         "image_path": (
@@ -147,6 +180,7 @@ async def vision_interpret(args: dict, **kwargs) -> str:
             else os.path.relpath(resolved, str(Path(workspace_path).resolve()))
         ),
         "model": ep.model_name,
+        "vision_source": vision_reason,
         "interpretation": (text or "").strip(),
     }, ensure_ascii=False)
 
@@ -157,13 +191,15 @@ registry.register(
     schema={
         "name": "vision_interpret",
         "description": (
-            "用视觉模型（VLM）解读工作区中的图片。任何需要「看」的场景都应主动调用："
+            "用视觉模型解读工作区中的图片。任何需要「看」的场景都应主动调用："
             "截图、报错弹窗、图表/曲线、UI 设计稿、扫描件、用户上传的图片"
             "（对话中的 [file-ref] 标记给出文件路径）、browser_screenshot 保存的截图。\n"
             "传入工作区相对路径（如 uploads/xxx.png、media/abc.png）或工作区内绝对路径，"
             "以及你想问的问题（如「提取图中全部文字」「这个图表的趋势是什么」）。\n"
-            "返回视觉模型的文字解读；若返回「不具备视觉能力」，说明独立视觉模型未配置"
-            "且当前主模型经探针确认无视觉能力——如实告知用户，不要假装看过图片。"
+            "系统优先用当前对话的主模型看图（先做一次视觉探针）；主模型确实不具备"
+            "视觉能力时才回落到系统配置的独立视觉模型。返回的是所选视觉模型的文字"
+            "解读；若返回「不具备视觉能力」，说明主模型经探针确认看不见且系统未配置"
+            "可用视觉模型——如实告知用户，不要假装看过图片。"
             "仅支持 png/jpg/jpeg/webp/gif/bmp，单文件 ≤20MB；detail=high 用于需要看清"
             "小字/细节的场合。"
         ),

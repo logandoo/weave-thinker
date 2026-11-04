@@ -349,8 +349,16 @@ async def _load_raw_by_kind(
 async def _load_file_memory_units(db: AsyncSession, user_id: str) -> list[tuple[str, list[str]]]:
     import hashlib
     from app.tools.memory import _get_memory_dir
+    from app.services.tenant_service import TenantConfigError
 
-    memory_dir = _get_memory_dir() / str(user_id)
+    try:
+        memory_dir = _get_memory_dir() / str(user_id)
+    except TenantConfigError:
+        logger.warning(
+            "file_memory ingestion skipped: tenant mode misconfigured "
+            "(startup guard refused, runtime config changed?)"
+        )
+        return []
     if not memory_dir.exists():
         return []
 
@@ -364,6 +372,21 @@ async def _load_file_memory_units(db: AsyncSession, user_id: str) -> list[tuple[
         except Exception:
             continue
         entries = [e.strip() for e in content.split("\n§\n") if e.strip()]
+        if config.memory_provenance_strict:
+            # Strict quarantine also covers ingestion: an unverified file
+            # entry must not be laundered into subconscious memory.
+            from app.services.memory_provenance import verified_entries
+            try:
+                entries = await asyncio.to_thread(
+                    verified_entries, fpath, str(user_id),
+                    target.replace(".md", "").lower(), entries,
+                )
+            except Exception:
+                logger.warning(
+                    "file_memory provenance check failed for %s; skipping under strict mode",
+                    fpath, exc_info=True,
+                )
+                entries = []
         for entry in entries[:200]:
             # B8 shadow（2026-09-14）：文件记忆条目过去不扫注入——记录不拒绝
             try:
@@ -567,6 +590,18 @@ async def _call_extraction_llm(
             lines = [l for l in lines if not l.startswith("```")]
             response = "\n".join(lines)
         parsed = _extract_json_object(response)
+        if parsed is not None:
+            try:
+                from app.prompts.contracts import MemoryExtraction, parse_contract
+
+                _contract, _failure = parse_contract(
+                    MemoryExtraction, json.dumps(parsed, ensure_ascii=False))
+                if _failure is not None:
+                    logger.warning("memory extraction contract failed: %s", _failure.kind)
+                else:
+                    parsed = _contract.model_dump()
+            except Exception:
+                logger.debug("memory extraction contract check skipped", exc_info=True)
         if parsed is None:
             logger.warning(
                 "Extraction LLM returned empty/non-JSON content for user=%s (len=%d, snippet=%r)",

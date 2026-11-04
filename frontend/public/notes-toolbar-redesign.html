@@ -1,0 +1,913 @@
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!doctype html>
+<html lang="zh-CN" data-skin="mono-brutal">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>笔记工具栏改造提案 · 黑白构成</title>
+  <style>
+    :root {
+      --ink: #111111;
+      --paper: #F5F4EC;
+      --surface: #FFFFFF;
+      --subtle: #EAE8DC;
+      --muted: #65645A;
+      --orange: #D64008;
+      --yellow: #DBAF00;
+      --blue: #2340B8;
+      --line: 2px solid var(--ink);
+      --shadow: 5px 5px 0 var(--ink);
+      --z-menu: 100;
+      --z-toast: 300;
+    }
+    * { box-sizing: border-box; }
+    html { color-scheme: light; background: var(--paper); }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background: var(--paper);
+      font: 14px/1.55 Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    button, [role="button"] { -webkit-tap-highlight-color: transparent; }
+    button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+      outline: 3px solid var(--orange);
+      outline-offset: 2px;
+    }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    svg { width: 18px; height: 18px; flex: 0 0 auto; }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+    .proposal-bar {
+      min-height: 58px;
+      display: flex;
+      align-items: stretch;
+      border-bottom: 3px solid var(--ink);
+      background: var(--surface);
+    }
+    .proposal-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 18px;
+      margin-right: auto;
+      font-weight: 700;
+    }
+    .proposal-title small { color: var(--muted); font-weight: 400; }
+    .view-tabs { display: flex; align-items: stretch; }
+    .view-tab {
+      border: 0;
+      border-left: var(--line);
+      background: var(--surface);
+      padding: 0 20px;
+      font-weight: 700;
+    }
+    .view-tab:hover { background: var(--subtle); }
+    .view-tab[aria-selected="true"] { background: var(--ink); color: white; }
+    .view-panel[hidden] { display: none; }
+    .view-panel { padding: 22px; }
+    .workspace {
+      height: calc(100vh - 102px);
+      min-height: 680px;
+      display: grid;
+      grid-template-columns: 74px 254px minmax(0, 1fr);
+      border: 3px solid var(--ink);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .rail {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 10px;
+      color: white;
+      background: var(--ink);
+    }
+    .brand {
+      width: 42px; height: 42px;
+      display: grid; place-items: center;
+      margin-bottom: 22px;
+      border: 2px solid white;
+      font: 900 22px/1 "Arial Black", sans-serif;
+    }
+    .rail-button {
+      width: 42px; height: 42px;
+      display: grid; place-items: center;
+      border: 2px solid transparent;
+      background: transparent;
+      color: white;
+      font-weight: 700;
+    }
+    .rail-button[aria-current="page"] { border-color: white; background: var(--orange); }
+    .rail-button:hover { border-color: white; }
+    .rail-spacer { flex: 1; }
+    .notes-sidebar {
+      min-width: 0;
+      border-right: var(--line);
+      background: var(--paper);
+      display: flex;
+      flex-direction: column;
+    }
+    .sidebar-heading {
+      display: flex; align-items: center; justify-content: space-between;
+      min-height: 58px; padding: 0 16px;
+      border-bottom: var(--line);
+    }
+    .sidebar-heading h1, .sidebar-heading h2 {
+      margin: 0; font: 900 17px/1.2 "Arial Black", "PingFang SC", sans-serif;
+    }
+    .square-action {
+      width: 34px; height: 34px;
+      display: inline-grid; place-items: center;
+      border: var(--line); background: var(--surface);
+      font-weight: 900;
+    }
+    .square-action:hover { background: var(--yellow); }
+    .notebook-label { padding: 18px 16px 8px; color: var(--muted); font-size: 12px; }
+    .note-list { list-style: none; padding: 0 10px; margin: 0; }
+    .note-list button {
+      width: 100%; display: flex; align-items: flex-start; gap: 10px;
+      padding: 12px 10px; border: 2px solid transparent; background: transparent;
+      text-align: left;
+    }
+    .note-list button:hover { background: var(--subtle); }
+    .note-list button[aria-current="true"] { border-color: var(--ink); background: var(--surface); }
+    .note-list strong { display: block; font-size: 13px; }
+    .note-list small { display: block; margin-top: 3px; color: var(--muted); }
+    .note-glyph { font: 900 18px/1 "Arial Black", sans-serif; }
+    .sidebar-foot { margin-top: auto; padding: 14px 16px; border-top: var(--line); color: var(--muted); }
+    .editor-shell { min-width: 0; display: flex; flex-direction: column; background: var(--surface); }
+    .document-header {
+      min-height: 58px;
+      display: flex; align-items: center; gap: 12px;
+      padding: 8px 16px;
+      border-bottom: var(--line);
+    }
+    .document-title-wrap { min-width: 0; margin-right: auto; }
+    .document-kicker { color: var(--muted); font-size: 12px; }
+    .document-title {
+      margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font: 900 19px/1.3 "Arial Black", "PingFang SC", sans-serif;
+    }
+    .document-actions { display: flex; gap: 8px; align-items: center; }
+    .action-button {
+      min-height: 36px; padding: 7px 12px;
+      border: var(--line); background: var(--surface); font-weight: 700;
+    }
+    .action-button:hover { background: var(--subtle); }
+    .action-button.primary { background: var(--ink); color: white; }
+    .action-button.primary:hover { background: var(--orange); }
+    .action-button.icon-only { width: 36px; padding: 0; display: grid; place-items: center; }
+    .document-menu-button { display: none; }
+    .format-region { border-bottom: var(--line); background: var(--paper); }
+    .toolbar {
+      display: flex; align-items: center; gap: 5px;
+      min-height: 56px; padding: 8px 12px;
+    }
+    .tool-button {
+      min-width: 40px; height: 40px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+      padding: 0 10px;
+      border: 2px solid transparent; background: transparent;
+      font-weight: 700; white-space: nowrap;
+    }
+    .tool-button:hover { border-color: var(--ink); background: var(--surface); }
+    .tool-button[aria-expanded="true"], .tool-button[aria-pressed="true"] {
+      border-color: var(--ink); background: var(--ink); color: white;
+    }
+    .tool-button.text-style { padding: 0 10px; font-size: 13px; }
+    .text-mark { font-size: 13px; font-weight: 700; }
+    .tool-button.bold { font-family: "Arial Black", sans-serif; }
+    .tool-button.italic { font-family: Georgia, serif; font-style: italic; }
+    .tool-separator { width: 2px; height: 26px; background: var(--ink); margin: 0 3px; }
+    .toolbar-note { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .editor-canvas {
+      flex: 1; min-height: 0; overflow: auto;
+      padding: 38px clamp(24px, 5vw, 74px) 80px;
+      background: var(--surface);
+    }
+    .editor-content { max-width: 790px; margin: 0 auto; }
+    .editor-content h2 {
+      margin: 0 0 22px;
+      font: 900 clamp(25px, 2.6vw, 36px)/1.2 "Arial Black", "PingFang SC", sans-serif;
+      letter-spacing: -.02em;
+      text-wrap: balance;
+    }
+    .editor-content h3 { margin: 30px 0 10px; font-size: 18px; }
+    .editor-content p { max-width: 70ch; margin: 12px 0; text-wrap: pretty; }
+    .editor-content ol { padding-left: 26px; }
+    .editor-content li { margin: 7px 0; }
+    .editor-content mark { padding: 1px 3px; background: var(--yellow); color: var(--ink); }
+    .inline-code { padding: 2px 5px; background: var(--subtle); font-family: Consolas, monospace; }
+    .note-table { width: 100%; margin: 18px 0; border-collapse: collapse; }
+    .note-table th, .note-table td { border: 1px solid var(--ink); padding: 8px 10px; text-align: left; }
+    .note-table th { background: var(--subtle); }
+    .save-state { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    .save-state::before { content: ""; width: 7px; height: 7px; background: var(--ink); }
+    .popover {
+      position: fixed; z-index: var(--z-menu);
+      width: min(590px, calc(100vw - 24px));
+      max-height: min(620px, calc(100vh - 24px));
+      overflow: auto;
+      border: 3px solid var(--ink); background: var(--surface); box-shadow: var(--shadow);
+    }
+    .popover[hidden] { display: none; }
+    .popover.simple { width: 208px; padding: 6px; }
+    .popover-header {
+      position: sticky; top: 0; z-index: 1;
+      display: flex; align-items: center; gap: 12px;
+      min-height: 50px; padding: 8px 12px;
+      border-bottom: var(--line); background: var(--surface);
+    }
+    .popover-header strong { margin-right: auto; font-size: 16px; }
+    .popover-close { width: 32px; height: 32px; border: 2px solid transparent; background: transparent; font-size: 22px; }
+    .popover-close:hover { border-color: var(--ink); background: var(--subtle); }
+    .menu-list { display: grid; gap: 2px; }
+    .menu-item, .command-item {
+      width: 100%; display: flex; align-items: center; gap: 12px;
+      min-height: 42px; padding: 8px 10px;
+      border: 2px solid transparent; background: transparent; text-align: left;
+    }
+    .menu-item:hover, .command-item:hover, .menu-item:focus-visible, .command-item:focus-visible {
+      border-color: var(--ink); background: var(--subtle); outline-offset: -1px;
+    }
+    .menu-item .item-icon, .command-item .item-icon {
+      width: 28px; height: 28px; display: grid; place-items: center;
+      border: 1px solid var(--ink); background: var(--surface); font-weight: 900; flex: 0 0 auto;
+    }
+    .menu-item .item-icon svg, .command-item .item-icon svg { width: 16px; height: 16px; }
+    .tool-button svg { width: 16px; height: 16px; flex: 0 0 auto; }
+    .menu-item small, .command-item small { display: block; color: var(--muted); }
+    .menu-item .shortcut { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .command-layout { display: grid; grid-template-columns: 142px minmax(0, 1fr); min-height: 330px; }
+    .command-groups { padding: 8px; border-right: var(--line); background: var(--paper); }
+    .command-group {
+      width: 100%; padding: 10px; border: 2px solid transparent; background: transparent; text-align: left;
+      font-weight: 700;
+    }
+    .command-group:hover { background: var(--subtle); }
+    .command-group[aria-selected="true"] { border-color: var(--ink); background: var(--ink); color: white; }
+    .command-pane { padding: 12px; }
+    .command-pane[hidden] { display: none; }
+    .command-pane h3 { margin: 2px 0 10px; font-size: 13px; color: var(--muted); }
+    .command-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .command-grid.single { grid-template-columns: 1fr; }
+    .command-item { align-items: flex-start; min-height: 58px; }
+    .command-item .item-icon { width: 26px; height: 26px; }
+    .inline-choices { display: flex; gap: 5px; margin: 8px 0 14px; }
+    .inline-choices button { flex: 1; min-height: 38px; border: var(--line); background: var(--surface); }
+    .inline-choices button:hover { background: var(--yellow); }
+    .toast {
+      position: fixed; z-index: var(--z-toast); right: 22px; bottom: 22px;
+      max-width: min(420px, calc(100vw - 32px)); padding: 12px 16px;
+      border: var(--line); background: var(--ink); color: white; box-shadow: 4px 4px 0 var(--orange);
+    }
+    .toast[hidden] { display: none; }
+    .page-heading { max-width: 1160px; margin: 0 auto 22px; }
+    .page-heading h2 { margin: 0 0 8px; font: 900 28px/1.2 "Arial Black", "PingFang SC", sans-serif; }
+    .page-heading p { max-width: 75ch; margin: 0; color: var(--muted); }
+    .contract-layout { max-width: 1160px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; border: 3px solid var(--ink); background: var(--surface); }
+    .contract-side { min-width: 0; padding: 20px; }
+    .contract-side + .contract-side { border-left: var(--line); }
+    .contract-side h3 { margin: 0 0 6px; font-size: 20px; }
+    .contract-side > p { color: var(--muted); }
+    .strategy-buttons { display: flex; gap: 8px; margin: 16px 0; }
+    .strategy-buttons button { padding: 8px 12px; border: var(--line); background: var(--surface); font-weight: 700; }
+    .strategy-buttons button[aria-pressed="true"] { background: var(--ink); color: white; }
+    .code-window {
+      min-height: 180px; padding: 14px; overflow: auto;
+      border: var(--line); background: var(--paper);
+      font: 13px/1.6 Consolas, "Courier New", monospace; white-space: pre-wrap;
+    }
+    .contract-result { margin-top: 12px; padding: 12px; border: var(--line); }
+    .contract-result strong { display: block; margin-bottom: 6px; }
+    .mime-tabs { display: flex; gap: 6px; margin: 14px 0 8px; }
+    .mime-tabs button { padding: 6px 9px; border: 1px solid var(--ink); background: var(--surface); }
+    .mime-tabs button[aria-pressed="true"] { background: var(--yellow); }
+    .decision-strip { max-width: 1160px; margin: 18px auto 0; display: flex; flex-wrap: wrap; gap: 0; border: var(--line); background: var(--surface); }
+    .decision-strip span { padding: 10px 14px; border-right: 1px solid var(--ink); }
+    .plan-wrap { max-width: 1160px; margin: 0 auto; }
+    .phase-table, .mapping-table { width: 100%; border-collapse: collapse; border: 3px solid var(--ink); background: var(--surface); }
+    .phase-table th, .phase-table td, .mapping-table th, .mapping-table td { border: 1px solid var(--ink); padding: 12px; text-align: left; vertical-align: top; }
+    .phase-table thead, .mapping-table thead { background: var(--ink); color: white; }
+    .phase-id { display: inline-grid; place-items: center; min-width: 46px; min-height: 32px; background: var(--ink); color: white; font-weight: 900; }
+    .phase-table ul { margin: 0; padding-left: 20px; }
+    .mapping-section { margin-top: 28px; }
+    .mapping-section h3 { font-size: 20px; }
+    .mapping-note { padding: 12px 14px; border: var(--line); background: var(--yellow); }
+    .mapping-table td:first-child { width: 24%; }
+    .mapping-table td:nth-child(2) { width: 26%; }
+    .mapping-table tr:nth-child(even):not(thead tr) { background: var(--paper); }
+    .compact-list { padding-left: 20px; }
+    @media (max-width: 1000px) {
+      .workspace { grid-template-columns: 64px 220px minmax(0, 1fr); }
+      .toolbar-note { display: none; }
+      .tool-button { padding: 0 7px; }
+      .document-kicker { display: none; }
+      .contract-layout { grid-template-columns: 1fr; }
+      .contract-side + .contract-side { border-left: 0; border-top: var(--line); }
+    }
+    @media (max-width: 767px) {
+      .proposal-bar { flex-wrap: wrap; }
+      .proposal-title { width: 100%; padding: 9px 12px; border-bottom: 1px solid var(--ink); }
+      .proposal-title small { display: none; }
+      .view-tabs { width: 100%; }
+      .view-tab { flex: 1; min-height: 42px; padding: 0 8px; border-left: 0; }
+      .view-tab + .view-tab { border-left: 1px solid var(--ink); }
+      .view-panel { padding: 0; }
+      #panel-plan, #panel-contract { padding: 16px 10px 28px; }
+      .workspace { height: calc(100vh - 126px); min-height: 620px; grid-template-columns: minmax(0, 1fr); border: 0; box-shadow: none; }
+      .rail, .notes-sidebar { display: none; }
+      .document-header { padding: 8px 10px; }
+      .document-title { font-size: 16px; }
+      .document-actions { gap: 5px; }
+      .action-button { padding: 6px 9px; }
+      .action-button.export-text { display: none; }
+      .document-menu-button { display: inline-grid; }
+      .save-state { display: flex; font-size: 10px; white-space: nowrap; }
+      .toolbar { gap: 2px; padding: 6px; justify-content: space-between; }
+      .tool-button { min-width: 34px; height: 38px; padding: 0 4px; font-size: 12px; }
+      .tool-button .tool-label { display: none; }
+      .tool-button .mobile-label { display: inline; }
+      .tool-separator { display: none; }
+      .editor-canvas { padding: 26px 18px 90px; }
+      .editor-content h2 { font-size: 26px; }
+      .popover.simple { width: calc(100vw - 16px); }
+      .popover {
+        left: 8px !important; right: 8px; top: auto !important; bottom: 8px;
+        width: auto; max-height: 72vh; box-shadow: 4px 4px 0 var(--ink);
+      }
+      .command-layout { grid-template-columns: 104px minmax(0, 1fr); }
+      .command-grid { grid-template-columns: 1fr; }
+      .command-pane { padding: 8px; }
+      .command-item { min-height: 50px; }
+      .page-heading h2 { font-size: 24px; }
+      .phase-table, .mapping-table { display: block; overflow-x: auto; }
+      .phase-table th, .phase-table td, .mapping-table th, .mapping-table td { min-width: 150px; padding: 9px; }
+      .contract-side { padding: 14px; }
+      .strategy-buttons { flex-wrap: wrap; }
+      .toast { right: 16px; top: auto; bottom: 16px; }
+    }
+    @media (min-width: 768px) { .mobile-label { display: none; } }
+    @media (max-width: 400px) {
+      .toolbar { gap: 2px; padding: 5px 4px; }
+      .tool-button { min-width: 30px; height: 34px; padding: 0 2px; font-size: 11px; }
+      .tool-button .mobile-label { display: none; }
+    }
+    @media (max-width: 340px) {
+      .toolbar { gap: 1px; padding: 5px 3px; }
+      .tool-button { min-width: 28px; padding: 0 1px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="proposal-bar">
+    <div class="proposal-title">
+      <span>笔记工具栏改造提案</span>
+      <small>26 个原有动作全保留 · 10 个一级入口 · 只有两级菜单</small>
+    </div>
+    <nav class="view-tabs" aria-label="提案视图" role="tablist">
+      <button class="view-tab" id="tab-editor" role="tab" aria-selected="true" aria-controls="panel-editor" data-view="editor">编辑界面</button>
+      <button class="view-tab" id="tab-contract" role="tab" aria-selected="false" aria-controls="panel-contract" data-view="contract">格式契约</button>
+      <button class="view-tab" id="tab-plan" role="tab" aria-selected="false" aria-controls="panel-plan" data-view="plan">实施路径</button>
+    </nav>
+  </header>
+
+  <main>
+    <section class="view-panel" id="panel-editor" role="tabpanel" aria-labelledby="tab-editor">
+      <div class="workspace">
+        <aside class="rail" aria-label="主导航">
+          <div class="brand" aria-label="Weave Thinker">罗</div>
+          <button class="rail-button" aria-label="Agent">A</button>
+          <button class="rail-button" aria-label="笔记" aria-current="page">笔</button>
+          <button class="rail-button" aria-label="工作台">台</button>
+          <div class="rail-spacer"></div>
+          <button class="rail-button" aria-label="设置">设</button>
+        </aside>
+
+        <aside class="notes-sidebar" aria-label="笔记列表">
+          <div class="sidebar-heading">
+            <h1>研究资料</h1>
+            <button class="square-action" aria-label="新建笔记" data-action="新建笔记">＋</button>
+          </div>
+          <div class="notebook-label">5 篇笔记</div>
+          <ul class="note-list">
+            <li><button aria-current="true"><span class="note-glyph">▤</span><span><strong>编辑器互操作审查</strong><small>刚刚编辑 · 研究</small></span></button></li>
+            <li><button><span class="note-glyph">▤</span><span><strong>Word 粘贴样本</strong><small>昨天 · 12 个用例</small></span></button></li>
+            <li><button><span class="note-glyph">▤</span><span><strong>知识工作者访谈</strong><small>10 月 30 日</small></span></button></li>
+            <li><button><span class="note-glyph">▤</span><span><strong>复制到 Word / WPS</strong><small>10 月 28 日</small></span></button></li>
+            <li><button><span class="note-glyph">▤</span><span><strong>工具动作归位表</strong><small>10 月 26 日</small></span></button></li>
+          </ul>
+          <div class="sidebar-foot">本地保存 · 已同步</div>
+        </aside>
+
+        <section class="editor-shell" aria-label="笔记编辑器原型">
+          <header class="document-header">
+            <div class="document-title-wrap">
+              <div class="document-kicker">研究资料 / 编辑器互操作审查</div>
+              <h2 class="document-title">编辑器互操作审查</h2>
+            </div>
+            <span class="save-state" id="save-state">所有更改已保存</span>
+            <div class="document-actions" aria-label="文档动作">
+              <button class="action-button primary" id="save-button">保存</button>
+              <button class="action-button export-text" data-action="导出笔记">导出</button>
+              <button class="action-button icon-only document-menu-button" data-menu="document" aria-label="文档动作" aria-haspopup="menu" aria-expanded="false" aria-controls="menu-document">⋯</button>
+              <button class="action-button icon-only" aria-label="删除笔记" data-action="删除笔记（需确认）">×</button>
+            </div>
+          </header>
+
+          <div class="format-region">
+            <div class="toolbar" id="format-toolbar" role="toolbar" aria-label="文本格式">
+              <button class="tool-button" data-menu="heading" aria-haspopup="menu" aria-expanded="false" aria-controls="menu-heading" tabindex="0">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 12h8"/><path d="M4 18V6"/><path d="M12 18V6"/></svg>
+                <span id="heading-label">正文</span><span aria-hidden="true">⌄</span>
+              </button>
+              <button class="tool-button text-style bold" aria-label="黑体" aria-pressed="false" data-action="黑体" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M6 4h8a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/><path d="M6 12h9a4 4 0 0 1 4 4 4 4 0 0 1-4 4H6z"/></svg>
+                <span class="tool-label">黑体</span>
+              </button>
+              <button class="tool-button text-style italic" aria-label="斜体" aria-pressed="false" data-action="斜体" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/></svg>
+                <span class="tool-label">斜体</span>
+              </button>
+              <button class="tool-button" data-menu="character" aria-haspopup="menu" aria-expanded="false" aria-controls="menu-character" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
+                <span class="tool-label">字符</span><span aria-hidden="true">⌄</span>
+              </button>
+              <button class="tool-button" data-menu="paragraph" aria-haspopup="menu" aria-expanded="false" aria-controls="menu-paragraph" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M13 4v16"/><path d="M17 4v16"/><path d="M19 4H9.5a3.5 3.5 0 0 0 0 7H15"/></svg>
+                <span class="tool-label">段落</span><span aria-hidden="true">⌄</span>
+              </button>
+              <button class="tool-button" data-menu="tools" aria-haspopup="menu" aria-expanded="false" aria-controls="menu-tools" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="8" cy="18" r="2" fill="currentColor" stroke="none"/></svg>
+                <span class="tool-label">编辑</span><span aria-hidden="true">⌄</span>
+              </button>
+              <button class="tool-button" data-menu="list" aria-haspopup="menu" aria-expanded="false" aria-controls="menu-list" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12"/><circle cx="4" cy="6" r="1" fill="currentColor"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/></svg>
+                <span class="tool-label">列表</span><span aria-hidden="true">⌄</span>
+              </button>
+              <button class="tool-button" data-menu="insert" aria-haspopup="menu" aria-expanded="false" aria-controls="menu-insert" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+                <span class="tool-label">插入</span><span aria-hidden="true">⌄</span>
+              </button>
+              <button class="tool-button" data-action="目录" aria-label="目录" aria-pressed="false" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h7"/><path d="M9 11h5"/></svg>
+                <span class="tool-label">目录</span>
+              </button>
+              <button class="tool-button icon-only" data-action="语音输入" aria-label="语音输入" aria-pressed="false" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 11v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="editor-canvas" id="editor-canvas">
+            <article class="editor-content" contenteditable="true" spellcheck="true" aria-label="笔记正文">
+              <h2>让格式在软件之间保持语义</h2>
+              <p>笔记需要保留的是<strong>标题、强调、列表、表格和公式</strong>，而不是来源软件附带的私有样式。复制与粘贴都应先经过同一套内容契约。</p>
+              <h3>本次改造的三个判断</h3>
+              <ol>
+                <li>横向滚动能解决“找得到”，不能解决“看得懂”。</li>
+                <li>Word 的编号外观不等于真实列表；<mark>结构必须先被识别</mark>。</li>
+                <li>复制到外部软件时，同时提供 <span class="inline-code">text/html</span> 和 <span class="inline-code">text/plain</span>。</li>
+              </ol>
+              <table class="note-table">
+                <thead><tr><th>内容</th><th>保留语义</th><th>丢弃噪音</th></tr></thead>
+                <tbody><tr><td>Word 列表</td><td>有序列表、层级</td><td>mso-*、书签</td></tr><tr><td>公式</td><td>TeX 源与显示方式</td><td>KaTeX 视觉节点</td></tr></tbody>
+              </table>
+              <p>行内公式保留为 <span class="inline-code">$E=mc^2$</span>；Mermaid 保留完整换行，而不是把源码压成一行。</p>
+            </article>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section class="view-panel" id="panel-contract" role="tabpanel" aria-labelledby="tab-contract" hidden>
+      <div class="page-heading">
+        <h2>同一份内容，两种明确选择</h2>
+        <p>默认保留结构，不让来源软件的视觉样式成为笔记的永久负担；需要时一键改为纯文本。向外复制时同时写入 HTML 与纯文本，由接收方选择它能理解的表示。</p>
+      </div>
+      <div class="contract-layout">
+        <section class="contract-side">
+          <h3>外部内容 → 笔记</h3>
+          <p>先识别来源，再清洗私有标记，最后映射到受支持的语义节点。</p>
+          <div class="strategy-buttons" aria-label="粘贴策略">
+            <button id="paste-rich" aria-pressed="true">保留语义</button>
+            <button id="paste-plain" aria-pressed="false">纯文本粘贴</button>
+          </div>
+          <div class="code-window" id="paste-input">Word 输入：MsoListParagraph + mso-list + 私有字体</div>
+          <div class="contract-result" id="paste-result" aria-live="polite"><strong>输出：真实有序列表</strong>1. 第一项<br>2. 第二项<br><small>已移除 mso-list、SimSun 和书签；保留粗体。</small></div>
+        </section>
+        <section class="contract-side">
+          <h3>笔记 → 外部软件</h3>
+          <p>HTML 面向 Word/WPS/Docs，纯文本面向聊天框、终端与代码编辑器。</p>
+          <div class="mime-tabs" aria-label="复制负载">
+            <button id="mime-html" aria-pressed="true">text/html</button>
+            <button id="mime-plain" aria-pressed="false">text/plain</button>
+          </div>
+          <div class="code-window" id="copy-output">&lt;p&gt;行内公式：&lt;span&gt;$E=mc^2$&lt;/span&gt;&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;graph TD
+A--&gt;B&lt;/code&gt;&lt;/pre&gt;</div>
+          <div class="contract-result"><strong>不再发生</strong>公式变成 E=mc2 / 分式只剩 ba；Mermaid 换行被合并；应用私有 CSS 进入 Word。</div>
+        </section>
+      </div>
+      <div class="decision-strip" aria-label="格式契约原则">
+        <span>保留：标题 / 强调 / 链接 / 列表 / 表格 / 代码 / 公式</span>
+        <span>清除：mso-* / 私有字体 / 编辑器 chrome / 不可见书签</span>
+        <span>无法保留时：明确降级，不静默损坏</span>
+      </div>
+    </section>
+
+    <section class="view-panel" id="panel-plan" role="tabpanel" aria-labelledby="tab-plan" hidden>
+      <div class="page-heading">
+        <h2>先止血，再统一内核</h2>
+        <p>工具栏改造与格式治理可以并行，但不应一次性替换全部编辑器。每一阶段都能独立验收和回滚。</p>
+      </div>
+      <div class="plan-wrap">
+        <table class="phase-table">
+          <thead><tr><th>阶段</th><th>交付</th><th>关键验收</th><th>回滚</th></tr></thead>
+          <tbody>
+            <tr><td><span class="phase-id">P0</span></td><td><strong>统一剪贴板边界 + 工具栏收纳</strong><ul class="compact-list"><li>Word/Google Docs 来源识别与规范化</li><li>HTML + plain 双 MIME；公式/图形保真降级</li><li>10 个一级入口；只保留两级菜单</li></ul></td><td>本报告的 Word、Google Docs、数学公式、Mermaid PoC 全部转为通过；桌面/390px 键盘与焦点回归。</td><td>独立适配器与工具栏配置开关；恢复旧面板，不改存量内容。</td></tr>
+            <tr><td><span class="phase-id">P1</span></td><td><strong>schema 文档树渐进迁移</strong><ul class="compact-list"><li>优先评估 Tiptap/ProseMirror</li><li>HTML/Markdown 仅作导入导出</li><li>选区、IME、公式/图表节点适配</li></ul></td><td>保存→重载→再编辑不漂移；撤销、中文 IME、多选区、列表编号与双宿主回归。</td><td>按笔记灰度；旧 Markdown 继续可读，新文档带 schema 版本。</td></tr>
+            <tr><td><span class="phase-id">P2</span></td><td><strong>真实应用互操作矩阵</strong><ul class="compact-list"><li>Word/WPS/Google Docs/Excel</li><li>Chromium/Firefox/Safari + Android WebView</li><li>图片、Excel 表格、OMML/MathML 增强</li></ul></td><td>每种来源 × 内容类型 × 目标应用留存实际剪贴板与渲染证据，不从 Chromium 外推。</td><td>来源特定增强独立禁用；核心规范化保持开启。</td></tr>
+          </tbody>
+        </table>
+
+        <section class="mapping-section">
+          <h3>26 个现有动作归位</h3>
+          <p class="mapping-note">一级顺序固定为：正文、黑体、斜体、字符、段落、编辑、列表、插入、目录、语音输入（语音仅图标）。「链接」按用户要求放入「插入」菜单；所有二级菜单都使用「图标 + 文字」，只列动作，不再嵌套标签页或三级菜单。</p>
+          <table class="mapping-table">
+            <thead><tr><th>现有动作</th><th>新位置</th><th>呈现与理由</th></tr></thead>
+            <tbody>
+              <tr><td>粗体 / 斜体</td><td>一级「黑体」「斜体」（正文右侧）</td><td>保留即时状态；图标 + 文字，支持快捷键与 aria-pressed。</td></tr>
+              <tr><td>标题</td><td>一级「正文」菜单</td><td>正文、H1–H4 同一入口，显示当前块类型。</td></tr>
+              <tr><td>项目符号 / 编号 / 重新编号</td><td>一级「列表」菜单</td><td>列表创建与编号维护不再拆成三个图标。</td></tr>
+              <tr><td>表格 / 公式 / 代码块</td><td>一级「插入」菜单</td><td>文字名称 + 简短说明，减少符号猜测。</td></tr>
+              <tr><td>图片 / 音频 / 视频</td><td>一级「插入」菜单</td><td>同属外部内容插入，按媒体类型分组。</td></tr>
+              <tr><td>链接</td><td>一级「插入」菜单</td><td>既有 Ctrl/Cmd+K 能力的可见入口；不占一级格式位。</td></tr>
+              <tr><td>引用</td><td>一级「段落」菜单</td><td>直接动作，二级菜单内不再嵌套标签页。</td></tr>
+              <tr><td>左 / 中 / 右对齐</td><td>一级「段落」菜单</td><td>同组三选一，保留当前对齐状态。</td></tr>
+              <tr><td>高亮 / 字体颜色</td><td>一级「字符」菜单</td><td>打开原有颜色选择器，不再并列两个 A。</td></tr>
+              <tr><td>上标 / 下标</td><td>一级「字符」菜单</td><td>保留成对关系与状态。</td></tr>
+              <tr><td>清除格式</td><td>一级「字符」菜单</td><td>文字说明作用范围；整篇仍需确认。</td></tr>
+              <tr><td>尾注（启用时）</td><td>一级「插入」菜单</td><td>只在偏好开启时出现，避免隐形丢功能。</td></tr>
+              <tr><td>查找 / 查找替换</td><td>一级「编辑」菜单</td><td>合并为一个入口，二级菜单内切换替换。</td></tr>
+              <tr><td>目录</td><td>一级「目录」按钮（语音左侧）</td><td>用户要求提为一级；再次点击收起。</td></tr>
+              <tr><td>语音输入</td><td>一级「语音输入」按钮</td><td>独立一级入口，仅图标；录音中切换停止图标与状态。</td></tr>
+              <tr><td>字数统计</td><td>工具栏右侧固定按钮</td><td>保留原弹层与位置。</td></tr>
+              <tr><td>保存 / 导出 / 删除</td><td>文档动作区</td><td>与文本格式分离；窄屏导出收进文档菜单，删除始终需确认。</td></tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div class="popover simple" id="menu-document" role="menu" aria-label="文档动作" hidden>
+    <div class="menu-list">
+      <button class="menu-item" role="menuitem" data-action="导出笔记"><span class="item-icon">⇩</span><span>导出笔记<small>Markdown / PDF</small></span></button>
+    </div>
+  </div>
+
+  <div class="popover simple" id="menu-heading" role="menu" aria-label="块类型" hidden>
+    <div class="menu-list">
+      <button class="menu-item" role="menuitem" data-heading="正文"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 4v16"/><path d="M17 4v16"/><path d="M19 4H9.5a3.5 3.5 0 0 0 0 7H15"/></svg></span><span>正文</span></button>
+      <button class="menu-item" role="menuitem" data-heading="标题 1"><span class="item-icon">H1</span><span>标题 1</span></button>
+      <button class="menu-item" role="menuitem" data-heading="标题 2"><span class="item-icon">H2</span><span>标题 2</span></button>
+      <button class="menu-item" role="menuitem" data-heading="标题 3"><span class="item-icon">H3</span><span>标题 3</span></button>
+      <button class="menu-item" role="menuitem" data-heading="标题 4"><span class="item-icon">H4</span><span>标题 4</span></button>
+    </div>
+  </div>
+
+  <div class="popover simple" id="menu-list" role="menu" aria-label="列表" hidden>
+    <div class="menu-list">
+      <button class="menu-item" role="menuitem" data-action="项目符号列表"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6h12"/><path d="M9 12h12"/><path d="M9 18h12"/><circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/></svg></span><span>项目符号列表</span><span class="shortcut">⌘⇧8</span></button>
+      <button class="menu-item" role="menuitem" data-action="编号列表"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="M4 6h1v4"/><path d="M4 10h2"/><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"/></svg></span><span>编号列表</span><span class="shortcut">⌘⇧7</span></button>
+      <button class="menu-item" role="menuitem" data-action="从这里重新编号"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v6h6"/><path d="M11 12h6"/></svg></span><span>从这里重新编号</span><small>拆分当前列表，从 1 开始</small></button>
+    </div>
+  </div>
+
+  <div class="popover" id="menu-insert" role="menu" aria-label="插入内容" hidden>
+    <div class="popover-header"><strong>插入内容</strong><button class="popover-close" aria-label="关闭插入菜单">×</button></div>
+    <div class="command-pane">
+      <div class="command-grid">
+        <button class="command-item" role="menuitem" data-action="插入链接"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1-1"/></svg></span><span>链接<small>选中文字后插入或编辑链接</small></span></button>
+        <button class="command-item" role="menuitem" data-action="插入表格"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18"/><path d="M9 10v10"/><path d="M15 10v10"/></svg></span><span>表格<small>选择行列，插入结构化表格</small></span></button>
+        <button class="command-item" role="menuitem" data-action="插入公式"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 4H6l6 8-6 8h12"/></svg></span><span>公式<small>行内或块级 TeX</small></span></button>
+        <button class="command-item" role="menuitem" data-action="插入代码块"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 18l6-6-6-6"/><path d="M8 6l-6 6 6 6"/></svg></span><span>代码块<small>保留语言与换行</small></span></button>
+        <button class="command-item" role="menuitem" data-action="插入图片"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span><span>图片<small>上传或粘贴图片</small></span></button>
+        <button class="command-item" role="menuitem" data-action="插入音频"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></span><span>音频<small>上传音频并内联播放</small></span></button>
+        <button class="command-item" role="menuitem" data-action="插入视频"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22.5 6.4a2.8 2.8 0 0 0-1.9-2C18.9 4 12 4 12 4s-6.9 0-8.6.4a2.8 2.8 0 0 0-1.9 2A29 29 0 0 0 1 11.8a29 29 0 0 0 .5 5.3 2.8 2.8 0 0 0 1.9 2C5.1 19.5 12 19.5 12 19.5s6.9 0 8.6-.4a2.8 2.8 0 0 0 1.9-2 29 29 0 0 0 .5-5.3 29 29 0 0 0-.5-5.4z"/><polygon points="9.8 15 15.5 11.8 9.8 8.5 9.8 15"/></svg></span><span>视频<small>上传视频并内联播放</small></span></button>
+        <button class="command-item" role="menuitem" data-action="插入尾注"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M9 13h4"/><path d="M9 17h6"/></svg></span><span>尾注<small>仅在尾注偏好开启时显示</small></span></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="popover simple" id="menu-character" role="menu" aria-label="字符" hidden>
+    <div class="popover-header"><strong>字符</strong><button class="popover-close" aria-label="关闭字符菜单">×</button></div>
+    <div class="menu-list">
+      <button class="menu-item" role="menuitem" data-action="高亮颜色"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l-6 6v3h4l6-6"/><path d="M22 13l-5-5-4 4 5 5z"/><path d="M13 20h9"/></svg></span><span>高亮<small>选择或取消高亮</small></span></button>
+      <button class="menu-item" role="menuitem" data-action="字号与颜色"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20h16"/><path d="M6 16l6-12 6 12"/><path d="M9 11h6"/></svg></span><span>字号与颜色<small>保留字号与文字色</small></span></button>
+      <button class="menu-item" role="menuitem" data-action="上标"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 18L9 6l5 12"/><path d="M17 4h4v4"/><path d="M17 8h4"/></svg></span><span>上标</span></button>
+      <button class="menu-item" role="menuitem" data-action="下标"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 16L9 4l5 12"/><path d="M17 16h4v4"/><path d="M17 20h4"/></svg></span><span>下标</span></button>
+      <button class="menu-item" role="menuitem" data-action="清除格式"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 20H8l-5-5a2 2 0 0 1 0-2.8l7-7a2 2 0 0 1 2.8 0l5 5a2 2 0 0 1 0 2.8L12 20"/><path d="M7 12l7 7"/></svg></span><span>清除格式<small>选区直接清除；整篇先确认</small></span></button>
+    </div>
+  </div>
+
+  <div class="popover simple" id="menu-paragraph" role="menu" aria-label="段落" hidden>
+    <div class="popover-header"><strong>段落</strong><button class="popover-close" aria-label="关闭段落菜单">×</button></div>
+    <div class="menu-list">
+      <button class="menu-item" role="menuitem" data-action="引用"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 17h3l2-4V7H5v6h3z"/><path d="M14 17h3l2-4V7h-6v6h3z"/></svg></span><span>引用<small>切换当前块为引用</small></span></button>
+      <button class="menu-item" role="menuitem" data-action="左对齐"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="13" y2="12"/><line x1="3" y1="18" x2="17" y2="18"/></svg></span><span>左对齐</span></button>
+      <button class="menu-item" role="menuitem" data-action="居中"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/></svg></span><span>居中</span></button>
+      <button class="menu-item" role="menuitem" data-action="右对齐"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="11" y1="12" x2="21" y2="12"/><line x1="7" y1="18" x2="21" y2="18"/></svg></span><span>右对齐</span></button>
+    </div>
+  </div>
+
+  <div class="popover simple" id="menu-tools" role="menu" aria-label="编辑" hidden>
+    <div class="popover-header"><strong>编辑</strong><button class="popover-close" aria-label="关闭编辑菜单">×</button></div>
+    <div class="menu-list">
+      <button class="menu-item" role="menuitem" data-action="查找与替换"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg></span><span>查找与替换<small>一个入口，面板内展开替换</small></span></button>
+      <button class="menu-item" role="menuitem" data-action="字数统计"><span class="item-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9h16"/><path d="M4 15h16"/><path d="M10 3L8 21"/><path d="M16 3l-2 18"/></svg></span><span>字数统计<small>字符、词数与阅读时间</small></span></button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script>
+    (() => {
+      const toolbar = document.getElementById('format-toolbar');
+      const toolButtons = [...toolbar.querySelectorAll('button')];
+      const popovers = [...document.querySelectorAll('.popover')];
+      const toast = document.getElementById('toast');
+      let active = null;
+      let toastTimer = null;
+
+      function notify(message) {
+        clearTimeout(toastTimer);
+        toast.textContent = message;
+        toast.hidden = false;
+        toastTimer = setTimeout(() => { toast.hidden = true; }, 2800);
+      }
+
+      function focusableItems(root) {
+        return [...root.querySelectorAll('button:not([disabled])')].filter((el) => el.offsetParent !== null);
+      }
+
+      function positionPopover(trigger, popover) {
+        if (window.innerWidth <= 767) return;
+        const rect = trigger.getBoundingClientRect();
+        const width = popover.offsetWidth;
+        const contentHeight = Math.min(popover.offsetHeight, window.innerHeight - 24);
+        const belowSpace = Math.max(80, window.innerHeight - rect.bottom - 12);
+        const aboveSpace = Math.max(80, rect.top - 12);
+        const useBelow = belowSpace >= contentHeight || belowSpace >= aboveSpace;
+        const height = Math.min(contentHeight, useBelow ? belowSpace : aboveSpace);
+        const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+        const top = useBelow
+          ? Math.min(rect.bottom + 7, window.innerHeight - height - 12)
+          : Math.max(12, rect.top - height - 7);
+        popover.style.maxHeight = `${height}px`;
+        popover.style.left = `${left}px`;
+        popover.style.top = `${top}px`;
+      }
+
+      function closePopover({ restoreFocus = true } = {}) {
+        if (!active) return;
+        const { trigger, popover } = active;
+        popover.hidden = true;
+        trigger.setAttribute('aria-expanded', 'false');
+        active = null;
+        if (restoreFocus) trigger.focus();
+      }
+
+      function openPopover(trigger) {
+        const name = trigger.dataset.menu;
+        const popover = document.getElementById(`menu-${name}`);
+        if (active && active.trigger === trigger) {
+          closePopover();
+          return;
+        }
+        closePopover({ restoreFocus: false });
+        // 非关键 toast 不与菜单争夺交互区；文档内联状态仍保留。
+        clearTimeout(toastTimer);
+        toast.hidden = true;
+        popover.hidden = false;
+        trigger.setAttribute('aria-expanded', 'true');
+        active = { trigger, popover, name };
+        positionPopover(trigger, popover);
+        const first = focusableItems(popover)[0];
+        if (first) first.focus();
+      }
+
+      document.querySelectorAll('[data-menu]').forEach((trigger) => {
+        trigger.addEventListener('click', () => openPopover(trigger));
+        trigger.addEventListener('keydown', (event) => {
+          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            event.preventDefault();
+            openPopover(trigger);
+          }
+        });
+      });
+
+      document.querySelectorAll('.popover-close').forEach((button) => {
+        button.addEventListener('click', () => closePopover());
+      });
+
+      document.addEventListener('pointerdown', (event) => {
+        if (active && !active.popover.contains(event.target) && !active.trigger.contains(event.target)) {
+          closePopover({ restoreFocus: false });
+        }
+      });
+
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' && active) {
+          event.preventDefault();
+          closePopover();
+        }
+      });
+
+      window.addEventListener('resize', () => {
+        if (active) positionPopover(active.trigger, active.popover);
+      });
+
+      toolbar.addEventListener('keydown', (event) => {
+        if (active) return;
+        const current = toolButtons.indexOf(document.activeElement);
+        if (current < 0) return;
+        let next = current;
+        if (event.key === 'ArrowRight') next = (current + 1) % toolButtons.length;
+        else if (event.key === 'ArrowLeft') next = (current - 1 + toolButtons.length) % toolButtons.length;
+        else if (event.key === 'Home') next = 0;
+        else if (event.key === 'End') next = toolButtons.length - 1;
+        else return;
+        event.preventDefault();
+        toolButtons.forEach((button, index) => { button.tabIndex = index === next ? 0 : -1; });
+        toolButtons[next].focus();
+      });
+
+      popovers.forEach((popover) => {
+        popover.addEventListener('keydown', (event) => {
+          if (event.key === 'Tab') {
+            if (popover.getAttribute('role') !== 'dialog') {
+              event.preventDefault();
+              closePopover();
+              return;
+            }
+            const items = focusableItems(popover);
+            if (!items.length) {
+              event.preventDefault();
+              return;
+            }
+            const first = items[0];
+            const last = items[items.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+              event.preventDefault();
+              last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+              event.preventDefault();
+              first.focus();
+            }
+            return;
+          }
+          if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+          const items = focusableItems(popover);
+          const current = items.indexOf(document.activeElement);
+          if (current < 0) return;
+          let next = current;
+          if (event.key === 'ArrowDown') next = (current + 1) % items.length;
+          if (event.key === 'ArrowUp') next = (current - 1 + items.length) % items.length;
+          if (event.key === 'Home') next = 0;
+          if (event.key === 'End') next = items.length - 1;
+          event.preventDefault();
+          items[next].focus();
+        });
+      });
+
+      function initRovingTabs(containerSelector, tabSelector, vertical = false) {
+        document.querySelectorAll(containerSelector).forEach((container) => {
+          const tabs = [...container.querySelectorAll(tabSelector)];
+          tabs.forEach((tab) => { tab.tabIndex = tab.getAttribute('aria-selected') === 'true' ? 0 : -1; });
+          container.addEventListener('keydown', (event) => {
+            const forward = vertical ? 'ArrowDown' : 'ArrowRight';
+            const backward = vertical ? 'ArrowUp' : 'ArrowLeft';
+            if (![forward, backward, 'Home', 'End'].includes(event.key)) return;
+            const current = tabs.indexOf(document.activeElement);
+            if (current < 0) return;
+            event.preventDefault();
+            event.stopPropagation();
+            let next = current;
+            if (event.key === forward) next = (current + 1) % tabs.length;
+            if (event.key === backward) next = (current - 1 + tabs.length) % tabs.length;
+            if (event.key === 'Home') next = 0;
+            if (event.key === 'End') next = tabs.length - 1;
+            tabs.forEach((tab, index) => { tab.tabIndex = index === next ? 0 : -1; });
+            tabs[next].click();
+            tabs[next].focus();
+          });
+        });
+      }
+      initRovingTabs('.view-tabs', '[data-view]');
+
+      document.querySelectorAll('[data-action]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const name = button.dataset.action;
+          if (button.classList.contains('tool-button') && (name === '粗体' || name === '斜体')) {
+            button.setAttribute('aria-pressed', button.getAttribute('aria-pressed') === 'true' ? 'false' : 'true');
+          }
+          notify(`已选择「${name}」· 原型演示，不修改真实笔记`);
+          closePopover();
+        });
+      });
+
+      document.querySelectorAll('[data-heading]').forEach((button) => {
+        button.addEventListener('click', () => {
+          document.getElementById('heading-label').textContent = button.dataset.heading;
+          notify(`块类型已设为「${button.dataset.heading}」`);
+          closePopover();
+        });
+      });
+
+      document.querySelectorAll('[data-pane]').forEach((tab) => {
+        tab.addEventListener('click', () => {
+          const name = tab.dataset.pane;
+          document.querySelectorAll('[data-pane]').forEach((item) => {
+            item.setAttribute('aria-selected', String(item === tab));
+            item.tabIndex = item === tab ? 0 : -1;
+          });
+          document.querySelectorAll('[data-pane-content]').forEach((pane) => { pane.hidden = pane.dataset.paneContent !== name; });
+          const first = focusableItems(document.querySelector(`[data-pane-content="${name}"]`))[0];
+          if (first) first.focus();
+        });
+      });
+
+      document.querySelectorAll('[data-view]').forEach((tab) => {
+        tab.addEventListener('click', () => {
+          closePopover({ restoreFocus: false });
+          const view = tab.dataset.view;
+          document.querySelectorAll('[data-view]').forEach((item) => {
+            item.setAttribute('aria-selected', String(item === tab));
+            item.tabIndex = item === tab ? 0 : -1;
+          });
+          document.querySelectorAll('.view-panel').forEach((panel) => { panel.hidden = panel.id !== `panel-${view}`; });
+          document.getElementById(`tab-${view}`).focus();
+        });
+      });
+
+      document.getElementById('save-button').addEventListener('click', () => {
+        document.getElementById('save-state').textContent = '已保存 · 刚刚';
+        notify('原型：所有更改已保存');
+      });
+
+      const pasteRich = document.getElementById('paste-rich');
+      const pastePlain = document.getElementById('paste-plain');
+      function setPasteMode(plain) {
+        pasteRich.setAttribute('aria-pressed', String(!plain));
+        pastePlain.setAttribute('aria-pressed', String(plain));
+        document.getElementById('paste-input').textContent = plain
+          ? 'Word 输入：MsoListParagraph + mso-list + 私有字体'
+          : 'Word 输入：MsoListParagraph + mso-list + 私有字体';
+        document.getElementById('paste-result').innerHTML = plain
+          ? '<strong>输出：继承当前样式的纯文本</strong>1. 第一项<br>2. 第二项<br><small>不解析 HTML；保留可读换行，不引入字体、颜色或列表样式。</small>'
+          : '<strong>输出：真实有序列表</strong>1. 第一项<br>2. 第二项<br><small>已移除 mso-list、SimSun 和书签；保留粗体。</small>';
+      }
+      pasteRich.addEventListener('click', () => setPasteMode(false));
+      pastePlain.addEventListener('click', () => setPasteMode(true));
+
+      const mimeHtml = document.getElementById('mime-html');
+      const mimePlain = document.getElementById('mime-plain');
+      function setMime(plain) {
+        mimeHtml.setAttribute('aria-pressed', String(!plain));
+        mimePlain.setAttribute('aria-pressed', String(plain));
+        document.getElementById('copy-output').textContent = plain
+          ? '行内公式：$E=mc^2$\n\n```mermaid\ngraph TD\nA-->B\n```'
+          : '<p>行内公式：<span>$E=mc^2$</span></p>\n<pre><code>graph TD\nA-->B</code></pre>';
+      }
+      mimeHtml.addEventListener('click', () => setMime(false));
+      mimePlain.addEventListener('click', () => setMime(true));
+
+      // 默认展开“字符”，让审阅者第一眼看到一层式二级菜单；不再有三级标签页。
+      const defaultTrigger = document.querySelector('[data-menu="character"]');
+      defaultTrigger.setAttribute('aria-expanded', 'true');
+      const defaultPopover = document.getElementById('menu-character');
+      defaultPopover.hidden = false;
+      active = { trigger: defaultTrigger, popover: defaultPopover, name: 'character' };
+      requestAnimationFrame(() => {
+        positionPopover(defaultTrigger, defaultPopover);
+        const first = focusableItems(defaultPopover)[0];
+        if (first) first.focus();
+      });
+    })();
+  </script>
+</body>
+</html>

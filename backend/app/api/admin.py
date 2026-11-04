@@ -137,6 +137,15 @@ async def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    from sqlalchemy import text as _text
+    for _table, _col in (
+        ("artifact_taint", "user_id"),
+        ("memory_action_tokens", "user_id"),
+        ("taint_states", "user_id"),
+    ):
+        await db.execute(_text(
+            f"DELETE FROM {_table} WHERE {_col} = :uid"
+        ), {"uid": user_id})
     await db.delete(user)
     await db.commit()
     return {"status": "ok"}

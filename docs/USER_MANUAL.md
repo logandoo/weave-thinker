@@ -196,7 +196,7 @@ main = "main"
 - **OpenAI 兼容格式**：云端 API 或本地 vLLM/Ollama 等自托管服务均可（`base_url` 指向你的服务）。
 - **语音（可选）**：`[endpoints.asr]`（DashScope FunASR / MiMo / general）、`[endpoints.tts]`（MiMo）——不配置时文字对话不受影响，语音功能不可用。
 - **记忆 v2 向量检索（可选）**：`[endpoints.embedding]`、`[endpoints.rerank]`——不配置时记忆子系统自动降级并在日志记录原因。
-- **视觉（可选）**：`[endpoints.vlm]` 供 `vision_interpret` 工具与死磕视觉评审使用；未配置时该工具返回友好错误。
+- **视觉（可选）**：`[endpoints.vlm]` 是**回落**用的独立视觉端点——系统先用当前主模型做能力探针，主模型能看图时无需配置它；主模型看不见才回落到这里；两者都不可用时该工具返回友好错误。
 - **占位不阻塞启动**：`<YOUR-*>` 占位未填时服务照常启动、页面可登录，仅对应功能在真实调用时报缺配。
 - 修改 `[endpoints.*]` / `[routing]` 后重启服务生效（或调用 `model_gateway.reload_model_registry()`）。
 
@@ -432,7 +432,7 @@ Weave Thinker 的记忆分三层，自动协同，无需手动管理：
 
 ### 12.1 系统技能
 
-内置 10 项系统技能（`backend/skills/`，每项含 SKILL.md 操作手册）：web_search、browser、code_execution、file_parsing、media_playback、echarts_chart、docx_manipulation、pptx_manipulation、xlsx_manipulation、rempilot-mcp。agent 会按需加载手册并按其规范操作。
+内置 9 项系统技能（`backend/skills/`，每项含 SKILL.md 操作手册）：web_search、browser、code_execution、file_parsing、media_playback、echarts_chart、docx_manipulation、pptx_manipulation、xlsx_manipulation。agent 会按需加载手册并按其规范操作。
 
 ### 12.2 用户技能
 
@@ -444,7 +444,11 @@ Weave Thinker 的记忆分三层，自动协同，无需手动管理：
 
 ### 12.3 MCP（模型上下文协议）
 
-在 `config.toml` 配置外部 MCP 服务（stdio 或 HTTP），启动后动态注册为工具（上不封顶）：
+MCP 分两层，均支持运行期生效（**不需要重启服务**）：
+
+**① 用户级（推荐，普通用户）**：`系统设置 → MCP` 添加自己的 HTTP / stdio server，保存后当前 worker 立即注册，下一轮即可用；只对本人可见/可调用，其他用户即使知道工具名也会被 fail-closed 拒绝。**信任边界**：stdio 会在服务器上启动子进程、HTTP 可能访问内网；代码默认两者都关闭，受信任部署才在 `[security]` 打开 `user_mcp_stdio_enabled` / `user_mcp_allow_private_hosts`。也可以直接对 agent 说「把这个 MCP 装上」，agent 通过 `manage_mcp_server` 工具完成 list/add/update/remove/reload。凭据（api_key / env 值）在列表里只显示 `***`，更新时保持 `***` 表示保留原值。
+
+**② 系统级（运维）**：在 `config.toml` 配置全公司共享的 MCP 服务；文件修改后 watcher 自动 diff（默认 5s，`[mcp].hot_reload_enabled=false` 可关闭），新增/删除/修改 server 会注册/注销工具并回收旧 stdio 子进程：
 
 ```toml
 # backend/config.toml
@@ -454,7 +458,7 @@ command = "npx"
 args = ["-y", "@your/mcp-server"]
 ```
 
-工具数量多时启用渐进式发现（`search_tools` 元工具按需加载），避免 schema 占满上下文。
+工具数量多时启用渐进式发现（`search_tools` 元工具按需加载），避免 schema 占满上下文。用户级工具名为 `mcp_u<uid8>_<server>_<tool>`，toolset 仍是 `mcp-<server>`。
 
 ---
 

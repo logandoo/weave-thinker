@@ -64,15 +64,35 @@
       <div v-if="message.role === 'assistant' && displaySequence.length > 0" class="alternating-content" :id="bodyDomId">
         <template v-for="(item, idx) in displaySequence" :key="idx">
           <template v-if="item.type === 'text'">
-            <div class="text segment-text" v-html="formatTextWithCitations(item.content)"></div>
-            <!-- 正文段恒全量：仅显式截断标记才出徽标（不按长度造噪音） -->
-            <span v-if="item.__truncated__ && truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span>
+            <!-- P0 R2: already-shown pre-tool prose is kept (A4.9 I2) but is a
+                 draft/process unit, never a second main answer. -->
+            <details v-if="item.superseded" class="superseded-draft">
+              <summary class="superseded-summary">草稿（已被终稿取代，点击展开）</summary>
+              <div class="text segment-text" v-html="formatTextWithCitations(item.content)"></div>
+              <span v-if="item.__truncated__ && truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span>
+            </details>
+            <template v-else>
+              <div class="text segment-text" v-html="formatTextWithCitations(item.content)"></div>
+              <!-- 正文段恒全量：仅显式截断标记才出徽标（不按长度造噪音） -->
+              <span v-if="item.__truncated__ && truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span>
+            </template>
           </template>
           <div v-else-if="item.type === 'reasoning_step'" class="reasoning-block">
             <details @toggle="(e) => onLazyToggle(`rs-${idx}`, e)">
               <summary class="reasoning-summary"><span class="step-title">{{ item.title || '💭 思考过程' }}</span><span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
               <div v-if="isLazyOpen(`rs-${idx}`)" class="reasoning-text" v-html="renderMarkdownToHtml(item.content, { deviceId: messageDeviceId })"></div>
             </details>
+          </div>
+          <div
+            v-else-if="item.type === 'interjection'"
+            class="inline-interjection"
+            :data-message-id="(item as any).message_id || undefined"
+          >
+            <div class="inline-interjection-head">
+              <span class="inline-interjection-label">插话</span>
+              <span v-if="item.created_at" class="inline-interjection-time">{{ formatTimestamp(String(item.created_at)) }}</span>
+            </div>
+            <div class="inline-interjection-text" v-html="formatTextWithCitations(item.content)"></div>
           </div>
           <ToolPartCard v-else-if="isToolSequenceItem(item)" :item="toToolPartItem(item)" />
           <div v-else class="agent-step-block">
@@ -399,6 +419,8 @@ import MediaLightbox from './MediaLightbox.vue'
 import { useInlineImageZoom } from '@/composables/useInlineImageZoom'
 import { useChatStore } from '@/stores/chat'
 import { resolveDisplaySequence, forceFullBody } from '@/stores/streamReducer'
+import { parseInterjectionItems, resolvePersistedInterjectionSequence } from '@/stores/interjectionDisplay'
+import { deriveToolStatus } from '@/utils/toolStatus'
 import { isExternalizedStub, stubMarkersTrusted } from '@/api/chat'
 import { classifyFile } from '@/composables/filePreview'
 import { buildDownloadUrl } from '@/api/workspaceFiles'
@@ -1094,9 +1116,18 @@ const displaySequence = computed<DisplaySequenceItem[]>(() => {
     parsedToolResultsData.value?.content_segments,
     props.message.content,
   )
+  // 2026-11-01：把插话边界插回持久化序列（tool_results 外置桩时按 after_char
+  // 切 content 兜底）。已有 interjection 项的序列保持原样。
+  const withInterjections = resolvePersistedInterjectionSequence(
+    resolved as any,
+    props.message.interjection_items,
+    props.message.content,
+  ) as typeof resolved
+  const hasInterjections = withInterjections.some(it => it.type === 'interjection')
+  if (hasInterjections) return withInterjections
   // N2/criterion #8 终极兜底：末条回答任何情况下不得截断——未愈合时直接以
   // 恒全量的 message.content 合并渲染（零请求、零依赖取回）。
-  return isLastAnswer.value ? forceFullBody(resolved, props.message.content) : resolved
+  return isLastAnswer.value ? forceFullBody(withInterjections, props.message.content) : withInterjections
 })
 
 // ─── 正文保真（2026-10-05 用户指令：正式回答绝对不可截断、折叠）─────────
@@ -1215,7 +1246,9 @@ function toToolPartItem(item: DisplaySequenceItem): DisplaySequenceItem {
   return {
     ...item,
     type: 'tool_call',
-    status: item.status ?? 'completed',
+    // F4（2026-11-01 审计）：持久化步骤没有 status，旧实现一律 'completed'
+    // —— 超时步骤刷新后仍显示 ✓ 完成。按载荷兜底推断，与实时口径一致。
+    status: deriveToolStatus(item),
     result: item.result ?? item.content,
     // 评审 I5：ToolPartCard 展开截断项时按此取回 payload 全文
     message_id: props.message.id,
@@ -2407,6 +2440,40 @@ onMounted(() => {
   margin-top: 12px;
 }
 
+/* 2026-11-01 插话内联：插话在 run 中真实进入模型上下文的位置。视觉上是一条
+   右对齐的用户气泡，但保留在 assistant 时间线内（不拆消息行/不破坏引用）。 */
+.inline-interjection {
+  margin: 14px 0 14px auto;
+  max-width: 88%;
+  padding: 9px 13px;
+  border-radius: var(--msg-bubble-radius);
+  background: var(--msg-user-bg);
+  border: var(--msg-bubble-border);
+  box-shadow: var(--msg-bubble-shadow);
+  overflow-wrap: anywhere;
+}
+.inline-interjection-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.inline-interjection-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-primary);
+}
+.inline-interjection-time {
+  font-size: 11px;
+  color: var(--msg-user-text);
+  opacity: .72;
+}
+.inline-interjection-text {
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--msg-user-text);
+}
+
 .agent-step-summary {
   cursor: pointer;
   font-weight: 500;
@@ -3190,6 +3257,26 @@ onMounted(() => {
   vertical-align: middle;
   white-space: nowrap;
   flex-shrink: 0;
+}
+
+/* P0 R2: superseded pre-tool draft — visible in the process area, collapsed
+   by default so it never reads as a second answer. */
+.superseded-draft {
+  margin: 0.35em 0;
+  padding: 0.3em 0.55em;
+  border: 1px dashed var(--color-border);
+  border-radius: 3px;
+  background: var(--color-bg-secondary, transparent);
+}
+.superseded-summary {
+  cursor: pointer;
+  font-size: 0.78em;
+  color: var(--color-text-light);
+  user-select: none;
+}
+.superseded-draft .segment-text {
+  margin-top: 0.35em;
+  opacity: 0.82;
 }
 
 /* 渐进落库（2026-10-06）：中断残稿徽标——skin token 体系，禁硬编码色 */

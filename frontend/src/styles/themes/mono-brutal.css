@@ -85,6 +85,7 @@
   --msg-bubble-border: 3px solid var(--skin-line);
   --msg-bubble-shadow: none;
   --msg-user-bg: var(--skin-fill);
+  --msg-user-text: var(--skin-onfill);
   --msg-assistant-bg: #ffffff;
   --input-container-radius: 0px;
   --input-container-min-height: 185px;
@@ -186,6 +187,7 @@
   --msg-bubble-border: 3px solid var(--skin-line);
   --msg-bubble-shadow: none;
   --msg-user-bg: var(--skin-fill);
+  --msg-user-text: var(--skin-onfill);
   --msg-assistant-bg: #1C1B17;
   --input-container-radius: 0px;
   --input-container-min-height: 185px;
@@ -2121,3 +2123,79 @@ html[data-skin="mono-brutal"][data-theme="dark"] .np-swipe-action.delete { backg
   html[data-skin="mono-brutal"] .zen-layout,
   html[data-skin="mono-brutal"] .voice-page { border: none; }
 }
+
+/* 笔记工具栏按钮尺寸统一（判据 #1，2026-10-25 笔记波）：与组件 scoped 基线同值
+   36×36 方盒（border-box + 内容居中）。本波前各按钮按内容撑尺寸（实测同栏
+   44x35 / 36x30 / 43x30 三档）；皮肤只保留各自的边框/圆角/配色。
+   作用域限定 .editor-toolbar / .zen-note-toolbar，聊天输入栏 .toolbar-btn 不受影响。 */
+html[data-skin="mono-brutal"] .editor-toolbar .toolbar-btn,
+html[data-skin="mono-brutal"] .zen-note-toolbar .toolbar-btn {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  font-weight: 800;
+  font-size: 12px;
+  transition: background-color .16s ease, color .16s ease;
+}
+html[data-skin="mono-brutal"] .editor-toolbar .toolbar-primary-btn,
+html[data-skin="mono-brutal"] .zen-note-toolbar .toolbar-primary-btn {
+  width: 60px;
+  min-width: 60px;
+  padding: 0;
+  gap: 5px;
+  justify-content: center;
+}
+html[data-skin="mono-brutal"] .editor-toolbar .toolbar-primary-label,
+html[data-skin="mono-brutal"] .zen-note-toolbar .toolbar-primary-label {
+  font-size: 12px;
+  font-weight: 800;
+}
+html[data-skin="mono-brutal"] .editor-toolbar .toolbar-btn:hover,
+html[data-skin="mono-brutal"] .zen-note-toolbar .toolbar-btn:hover {
+  background: var(--skin-lt);
+  color: var(--color-text);
+}
+html[data-skin="mono-brutal"] .editor-toolbar .toolbar-btn.active,
+html[data-skin="mono-brutal"] .zen-note-toolbar .toolbar-btn.active {
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+}
+/* 二级面板：硬边 2px 墨线 + 偏移硬阴影，直角 */
+html[data-skin="mono-brutal"] .note-toolbar-panel {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  box-shadow: 5px 5px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .note-toolbar-panel-head {
+  background: var(--skin-lt);
+  border-bottom: 2px solid var(--skin-line);
+}
+html[data-skin="mono-brutal"] .note-toolbar-panel-close { border-radius: 0; }
+html[data-skin="mono-brutal"] .note-toolbar-menu-item { border-radius: 0; border-width: 2px; border-color: transparent; }
+html[data-skin="mono-brutal"] .note-toolbar-menu-item .heading-icon { border-width: 2px; border-radius: 0; }
+html[data-skin="mono-brutal"] .note-toolbar-menu-item:hover { background: var(--skin-lt); border-color: var(--skin-line); }
+html[data-skin="mono-brutal"] .note-toolbar-menu-item.active { background: var(--skin-fill); color: var(--skin-onfill); border-color: var(--skin-line); }
+html[data-skin="mono-brutal"] .note-toolbar-menu-item:focus-visible { outline: 2px solid var(--skin-fill); outline-offset: -3px; }
+html[data-skin="mono-brutal"] .note-toolbar-table-cell { border: 2px solid var(--skin-line); border-radius: 0; }
+html[data-skin="mono-brutal"] .note-toolbar-table-cell.active { background: var(--skin-fill); }
+html[data-skin="mono-brutal"] .note-toolbar-group-label { color: var(--color-text); font-weight: 800; }
+
+html[data-skin="mono-brutal"] .toc-panel {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  box-shadow: 5px 5px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .toc-header { background: var(--skin-lt); border-bottom: 2px solid var(--skin-line); }
+html[data-skin="mono-brutal"] .toc-close-btn { border-radius: 0; }
+html[data-skin="mono-brutal"] .toc-item { border-radius: 0; }
+html[data-skin="mono-brutal"] .toc-item:hover { background: var(--skin-lt); }

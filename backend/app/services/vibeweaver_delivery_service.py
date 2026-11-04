@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 import os
 import re
 import time
@@ -32,6 +33,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.services import vibeweaver_state
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +53,10 @@ CUE_STATS_CAP = 100
 _PENDING_CAP = 50
 _SESSION_CUE_CAP = 500
 
-_SAFE_GLOB_MAX_LEN = 200
+_SAFE_GLOB_MAX_LEN = 64
 _SAFE_GLOB_MAX_DOUBLE_STAR = 2
+_SAFE_GLOB_MAX_TOTAL_STAR = 2
+_CUE_MATCH_BUDGET_SECONDS = 0.05
 
 # 首触 cue 的进程内去重（root:conv → 已投递）；有界
 _SESSION_MEM: Dict[str, bool] = {}
@@ -182,32 +194,85 @@ def _delivery_state_path(root: Path) -> Path:
     return root / vibeweaver_state.STATE_DIR / DELIVERY_STATE_FILE
 
 
+@contextmanager
+def _delivery_lock(root: Path):
+    """Bounded, process-safe lock for delivery-state read/modify/write.
+
+    Use OS advisory locks (flock / msvcrt) rather than the old create/unlink
+    owner-token protocol. The old recovery lock could leave a permanent
+    `.recovery` file after a crash; every later consume then spun for ~200s
+    while blocking the event loop. Advisory locks are released by the kernel
+    on process exit, so there is no stale-lock recovery path to wedge.
+    """
+    lock_path = _delivery_state_path(root).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd: Optional[int] = None
+    last_exc: Optional[BaseException] = None
+    for _ in range(100):  # <= 500 ms synchronous wait; never a 200 s wedge
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - exotic platform
+                raise OSError("no advisory file locking available")
+            break
+        except OSError as exc:
+            last_exc = exc
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+            time.sleep(0.005)
+    if fd is None:
+        raise TimeoutError(f"pending resume state lock timeout: {last_exc}")
+    try:
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
+
+
 def mark_pending_resume(root: Path, conversation_id: str) -> None:
     """标记「下一轮 system 装配注入一次」。会话键缺失 → 不标记（避免根级兜底键
     被无关会话消费掉「一次性」语义，评审 B-m3）。"""
     if not root or not conversation_id:
         return
     try:
-        p = _delivery_state_path(root)
-        try:
-            st: Dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
-            if not isinstance(st, dict):
+        with _delivery_lock(root):
+            p = _delivery_state_path(root)
+            try:
+                st: Dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(st, dict):
+                    st = {}
+            except (OSError, ValueError):
                 st = {}
-        except (OSError, ValueError):
-            st = {}
-        pending = st.get("pendingResume")
-        if not isinstance(pending, dict):
-            pending = {}
-        key = str(conversation_id)
-        pending.pop(key, None)  # 重标记刷新 recency（cap 逐出按最旧，评审 B-m4）
-        pending[key] = int(time.time() * 1000)
-        if len(pending) > _PENDING_CAP:
-            pending = dict(list(pending.items())[-_PENDING_CAP:])
-        st["pendingResume"] = pending
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, p)
+            pending = st.get("pendingResume")
+            if not isinstance(pending, dict):
+                pending = {}
+            key = str(conversation_id)
+            pending.pop(key, None)  # 重标记刷新 recency（cap 逐出按最旧，评审 B-m4）
+            pending[key] = int(time.time() * 1000)
+            if len(pending) > _PENDING_CAP:
+                pending = dict(list(pending.items())[-_PENDING_CAP:])
+            st["pendingResume"] = pending
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
     except OSError as exc:
         logger.debug("pending resume mark failed-open: %s", exc)
 
@@ -218,25 +283,27 @@ def consume_pending_resume(root: Path, conversation_id: str) -> Optional[str]:
         return None
     key = str(conversation_id)
     try:
-        p = _delivery_state_path(root)
-        try:
-            st: Dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
-            if not isinstance(st, dict):
+        with _delivery_lock(root):
+            p = _delivery_state_path(root)
+            try:
+                st: Dict[str, Any] = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(st, dict):
+                    return None
+            except (OSError, ValueError):
                 return None
-        except (OSError, ValueError):
-            return None
-        pending = st.get("pendingResume")
-        if not isinstance(pending, dict):
-            return None
-        if key not in pending:
-            return None
-        pending.pop(key, None)
-        st["pendingResume"] = pending
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, p)
+            pending = st.get("pendingResume")
+            if not isinstance(pending, dict):
+                return None
+            if key not in pending:
+                return None
+            bundle = compact_state_bundle(root)
+            pending.pop(key, None)
+            st["pendingResume"] = pending
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
         vibeweaver_state.record_memory_delivery(root, "compactResume")
-        return compact_state_bundle(root)
+        return bundle
     except OSError as exc:
         logger.debug("pending resume consume failed-open: %s", exc)
         return None
@@ -309,15 +376,15 @@ def note_note_write(root: Path, rel_path: str) -> None:
 
 def safe_glob(t: Any) -> bool:
     """投递安全上限：记忆主题文本会被编译成正则同步执行——恶意/疏忽的 glob
-    （重复 `**/` → 组合式回溯）会楔死事件循环。`**` 组 ≤2、长度 ≤200、拒控制字符
-    （它们兼作内部哨兵字节）。"""
+    （重复 `**/` → 组合式回溯）会楔死事件循环。`**` 组 ≤2、总星号 ≤2、
+    长度 ≤64、拒控制字符（它们兼作内部哨兵字节）。"""
     if not isinstance(t, str) or not t:
         return False
     if len(t) > _SAFE_GLOB_MAX_LEN:
         return False
     if re.search(r"[\x00-\x1f]", t):
         return False
-    return t.count("**") <= _SAFE_GLOB_MAX_DOUBLE_STAR
+    return t.count("**") <= _SAFE_GLOB_MAX_DOUBLE_STAR and t.count("*") <= _SAFE_GLOB_MAX_TOTAL_STAR
 
 
 def glob_to_regex(glob: str) -> re.Pattern:
@@ -375,8 +442,18 @@ def cue_notes(root: Path, file_path: Optional[str]) -> List[str]:
             return []
         notes: List[str] = []
         fired: List[str] = []
+        deadline = time.monotonic() + _CUE_MATCH_BUDGET_SECONDS
+        budget_skipped = 0
         for f in sorted(mem_dir.iterdir()):
+            if time.monotonic() > deadline:
+                budget_skipped += 1
+                break
             if not f.is_file() or not f.name.endswith(".md") or f.name == "MEMORY.md":
+                continue
+            try:
+                if f.stat().st_size > 256 * 1024:
+                    continue
+            except OSError:
                 continue
             text = _safe_read(f).replace("\r\n", "\n").lstrip("\ufeff")
             m = re.match(r"^---\n([\s\S]*?)\n---", text)
@@ -388,6 +465,9 @@ def cue_notes(root: Path, file_path: Optional[str]) -> List[str]:
                 continue
             hit = False
             for t in triggers:
+                if time.monotonic() > deadline:
+                    budget_skipped += 1
+                    break
                 try:
                     if glob_to_regex(t).match(rel):
                         hit = True
@@ -407,6 +487,11 @@ def cue_notes(root: Path, file_path: Optional[str]) -> List[str]:
             fired.append(f.name)
             if len(notes) >= CUE_MAX:
                 break
+        if budget_skipped:
+            notes.append(
+                "[GATE-WARNING (vibeweaver-cue)] memory-trigger matching hit its 50ms budget; "
+                "remaining patterns were skipped (tighten the trigger globs)"
+            )
         if fired:
             vibeweaver_state.record_cue_fires(root, fired)
         return notes

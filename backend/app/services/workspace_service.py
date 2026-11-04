@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,7 @@ from app.core.config import get_config
 from app.db.database import UserWorkspace
 
 config = get_config()
+logger = logging.getLogger(__name__)
 
 
 def _slugify(value: Optional[str]) -> str:
@@ -54,12 +56,13 @@ async def ensure_user_workspace(
     workspace = result.scalar_one_or_none()
 
     workspace_name = f"{_slugify(username)}-{user_id[:8]}"
-    root_path = (config.workspace_root / workspace_name).resolve()
-    _ensure_workspace_directories(root_path)
+    from app.services.tenant_service import scoped_root
+    root_path = (scoped_root(config.workspace_root) / workspace_name).resolve()
 
     python_env_path = str((config.project_root / ".venv").resolve()) if config.workspace_use_project_venv else None
 
     if workspace is None:
+        _ensure_workspace_directories(root_path)
         workspace = UserWorkspace(
             user_id=user_id,
             root_path=str(root_path),
@@ -72,9 +75,21 @@ async def ensure_user_workspace(
         await db.refresh(workspace)
         return workspace
 
-    workspace.root_path = str(root_path)
-    workspace.python_env_path = python_env_path
-    workspace.node_workspace_path = str(root_path)
+    # P2 tenant safety: never silently re-point an existing workspace when a
+    # tenant id / username changes.  New rows get the new path; existing rows
+    # keep their persisted root (a move requires an explicit migration).
+    if str(workspace.root_path or "") != str(root_path):
+        logger.warning(
+            "workspace path differs for user %s (persisted=%s computed=%s); "
+            "keeping persisted path (no silent move)",
+            user_id, workspace.root_path, root_path,
+        )
+        if workspace.root_path:
+            _ensure_workspace_directories(Path(workspace.root_path))
+    else:
+        _ensure_workspace_directories(root_path)
+        workspace.python_env_path = python_env_path
+        workspace.node_workspace_path = str(root_path)
     if not workspace.metadata_json:
         workspace.metadata_json = _workspace_metadata()
     await db.commit()

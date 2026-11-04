@@ -20,6 +20,10 @@ jobs:
   backend:
     name: Backend (install / compile / import)
     runs-on: ubuntu-latest
+    env:
+      # 真实 PG 回归测试（backend/tests/test_message_payload_pg_fk.py）用——
+      # service 凭据与 tracked config.toml（本地 dev）不同，靠 env 桥接。
+      WT_TEST_PG_URL: postgresql+asyncpg://weavethinker:changeme@127.0.0.1:5432/weavethinker
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -66,6 +70,19 @@ jobs:
 
       - name: Import smoke (app wiring)
         run: cd backend && python -c "import main; print('import main OK')"
+
+      - name: Prompt lint / coverage / contracts / golden set
+        run: |
+          cd backend
+          python -m scripts.prompt_audit verify --check
+          python -m scripts.prompt_audit budget --check
+          python -m scripts.prompt_eval --check
+          python -m scripts.prompt_judge_calibration --check
+          python -m scripts.prompt_judge_calibration --self-test
+          python -m scripts.prompt_feedback check
+          python -m scripts.prompt_live_eval --check
+          python -m scripts.prompt_context_rot --check
+          python -m scripts.prompt_model_matrix --out /tmp/prompt_model_matrix.json
 
       - name: Unit tests (hermetic subset; run when tests ship with the tree)
         run: |

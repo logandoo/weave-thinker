@@ -219,7 +219,9 @@ class JobRunner:
         if spec.get("kind") == "python":
             script = d / "script.py"
             script.write_text(spec["code"])
-            inner = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+            # F1（2026-11-01 复核）：durable 作业是"长任务逃生口"，日志必须
+            # 实时可读（`job_logs` 靠 run.log），故 python 侧强制不缓冲。
+            inner = f"{shlex.quote(sys.executable)} -u {shlex.quote(str(script))}"
         else:
             inner = spec["command"]
         run_sh = d / "run.sh"
@@ -546,7 +548,11 @@ class SqlJobStore:
         from app.db.database import AsyncSessionLocal, DurableJob
         async with AsyncSessionLocal() as db:
             row = await db.get(DurableJob, job["id"])
-            fields = {k: v for k, v in job.items() if k != "spec"}
+            # id/spec 由 insert 分支显式传递——fields 必须排除，否则
+            # `DurableJob(id=..., **_ins)` 撞键 TypeError（60 生产 conv
+            # 5c89e092 durable terminal/job_submit 必崩原文）；update 分支
+            # 同步排除 id（主键不可变）。
+            fields = {k: v for k, v in job.items() if k not in ("spec", "id")}
             spec = job.get("spec") or {}
             if row is None:
                 _ins = {k: (_norm_dt(v) if k in _DT_FIELDS else v) for k, v in fields.items()}
@@ -569,7 +575,9 @@ class SqlJobStore:
             if row is None or row.state != expected_state:
                 return False
             row.spec = json.dumps(job.get("spec") or {}, ensure_ascii=False)
-            for k, v in {k: v for k, v in job.items() if k != "spec"}.items():
+            # id 与 save() 同步排除：主键不可变（同值 setattr 虽为 no-op，但
+            # 保留回写会在 dict 形态漂移时制造不对称语义 —— re-review Minor-1）。
+            for k, v in {k: v for k, v in job.items() if k not in ("spec", "id")}.items():
                 setattr(row, k, _norm_dt(v) if k in _DT_FIELDS else v)
             await db.commit()
             return True

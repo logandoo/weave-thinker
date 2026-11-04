@@ -25,7 +25,11 @@ if [ -d config.toml ]; then
 fi
 if [ ! -f config.toml ]; then
     if [ -f config.toml.example ]; then
-        log "未发现 config.toml——从模板 + 环境变量生成（仅存活于本容器；重建即丢，生产请挂载配置文件）"
+        # Auto-generated config = fresh self-host deployment: enforce the
+        # production guard by default.  A mounted config (local/dev) keeps
+        # its own WT_ENV choice; explicit WT_ENV still wins.
+        export WT_ENV="${WT_ENV:-production}"
+        log "未发现 config.toml——从模板 + 环境变量生成（WT_ENV=${WT_ENV}；生产请挂载配置文件）"
         python /app/docker/bootstrap_config.py \
             --from config.toml.example --out config.toml \
             --db-host "${WT_DB_HOST:-db}" \

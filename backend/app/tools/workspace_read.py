@@ -111,7 +111,19 @@ async def workspace_read(args: Dict[str, Any], **kwargs) -> str:
 
     from app.services.workspace_service import ensure_user_workspace
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
-    workspace_root = str(Path(workspace.root_path).resolve())
+    user_root = Path(workspace.root_path).resolve()
+    workspace_root = str(user_root)
+    override = str(kwargs.get("workspace_path") or "").strip()
+    if override:
+        candidate = Path(override).resolve()
+        try:
+            candidate.relative_to(user_root)
+            workspace_root = str(candidate)
+        except ValueError:
+            return json.dumps(
+                {"error": "任务工作区路径超出用户工作区，禁止读取", "success": False},
+                ensure_ascii=False,
+            )
 
     target = str(args.get("path") or args.get("file_path") or "").strip().strip("'\"")
     if not target:
@@ -149,7 +161,9 @@ async def workspace_read(args: Dict[str, Any], **kwargs) -> str:
         )
         if inline_images_enabled():
             envelope = build_image_envelope_from_file(
-                resolved, f"[workspace_read] 图像 {name}（{ext}）已内联返回，可直接判读。",
+                resolved,
+                f"[workspace_read] 图像 {name}（{ext}）已内联返回，可直接判读。",
+                display_path=os.path.relpath(resolved, workspace_root),
             )
             if envelope is not None:
                 return envelope

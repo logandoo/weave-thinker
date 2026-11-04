@@ -268,7 +268,7 @@
         <div v-show="!groupsDirectoryCollapsed" class="groups-directory-content">
           <SortableList
             v-model="groupStore.groups"
-            :group="{ name: 'groups', pull: false, put: false }"
+            :group="groupsDragGroup"
             item-key="id"
             handle=".group-header"
             :delay="100"
@@ -816,7 +816,7 @@ import NotebookPicker from './NotebookPicker.vue'
 import NotesPanelInline from './NotesPanelInline.vue'
 import SystemSettingsDialog from './SystemSettingsDialog.vue'
 import ConversationRow from './ConversationRow.vue'
-import SortableList from './SortableList.vue'
+import SortableList, { resetGlobalDragState } from './SortableList.vue'
 import LogoIcon from './LogoIcon.vue'
 
 const router = useRouter()
@@ -1009,6 +1009,15 @@ const convDragGroup = {
   name: 'conversations',
   pull: true,
   put: true
+}
+
+// W26：groups 目录拖拽组引用必须稳定 —— 内联对象字面量每次渲染都产生新
+// 引用，触发 SortableList 的 props.group watcher 重建实例；拖拽中重建 =
+// SortableJS destroy() → 全局拖拽态被清空 → 拖拽卡死。
+const groupsDragGroup = {
+  name: 'groups',
+  pull: false,
+  put: false
 }
 
 const emptyUngroupedList = ref<Conversation[]>([])
@@ -1435,6 +1444,22 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener('click', closeAllMenus)
+  // W26：卸载时摘除 failsafe 监听与拖拽期 document 监听，防止闭包钉住
+  // 组件引用、stale 计时器对死引用点火
+  removeDragFailsafeListeners()
+  document.removeEventListener('mousemove', handleDragMouseMove)
+  document.removeEventListener('touchmove', handleDragMouseMove)
+  if (dragCancelTimer !== null) {
+    window.clearTimeout(dragCancelTimer)
+    dragCancelTimer = null
+  }
+  dragCancelRequested = false
+  // 拖拽中卸载（Sidebar 被替换）→ 模块级全局态必须复位，否则所有列表的
+  // mutation/重建守卫永久锁死（评审 B-I2）。
+  if (isDragging.value) {
+    isDragging.value = false
+    resetGlobalDragState()
+  }
   })
 
 function selectAssistant(id: string) {
@@ -1535,10 +1560,17 @@ async function handleNewChat() {
     return (!msgs || msgs.length === 0) && c.title === '新对话'
   })
   if (emptyConv) {
+    // The new-task boundary is the user's click, not the later async completion.
+    // Clear older intent now so a newer explicit ON during selection survives.
+    chatStore.deathmatchMode = false
+    chatStore.deathmatchAction = null
     await chatStore.selectConversation(emptyConv.id)
-    await navigateWithMobileHistory(router, '/')
-    emit('close-drawer')
-    return
+    if (!chatStore.messages[emptyConv.id]?.length) {
+      if (!(await chatStore.applyDefaultExecutionTargetToConversation(emptyConv.id))) return
+      await navigateWithMobileHistory(router, '/')
+      emit('close-drawer')
+      return
+    }
   }
   await chatStore.createConversation(undefined, assistantStore.currentAssistantId)
   await navigateWithMobileHistory(router, '/')
@@ -2039,12 +2071,193 @@ function handleGroupHeaderClick(groupId: string) {
 
 const collapsedBeforeDrag = ref<Set<string>>(new Set())
 
+// ─── W26 拖拽 failsafe ──────────────────────────────────────────
+// SortableJS 的 end 事件若因任何原因未到达（历史根因：拖拽中实例被
+// destroy → 模块级全局拖拽态清空 → end 永不派发），鼠标/触摸已释放或
+// 用户按 Escape 后 150ms 强制复位 —— 拖拽绝不可卡死，.sidebar-dragging
+// 绝不永驻（全展开 CSS 的寿命锚定 isDragging）。
+let dragGeneration = 0  // 世代令牌：stale 计时器不得扼杀新拖拽
+let dragFailsafeTimer: number | null = null
+// Escape = 取消请求：SortableJS 1.14 无 cancel API，松手时仍会派发
+// add/remove/update。取消语义必须让模块级 mutation 守卫保持到真实 end，
+// 否则取消的拖拽会被写进 dragLists / 分组顺序（评审 A-I1/B-I1）。
+let dragCancelRequested = false
+let dragCancelTimer: number | null = null
+let dragIsGroup = false
+
+function removeDragFailsafeListeners() {
+  window.removeEventListener('mouseup', onDragFailsafePointer, true)
+  window.removeEventListener('touchend', onDragFailsafePointer, true)
+  window.removeEventListener('touchcancel', onDragFailsafePointer, true)
+  window.removeEventListener('keydown', onDragFailsafeKey, true)
+  if (dragFailsafeTimer !== null) {
+    window.clearTimeout(dragFailsafeTimer)
+    dragFailsafeTimer = null
+  }
+}
+function onDragFailsafePointer(e?: Event) {
+  // 主键/首触才代表拖拽释放：右键/中键抬起不得终止在途拖拽
+  if (e && 'button' in e && (e as MouseEvent).button !== 0) return
+  // 多点触控：第二根手指抬起≠拖拽结束（SortableJS 只跟踪首触）
+  if (e && 'touches' in e && (e as TouchEvent).touches.length > 0) return
+  const gen = dragGeneration
+  removeDragFailsafeListeners()
+  dragFailsafeTimer = window.setTimeout(() => {
+    dragFailsafeTimer = null
+    // 世代守卫：计时器属于旧拖拽时不得动新拖拽的状态
+    if (gen !== dragGeneration) return
+    if (isDragging.value) forceEndDrag('pointer-released-without-end-event')
+  }, 150)
+}
+function onDragFailsafeKey(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return
+  if (!isDragging.value) return
+  removeDragFailsafeListeners()
+  forceEndDrag('escape')
+}
+function forceEndDrag(reason: string) {
+  if (!isDragging.value) return
+  console.warn('[sidebar] drag failsafe engaged:', reason)
+  document.body.style.userSelect = ''
+  document.body.style.cursor = ''
+  if (reason === 'escape') {
+    // Escape = 取消请求：不立即清模块级拖拽态 —— SortableJS 仍在跟踪首触，
+    // 松手时仍会派发 add/remove/update；提前复位会让 SortableList 的
+    // mutation 守卫失效，被取消的拖拽会写进 dragLists/分组顺序。守卫保持到
+    // 真实 end（SortableList onEnd 的延迟清理复位），此处只清 UI/监听，并留
+    // 有界兜底（end 始终未达也不得永久锁死）。
+    dragCancelRequested = true
+    removeDragFailsafeListeners()
+    stopEdgeScroll()
+    document.removeEventListener('mousemove', handleDragMouseMove)
+    document.removeEventListener('touchmove', handleDragMouseMove)
+    cancelDragMoveRaf()
+    if (dragHoverTimer) {
+      clearTimeout(dragHoverTimer)
+      dragHoverTimer = null
+    }
+    dragHoverTargetGroupId = null
+    dragExpandedGroupId.value = null
+    if (dragCancelTimer !== null) window.clearTimeout(dragCancelTimer)
+    dragCancelTimer = window.setTimeout(() => {
+      dragCancelTimer = null
+      if (!isDragging.value) return
+      // end 始终未达（drawer 关闭 / 手势异常）：兜底复位，绝不永久卡死
+      dragCancelRequested = false
+      isDragging.value = false
+      resetGlobalDragState()
+      if (groupsDirectoryWasCollapsed.value) {
+        groupsDirectoryCollapsed.value = true
+      }
+      groupsDirectoryWasCollapsed.value = false
+      nextTick(() => {
+        deduplicateDragElements()
+        syncDragLists()
+      })
+    }, 2000)
+    return
+  }
+  // 指针已释放但 end 未达：SortableList onEnd 的清理（body 样式 + 模块级
+  // 全局态）也一并缺失 —— 两者都必须还原（全局态不复位会永久锁死全部
+  // SortableList 实例的 re-init 与变更持久化）。
+  resetGlobalDragState()
+  if (dragIsGroup) {
+    // 分组目录拖拽的 end 丢失：没有 event.moved 就没有合法的 reorder 载荷。
+    // 不做会话级 reconcile/persist（那会把 conversation 顺序写脏），只复位
+    // UI 与监听，等下一次渲染/拖拽按 store 权威重排。
+    isDragging.value = false
+    stopEdgeScroll()
+    document.removeEventListener('mousemove', handleDragMouseMove)
+    document.removeEventListener('touchmove', handleDragMouseMove)
+    cancelDragMoveRaf()
+    if (dragHoverTimer) {
+      clearTimeout(dragHoverTimer)
+      dragHoverTimer = null
+    }
+    dragHoverTargetGroupId = null
+    dragExpandedGroupId.value = null
+    removeDragFailsafeListeners()
+    nextTick(() => syncDragLists())
+    return
+  }
+  // DOM 可能已被 SortableJS 挪动 —— 读回并对账持久化
+  deduplicateDragElements()
+  reconcileDragState()
+  isDragging.value = false
+  processDragChanges()
+  stopEdgeScroll()
+  document.removeEventListener('mousemove', handleDragMouseMove)
+  document.removeEventListener('touchmove', handleDragMouseMove)
+  cancelDragMoveRaf()
+  if (dragHoverTimer) {
+    clearTimeout(dragHoverTimer)
+    dragHoverTimer = null
+  }
+  dragHoverTargetGroupId = null
+  dragExpandedGroupId.value = null
+  removeDragFailsafeListeners()
+  if (groupsDirectoryWasCollapsed.value) {
+    groupsDirectoryCollapsed.value = true
+  }
+  groupsDirectoryWasCollapsed.value = false
+  nextTick(() => {
+    deduplicateDragElements()
+    syncDragLists()
+  })
+}
+
+/** 取消请求的真实 end：不 reconcile/不 persist，按 Vue 状态还原 DOM。 */
+function finishCancelledDrag() {
+  dragCancelRequested = false
+  if (dragCancelTimer !== null) {
+    window.clearTimeout(dragCancelTimer)
+    dragCancelTimer = null
+  }
+  isDragging.value = false
+  removeDragFailsafeListeners()
+  stopEdgeScroll()
+  document.removeEventListener('mousemove', handleDragMouseMove)
+  document.removeEventListener('touchmove', handleDragMouseMove)
+  cancelDragMoveRaf()
+  if (dragHoverTimer) {
+    clearTimeout(dragHoverTimer)
+    dragHoverTimer = null
+  }
+  dragHoverTargetGroupId = null
+  dragExpandedGroupId.value = null
+  resetGlobalDragState()
+  if (groupsDirectoryWasCollapsed.value) {
+    groupsDirectoryCollapsed.value = true
+  }
+  groupsDirectoryWasCollapsed.value = false
+  nextTick(() => {
+    deduplicateDragElements()
+    syncDragLists()
+  })
+}
+
 function onDragStart(event: any) {
   isDragging.value = true
+  dragGeneration += 1
+  dragCancelRequested = false
+  // 分组目录拖拽判定：SortableJS 的 event.from 是 SortableList 根
+  // （.sortable-list），分组目录外层 .groups-directory-content 不在其中 ——
+  // 旧判据恒 false（分支不可达）。以被拖项形态判定：分组项是
+  // .conversation-group，会话项是会话行。
+  dragIsGroup = event?.item?.classList?.contains('conversation-group') === true
+  if (dragCancelTimer !== null) {
+    window.clearTimeout(dragCancelTimer)
+    dragCancelTimer = null
+  }
 
-  const fromEl = event?.from as HTMLElement | undefined
-  const isGroupDrag = fromEl?.classList?.contains('groups-directory-content') === true
+  // failsafe 兜底监听（正常 end 路径会在 onConversationDragEnd /
+  // onGroupDragEnd 中摘除；failsafe 触发即自摘）
+  window.addEventListener('mouseup', onDragFailsafePointer, true)
+  window.addEventListener('touchend', onDragFailsafePointer, true)
+  window.addEventListener('touchcancel', onDragFailsafePointer, true)
+  window.addEventListener('keydown', onDragFailsafeKey, true)
 
+  const isGroupDrag = dragIsGroup
   collapsedBeforeDrag.value = new Set(groupStore.collapsedGroups)
 
   if (isGroupDrag) {
@@ -2067,6 +2280,13 @@ function onDragStart(event: any) {
 }
 
 function onConversationDragEnd(event: any) {
+  // failsafe 已复位后迟到的真实 end 不得二次 reconcile+persist
+  // （Escape 取消后松手会把会话落到光标所在处）。
+  if (!isDragging.value) return
+  if (dragCancelRequested) {
+    finishCancelledDrag()
+    return
+  }
   // ── Determine target group from DOM ──────────────────────────
   const toEl = event?.to as HTMLElement | undefined
   let targetGroupEl = toEl?.closest('.conversation-group') as HTMLElement | null
@@ -2170,6 +2390,7 @@ function onConversationDragEnd(event: any) {
       document.removeEventListener('mousemove', handleDragMouseMove)
       document.removeEventListener('touchmove', handleDragMouseMove)
       cancelDragMoveRaf()
+      removeDragFailsafeListeners()
 
       if (dragHoverTimer) {
         clearTimeout(dragHoverTimer)
@@ -2273,6 +2494,12 @@ function reconcileDragState() {
 }
 
 function onGroupDragEnd(event: any) {
+  // 同 onConversationDragEnd：failsafe 复位后的迟到 end 直接丢弃
+  if (!isDragging.value) return
+  if (dragCancelRequested) {
+    finishCancelledDrag()
+    return
+  }
   isDragging.value = false
 
   // Restore original collapsed state
@@ -2293,6 +2520,7 @@ function onGroupDragEnd(event: any) {
   document.removeEventListener('mousemove', handleDragMouseMove)
   document.removeEventListener('touchmove', handleDragMouseMove)
   cancelDragMoveRaf()
+  removeDragFailsafeListeners()
 
   if (!event.moved) return
   const items = groupStore.groups.map((group, index) => ({

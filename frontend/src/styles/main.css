@@ -82,6 +82,7 @@ html[data-skin="mono-brutal"] { --mobile-tab-bar-offset: 60px; }
   --msg-bubble-border: none;
   --msg-bubble-shadow: var(--shadow-sm);
   --msg-user-bg: var(--color-user-bubble);
+  --msg-user-text: var(--color-text);
   --msg-assistant-bg: var(--color-white);
   /* 输入区 */
   --input-container-radius: 28px;
@@ -256,6 +257,7 @@ html[data-skin="mono-brutal"] { --mobile-tab-bar-offset: 60px; }
   --msg-bubble-border: none;
   --msg-bubble-shadow: var(--shadow-sm);
   --msg-user-bg: var(--color-user-bubble);
+  --msg-user-text: var(--color-text);
   --msg-assistant-bg: var(--color-white);
   --input-container-radius: 28px;
   --input-container-min-height: 180px;

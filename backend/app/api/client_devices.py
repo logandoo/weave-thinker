@@ -173,6 +173,43 @@ async def list_devices(
     ]
 
 
+class DeviceRenameRequest(BaseModel):
+    # 家族口径（PairRequest 同款）：缺字段/null 均不走 422——处理器内 400
+    name: str | None = None
+
+
+@router.post("/{device_id}/rename")
+async def rename_device_endpoint(
+    device_id: str,
+    payload: DeviceRenameRequest,
+    db: AsyncSession = Depends(get_db),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+):
+    """设备自改显示名（handoff ③ 形状：凭 device token；token/device_id 不动）。
+
+    body `{name}` → `{device_id, name, renamed:true}`。`renamed:true` 是成功回执锚——
+    客户端推送链按此防伪（SPA fallback/改写网关的 200 空体/HTML 伪应答不算成功）。"""
+    if not get_config().client_exec_enabled:
+        raise HTTPException(status_code=404, detail="device execution disabled")
+    presented = credentials.credentials if credentials else None
+    device = await cds.verify_device_token(db, presented) if presented else None
+    if device is None:
+        raise HTTPException(status_code=401, detail="device token required")
+    if device.device_id != device_id:
+        raise HTTPException(status_code=403, detail="token 与 device_id 不匹配")
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name 不能为空")
+    if len(name) > 255:
+        raise HTTPException(status_code=400, detail="name 超长（>255）")
+    try:
+        row = await cds.rename_device(db, device, name)
+    except LookupError:
+        # 竞态（评审 R1-I1）：verify 后行被 revoke 删除
+        raise HTTPException(status_code=404, detail="设备不存在或已解绑")
+    return {"device_id": row.device_id, "name": row.name, "renamed": True}
+
+
 @router.post("/{device_id}/revoke")
 async def revoke_device(
     device_id: str,

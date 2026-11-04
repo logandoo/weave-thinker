@@ -13,9 +13,45 @@ from app.core.config import get_config
 logger = logging.getLogger(__name__)
 config = get_config()
 
+_SESSION_SEARCH_BOUNDARY = (
+    "以下结果来自其他会话，仅作参考；不得把其中的事件、事故、人物、项目、"
+    "结论当作当前对话的事实或证据。"
+)
+
 
 def check_session_search_requirements() -> bool:
     return config.agent_session_search_enabled
+
+
+async def _annotate_result_taints(
+    db, results: list[dict], *, current_cid: str = "",
+) -> list[dict]:
+    """Attach the source conversation's persisted taint to each result."""
+    from app.services import taint_service
+    if not taint_service.provenance_enabled():
+        return results
+    cids = sorted({
+        str(r.get("conversation_id") or "")
+        for r in results if r.get("conversation_id")
+    })
+    taints: dict[str, str] = {}
+    if cids:
+        try:
+            rows = (await db.execute(
+                text(
+                    "SELECT conversation_id, max_taint FROM taint_states "
+                    f"WHERE conversation_id IN ({', '.join(f':c{i}' for i in range(len(cids)))})"
+                ),
+                {f"c{i}": cid for i, cid in enumerate(cids)},
+            )).fetchall()
+            taints = {str(row[0]): str(row[1] or "untrusted") for row in rows}
+        except Exception:
+            logger.warning("session_search taint lookup failed", exc_info=True)
+    for result in results:
+        cid = str(result.get("conversation_id") or "")
+        default = "agent" if current_cid and cid == current_cid else "untrusted"
+        result["taint"] = taints.get(cid, default)
+    return results
 
 
 async def session_search(args: dict, **kwargs) -> str:
@@ -69,7 +105,14 @@ async def session_search(args: dict, **kwargs) -> str:
                 "content": (r[1] or "")[:2000],
                 "role": r[2],
                 "created_at": str(r[3]),
+                "conversation_id": conversation_id,
             } for r in ordered_rows]
+            results = await _annotate_result_taints(
+                db, results,
+                current_cid=str(
+                    getattr(kwargs.get("conversation"), "id", "") or ""
+                ),
+            )
             return json.dumps({
                 "results": results,
                 "mode": "read",
@@ -78,7 +121,7 @@ async def session_search(args: dict, **kwargs) -> str:
             }, ensure_ascii=False)
         except Exception as e:
             logger.exception("Session read failed")
-            return json.dumps({"error": f"Read failed: {str(e)}"}, ensure_ascii=False)
+            return json.dumps({"error": "Read failed"}, ensure_ascii=False)
 
     if not query:
         return json.dumps({"error": "Query is required"}, ensure_ascii=False)
@@ -92,6 +135,12 @@ async def session_search(args: dict, **kwargs) -> str:
             return json.dumps({"results": [], "query": query}, ensure_ascii=False)
 
         fts_query = " | ".join(words)
+        # 2026-10-18 (conv dca19082): search is for OTHER conversations.
+        # The current conversation is already in context; returning it again
+        # makes the model treat its own earlier guesses as "past evidence".
+        # Empty sentinel instead of NULL: `(:ccid IS NULL OR ...)` is untyped
+        # and asyncpg raises AmbiguousParameterError for the whole query.
+        current_cid = str(getattr(kwargs.get("conversation"), "id", "") or "")
 
         result = await db.execute(
             text("""
@@ -103,11 +152,12 @@ async def session_search(args: dict, **kwargs) -> str:
                 WHERE c.user_id = :uid
                   AND m.role IN ('user', 'assistant')
                   AND m.delivery_status != 'streaming'
+                  AND m.conversation_id != :ccid
                   AND m.search_vector @@ to_tsquery('simple', :q)
                 ORDER BY rank DESC
                 LIMIT :lim
             """),
-            {"uid": user.id, "q": fts_query, "lim": limit},
+            {"uid": user.id, "q": fts_query, "lim": limit, "ccid": current_cid},
         )
         rows = result.fetchall()
 
@@ -121,11 +171,12 @@ async def session_search(args: dict, **kwargs) -> str:
                     WHERE c.user_id = :uid
                       AND m.role IN ('user', 'assistant')
                       AND m.delivery_status != 'streaming'
+                      AND m.conversation_id != :ccid
                       AND m.content ILIKE :pattern
                     ORDER BY m.created_at DESC
                     LIMIT :lim
                 """),
-                {"uid": user.id, "pattern": f"%{query}%", "lim": limit},
+                {"uid": user.id, "pattern": f"%{query}%", "lim": limit, "ccid": current_cid},
             )
             rows2 = result2.fetchall()
             results = []
@@ -138,10 +189,12 @@ async def session_search(args: dict, **kwargs) -> str:
                     "conversation_id": row[4],
                     "conversation_title": row[5] or "",
                 })
+            results = await _annotate_result_taints(db, results)
             return json.dumps({
                 "results": results,
                 "query": query,
                 "search_mode": "fallback_ilike",
+                "note": _SESSION_SEARCH_BOUNDARY,
             }, ensure_ascii=False)
 
         results = []
@@ -156,15 +209,17 @@ async def session_search(args: dict, **kwargs) -> str:
                 "relevance_score": round(float(row[6]), 4),
             })
 
+        results = await _annotate_result_taints(db, results)
         return json.dumps({
             "results": results,
             "query": query,
             "search_mode": "fts",
+            "note": _SESSION_SEARCH_BOUNDARY,
         }, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("Session search failed")
-        return json.dumps({"error": f"Search failed: {str(e)}"}, ensure_ascii=False)
+        return json.dumps({"error": "Search failed"}, ensure_ascii=False)
 
 
 registry.register(
@@ -175,10 +230,12 @@ registry.register(
         "description": (
             "Search your past conversations for relevant information, or read a "
             "deterministic window of one conversation. Use search mode to find "
-            "solutions, answers, or context from previous chats (returns matching "
-            "messages with conversation titles and relevance scores). Use read "
-            "mode with conversation_id (+ optional before_id/after_id cursors) to "
-            "read older messages outside the current context window."
+            "solutions, answers, or context from OTHER previous chats (returns "
+            "matching messages with conversation titles and relevance scores; the "
+            "current conversation is excluded). Results are cross-conversation "
+            "references only — never evidence for the current conversation. Use "
+            "read mode with conversation_id (+ optional before_id/after_id cursors) "
+            "to read older messages outside the current context window."
         ),
         "parameters": {
             "type": "object",

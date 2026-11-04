@@ -283,7 +283,7 @@
             <button
               v-show="!isRecording"
               class="toolbar-btn exec-env-btn"
-              :class="{ active: !!chatStore.executionTarget, offline: selectedDeviceOffline }"
+              :class="{ active: !!displayedExecutionTarget, offline: selectedDeviceOffline }"
               @click="openExecMenu"
               :title="execButtonTitle"
             >
@@ -305,7 +305,7 @@
                   <div class="reasoning-menu-title">执行环境</div>
                   <button
                     class="reasoning-menu-item"
-                    :class="{ active: !chatStore.executionTarget }"
+                    :class="{ active: !displayedExecutionTarget }"
                     @click="selectExecTarget(null)"
                   >
                     <span class="reasoning-menu-label">云端服务器</span>
@@ -315,7 +315,7 @@
                     v-for="dev in execDevices"
                     :key="dev.device_id"
                     class="reasoning-menu-item exec-device-row"
-                    :class="{ active: chatStore.executionTarget === `device:${dev.device_id}` }"
+                    :class="{ active: displayedExecutionTarget === `device:${dev.device_id}` }"
                     @click="selectExecTarget(`device:${dev.device_id}`)"
                   >
                     <span class="reasoning-menu-label">
@@ -505,7 +505,7 @@ import { useDraftsStore } from '@/stores/drafts'
 import { useUploadStore } from '@/stores/upload'
 import { notesApi } from '@/api/notes'
 import { clientDevicesApi } from '@/api/clientDevices'
-import { saveUiPreferences, getUiPreferences } from '@/api/skins'
+import { saveUiPreferences } from '@/api/skins'
 import type { ClientDevice } from '@/types'
 import { renderMarkdownToHtml } from '@/composables/useMarkdown'
 import { useAsrStreaming } from '@/composables/useAsrStreaming'
@@ -518,7 +518,8 @@ import FilePreviewDialog from './FilePreviewDialog.vue'
 import { skillsApi } from '@/api/skills'
 import type { Skill } from '@/types'
 import { fileUploadApi, type FileParseResult } from '@/api/fileUpload'
-import { dropRestoredChips } from '@/utils/fileRefs'
+import { dropRestoredChips, restoreEditChips } from '@/utils/fileRefs'
+import { buildNoteRefBlock, dropRestoredNotes, restoreEditNotes, type NoteRefData } from '@/utils/noteRefs'
 import { classifyFile } from '@/composables/filePreview'
 import { buildDownloadUrl } from '@/api/workspaceFiles'
 import { downloadUrl } from '@/composables/useDownload'
@@ -560,30 +561,54 @@ const canInterject = computed(() => chatStore.isStreamingCurrentConversation && 
 const sendBtnDisabled = computed(() => {
   if (chatStore.isStreamingCurrentConversation) {
     if (chatStore.deathmatchMode) return true  // deathmatch 生成中保持阻断（自有交互机制）
-    if (editMessageId.value) return !inputText.value.trim() && uploadedFiles.value.length === 0  // 编辑重发（自处理在途流），与 handleSend 空发守卫同式
-    return !inputText.value.trim() || dropRestoredChips(uploadedFiles.value).length > 0  // 插话 v1 纯文本（restored 芯片不计）
+    if (editMessageId.value) return !inputText.value.trim() && uploadedFiles.value.length === 0 && referencedNotes.value.length === 0  // 编辑重发（自处理在途流），与 handleSend 空发守卫同式
+    return !inputText.value.trim() || dropRestoredChips(uploadedFiles.value).length > 0 || dropRestoredNotes(referencedNotes.value).length > 0  // 插话 v1 纯文本（restored 芯片/引用不计）
   }
-  return !inputText.value.trim() && (editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)).length === 0
+  return !inputText.value.trim()
+    && (editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)).length === 0
+    && (editMessageId.value ? referencedNotes.value : dropRestoredNotes(referencedNotes.value)).length === 0
 })
 const sendBtnTitle = computed(() => {
   if (chatStore.isStreamingCurrentConversation && !chatStore.deathmatchMode && editMessageId.value) return '发送编辑（将停止当前生成）'
   if (canInterject.value) {
     if (dropRestoredChips(uploadedFiles.value).length > 0) return '插话暂不支持附件，请先停止生成或移除附件'
+    if (dropRestoredNotes(referencedNotes.value).length > 0) return '插话暂不支持笔记引用，请先停止生成或移除引用'
     return '发送插话（注入当前回答）'
   }
   return '发送'
 })
 const DRAFT_KEY = 'chatllm_draft_input'
 
-// Note reference tags
-interface NoteRef {
-  id: string
-  title: string
-  content: string
-}
+// Note reference tags（评审 R2 F7：复用 utils/noteRefs 的单一类型，弃本地重复声明）
+type NoteRef = NoteRefData
 const referencedNotes = ref<NoteRef[]>([])
 const previewingNoteIdx = ref<number | null>(null)
 const editMessageId = ref<string | null>(null)
+// 编辑武装不跨会话（2026-11-04）：editMessageId 此前只在发送时清除，切换会话后
+// 发送会拿他会话的 edit_message_id 走 editAndResendMessage → targetIndex=-1
+// 静默丢消息（输入已清空）。解除武装即「弃编辑」——restored 引用/芯片当场清除
+// （评审 R2 F2：不留到发送时才被 dropRestored* 剥离，否则新会话里「芯片可见却
+// 未被引用」重现本波要修的表象），手动内容保留。
+watch(() => chatStore.currentConversationId, () => {
+  if (!editMessageId.value) return
+  editMessageId.value = null
+  referencedNotes.value = restoreEditNotes(referencedNotes.value, [])
+  removeStaleNoteTagElements()
+  uploadStore.setFiles(restoreEditChips(uploadStore.files, []))
+})
+
+/** Remove .note-tag elements whose note id is no longer referenced (disarm
+ *  purge complement — syncInputText would drop the state anyway, but the chip
+ *  must not stay visible while the reference is gone). */
+function removeStaleNoteTagElements() {
+  const el = editorRef.value
+  if (!el) return
+  const keep = new Set(referencedNotes.value.map((n) => n.id))
+  el.querySelectorAll<HTMLElement>('.note-tag').forEach((tag) => {
+    const id = tag.dataset.noteId
+    if (id !== undefined && !keep.has(id)) tag.remove()
+  })
+}
 
 const previewNoteHtml = computed(() => {
   if (previewingNoteIdx.value === null) return ''
@@ -685,7 +710,7 @@ const selectedSkillIndex = ref(0)
 const skillSearchQuery = ref('')
 const skillPopupStyle = ref<Record<string, string>>({})
 const inputAreaRef = ref<HTMLDivElement | null>(null)
-let skillPopupDismissed = false
+
 
 const moreMenuStyle = computed(() => {
   if (!showMoreMenu.value || !moreMenuRef.value) return {}
@@ -740,8 +765,6 @@ function closeSkillPopup() {
   showSkillPopup.value = false
   skillSearchQuery.value = ''
   selectedSkillIndex.value = 0
-  skillPopupDismissed = true
-  setTimeout(() => { skillPopupDismissed = false }, 300)
 }
 
 function selectSkill(skill: Skill) {
@@ -793,14 +816,8 @@ function handleReasoningClick() {
   chatStore.enableReasoning = !chatStore.enableReasoning
 }
 
-function handleDeathmatchClick() {
-  if (chatStore.deathmatchMode) {
-    chatStore.deathmatchMode = false
-    chatStore.deathmatchAction = 'stop'
-  } else {
-    chatStore.deathmatchMode = true
-    chatStore.deathmatchAction = 'start'
-  }
+async function handleDeathmatchClick() {
+  await chatStore.setDeathmatchModeEnabled(!chatStore.deathmatchMode)
 }
 
 // ---- W16 执行环境切换（set-once D-6：已有消息的会话禁止换环境） ----
@@ -811,22 +828,35 @@ const pairingHint = ref('在客户端「设备执行」面板输入此码（短�
 const revokeArmId = ref<string | null>(null)
 // A4.9 I-3：用户显式选择标记——偏好恢复竞态护栏
 const execUserSelected = ref(false)
+const execBindingBusy = ref(false)
+const execBindingUncertain = ref(false)
+
+const displayedExecutionTarget = computed(() => {
+  const convId = chatStore.currentConversationId
+  const meta = convId ? chatStore.conversationMeta[convId] : null
+  if (meta && meta.execution_target !== undefined) return meta.execution_target ?? null
+  return chatStore.executionTarget
+})
 
 const selectedDeviceOffline = computed(() => {
-  const t = chatStore.executionTarget
+  const t = displayedExecutionTarget.value
   if (!t || !t.startsWith('device:')) return false
   const dev = execDevices.value.find(d => `device:${d.device_id}` === t)
   return !!dev && (!dev.online || dev.revoked)
 })
 
 const execButtonTitle = computed(() => {
-  if (!chatStore.executionTarget) return '执行环境：云端服务器'
+  if (execBindingUncertain.value) return '执行环境绑定结果未知（已阻止发送）'
+  if (execBindingBusy.value) return '执行环境绑定中…'
+  if (!displayedExecutionTarget.value) return '执行环境：云端服务器'
   if (selectedDeviceOffline.value) return '执行环境：客户端设备（离线/已解绑）'
   return `执行环境：客户端设备（${execTargetLabel.value}）`
 })
 
 const execTargetLabel = computed(() => {
-  const t = chatStore.executionTarget
+  if (execBindingUncertain.value) return '结果未知'
+  if (execBindingBusy.value) return '绑定中…'
+  const t = displayedExecutionTarget.value
   if (!t) return '云端'
   const dev = execDevices.value.find(d => `device:${d.device_id}` === t)
   return dev?.name || '客户端'
@@ -883,27 +913,70 @@ async function revokeDevice(dev: ClientDevice) {
   }
 }
 
-function selectExecTarget(target: string | null) {
+async function selectExecTarget(target: string | null) {
+  if (execBindingBusy.value) return
   const convId = chatStore.currentConversationId
   const meta = convId ? chatStore.conversationMeta[convId] : null
-  const fixed = meta?.execution_target ?? null
+  const previousMetaTarget = meta?.execution_target
+  const previousTarget = previousMetaTarget !== undefined
+    ? previousMetaTarget
+    : chatStore.executionTarget
+  // 只写「下次默认」，不代替当前会话的服务端绑定。
+  const preferenceSave = saveUiPreferences({ default_execution_target: target ?? '' }).catch(() => {})
+  if (previousTarget === target) {
+    showExecMenu.value = false
+    void preferenceSave
+    return
+  }
   const hasMessages = !!(convId && (chatStore.messages[convId]?.length))
-  if (hasMessages && fixed !== target) {
-    showToast('执行环境已固定：切换云端/客户端请新建会话', 'error')
+  if (hasMessages && previousTarget !== target) {
+    showToast('执行环境已固定：切换云端/客户端执行环境请新建会话', 'error')
     showExecMenu.value = false
     return
   }
   execUserSelected.value = true
+  chatStore.executionTargetUserSelected = !convId
   revokeArmId.value = null
-  chatStore.executionTarget = target
+  execBindingUncertain.value = false
+  execBindingBusy.value = true
   showExecMenu.value = false
-  // G7：默认执行环境持久化（合并 PUT，不抹 skin 等并存键；失败静默=仅本次会话级）
-  void saveUiPreferences({ default_execution_target: target ?? '' }).catch(() => {})
-  if (target && target.startsWith('device:')) {
-    const dev = execDevices.value.find(d => `device:${d.device_id}` === target)
-    if (dev && (!dev.online || dev.revoked)) {
-      showToast(dev.revoked ? '该设备已解绑：请撤销绑定后重新配对，或改用云端' : '该设备当前离线：发送后工具将无法执行', 'error')
+  try {
+    if (convId) {
+      await chatStore.bindExecutionTarget(convId, target)
+      void preferenceSave
+    } else {
+      await preferenceSave
+      chatStore.executionTarget = target
     }
+    if (target && target.startsWith('device:')) {
+      const dev = execDevices.value.find(d => `device:${d.device_id}` === target)
+      if (dev && (!dev.online || dev.revoked)) {
+        showToast(dev.revoked ? '该设备已解绑：请撤销绑定后重新配对，或改用云端' : '该设备当前离线：发送后工具将无法执行', 'error')
+      }
+    }
+  } catch (e: any) {
+    // A committed response may be lost after the server wrote the row. Never
+    // roll back blindly: reconcile first; if that fails, keep sending blocked.
+    let reconciled = false
+    if (convId) {
+      try {
+        await chatStore.reconcileExecutionTarget(convId)
+        reconciled = true
+      } catch {
+        reconciled = false
+      }
+    }
+    if (reconciled) {
+      execBindingUncertain.value = false
+      showToast(e?.response?.data?.detail || '执行环境绑定结果已按服务端状态同步', 'error')
+    } else {
+      if (chatStore.currentConversationId === convId) chatStore.executionTarget = previousTarget
+      if (meta) meta.execution_target = previousMetaTarget
+      execBindingUncertain.value = true
+      showToast('执行环境绑定结果未知，已阻止发送，请刷新重试', 'error')
+    }
+  } finally {
+    execBindingBusy.value = false
   }
 }
 
@@ -911,7 +984,22 @@ function selectExecTarget(target: string | null) {
 // A4.9 I-2：execDevices 仅在菜单打开时填充——设备目标下发送前强制刷新列表
 // （菜单从未打开/偏好恢复的目标不得 fail-open）。
 async function execPreSendCheck(): Promise<boolean> {
-  const t = chatStore.executionTarget
+  if (execBindingBusy.value) {
+    showToast('执行环境绑定中，请稍候', 'info')
+    return false
+  }
+  if (execBindingUncertain.value) {
+    const convId = chatStore.currentConversationId
+    if (!convId) return false
+    try {
+      await chatStore.reconcileExecutionTarget(convId)
+      execBindingUncertain.value = false
+    } catch {
+      showToast('执行环境状态仍无法确认，已阻止发送', 'error')
+      return false
+    }
+  }
+  const t = chatStore.resolveExecTargetFor(chatStore.currentConversationId)
   if (!t || !t.startsWith('device:')) return true
   try {
     execDevices.value = await clientDevicesApi.list()
@@ -982,7 +1070,12 @@ watch(() => assistantStore.currentAssistantId, () => {
 watch(() => chatStore.interjectionRestoreText, (text) => {
   if (!text) return
   inputText.value = text
-  if (editorRef.value) editorRef.value.textContent = text
+  if (editorRef.value) {
+    editorRef.value.textContent = text
+    // 评审 R2 F5：textContent 会抹掉 .note-tag —— 不补标签的话 syncInputText
+    // 的「无标签即删」同步会在下一次键入/发送吞掉现存引用（与草稿缺陷同类）。
+    insertNoteTagElements(referencedNotes.value)
+  }
   editorHasContent.value = true
   chatStore.interjectionRestoreText = ''
   nextTick(() => editorRef.value?.focus())
@@ -1170,7 +1263,12 @@ function onEditorClick(e: MouseEvent) {
     if (idx !== -1) {
       previewingNoteIdx.value = previewingNoteIdx.value === idx ? null : idx
     }
+    return
   }
+  // Clicking the empty tail can put the caret after the invisible anchor.
+  // Clean a leftover ghost line immediately; typing after it is covered by
+  // onEditorInput → scrollCaretIntoView → removeStrayLineAnchors.
+  ensureTrailingLineAnchor()
 }
 
 async function onMicClick() {
@@ -1331,21 +1429,24 @@ async function handleSend() {
     if (!editMessageId.value) {
       if (!text) return
       if (dropRestoredChips(uploadedFiles.value).length > 0) return  // 插话 v1 不支持附件（restored 芯片不计——弃编辑残留）
+      if (dropRestoredNotes(referencedNotes.value).length > 0) return  // 插话 v1 不支持笔记引用——不同步吞掉（2026-11-04，与附件同式）
       await handleInterject(text)
       return
     }
   }
-  if (!text && (editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)).length === 0) return
+  // Restored-tagged refs/chips belong to an edit session (utils/noteRefs +
+  // utils/fileRefs): a normal send after an abandoned edit must not reference
+  // the edited message's notes or attach its files.
+  const notesToSend = editMessageId.value ? referencedNotes.value : dropRestoredNotes(referencedNotes.value)
+  const filesToAttach = editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)
+  // 引用即内容（与草稿先例一致：仅引用的草稿可存可发）——仅引用无正文的
+  // 消息编辑重发必须可发，否则恢复的引用无法原样重发（2026-11-04）。
+  if (!text && filesToAttach.length === 0 && notesToSend.length === 0) return
 
   let fullContent = ''
-  if (referencedNotes.value.length > 0) {
-    for (const noteRef of referencedNotes.value) {
-      fullContent += `[note-ref:${noteRef.id}|${noteRef.title}]\n${noteRef.content}\n[/note-ref]\n\n`
-    }
+  for (const noteRef of notesToSend) {
+    fullContent += buildNoteRefBlock(noteRef)
   }
-  // Restored-tagged chips belong to an edit session (utils/fileRefs): a normal
-  // send after an abandoned edit must not attach the edited message's files.
-  const filesToAttach = editMessageId.value ? uploadedFiles.value : dropRestoredChips(uploadedFiles.value)
   if (filesToAttach.length > 0) {
     for (const f of filesToAttach) {
       if (f.file_path || f.rel_path) {
@@ -1371,8 +1472,25 @@ async function handleSend() {
   }
 
   const currentEditMessageId = editMessageId.value
+  if (chatStore.activeSteerTask && !currentEditMessageId
+      && filesToAttach.length === 0 && notesToSend.length === 0) {
+    // §7.1/§11.4: C2 is owned by an active task — send the text as a steer,
+    // not as a new chat stream (the backend would answer 409).
+    const steered = await chatStore.steerActiveTask(fullContent)
+    if (steered) {
+      inputText.value = ''
+      clearEditorDom()
+      editorHasContent.value = false
+      referencedNotes.value = []
+      previewingNoteIdx.value = null
+      uploadStore.clear()
+      sessionStorage.removeItem(DRAFT_KEY)
+      emit('sent')
+      return
+    }
+  }
   inputText.value = ''
-  if (editorRef.value) editorRef.value.textContent = ''
+  clearEditorDom()
   editorHasContent.value = false
   referencedNotes.value = []
   previewingNoteIdx.value = null
@@ -1390,7 +1508,7 @@ async function handleSend() {
 
 async function handleInterject(text: string) {
   inputText.value = ''
-  if (editorRef.value) editorRef.value.textContent = ''
+  clearEditorDom()
   editorHasContent.value = false
   sessionStorage.removeItem(DRAFT_KEY)
   await chatStore.sendInterjection(text, assistantStore.currentAssistantId)
@@ -1406,12 +1524,15 @@ function saveCurrentAsDraft() {
   if (!text && referencedNotes.value.length === 0) return
   draftsStore.addDraft({
     content: text,
+    // 评审 R2 F1：显式存草稿=用户收编（restored 标记有意不随草稿持久化——
+    // 草稿可在任意会话发送，存下即成为用户自己的引用；弃编辑泄漏面由
+    // dropRestoredNotes 在普通发送剥离 + 解除武装即清兜住）。
     references: referencedNotes.value.map(r => ({ id: r.id, title: r.title, content: r.content })),
     conversationId: chatStore.currentConversationId,
     assistantId: assistantStore.currentAssistantId,
   })
   inputText.value = ''
-  if (editorRef.value) editorRef.value.textContent = ''
+  clearEditorDom()
   editorHasContent.value = false
   referencedNotes.value = []
   previewingNoteIdx.value = null
@@ -1532,9 +1653,17 @@ function loadDraftIntoInput(draftId: string) {
   const draft = draftsStore.getDraft(draftId)
   if (!draft) return
   inputText.value = draft.content
-  if (editorRef.value) editorRef.value.textContent = draft.content
+  if (editorRef.value) {
+    editorRef.value.textContent = draft.content
+    // Tags must be re-created in the DOM (2026-11-04): syncInputText() drops
+    // any referencedNote without a .note-tag element, so a state-only draft
+    // restore lost every note reference on the first keystroke/send.
+    referencedNotes.value = draft.references.map(r => ({ ...r }))
+    insertNoteTagElements(referencedNotes.value)
+  } else {
+    referencedNotes.value = draft.references.map(r => ({ ...r }))
+  }
   editorHasContent.value = !!draft.content.length
-  referencedNotes.value = draft.references.map(r => ({ ...r }))
   showDrafts.value = false
   draftsStore.removeDraft(draftId)
   nextTick(() => editorRef.value?.focus())
@@ -1545,7 +1674,7 @@ async function sendDraftNow(draftId: string) {
   if (!draft || chatStore.isStreamingCurrentConversation) return
   let fullContent = ''
   for (const noteRef of draft.references) {
-    fullContent += `[note-ref:${noteRef.id}|${noteRef.title}]\n${noteRef.content}\n[/note-ref]\n\n`
+    fullContent += buildNoteRefBlock(noteRef)
   }
   fullContent += draft.content
   draftsStore.removeDraft(draftId)
@@ -1578,7 +1707,7 @@ function formatDraftDate(iso: string): string {
 // 为段落分隔（与 markdown 渲染及 Shift+Enter 字面 '\n' 的最终视觉一致）。
 function extractEditorText(source: HTMLElement): string {
   const clone = source.cloneNode(true) as HTMLElement
-  clone.querySelectorAll('.note-tag').forEach(el => el.remove())
+  clone.querySelectorAll('.note-tag, .line-anchor').forEach(el => el.remove())
   const BLOCK_TAGS = new Set(['DIV', 'P'])
   let out = ''
   const walk = (node: Node) => {
@@ -1601,6 +1730,15 @@ function extractEditorText(source: HTMLElement): string {
   walk(clone)
   const text = out.replace(/\u200B/g, '').replace(/\n{3,}/g, '\n\n')
   return text.trim() ? text : ''
+}
+
+function clearEditorDom() {
+  const el = editorRef.value
+  if (!el) return
+  el.textContent = ''
+  // 2026-11-01: a trailing-line class left behind would keep the CSS ::after
+  // empty line after send/draft-clear even though the DOM is empty.
+  el.classList.remove('trailing-line')
 }
 
 function syncInputText() {
@@ -1644,18 +1782,14 @@ function debouncedSyncInputText() {
 function scrollCaretIntoView() {
   const area = inputAreaRef.value
   if (!area) return
+  removeStrayLineAnchors()
+  ensureTrailingLineAnchor()
   const sel = window.getSelection()
   if (!sel || sel.rangeCount === 0) return
   const range = sel.getRangeAt(0)
   // 仅当选区在输入区内才跟随，防止外部选区误滚
   if (!area.contains(range.commonAncestorContainer)) return
-  // 光标矩形：折叠选区优先取 getClientRects 末段（行尾/换行处），兜底用包围矩形
-  const rects = range.getClientRects()
-  let caretRect: DOMRect | null = rects.length ? rects[rects.length - 1] : null
-  if (!caretRect || (caretRect.height === 0 && caretRect.width === 0 && caretRect.top === 0)) {
-    const r = range.getBoundingClientRect()
-    caretRect = r.height || r.top ? r : null
-  }
+  const caretRect = measureCaretRect(range)
   if (!caretRect) return
   const areaRect = area.getBoundingClientRect()
   const margin = 8
@@ -1664,6 +1798,79 @@ function scrollCaretIntoView() {
   } else if (caretRect.top < areaRect.top + margin) {
     area.scrollTop -= areaRect.top + margin - caretRect.top
   }
+}
+
+// 幽灵空行锚点：末尾 \n/<br> 在本盒（固定高+pre-wrap）不生成行盒——scrollHeight
+// 不涨、空行光标零矩形且不可滚（用户症状：填满后 Shift+Enter 可视区不随光标）。
+// 实测（probe7/8）：追加 \n\n/裸 \u200b 均 +0 高，唯「透明实字符」span 撑起行盒
+// （+22px）；但透明实字符会被用户看见成「缩进」且 contenteditable=false 的 span
+// 在删到空时不可删（2026-11-01 用户复现：3 次 Backspace 后卡在
+// "\n<span class=line-anchor>X</span>"，再按 3 次无变化）。
+// 现行锚点 = 零宽 inline-block（width:0;height:1.4em）——仍有行盒、永不显示缩进；
+// 三条不变量：① 只在严格末尾且逻辑文本非空时存在；② 任何非末尾锚点立即清除；
+// ③ 逻辑文本为空时 Backspace/Delete 清空整行（含锚点），绝不让不可删字符留下。
+//
+// 两条铁律（保留）：① 绝不改写既有文本节点——textContent 写入会把 live
+// selection 重置到节点开头（光标跳顶实测）；② extractEditorText 连同 .note-tag
+// 一并剥除 .line-anchor，消息文本不受染。
+function _endsWithBreak(node: Node | null): boolean {
+  return !!node && (
+    (node.nodeType === Node.TEXT_NODE && /\n$/.test(node.textContent || '')) ||
+    (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).tagName === 'BR')
+  )
+}
+
+/** Legacy cleanup: earlier builds appended an invisible `.line-anchor` span
+ *  after the trailing break. It is no longer created (the CSS pseudo-element
+ *  below is the line box), but a hot-reloaded/restored DOM may still carry one;
+ *  remove it so it can never become an undeletable mid-line character. */
+function removeStrayLineAnchors() {
+  const el = editorRef.value
+  if (!el) return
+  el.querySelectorAll('.line-anchor').forEach(a => a.remove())
+}
+
+/** Toggle the trailing-empty-line line box.
+ *
+ *  A fixed-height `white-space: pre-wrap` contenteditable gives a trailing
+ *  newline no line box (scrollHeight does not grow, caret rect is zero, the
+ *  viewport cannot follow). A real character fixes the box but is an
+ *  undeletable invisible glyph (the 2026-11-01 ghost-line report). The box is
+ *  now generated by CSS `::after` (`display:block;height:1.4em`) on this
+ *  class — no editable artifact, no indent, and deleting the newline removes
+ *  the class on the next input event. */
+function ensureTrailingLineAnchor() {
+  const el = editorRef.value
+  if (!el) return
+  removeStrayLineAnchors()
+  const logical = (el.textContent || '').replace(/\u200B/g, '').trim()
+  el.classList.toggle('trailing-line', !!logical && _endsWithBreak(el.lastChild))
+}
+
+// 光标矩形三级测量：折叠选区取 getClientRects 末段（行尾/换行处）→ 包围矩形兜底
+// → 两者全零（Shift+Enter 新空行零矩形：collapsed range 无 client rects，见
+// SO 59767515 / ckeditor5#14028）时用临时 \ufeff 标记实测行位，测完即除并
+// normalize 复原被拆分的文本节点。
+function measureCaretRect(range: Range): DOMRect | null {
+  const rects = range.getClientRects()
+  let caretRect: DOMRect | null = rects.length ? rects[rects.length - 1] : null
+  if (!caretRect || (caretRect.height === 0 && caretRect.width === 0 && caretRect.top === 0)) {
+    const r = range.getBoundingClientRect()
+    caretRect = r.height || r.top ? r : null
+  }
+  if (caretRect) return caretRect
+  if (!range.collapsed) return null
+  // 标记必须是元素：Text 节点无 getBoundingClientRect
+  const probeRange = range.cloneRange()
+  const probe = document.createElement('span')
+  probe.textContent = '\ufeff'
+  probe.style.cssText = 'display:inline;padding:0;margin:0;border:0'
+  probeRange.insertNode(probe)
+  const rect = probe.getBoundingClientRect()
+  const parent = probe.parentNode
+  probe.remove()
+  parent?.normalize?.()
+  return rect.height || rect.top ? rect : null
 }
 
 function onEditorInput() {
@@ -1677,9 +1884,13 @@ function onEditorInput() {
   editorHasContent.value = !!text.length
   if (!isComposing.value) {
     debouncedSyncInputText()
-    if (text.startsWith('/') && !skillPopupDismissed) {
-      const query = text.slice(1)
-      if (query.length <= 30 && !query.includes(' ')) {
+    const skillText = text.replace(/^[\r\n]+/, '')
+    if (skillText.startsWith('/')) {
+      // The trailing <br>/line-anchor artifact makes getEditorText() end with
+      // "\n" after deleting the only character. Strip only trailing newlines
+      // (not spaces: a real space must still close the menu).
+      const query = skillText.slice(1).replace(/[\r\n]+$/, '')
+      if (query.length <= 30 && !query.includes(' ') && !query.includes('\n') && !query.includes('\r')) {
         skillSearchQuery.value = query
         if (!showSkillPopup.value) {
           openSkillPopup()
@@ -1763,29 +1974,23 @@ onMounted(() => {
   document.addEventListener('keydown', handleKeyDown)
     document.addEventListener('click', handleOutsideClick)
   chatStore.loadModels() // 模型别名能力表（思考菜单驱动），懒加载一次
-  // W18 G7：恢复用户默认执行环境（仅新会话/无目标时生效；失败静默）。
-  // A4.9：execUserSelected 竞态护栏——恢复请求在途时用户显式选择不得被晚到的
-  // GET 覆盖（含显式选云端）。
-  void getUiPreferences()
-    .then((prefs) => {
-      const t = prefs.default_execution_target || null
-      if (
-        t
-        && !execUserSelected.value
-        && !chatStore.executionTarget
-        && !chatStore.currentConversationId
-      ) {
-        chatStore.executionTarget = t
-        // 遗留清偿 #6（P2 显式提示）：静默采纳默认执行环境=用户不知情进入设备模式
-        // （conv e8e9494f 事故触发条件之一）——采纳即提示。评审 r4 M1：每标签页会话
-        // 只提示一次（reload 重放不复读）。
-        if (!sessionStorage.getItem('wt-default-exec-toast')) {
-          sessionStorage.setItem('wt-default-exec-toast', '1')
-          showToast('新会话已按你的默认设置使用设备执行', 'info')
-        }
+  // G7：新会话起点来自用户默认，而非上一会话残留；设备可用性同时核验。
+  // execUserSelected 护栏：恢复在途时显式选择不得被晚到结果覆盖。
+  void chatStore.resolveDefaultExecutionTarget()
+    .then((resolution) => {
+      if (!execUserSelected.value && !chatStore.currentConversationId) {
+        chatStore.executionTarget = resolution.target
+        chatStore.executionTargetUserSelected = false
+        chatStore.notifyDefaultExecutionTarget(resolution)
       }
     })
-    .catch(() => {})
+    .catch(() => {
+      if (!execUserSelected.value && !chatStore.currentConversationId) {
+        chatStore.executionTarget = null
+        chatStore.executionTargetUserSelected = false
+        showToast('默认执行环境读取失败，请检查设备状态', 'error')
+      }
+    })
   if (editorRef.value && inputText.value) {
     editorRef.value.textContent = inputText.value
     // Draft restored into the DOM — the placeholder class binds to
@@ -1821,12 +2026,24 @@ function handleOutsideClick(e: MouseEvent) {
   }
 }
 
-function setEditContent(text: string, messageId: string) {
+function setEditContent(text: string, messageId: string, noteRefs?: NoteRefData[]) {
   inputText.value = text
   editorHasContent.value = !!text.length
   editMessageId.value = messageId
+  // Note refs restore (2026-11-04, same loss class as the 2026-10-09 file
+  // chips): re-seat the session — replaces refs restored by an earlier
+  // abandoned edit (even when this message carries none), keeps refs the
+  // user manually added, tags the incoming ones `restored` (a later normal
+  // send drops them — restoreEditNotes/dropRestoredNotes mirror fileRefs).
+  referencedNotes.value = restoreEditNotes(referencedNotes.value, noteRefs ?? [])
+  previewingNoteIdx.value = null
   if (editorRef.value) {
     editorRef.value.textContent = text
+    // The chips MUST exist as .note-tag elements in the editor DOM:
+    // syncInputText() drops any referencedNote without a DOM tag (browser-
+    // deletion sync), so a state-only restore is silently lost on the next
+    // keystroke or on send (handleSend syncs first).
+    insertNoteTagElements(referencedNotes.value)
     editorRef.value.focus()
     // Place cursor at end
     const range = document.createRange()
@@ -1838,6 +2055,20 @@ function setEditContent(text: string, messageId: string) {
       sel.addRange(range)
     }
   }
+}
+
+/** Insert note chips at the top of the editor (message content order: the
+ *  [note-ref] blocks precede the body). Mirrors insertNoteReferences' tag +
+ *  zero-width spacer shape so extractEditorText ignores them. */
+function insertNoteTagElements(refs: NoteRef[]) {
+  const el = editorRef.value
+  if (!el || refs.length === 0) return
+  const frag = document.createDocumentFragment()
+  for (const noteRef of refs) {
+    frag.appendChild(createNoteTagElement(noteRef))
+    frag.appendChild(document.createTextNode('\u200B'))
+  }
+  el.insertBefore(frag, el.firstChild)
 }
 
 const emit = defineEmits<{ (e: 'sent'): void }>()
@@ -2124,6 +2355,18 @@ defineExpose({ setEditContent })
 
 .chat-input.composing::before {
   display: none;
+}
+
+/* 尾随空行行盒（2026-11-01 幽灵缩进根治）：固定高 + pre-wrap 的
+   contenteditable 对末尾换行不生成行盒；过去用透明实字符 span 撑高，但那个
+   span 在光标落到其后输入/删到空时变成不可删除的隐形字符（用户报「诡异的
+   缩进和换行」）。改为纯 CSS 块级伪元素：无 DOM 字符、零宽、不可点击；逻辑
+   文本为空或末尾不再是换行时由 ensureTrailingLineAnchor() 摘掉 class。 */
+.chat-input.trailing-line::after {
+  content: '';
+  display: block;
+  height: 1.5em;
+  pointer-events: none;
 }
 
 .send-btn {

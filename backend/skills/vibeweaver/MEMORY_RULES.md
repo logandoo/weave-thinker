@@ -244,6 +244,15 @@ Agent runs Playwright / automated tests
 
 **≥3 failures on same problem → escalate all failed methods to a ⛔ Forbidden topic file.**
 
+### A7.7.1 Unattended / Headless Degradation (no human to confirm)
+
+In unattended contexts (CI, batch runs, eval harnesses, overnight automation) **never stop work or end the session waiting for confirmation**. The ⏳ → ✅ promotion still happens ONLY on user confirmation (never self-promote), but the wait becomes bookkeeping:
+
+- Record what needs confirming as `- awaiting decision: <what + how to verify>` in the fix entry; keep `status: ⏳`.
+- Continue and complete every remaining piece of work; list the pending items in the final output (they block nothing).
+- The session must NOT end with a question or a conditional offer ("say so and I'll …"). Final output ends with the completion table, not with a request.
+- Interactive sessions are unchanged: asking a clarifying question mid-task is still fine when a human is present.
+
 ---
 
 ## A7.8 Pre-Change Guardrails
@@ -275,13 +284,12 @@ Before implementing any change:
 7. **Check MEMORY.md caps** — If index exceeds 150 lines or 20KB, consolidate before adding more
 8. **Resolve the task working note** — distill `tests/working_note.md` (§A7.15) into the permanent topic files, then delete it (machine-checked by group 19 on the `--final` run)
 
-**The checklist item "Memory topic file written to memory/" is MANDATORY — do not skip it.**
-
 **The checklist item "Memory topic file written to memory/" is MANDATORY for
-any task that produced a lesson — do not skip it.** Lesson-less tasks
-(Class DOC / trivial changes, §V11.3) state `- memory: na (<why no lesson>)`
-in `tests/verification_log.md` instead of writing filler topics (A7.1
-"what NOT to save" — a forced empty topic is worse than none).
+any task that produced a lesson — lesson-triggered, not per-task ritual.**
+Lesson-less tasks (Class DOC / trivial changes, §V11.3) state
+`- memory: na (<why no lesson>)` in `tests/verification_log.md` instead of
+writing filler topics (A7.1 "what NOT to save" — a forced empty topic is
+worse than none).
 
 ---
 
@@ -291,7 +299,7 @@ Before outputting the completion table, you MUST pass this gate. If any check fa
 
 1. **Memory files exist** — At least one new or updated topic file exists in `memory/` for this session (unless the task was purely informational and produced nothing persistable).
 2. **Index updated** — `memory/MEMORY.md` contains a pointer to the new topic file(s), and the index is under 200 lines / 25KB.
-3. **Fix entries have commit** — Every `type: fix` topic file written this session includes `commit: <short-hash>` in its frontmatter.
+3. **Fix entries have commit** — Every `type: fix` topic file written this session includes `commit: <short-hash>` in its frontmatter. **History-rewrite waves (Class-E `git filter-repo`, ENGINEERING_STD §A10.1) must complete the commit-map hash remap BEFORE passing this gate** — every `commit:` cited in `memory/**` and `tests/verification_log.md` is rewritten from `.git/filter-repo/commit-map` (copy, never retype a hash), then this gate re-checks them.
 4. **No stale references introduced** — Any file/function/line cited in new memories was verified against current code during this session.
 5. **Scratchpad cleaned (legacy)** — the pre-§A7.15 `memory/.session-scratchpad.md` is superseded by tests/working_note.md; if a legacy scratchpad exists, delete it after permanent memories are written.
 6. **Working note resolved** — If `tests/working_note.md` was created (§A7.15), its persistable content was distilled into the topic files written this session and the file itself is deleted. The completion-time `assert_artifacts.py --final` run (group 19) machine-checks the deletion.
@@ -405,6 +413,17 @@ expensively reconstruct from the log tail.
 iteration or a first FAIL. Lane S single-pass tasks may skip (state the
 skip). Class DOC lesson-less tasks may skip.
 
+**Ledger fields (M5, W20b):** the hypothesis ledger MUST record the **core
+assumption + its falsifier** (the external test that would disprove it) next
+to current hypothesis / tried+result / next direction — make the epistemic
+state VISIBLE (2607.09510 "epistemic errors remain hidden"). At a dead-end the
+falsifier is RUN (group 23 `assumption-falsify`), not just stated. **M2
+approach-review:** for Lane L, record `- approach-review: approach-sound |
+pivot-needed | target: <方向>` at the approach-commitment point (right after
+decompose, before deep execution) — an independent look at whether the
+DIRECTION is right (defer-to-verifier when committed, 2606.22936); it overlaps
+A4.9 but fires EARLIER (at commitment, not completion).
+
 **Form (≤50 lines, REWRITTEN each update — it is state, not chronicle; git
 history is the audit trail):**
 
@@ -440,6 +459,21 @@ consulted: <memory topics read this task>
    machine-checks the deletion (group 19); mid-task runs (no `--final`,
    incl. the physical gate) tolerate it. The A7.10 Memory Gate reports the
    resolution (check 6).
+
+**Deterministic delivery (wave21, harness-side, best-effort):** the
+vibeweaver-gate plugin delivers the note for you — its content is pushed into
+the compaction prompt at every pre-summary (`experimental.session.compacting`),
+re-injected on that session's next model request after every
+`session.compacted` event (system transform, session-keyed — verified live on
+opencode 1.18.35), and pointed to by a one-line cue on the session's first
+gated write. Delivery counts land in `.vibeweaver/state.json`
+(`memoryDeliveries`); a harness-owned snapshot (`.vibeweaver/memory-snapshot.json`)
+keeps boundary delivery working even if the note file itself disappears mid-task. These channels are host features and degrade quietly
+where absent — treat them as reliable when present, never as a license to
+skip the note discipline. Consequence for the author: **keep the note FRESH**
+— the harness delivers whatever is in the file verbatim; a stale ledger is
+delivered stale. Update it at iteration/FAIL boundaries rather than relying
+on "remember before compaction".
 
 **Relationship to C8 (outer loop):** the working note is ITEM-scoped state
 (dies when the backlog item completes); `tests/progress.txt` is the

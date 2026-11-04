@@ -1829,6 +1829,68 @@ export function renderMermaidOnNextTick(getContainer: () => HTMLElement | null) 
  * Convert HTML to markdown string.
  * This is a simplified converter for WYSIWYG editing.
  */
+/**
+ * 粘贴文本面的编号重置拆分（判据 #40 · H4 ADR）：把「空行分隔且组首为 1.」的
+ * 连续有序列表拆成独立列表（插入 `<!--list-break-->` 屏障）。语义取「可见编号
+ * 优先」——粘贴源里明明写了两个从 1 开始的序列，就还原成两个序列，而不是按
+ * CommonMark 合并成 1..4。仅用于编辑器粘贴；全局渲染（聊天等）保持 CommonMark
+ * 语义不变。围栏代码块内不拆。
+ */
+export function splitNumberingResets(md: string): string {
+  const lines = md.split('\n')
+  const out: string[] = []
+  // 围栏追踪按 CommonMark：同字符且行长 ≥ 开栏才闭栏（评审 A C3：~~~ 栏内的 ```
+  // 形似行不得翻转状态，否则屏障会被注进代码块变成字面文本=用户内容损伤）。
+  // ≥4 空格缩进 = 缩进代码块，永不开关栏。
+  let fenceChar = ''
+  let fenceLen = 0
+  let inRun = false
+  let blanks = 0
+  for (const line of lines) {
+    const fm = line.match(/^( {0,3})(`{3,}|~{3,})(.*)$/)
+    if (fm && !fenceChar) {
+      fenceChar = fm[2][0]
+      fenceLen = fm[2].length
+      inRun = false
+      blanks = 0
+      out.push(line)
+      continue
+    }
+    if (fenceChar) {
+      if (fm && fm[2][0] === fenceChar && fm[2].length >= fenceLen && !fm[3].trim()) {
+        fenceChar = ''
+        fenceLen = 0
+      }
+      out.push(line)
+      continue
+    }
+    if (!line.trim()) {
+      blanks++
+      out.push(line)
+      continue
+    }
+    const isTopItem = /^ {0,3}\d+[.)][ \t]/.test(line)
+    if (isTopItem) {
+      const startsAtOne = /^ {0,3}1[.)][ \t]/.test(line)
+      if (inRun && blanks > 0 && startsAtOne) {
+        out.push('<!--list-break-->')
+        out.push('')
+      }
+      inRun = true
+      blanks = 0
+      out.push(line)
+      continue
+    }
+    // 列表项的缩进续行（≥1 空格且非顶层项）保持 run；其余行终结 run
+    if (!(inRun && /^[ \t]+\S/.test(line))) {
+      inRun = false
+    }
+    blanks = 0
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
 export function htmlToMarkdown(html: string): string {
   if (!html) return ''
 
@@ -2094,6 +2156,46 @@ export function htmlToMarkdown(html: string): string {
     return /^rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)$/.test(bg)
   }
 
+  function rawOuterHtml(el: HTMLElement): string {
+    const clone = el.cloneNode(true) as HTMLElement
+    clone.querySelectorAll('*').forEach((node) => {
+      const child = node as HTMLElement
+      Array.from(child.attributes).forEach((attr) => {
+        // Keep class: KaTeX/Mermaid/endnote identity is class-based.
+        if (/^(id|contenteditable|draggable|spellcheck|on)/i.test(attr.name)) {
+          child.removeAttribute(attr.name)
+        }
+      })
+    })
+    return clone.outerHTML
+  }
+
+  function inlineOverrideRawHtml(el: HTMLElement): string {
+    const clone = el.cloneNode(true) as HTMLElement
+    // Keep semantic attributes (href/src/alt/data-tex/data-endnote-*); drop
+    // only presentational and event-handler noise so links, images, formulas
+    // and endnote references survive the save.
+    clone.querySelectorAll('*').forEach((node) => {
+      const child = node as HTMLElement
+      Array.from(child.attributes).forEach((attr) => {
+        // Keep class: KaTeX/Mermaid/endnote identity is class-based.
+        if (/^(id|contenteditable|draggable|spellcheck|on)/i.test(attr.name)) {
+          child.removeAttribute(attr.name)
+        }
+      })
+    })
+    // The clone is embedded in Markdown as inline raw HTML; its text is still
+    // parsed for emphasis/links, so escape Markdown metacharacters in TEXT nodes
+    // only (attributes such as href/src/data-* must stay byte-intact).
+    const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT)
+    let textNode: Node | null
+    while ((textNode = walker.nextNode())) {
+      const text = textNode.textContent || ''
+      textNode.textContent = text.replace(/([\\`*_~$[\]])/g, '\\$1')
+    }
+    return clone.outerHTML
+  }
+
   function emitEmphasis(el: HTMLElement, marker: string, htmlTag: string, ctx: SiblingCtx, inner?: string): string {
     const content = inner ?? processChildren(el)
     const text = el.textContent || ''
@@ -2149,11 +2251,18 @@ export function htmlToMarkdown(html: string): string {
   }
 
   function leadingBlockMarkerGuard(text: string): string {
-    // A paragraph starting with "- ", "+ " or "1. " would be re-parsed as a
-    // list; escape the first character so it stays literal text.
-    if (/^([-+]|\d{1,9}[.)])(\s|$)/.test(text)) {
-      return '\\' + text
-    }
+    // A paragraph starting with a markdown block marker would be re-parsed as
+    // that block on reload (list/heading/quote/fence/thematic break) — escape
+    // the first character so it stays literal text. 代码块被「清除格式」降级为
+    // 普通段落后，行文里恰好以这些标记开头的情况（`---`、`# 注释`、`> 引用`）
+    // 必须仍然保存为字面文本（A4.9 复审 Critical）。
+    // 有序列表标记必须转义分隔符本身（`\1` 不是合法 Markdown 转义，会留下可见反斜杠）
+    if (/^\d{1,9}[.)](\s|$)/.test(text)) return text.replace(/^(\d{1,9})([.)])/, '$1\\$2')
+    if (/^([-+])(\s|$)/.test(text)) return '\\' + text
+    if (/^#{1,6}(\s|$)/.test(text)) return '\\' + text
+    if (/^>(\s|$)/.test(text)) return '\\' + text
+    if (/^(`{3,}|~{3,})/.test(text)) return '\\' + text
+    if (/^([-*_])(\s*\1){2,}\s*$/.test(text)) return '\\' + text
     return text
   }
 
@@ -2164,6 +2273,9 @@ export function htmlToMarkdown(html: string): string {
   // passes through marked unchanged and re-parses to the same DOM (stable
   // across round-trips). Simple tables keep the pipe form.
   function tableNeedsRawHtml(table: HTMLElement): boolean {
+    // GFM cells are inline-only: lists / code blocks / nested tables in a cell
+    // would be flattened ("1. A 2. B"), so keep the table as raw HTML.
+    if (table.querySelector('td ol, td ul, td pre, td table, th ol, th ul, th pre, th table')) return true
     const cells = Array.from(table.querySelectorAll('th, td')) as HTMLElement[]
     return cells.some((cell) => {
       if (parseInt(cell.getAttribute('colspan') || '1', 10) > 1) return true
@@ -2172,6 +2284,26 @@ export function htmlToMarkdown(html: string): string {
       if (ta && ta !== 'left' && ta !== 'start') return true
       return !!(cell.style.backgroundColor || cell.style.color)
     })
+  }
+
+  function serializeBlockChildrenAsHtml(el: HTMLElement): string {
+    const directBlocks = Array.from(el.children).filter((child) => {
+      const t = child.tagName.toLowerCase()
+      return (t === 'p' || t === 'div') && (child.textContent || '').trim()
+    })
+    if (directBlocks.length <= 1) return serializeChildrenAsHtml(el)
+    const holder = document.createElement('div')
+    return Array.from(el.childNodes).map((node) => {
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const child = node as HTMLElement
+        const t = child.tagName.toLowerCase()
+        if ((t === 'p' || t === 'div') && (child.textContent || '').trim()) {
+          return '<p>' + serializeChildrenAsHtml(child) + '</p>'
+        }
+      }
+      holder.replaceChildren(node.cloneNode(true))
+      return serializeChildrenAsHtml(holder)
+    }).join('')
   }
 
   function serializeTableAsHtml(table: HTMLElement): string {
@@ -2187,8 +2319,9 @@ export function htmlToMarkdown(html: string): string {
       if (ta && ta !== 'left' && ta !== 'start') parts.push('text-align:' + ta)
       blockColorStyleParts(cell, parts)
       if (parts.length > 0) attrs += ' style="' + parts.join(';') + '"'
-      const inner = blockEmphasisWrap(cell, serializeChildrenAsHtml(cell), true, { prev: '', next: '' })
-      return '<' + tag + attrs + '>' + (inner.trim() ? inner : '<br>') + '</' + tag + '>'
+      const cellInner = serializeBlockChildrenAsHtml(cell)
+      const inner = blockEmphasisWrap(cell, cellInner, true, { prev: '', next: '' }).trim()
+      return '<' + tag + attrs + '>' + (inner || '<br>') + '</' + tag + '>'
     }
     const renderRows = (rows: Element[]): string =>
       rows.map((tr) =>
@@ -2222,7 +2355,7 @@ export function htmlToMarkdown(html: string): string {
     }
     if (headRows.length > 0) sections.push('<thead>' + renderRows(headRows) + '</thead>')
     sections.push('<tbody>' + renderRows(bodyRows) + '</tbody>')
-    return '<table>' + sections.join('') + '</table>\n\n'
+    return '<table>' + sections.join('') + '</table>'
   }
 
   // marked does NOT parse markdown inside raw HTML blocks, so any raw-HTML
@@ -2415,6 +2548,12 @@ export function htmlToMarkdown(html: string): string {
           const color = el.style.color || ''
           const bg = el.style.backgroundColor || ''
           const styleParts: string[] = []
+          // A raw block (styled p / colored cell / raw list) must be able to
+          // punch a hole in surrounding emphasis, otherwise reload re-bolds it.
+          if (el.style.fontWeight === 'normal' || el.style.fontWeight === '400') {
+            styleParts.push('font-weight:normal')
+          }
+          if (el.style.fontStyle === 'normal') styleParts.push('font-style:normal')
           if (color) styleParts.push('color:' + color)
           if (bg) styleParts.push('background-color:' + bg)
           blockTypographyStyleParts(el, styleParts)
@@ -2425,6 +2564,31 @@ export function htmlToMarkdown(html: string): string {
           }
           break
         }
+        case 'table':
+          out += serializeTableAsHtml(el as HTMLTableElement)
+          break
+        case 'pre':
+          out += el.outerHTML
+          break
+        case 'ol':
+        case 'ul':
+        case 'li':
+          // GFM cannot nest a list inside a table cell; keep the exact markup
+          // (start/value/styles included) in raw contexts, with the same
+          // attribute hygiene as every other raw emitter.
+          out += rawOuterHtml(el as HTMLElement)
+          break
+        case 'blockquote':
+          out += '<blockquote>' + serializeChildrenAsHtml(el).trim() + '</blockquote>'
+          break
+        case 'h1':
+        case 'h2':
+        case 'h3':
+        case 'h4':
+        case 'h5':
+        case 'h6':
+          out += '<' + el.tagName.toLowerCase() + '>' + serializeChildrenAsHtml(el) + '</' + el.tagName.toLowerCase() + '>'
+          break
         default:
           Array.from(el.childNodes).forEach(walk)
       }
@@ -2518,6 +2682,15 @@ export function htmlToMarkdown(html: string): string {
         // wrapper around the whole copy) means the element is NOT bold — unwrap it
         // or the plain text would persist as `**…**` and render bold after re-entering.
         if (effectiveFontWeight(el) === 'normal') { result = processChildren(el); break }
+        // A nested normal-weight span must punch a hole in the outer emphasis.
+        // Markdown has no "bold off" marker, so preserve this subtree as raw
+        // HTML instead of turning the whole `abc` bold.
+        if (Array.from(el.querySelectorAll<HTMLElement>('[style]')).some((node) =>
+          node.style.fontWeight === 'normal' || node.style.fontWeight === '400',
+        )) {
+          result = inlineOverrideRawHtml(el)
+          break
+        }
         result = emitEmphasis(el, '**', 'strong', ctx)
         break
       }
@@ -2666,26 +2839,33 @@ export function htmlToMarkdown(html: string): string {
       }
       case 'ul':
       case 'ol': {
-        if (tag === 'ol' && el.style.counterReset) {
-          const inner = processListElement(el, 0)
-          result = '<ol style="counter-reset:' + el.style.counterReset + '">\n' + inner + '</ol>\n'
-        } else {
-          result = processListElement(el, 0) + '\n'
-        }
+        // GFM cannot represent start/value or styled list items. Emit one
+        // normalized raw list so those semantics survive save → reload instead
+        // of degrading to a naked <li> outside a list container.
+        result = (listNeedsRawHtml(el) ? serializeListAsHtml(el) + '\n\n' : processListElement(el, 0) + '\n')
         break
       }
       case 'li': {
         let text = ''
         let nested = ''
+        let nestedLastWasList = false
         const liChildren = Array.from(el.childNodes)
-        const liTexts = liChildren.map((c) => c.textContent || '')
+        const liTexts = liChildren.map((c) => (c.nodeType === Node.COMMENT_NODE ? '' : (c.textContent || '')))
         liChildren.forEach((node, i) => {
           if (node.nodeType === Node.ELEMENT_NODE) {
             const t = (node as HTMLElement).tagName.toLowerCase()
             if (t === 'ul' || t === 'ol') {
-              nested += processListElement(node as HTMLElement, 1)
+              const nestedOut = processListElement(node as HTMLElement, 1)
+              // 同层相邻嵌套列表同屏障（判据 #39：与 processListElement 同语义，
+              // 缩进到项内容层——列 0 注释会把后续项变成代码块弹出列表）
+              const barrier = '\n    <!--list-break-->\n\n'
+              nested += (nestedLastWasList ? barrier : '') + nestedOut
+              nestedLastWasList = true
               return
             }
+          }
+          if (nestedLastWasList && node.nodeType !== Node.COMMENT_NODE && (node.textContent || '').trim()) {
+            nestedLastWasList = false
           }
           let prev = ''
           for (let j = i - 1; j >= 0; j--) {
@@ -2725,7 +2905,7 @@ export function htmlToMarkdown(html: string): string {
       }
       case 'table': {
         if (tableNeedsRawHtml(el)) {
-          result = serializeTableAsHtml(el)
+          result = serializeTableAsHtml(el) + '\n\n'
           break
         }
         const rows: string[] = []
@@ -2769,7 +2949,7 @@ export function htmlToMarkdown(html: string): string {
             // div becomes a styled paragraph so the styling survives.
             result = '<p style="' + dStyleParts.join(';') + '">' + (isEmpty ? '<br>' : blockEmphasisWrap(el, serializeChildrenAsHtml(el), true, ctx)) + '</p>\n\n'
           } else {
-            result = blockEmphasisWrap(el, inner, false, ctx) + '\n'
+            result = blockEmphasisWrap(el, inner, false, ctx) + '\n\n'
           }
         }
         break
@@ -2829,8 +3009,21 @@ export function htmlToMarkdown(html: string): string {
     const children = Array.from(parent.childNodes)
     // Pre-compute sibling boundary characters for flanking checks: the char
     // immediately before/after each child in the serialized output.
-    const texts = children.map((c) => c.textContent || '')
+    // 注释节点的 data 会被 textContent 计入而污染 flanking 邻字（评审 B bonus），
+    // 一律按空串处理。
+    const texts = children.map((c) => (c.nodeType === Node.COMMENT_NODE ? '' : (c.textContent || '')))
     let s = ''
+    // 列表边界屏障（判据 #29）：CommonMark 里空行不拆分相邻同型列表——
+    // `1. a\n\n1. b` 会被解析回单个列表（b 变第 2 项），DOM 上已拆分/重起编号的
+    // 列表（restartOlNumbering / unwrapListItem / 自动列表）经 markdown 往返必然
+    // 被重新合并成连续编号。相邻列表块之间插入 `<!--list-break-->` HTML 注释块：
+    // marked 将其中断为两个列表；注释节点不渲染、不进 textContent，序列化期由本
+    // 函数重加 —— 往返稳定（注意：DOMPurify 对非 `<[/\w]` 开头的注释**保留**，
+    // 注释节点会留在 contenteditable DOM / 导出 md 里 —— 导出面在
+    // `_build_note_md` / cleanCopy 统一剥离）。空白输出不重置边界标记。
+    // TD/TH/P 等非块级容器里不插屏障（会变成表格单元格里的行内噪音文本）。
+    let lastWasList = false
+    const barrierOk = parent.tagName !== 'TD' && parent.tagName !== 'TH' && parent.tagName !== 'P'
     children.forEach((child, i) => {
       let prev = ''
       for (let j = i - 1; j >= 0; j--) {
@@ -2840,9 +3033,68 @@ export function htmlToMarkdown(html: string): string {
       for (let j = i + 1; j < texts.length; j++) {
         if (texts[j]) { next = texts[j].charAt(0); break }
       }
-      s += processNode(child, { prev, next })
+      const isListNode = child.nodeType === Node.ELEMENT_NODE &&
+        ((child as HTMLElement).tagName === 'UL' || (child as HTMLElement).tagName === 'OL')
+      const topLevelBlock = parent === container && child.nodeType === Node.ELEMENT_NODE &&
+        /^(P|DIV|H[1-6]|UL|OL|BLOCKQUOTE|PRE|TABLE|HR|FIGURE)$/.test((child as HTMLElement).tagName)
+      if (topLevelBlock && s && !s.endsWith('\n')) s += '\n\n'
+      let out = processNode(child, { prev, next })
+      if (isListNode) {
+        if (lastWasList && barrierOk) out = '\n<!--list-break-->\n\n' + out
+        lastWasList = true
+      } else if (out.trim()) {
+        lastWasList = false
+      }
+      s += out
     })
     return s
+  }
+
+  function listNeedsRawHtml(listEl: HTMLElement): boolean {
+    if (listEl.tagName === 'OL' && parseInt(listEl.getAttribute('start') || '1', 10) !== 1) return true
+    if (listEl.querySelector('ol[start]')) return true
+    return Array.from(listEl.querySelectorAll('li')).some((li) => {
+      const el = li as HTMLElement
+      const blockChildren = Array.from(el.children).filter((child) =>
+        (child.tagName === 'P' || child.tagName === 'DIV') && (child.textContent || '').trim(),
+      )
+      return el.hasAttribute('value') ||
+        !!el.style.marginLeft ||
+        blockChildren.length > 1 ||
+        (!!el.style.textAlign && el.style.textAlign !== 'left' && el.style.textAlign !== 'start')
+    })
+  }
+
+  function serializeListAsHtml(listEl: HTMLElement): string {
+    const tag = listEl.tagName.toLowerCase()
+    let attrs = ''
+    if (tag === 'ol') {
+      const start = parseInt(listEl.getAttribute('start') || '1', 10)
+      if (Number.isFinite(start) && start !== 1) attrs += ' start="' + start + '"'
+    }
+    const items = Array.from(listEl.children)
+      .filter((child) => child.tagName === 'LI')
+      .map((child) => {
+        const li = child as HTMLElement
+        let liAttrs = ''
+        const value = parseInt(li.getAttribute('value') || '', 10)
+        if (Number.isFinite(value)) liAttrs += ' value="' + value + '"'
+        const styles: string[] = []
+        if (li.style.marginLeft) styles.push('margin-left:' + li.style.marginLeft)
+        if (li.style.textAlign && li.style.textAlign !== 'left' && li.style.textAlign !== 'start') {
+          styles.push('text-align:' + li.style.textAlign)
+        }
+        if (styles.length) liAttrs += ' style="' + styles.join(';') + '"'
+        const clone = li.cloneNode(true) as HTMLElement
+        const nested = Array.from(clone.children).filter((el) =>
+          el.tagName === 'UL' || el.tagName === 'OL',
+        ) as HTMLElement[]
+        nested.forEach((el) => el.remove())
+        const inner = serializeBlockChildrenAsHtml(clone).trim()
+        const nestedHtml = nested.map((el) => serializeListAsHtml(el)).join('')
+        return '<li' + liAttrs + '>' + (inner || '<br>') + nestedHtml + '</li>'
+      })
+    return '<' + tag + attrs + '>' + items.join('') + '</' + tag + '>'
   }
 
   function processListElement(listEl: HTMLElement, depth: number): string {
@@ -2850,22 +3102,40 @@ export function htmlToMarkdown(html: string): string {
     let md = ''
     let idx = 1
     const indent = '    '.repeat(depth)
-    Array.from(listEl.children).forEach((child) => {
-      if (child.tagName.toLowerCase() !== 'li') return
+    const liChildren = Array.from(listEl.children).filter((c) => c.tagName.toLowerCase() === 'li')
+    // 存量损坏形状（评审 B）：旧 counterReset 逃生口把列表存成「无 <li> 的裸文本」，
+    // 下次保存若按 li 迭代会返回空串把全文静默吃掉。无 li 但有文本时降级为纯文本
+    // 段落输出 —— 保内容优先于保列表语义。
+    if (!liChildren.length) {
+      const txt = (listEl.textContent || '').split(/\n/).map((l) => l.trim()).filter(Boolean)
+      if (txt.length) return txt.join('\n') + '\n'
+      return ''
+    }
+    liChildren.forEach((child) => {
       const li = child as HTMLElement
       const marginLeft = li.style.marginLeft ? parseInt(li.style.marginLeft, 10) : 0
       const textAlign = li.style.textAlign || ''
       let textContent = ''
       let nestedListHtml = ''
-      const liChildren = Array.from(li.childNodes)
-      const liTexts = liChildren.map((c) => c.textContent || '')
-      liChildren.forEach((node, i) => {
+      let nestedLastWasList = false
+      const liNodes = Array.from(li.childNodes)
+      const liTexts = liNodes.map((c) => (c.nodeType === Node.COMMENT_NODE ? '' : (c.textContent || '')))
+      liNodes.forEach((node, i) => {
         if (node.nodeType === Node.ELEMENT_NODE) {
           const tag = (node as HTMLElement).tagName.toLowerCase()
           if (tag === 'ul' || tag === 'ol') {
-            nestedListHtml += processListElement(node as HTMLElement, depth + 1)
+            const nestedOut = processListElement(node as HTMLElement, depth + 1)
+            // 同层相邻嵌套列表同样会被 CommonMark 合并（评审 B：嵌套层的 C29 同类 bug）。
+            // 屏障必须缩进到项内容层（实证：列 0 注释会把后续项变成代码块并弹出列表）。
+            const nestedBarrier = '\n' + '    '.repeat(depth + 1) + '<!--list-break-->\n\n'
+            nestedListHtml += (nestedLastWasList ? nestedBarrier : '') + nestedOut
+            nestedLastWasList = true
             return
           }
+        }
+        // 注释节点的 textContent 是其 data（'list-break'）——不得重置边界标记
+        if (nestedLastWasList && node.nodeType !== Node.COMMENT_NODE && (node.textContent || '').trim()) {
+          nestedLastWasList = false
         }
         let prev = ''
         for (let j = i - 1; j >= 0; j--) {

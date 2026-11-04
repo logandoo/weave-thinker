@@ -30,12 +30,12 @@
             <line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
           <p class="drop-text">点击或拖拽文件到此处</p>
-          <p class="drop-hint">支持 Word、PPT、Excel、CSV、PDF、Markdown、音频（MP3/WAV/M4A/OGG）、视频（MP4/WebM/MOV）等；文件保存后由 AI 助手自主解析</p>
+          <p class="drop-hint">支持图片（JPG/PNG/HEIC 等）、Word、PPT、Excel、CSV、PDF、Markdown、音频（MP3/WAV/M4A/OGG）、视频（MP4/WebM/MOV）等；文件保存后由 AI 助手自主解析</p>
           <input
             ref="fileInputRef"
             type="file"
             multiple
-            accept=".docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.pdf,.md,.markdown,.mp3,.wav,.m4a,.ogg,.flac,.aac,.mp4,.webm,.mov,.m4v"
+            accept="image/*,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.csv,.pdf,.md,.markdown,.mp3,.wav,.m4a,.ogg,.flac,.aac,.mp4,.webm,.mov,.m4v"
             style="display: none"
             @change="handleFileSelect"
           />

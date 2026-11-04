@@ -165,9 +165,23 @@ class ProcessSessionManager:
                         pass
             for task in session.readers:
                 task.cancel()
+            self._spawn_unregister(session)
+
+    def _spawn_unregister(self, session: _Session) -> None:
+        """F2/A4.9 I2：会话终结点销记（组内仍有后台子孙则保留给清扫面）。"""
+        try:
+            from app.services.spawn_registry import unregister_if_empty
+            try:
+                pgid = os.getpgid(session.proc.pid)
+            except Exception:
+                pgid = session.proc.pid
+            unregister_if_empty(pgid)
+        except Exception:
+            pass
 
     async def _terminate(self, session: _Session, grace: float = 3.0) -> None:
         if session.proc.returncode is not None:
+            self._spawn_unregister(session)
             return
         try:
             os.killpg(os.getpgid(session.proc.pid), signal.SIGTERM)
@@ -175,6 +189,7 @@ class ProcessSessionManager:
             try:
                 session.proc.terminate()
             except ProcessLookupError:
+                self._spawn_unregister(session)
                 return
         try:
             await asyncio.wait_for(session.proc.wait(), timeout=grace)
@@ -190,6 +205,7 @@ class ProcessSessionManager:
                 await asyncio.wait_for(session.proc.wait(), timeout=grace)
             except asyncio.TimeoutError:
                 logger.warning("process session %s did not exit after SIGKILL", session.session_id)
+        self._spawn_unregister(session)
 
     async def _reader(self, session: _Session, stream: Any, target: _Stream) -> None:
         cap = self._buffer_cap()
@@ -208,6 +224,7 @@ class ProcessSessionManager:
             session.last_activity = time.monotonic()
 
     def _build_env(self, cwd: str) -> Dict[str, str]:
+        from app.services.sandbox_env import playwright_browsers_env as _sandbox_playwright_env
         try:
             project_bin = str(get_config().project_root / ".venv" / "bin")
         except Exception:
@@ -232,7 +249,11 @@ class ProcessSessionManager:
             "LANG": "C.UTF-8",
             "TERM": "dumb",
             "PYTHONDONTWRITEBYTECODE": "1",
+            # F1（2026-11-01 复核）：超时 guidance 让用户改走 process/durable，
+            # 这条链路也必须不缓冲，否则"看进度"再次落空。
+            "PYTHONUNBUFFERED": "1",
             "TZ": "Asia/Shanghai",
+            **_sandbox_playwright_env(),
             **bundled_git_env,
         }
 
@@ -318,6 +339,18 @@ class ProcessSessionManager:
             asyncio.create_task(self._reader(session, proc.stderr, session.err)),
         ]
         self._sessions[session.session_id] = session
+        # F2（2026-10-26）：登记子进程组，SIGKILL/崩溃后由启动清扫回收（会话自身
+        # 的 killpg 回收只覆盖优雅关停路径）。A4.9 I1：登记已知命令串。
+        try:
+            import os as _os
+            from app.services.spawn_registry import register as _spawn_register
+            try:
+                _pgid = _os.getpgid(proc.pid)
+            except Exception:
+                _pgid = proc.pid
+            _spawn_register(_pgid, command, resolved_cwd, "process")
+        except Exception:
+            pass
 
         initial = await self.read(user_id, session.session_id, wait_ms=max(0, min(int(wait_ms), 2000)))
         return {

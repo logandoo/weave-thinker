@@ -23,6 +23,10 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+from app.prompts.tools import (
+    _CLASSIFY_SYSTEM_PROMPT,
+)
+
 class ErrorCategory(Enum):
     AUTH = "auth"
     BILLING = "billing"
@@ -115,21 +119,6 @@ _STATUS_TO_CATEGORY: Dict[int, ErrorCategory] = {
 # judgment; a named policy constant.
 _LLM_FAILURE_CATEGORY = ErrorCategory.TIMEOUT
 
-_CLASSIFY_SYSTEM_PROMPT = (
-    "你是一个 LLM API 错误分类器。给定一个错误消息文本，将其归类为以下类别之一，"
-    "输出JSON。只做分类，不要解释。\n"
-    "类别：\n"
-    "- auth: API密钥无效/过期/未授权（401 语义）\n"
-    "- billing: 余额不足/配额用尽/计费问题（402 语义）\n"
-    "- rate_limit: 请求频率超限/并发容量不足（429 语义）\n"
-    "- timeout: 请求超时/上游无响应\n"
-    "- context_overflow: 上下文长度超限/token 超限\n"
-    "- network: 网络连接错误/DNS/SSL/网关错误\n"
-    "- tool_failure: 工具执行失败（如 code_execution 沙箱内部错误）\n"
-    "- reasoning_content: 需要回传 reasoning_content 的错误\n"
-    "- unknown: 无法归入上述任何类别\n"
-    '输出格式（只输出JSON）：{"category": "auth|billing|rate_limit|timeout|context_overflow|network|tool_failure|reasoning_content|unknown", "reason": "一句话依据"}'
-)
 
 _VALID_CATEGORIES = {c.value for c in ErrorCategory}
 
@@ -257,7 +246,17 @@ class ErrorClassifier:
         )
         if not isinstance(parsed, dict):
             return _LLM_FAILURE_CATEGORY
-        cat = str(parsed.get("category") or "").strip().lower()
+        # P1.4: bind to the versioned error.classify contract.
+        import json as _json
+        from app.prompts.contracts import ErrorClassification, parse_contract
+
+        contract, failure = parse_contract(
+            ErrorClassification, _json.dumps(parsed, ensure_ascii=False))
+        if failure is not None or contract is None:
+            logger.info("error classify contract failed: %s",
+                        failure.kind if failure else "schema")
+            return _LLM_FAILURE_CATEGORY
+        cat = str(contract.category or "").strip().lower()
         if cat not in _VALID_CATEGORIES:
             return _LLM_FAILURE_CATEGORY
         return ErrorCategory(cat)

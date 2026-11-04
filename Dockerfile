@@ -16,6 +16,9 @@ FROM node:22-bookworm-slim AS frontend-build
 ARG NPM_REGISTRY=""
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
+# patches/ must be present BEFORE npm ci: postinstall runs patch-package and
+# would otherwise silently succeed with "No patch files found" (vue-router #2704).
+COPY frontend/patches ./patches
 RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi \
     && npm ci --no-audit --no-fund
 COPY frontend/ ./
@@ -92,6 +95,7 @@ RUN mkdir -p /app/user_workspaces \
              /app/backend/agent_memories \
              /app/backend/audio_files \
              /app/backend/output_files \
+             /app/backend/tma_checkpoints \
              /app/backend/skins_custom \
              /app/backend/Fonts \
     && chmod +x /app/docker/entrypoint.sh \

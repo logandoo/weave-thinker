@@ -92,7 +92,16 @@ async def browser_navigate(args: dict, **kwargs) -> str:
         return json.dumps({"error": "Failed to create browser session. Is Playwright installed?"}, ensure_ascii=False)
 
     from app.services.interactive_browser_service import navigate
-    result = await navigate(session, url)
+    try:
+        _timeout_ms = int(args.get("timeout_ms") or 0)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "timeout_ms must be an integer"}, ensure_ascii=False)
+    result = await navigate(
+        session, url,
+        wait_selector=str(args.get("wait_selector") or ""),
+        timeout_ms=_timeout_ms,
+        wait_js=str(args.get("wait_js") or ""),
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -139,6 +148,14 @@ async def browser_type(args: dict, **kwargs) -> str:
     session = await service.get_or_create_session(conv_id)
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
+
+    # P0-3（上轮评估）：canvas 游戏/隐藏 IME 输入无 ref 可寻址——ref="_focused"
+    # 走 CDP trusted 键盘逐字键入当前聚焦元素（浏览器点击聚焦后使用）。
+    if ref == "_focused":
+        from app.services.interactive_browser_service import type_focused
+        submit = bool(args.get("submit", False))
+        result = await type_focused(session, text, submit=submit)
+        return json.dumps(result, ensure_ascii=False)
 
     from app.services.interactive_browser_service import type_text
     result = await type_text(session, ref, text)
@@ -232,7 +249,26 @@ async def browser_screenshot(args: dict, **kwargs) -> str:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
     from app.services.interactive_browser_service import screenshot
-    result = await screenshot(session, full_page=full_page)
+    result = await screenshot(session, full_page=full_page, name_prefix=conv_id)
+    if result.get("success") and result.get("path"):
+        # P0-2（上轮评估）：截图以图像信封回传——对话模型直接「看见」页面。
+        # I7（A4.9）：构造期即尊重 inline_tool_images 开关（对齐 workspace_read）
+        # ——关闭时只回路径 JSON，MB 级 base64 不入 tool_results 落库。
+        try:
+            from app.services.tool_image_results import (
+                build_image_envelope_from_file,
+                inline_images_enabled,
+            )
+            if inline_images_enabled():
+                _env = build_image_envelope_from_file(
+                    result["path"],
+                    f"浏览器截图已保存：{result.get('filename')}（url={result.get('url')}）",
+                    display_path=str(result.get("filename") or ""),
+                )
+                if _env:
+                    return _env
+        except Exception:
+            logger.debug("screenshot image envelope failed, falling back to path JSON")
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -242,7 +278,27 @@ _NAVIGATE_SCHEMA = {
         "Navigate to a URL in an interactive browser session. Returns a page snapshot with interactive elements "
         "labeled as [@__br_1], [@__br_2], etc. which can be used with browser_click and browser_type. "
         "Use this when you need to interact with a web page (click buttons, fill forms, navigate menus). "
-        "For simple content reading, use the 'browser' tool instead (faster, no session overhead)."
+        "For simple content reading, use the 'browser' tool instead (faster, no session overhead). "
+        "READINESS WARNING: a selector appearing is NOT the same as the app being ready. Canvas/SPA apps "
+        "(games, editors, node-graph tools, dashboards) often render their shell/loading canvas long before "
+        "the real document finishes loading — nearly all canvas apps need several seconds of warm-up, and "
+        "a boot/loading document can already satisfy a weak predicate. For such apps pass wait_js with a "
+        "condition that identifies the TARGET document (a specific element, text, route/hash, or app-ready "
+        "flag), never merely \"a canvas exists\" or \"the app object exists\". Verify the loaded document "
+        "identity before acting, and never assume the boot/default document is the intended one or reuse "
+        "its ids. If the target document is not loaded yet, inspect the snapshot/screenshot or load the "
+        "intended document/template explicitly. "
+        "RESULT FIELDS: large-canvas pages are observed automatically (even without wait_selector) and "
+        "return settled (stable within the window), observed_change (whether any transition was seen), "
+        "settle_mode (canvas_heuristic|heuristic|wait_js), settle_ms, canvas, and warnings. "
+        "settled=true means only that the page was stable — NOT that the target document is ready; "
+        "settled=true + observed_change=false on a canvas page may still be a static loading screen. "
+        "settled=false means the page kept changing/observation failed — do not act on it as ready. "
+        "warnings are diagnostics, not an automatic hard stop. "
+        "Strategy note: for canvas/WebGL games or 「clear/complete this game」 style long-horizon tasks, "
+        "prefer offline reverse-engineering of game assets/logic first (download + parse) — real-time "
+        "gameplay loops are expensive and unreliable; use browser_mouse + screenshots only for targeted "
+        "steps (e.g., entering a password)."
     ),
     "parameters": {
         "type": "object",
@@ -250,6 +306,29 @@ _NAVIGATE_SCHEMA = {
             "url": {
                 "type": "string",
                 "description": "The URL to navigate to (e.g., 'https://example.com')",
+            },
+            "wait_selector": {
+                "type": "string",
+                "description": "Optional CSS selector to wait for before snapshot (e.g., 'canvas' for WASM games — DOM-ready is not UI-ready)",
+            },
+            "wait_js": {
+                "type": "string",
+                "description": (
+                    "Optional JavaScript predicate (expression or arrow function) that must become truthy "
+                    "before the tool returns. Use for canvas/SPA apps whose DOM shell is ready before their "
+                    "app state/document: make it identify the TARGET document (a specific element, text, "
+                    "route/hash, or app-ready flag), not merely \"canvas exists\" or \"app object exists\" "
+                    "— the boot/loading document already satisfies those. Example shapes: "
+                    "\"() => !!document.querySelector('[data-app-ready=true]')\", "
+                    "\"() => location.hash === '#/editor' && !!document.querySelector('.toolbar')\", "
+                    "\"() => window.__APP_READY__ === true\". If it never becomes truthy (capped at 15 s), "
+                    "the call returns success=false with the current URL/title/snapshot; inspect or load "
+                    "the intended document explicitly, do not treat the boot state as ready."
+                ),
+            },
+            "timeout_ms": {
+                "type": "integer",
+                "description": "Navigation timeout in ms (default 20000, max 120000)",
             },
         },
         "required": ["url"],
@@ -298,9 +377,13 @@ _CLICK_SCHEMA = {
 _TYPE_SCHEMA = {
     "name": "browser_type",
     "description": (
-        "Type text into an input field identified by its ref ID from the snapshot. "
-        "Clears the field first, then types the new text. "
+        "Type text into an input field identified by its ref ID from the snapshot "
+        "(for DOM inputs: clears the field first, then types). "
         "After typing, you typically need browser_press(key='Enter') to submit the form. "
+        "Use ref=\"_focused\" to type into the CURRENTLY FOCUSED element with real key "
+        "events — works on canvas games / hidden IME inputs after browser_mouse click "
+        "focuses them (appends at the caret, does NOT clear; set submit=true to press "
+        "Enter after typing). "
         "Requires browser_navigate to have been called first."
     ),
     "parameters": {
@@ -308,11 +391,16 @@ _TYPE_SCHEMA = {
         "properties": {
             "ref": {
                 "type": "string",
-                "description": "The input element reference from the snapshot (e.g., '__br_3')",
+                "description": "The input element reference from the snapshot (e.g., '__br_3') or '_focused' for the focused element",
             },
             "text": {
                 "type": "string",
                 "description": "The text to type into the field",
+            },
+            "submit": {
+                "type": "boolean",
+                "description": "With ref='_focused': press Enter after typing (default false)",
+                "default": False,
             },
         },
         "required": ["ref", "text"],
@@ -428,7 +516,10 @@ _SCREENSHOT_SCHEMA = {
     "name": "browser_screenshot",
     "description": (
         "Take a screenshot of the current browser page and save it as a PNG file. "
-        "Returns the file path of the saved screenshot. "
+        "Vision-capable models receive the image inline (when [agent] inline_tool_images is on); "
+        "the result also includes the saved path for vision_interpret. "
+        "For canvas/WebGL pages whose snapshot is empty, take a screenshot first, then use "
+        "browser_mouse with viewport CSS pixel coordinates (move/down/up/click/wheel). "
         "Requires browser_navigate to have been called first."
     ),
     "parameters": {
@@ -558,7 +649,11 @@ registry.register(
 async def browser_video(args: dict, **kwargs) -> str:
     """P3/B5：会话录像证据（Playwright 原生）。action=save 把活体 webm
     拷贝到 output_files；status 报告录像状态。页内音频未采集（诚实降级
-    标记 UNVERIFIED-audio）。"""
+    标记 UNVERIFIED-audio）。
+
+    2026-11-03：录像随 agent 回合结束销毁（record_video_dir 只在
+    context.close 停止编码；回合结束会关闭会话以释放 Chromium/ffmpeg）。
+    需要证据必须在同一回合内调用 action=save，跨回合无法补存。"""
     action = str(args.get("action") or "save").strip().lower()
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
@@ -582,7 +677,9 @@ registry.register(
         "description": (
             "Save or inspect the interactive browser session's video recording as evidence. "
             "action='save' copies the live Playwright webm to output_files and returns its path; "
-            "action='status' reports recording state. Recording starts automatically with the session. "
+            "action='status' reports recording state. Recording starts automatically with the session "
+            "and is destroyed when the agent turn ends — call action='save' in the SAME turn; it cannot "
+            "be saved in a later turn. "
             "In-page audio is NOT captured (returns an UNVERIFIED-audio mark) — use the APPENDIX §A1 "
             "MediaRecorder template via browser_execute_js when audio evidence is required."
         ),
@@ -598,5 +695,81 @@ registry.register(
     check_fn=check_browser_interaction_requirements,
     is_async=True,
     description="Save/inspect browser session video evidence",
+    emoji="",
+)
+
+
+_MOUSE_SCHEMA = {
+    "name": "browser_mouse",
+    "description": (
+        "Coordinate-based mouse actions in the interactive browser (real CDP mouse events). "
+        "Use this for canvas/WebGL apps, maps, drawing tools and custom widgets that have NO "
+        "DOM refs (snapshot is empty) — identify coordinates from a browser_screenshot first. "
+        "action: move (hover), down/up (drag halves), click (x,y), wheel (scroll at position). "
+        "Coordinates are viewport CSS pixels from the screenshot's top-left."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["move", "down", "up", "click", "wheel"],
+                "description": "Mouse action",
+            },
+            "x": {"type": "number", "description": "Viewport X in CSS pixels (move/click)"},
+            "y": {"type": "number", "description": "Viewport Y in CSS pixels (move/click)"},
+            "button": {
+                "type": "string",
+                "enum": ["left", "right", "middle"],
+                "description": "Button for down/up/click (default left)",
+            },
+            "clicks": {"type": "integer", "description": "Click count for click (2=double)", "default": 1},
+            "delta_y": {"type": "number", "description": "Vertical scroll amount for wheel (positive=down)"},
+        },
+        "required": ["action"],
+    },
+}
+
+
+async def browser_mouse(args: dict, **kwargs) -> str:
+    """P0-1（上轮评估）：坐标鼠标原语——canvas/WebGL/自绘控件的唯一寻址方式。"""
+    action = str(args.get("action") or "").strip().lower()
+    if not action:
+        return json.dumps({"error": "No mouse action provided"}, ensure_ascii=False)
+
+    service = InteractiveBrowserService.get_instance()
+    conv_id = _get_conversation_id(kwargs)
+    session = await service.get_or_create_session(conv_id)
+    if not session:
+        return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
+
+    from app.services.interactive_browser_service import mouse
+    try:
+        _x = float(args.get("x", 0) or 0)
+        _y = float(args.get("y", 0) or 0)
+        _clicks = int(args.get("clicks", 1) or 1)
+        _dy = float(args.get("delta_y", 0) or 0)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "x/y/clicks/delta_y must be numeric"}, ensure_ascii=False)
+    result = await mouse(
+        session,
+        action,
+        x=_x,
+        y=_y,
+        button=str(args.get("button") or "left"),
+        clicks=_clicks,
+        delta_y=_dy,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+registry.register(
+    name="browser_mouse",
+    toolset="web",
+    schema=_MOUSE_SCHEMA,
+    handler=browser_mouse,
+    check_fn=check_browser_interaction_requirements,
+    is_async=True,
+    description="Coordinate mouse actions (canvas/WebGL/custom widgets)",
     emoji="",
 )

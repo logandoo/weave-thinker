@@ -116,5 +116,37 @@ export const memoryApi = {
   async getCostGovernanceStatus(): Promise<CostGovernanceStatus> {
     const { data } = await api.get<CostGovernanceStatus>('/memory/cost_governance/status')
     return data
+  },
+
+  // W1-2 约束固定（可见可撤销）
+  async getConstraints(conversationId?: string): Promise<any[]> {
+    const { data } = await api.get<{ items: any[] }>('/memory/constraints', {
+      params: conversationId ? { conversation_id: conversationId } : {}
+    })
+    return data.items || []
+  },
+
+  async revokeConstraint(pinId: string): Promise<void> {
+    await api.post(`/memory/constraints/${pinId}/revoke`)
+  },
+
+  // W5-3 保留/淘汰预览（shadow 只记录；可撤销）
+  async getRetentionPreview(capacity?: number): Promise<any> {
+    const { data } = await api.get<any>('/memory/retention_preview', {
+      params: capacity ? { capacity } : {}
+    })
+    return data
+  },
+
+  async undoRetention(conceptIds: string[]): Promise<void> {
+    await api.post('/memory/retention/undo', { concept_ids: conceptIds })
+  },
+
+  // W3-3 dream 修复报告
+  async getDreamRepairReports(limit = 20): Promise<any[]> {
+    const { data } = await api.get<{ items: any[] }>('/memory/dream_repair_reports', {
+      params: { limit }
+    })
+    return data.items || []
   }
 }

@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import html as _html
 import json as _json
 import logging
 import re as _re
+import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional
+from xml.etree import ElementTree as _ET
 
 import httpx
 
@@ -360,6 +364,15 @@ class WebSearchService:
         for p in config.web_search_fallback_providers:
             if p not in chain:
                 chain.append(p)
+        # T1b (2026-10-18): RATED reorders ONLY fallbacks; the user-ruled
+        # primary provider never moves. Default off, so config order is
+        # byte-identical unless the flag is enabled.
+        try:
+            if bool(config.agent.get("tools_reliability_ranking_enabled", False)):
+                from app.services.tool_reliability_service import provider_order
+                chain = provider_order(chain, config.web_search_provider)
+        except Exception:
+            logger.debug("provider reliability order failed (config order)", exc_info=True)
         return chain
 
     @staticmethod
@@ -371,13 +384,62 @@ class WebSearchService:
             # chain. The shared api_key (e.g. Tavily's) is never forwarded to
             # mcp.exa.ai — _search_exa only appends its own key slot.
             return True
+        if provider == "deepseek":
+            return bool(WebSearchService._deepseek_api_key())
+        if provider == "bing":
+            # Bing RSS is keyless; an operator-supplied Azure/Bing key is
+            # optional and only changes the endpoint, not availability.
+            return True
         if provider in ("tavily", "serper"):
             return bool(config.web_search_api_key)
-        if provider == "bocha":
-            return bool(config.web_search_bocha_api_key)
         if provider == "firecrawl":
             return bool(config.web_search_firecrawl_api_key)
         return False
+
+    @staticmethod
+    def _deepseek_endpoint() -> tuple[str, str]:
+        """DeepSeek Search (key, base_url) — dedicated slot, else LLM endpoint.
+
+        DeepSeek Search/Fetch use the same Bearer auth as the model API, so a
+        deployment that already configured `[endpoints.deepseek]` needs no
+        second secret. Registry lookup is lazy (search_service is imported by
+        tool startup before the registry in some entry points).
+        """
+        key = str(config.web_search_deepseek_api_key or "").strip()
+        if key:
+            return key, str(config.web_search_deepseek_api_url or "").strip()
+        try:
+            from app.model_gateway.registry import get_model_registry
+            registry = get_model_registry()
+            for alias in ("deepseek", "main"):
+                try:
+                    ep = registry.get(alias)
+                except Exception:
+                    continue
+                if ep is None:
+                    continue
+                marker = f"{getattr(ep, 'base_url', '')} {getattr(ep, 'model_name', '')}".lower()
+                ep_key = str(getattr(ep, "api_key", "") or "").strip()
+                # Do not let an empty template endpoint shadow a populated
+                # legacy/main key (re-review Important).
+                if "deepseek" in marker and ep_key:
+                    return ep_key, str(getattr(ep, "base_url", "") or "").strip()
+        except Exception:
+            pass
+        # Legacy single-endpoint deployments: [api] base/key.
+        try:
+            if "deepseek" in str(getattr(config, "api_base_url", "") or "").lower():
+                return (
+                    str(getattr(config, "api_key", "") or "").strip(),
+                    str(getattr(config, "api_base_url", "") or "").strip(),
+                )
+        except Exception:
+            pass
+        return "", ""
+
+    @classmethod
+    def _deepseek_api_key(cls) -> str:
+        return cls._deepseek_endpoint()[0]
 
     async def search(self, query: str, time_sensitive: bool = False) -> List[SearchHit]:
         if not self.is_available or not query.strip():
@@ -392,15 +454,38 @@ class WebSearchService:
                 logger.info("web_search: skipping provider %r (no API key configured)", provider)
                 continue
             try:
+                _started = time.monotonic()
                 hits = await asyncio.wait_for(
                     self._search_via(provider, query, time_sensitive=time_sensitive),
                     timeout=timeout,
                 )
+                try:
+                    from app.services.tool_reliability_service import record as _record_rel
+                    _record_rel(
+                        f"web_search:{provider}", bool(hits),
+                        error_class="" if hits else "empty",
+                        latency_ms=(time.monotonic() - _started) * 1000.0,
+                        provider=provider,
+                    )
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 logger.warning("web_search: provider %r timed out after %.1fs — trying next in chain", provider, timeout)
+                try:
+                    from app.services.tool_reliability_service import record as _record_rel
+                    _record_rel(f"web_search:{provider}", False, error_class="timeout",
+                                latency_ms=timeout * 1000.0, provider=provider)
+                except Exception:
+                    pass
                 hits = None
             except Exception as e:
                 logger.warning("web_search: provider %r failed (%s: %s) — trying next in chain", provider, type(e).__name__, e)
+                try:
+                    from app.services.tool_reliability_service import record as _record_rel
+                    _record_rel(f"web_search:{provider}", False,
+                                error_class=type(e).__name__, provider=provider)
+                except Exception:
+                    pass
                 hits = None
             if hits:
                 logger.info("web_search: provider %r returned %d hits", provider, len(hits))
@@ -469,6 +554,8 @@ class WebSearchService:
         self, provider: str, query: str, time_sensitive: bool = False
     ) -> Optional[List[SearchHit]]:
         """Dispatch one provider; None means 'no usable result, try next'."""
+        if provider == "deepseek":
+            return await self._search_deepseek(query, time_sensitive=time_sensitive)
         if provider == "exa":
             try:
                 return await asyncio.wait_for(
@@ -478,10 +565,10 @@ class WebSearchService:
             except asyncio.TimeoutError:
                 logger.warning("Exa search timed out for query %r", query)
                 return None
-        if provider == "bocha":
-            return await self._search_bocha(query, time_sensitive=time_sensitive)
         if provider == "firecrawl":
             return await self._search_firecrawl(query, time_sensitive=time_sensitive)
+        if provider == "bing":
+            return await self._search_bing(query, time_sensitive=time_sensitive)
         if provider == "tavily":
             return await self._search_tavily(get_shared_async_client(), query, time_sensitive=time_sensitive)
         if provider == "serper":
@@ -650,28 +737,66 @@ class WebSearchService:
 
         return hits
 
-    async def _search_bocha(self, query: str, time_sensitive: bool = False) -> Optional[List[SearchHit]]:
-        """Bocha (博查) Web Search API — China-native, LLM-oriented search.
-
-        Endpoint: POST https://api.bochaai.com/v1/web-search (Bearer auth).
-        Returns None on any error/empty so the caller can fall through the chain.
-        """
-        api_key = config.web_search_bocha_api_key or ""
-        if not api_key:
-            logger.warning("Bocha search skipped — bocha_api_key not configured")
+    @staticmethod
+    def _normalise_rfc822_date(raw: str) -> Optional[str]:
+        """RFC 822/1123 pubDate (Bing RSS) → YYYY-MM-DD (UTC)."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt is None:
+                return None
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
             return None
 
-        freshness = "oneMonth" if time_sensitive else "noLimit"
+    @staticmethod
+    def _deepseek_search_url(base_url: str = "") -> str:
+        """DeepSeek Search endpoint derived from the endpoint that owns the key.
+
+        The official base is `https://api.deepseek.com/v1`; a custom gateway
+        that mirrors the API keeps working without a second config knob.
+        """
+        base = str(base_url or "").rstrip("/") or "https://api.deepseek.com/v1"
+        if base.endswith("/v1"):
+            return base + "/tools/search"
+        return base + "/v1/tools/search"
+
+    async def _search_deepseek(self, query: str, time_sensitive: bool = False) -> Optional[List[SearchHit]]:
+        """DeepSeek Search API (POST /v1/tools/search) — primary provider.
+
+        Native LLM-oriented index (rerank_score / summary / authority), same
+        Bearer auth as the model API. Billed per successful request, so
+        `need_content` stays False: the 600-800 char `summary` is what the
+        model reads, and fetching full pages belongs to the browser tool.
+        """
+        api_key, base_url = self._deepseek_endpoint()
+        if not api_key:
+            logger.warning("DeepSeek search skipped — no deepseek api key configured")
+            return None
+
+        q = (query or "").strip()
+        if not q:
+            return None
+        # DeepSeek query syntax: 1–128 chars; `after:` narrows recency.
+        if time_sensitive:
+            # One-month freshness window (DeepSeek supports ISO `after:`).
+            _after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+            suffix = f" after:{_after}"
+            q = q[: max(1, 128 - len(suffix))] + suffix
+        q = q[:128]
+
         payload = {
-            "query": query,
-            "count": config.web_search_max_results,
-            "freshness": freshness,
-            "summary": False,
+            "query": q,
+            "count": max(1, min(int(config.web_search_max_results), 50)),
+            "need_content": False,
         }
-        client = get_shared_async_client()
         try:
-            resp = await client.post(
-                "https://api.bochaai.com/v1/web-search",
+            resp = await get_shared_async_client().post(
+                self._deepseek_search_url(base_url),
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -679,45 +804,170 @@ class WebSearchService:
                 json=payload,
                 timeout=config.web_search_timeout_seconds,
             )
-            if resp.status_code != 200:
-                logger.warning("Bocha search failed: %d %s", resp.status_code, resp.text[:200])
-                return None
-            data = resp.json()
         except Exception as e:
-            logger.warning("Bocha search request failed: %r", e)
+            logger.warning("DeepSeek search request failed: %r", e)
             return None
 
-        hits = self._parse_bocha_results(data)
+        if resp.status_code == 402:
+            logger.warning("DeepSeek search failed: 402 insufficient balance")
+            return None
+        if resp.status_code != 200:
+            logger.warning("DeepSeek search failed: %d %s", resp.status_code, resp.text[:200])
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning("DeepSeek search returned non-JSON response")
+            return None
+
+        hits = self._parse_deepseek_results(data)
         if not hits:
-            logger.warning("Bocha search returned no parseable hits")
+            logger.warning("DeepSeek search returned no parseable hits")
             return None
         return hits
 
     @staticmethod
-    def _parse_bocha_results(data: dict) -> List[SearchHit]:
-        hits: List[SearchHit] = []
-        # Response shape: {"code": 200, "data": {"webPages": {"value": [...]}}}
-        web_pages = (data.get("data") or {}).get("webPages") or {}
-        for item in web_pages.get("value") or []:
+    def _parse_deepseek_results(data: dict) -> List[SearchHit]:
+        items = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return []
+        ranked = []
+        for item in items:
             if not isinstance(item, dict):
                 continue
-            url = item.get("url") or ""
-            title = item.get("name") or item.get("title") or ""
+            url = str(item.get("url") or "").strip()
+            title = str(item.get("title") or "").strip()
             if not url or not title:
                 continue
-            snippet = item.get("snippet") or item.get("summary") or ""
-            published = ""
-            date_raw = item.get("datePublished") or ""
-            if date_raw:
-                published = _normalise_date(str(date_raw)) or ""
-            hits.append(
-                SearchHit(
-                    title=title[:300],
-                    url=url,
-                    snippet=snippet[:500],
-                    published_date=published or None,
-                )
+            # summary (600-800 chars) is the model-facing text; snippet is a
+            # short UI blurb. Prefer summary, then content, then snippet.
+            body = (
+                str(item.get("summary") or "").strip()
+                or str(item.get("content") or "").strip()
+                or str(item.get("snippet") or "").strip()
             )
+            try:
+                score = float(item.get("rerank_score") or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            ranked.append((score, SearchHit(
+                title=title[:300],
+                url=url,
+                snippet=body[:1200],
+                published_date=_normalise_date(str(item.get("date") or "")),
+                site_name=(str(item.get("site_name")).strip()[:120] if item.get("site_name") else None),
+            )))
+        # Native relevance order is authoritative (>=1.5 = high quality).
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        return [hit for _score, hit in ranked]
+
+    async def _search_bing(self, query: str, time_sensitive: bool = False) -> Optional[List[SearchHit]]:
+        """Bing web results via the public RSS endpoint (keyless aggregation).
+
+        The retired Bing Web Search API needs an Azure key; the RSS surface
+        keeps the same index without one. An operator can point
+        `web_search.bing_api_url` at an Azure/Bing endpoint and set
+        `bing_api_key`; that path sends the subscription-key header.
+        """
+        api_url = config.web_search_bing_api_url or "https://www.bing.com/search"
+        api_key = config.web_search_bing_api_key or ""
+        params = {
+            "format": "rss",
+            "q": query,
+            "count": max(1, min(int(config.web_search_max_results), 50)),
+        }
+        if time_sensitive:
+            # Bing qft age filter: 43200 minutes = 30 days.
+            params["qft"] = "+filterui:age-lt43200"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        }
+        if api_key and "bing.com" not in _re.sub(r"^https?://", "", api_url).split("/")[0]:
+            headers["Ocp-Apim-Subscription-Key"] = api_key
+        try:
+            resp = await get_shared_async_client().get(
+                api_url,
+                params=params,
+                headers=headers,
+                timeout=config.web_search_timeout_seconds,
+            )
+        except Exception as e:
+            logger.warning("Bing search request failed: %r", e)
+            return None
+        if resp.status_code != 200:
+            logger.warning("Bing search failed: %d %s", resp.status_code, resp.text[:200])
+            return None
+
+        _body = resp.text or ""
+        _ctype = ""
+        try:
+            _ctype = str((getattr(resp, "headers", {}) or {}).get("content-type", ""))
+        except Exception:
+            pass
+        # Azure Bing Web Search returns JSON; the public RSS surface returns
+        # XML. Support both so `bing_api_url` is not a dead config knob.
+        if "json" in _ctype.lower() or _body.lstrip().startswith("{"):
+            try:
+                _data = resp.json()
+            except Exception:
+                _data = {}
+            hits = self._parse_bing_json(_data)
+        else:
+            hits = self._parse_bing_rss(_body)
+        if not hits:
+            logger.warning("Bing search returned no parseable hits")
+            return None
+        return hits[: config.web_search_max_results]
+
+    @staticmethod
+    def _parse_bing_json(data: dict) -> List[SearchHit]:
+        """Bing Web Search v7 JSON (`webPages.value[]`)."""
+        pages = ((data or {}).get("webPages") or {}).get("value") or []
+        hits: List[SearchHit] = []
+        for item in pages:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            title = str(item.get("name") or "").strip()
+            if not url or not title:
+                continue
+            hits.append(SearchHit(
+                title=title[:300],
+                url=url,
+                snippet=str(item.get("snippet") or "")[:1200] or title,
+                published_date=_normalise_date(str(item.get("datePublished") or "")),
+            ))
+        return hits
+
+    @staticmethod
+    def _parse_bing_rss(xml_text: str) -> List[SearchHit]:
+        if not xml_text or "<rss" not in xml_text[:500]:
+            return []
+        try:
+            root = _ET.fromstring(xml_text)
+        except _ET.ParseError:
+            logger.warning("Bing RSS parse failed")
+            return []
+        hits: List[SearchHit] = []
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            url = (item.findtext("link") or "").strip()
+            if not title or not url:
+                continue
+            desc = item.findtext("description") or ""
+            # RSS descriptions are HTML fragments; the model needs prose.
+            desc = _re.sub(r"<[^>]+>", " ", desc)
+            desc = _re.sub(r"\s+", " ", _html.unescape(desc)).strip()
+            pub = item.findtext("pubDate") or ""
+            hits.append(SearchHit(
+                title=title[:300],
+                url=url,
+                snippet=desc[:1200] or title,
+                published_date=WebSearchService._normalise_rfc822_date(pub),
+            ))
         return hits
 
     async def _search_firecrawl(self, query: str, time_sensitive: bool = False) -> Optional[List[SearchHit]]:

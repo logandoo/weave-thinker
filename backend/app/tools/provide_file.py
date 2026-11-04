@@ -69,7 +69,20 @@ async def provide_file(args: Dict[str, Any], **kwargs) -> str:
     )
 
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
-    workspace_root = str(Path(workspace.root_path).resolve())
+    user_root = Path(workspace.root_path).resolve()
+    workspace_root = str(user_root)
+    override = str(kwargs.get("workspace_path") or "").strip()
+    if override:
+        candidate = Path(override).resolve()
+        try:
+            candidate.relative_to(user_root)
+            workspace_root = str(candidate)
+        except ValueError:
+            return json.dumps(
+                {"error": "任务工作区路径超出用户工作区，禁止提供文件",
+                 "generated_files": []},
+                ensure_ascii=False,
+            )
 
     # Accept both a single file_path string and a files list.
     raw_files: List[str] = []

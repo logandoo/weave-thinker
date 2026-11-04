@@ -20,28 +20,16 @@ logger = logging.getLogger(__name__)
 _TZ_CN = timezone(timedelta(hours=8))
 
 
+from app.prompts.tools import (
+    _SCHEDULE_EXTRACT_PROMPT,
+)
+
 def _strip_tz(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is not None and dt.tzinfo is not None:
         return dt.replace(tzinfo=None)
     return dt
 
 
-_SCHEDULE_EXTRACT_PROMPT = (
-    "你是定时调度解析器。将用户的自然语言调度描述解析为结构化 JSON。\n"
-    "输出格式（只输出JSON）：\n"
-    '{"schedule_type": "interval|daily|weekly|once_delay|once_datetime", ...}\n'
-    "各类型字段：\n"
-    '- interval（每隔N秒/分钟/小时/天/周）: {"amount": N, "unit": "s|m|h|d|w"}\n'
-    '- daily（每天X点/每天上午X点/每天下午X点）: {"hour": 0-23, "minute": 0-59}\n'
-    '  注意：下午/晚上 3 点 → hour=15；凌晨 0-5 点 → hour 不变\n'
-    '- weekly（每周X X点）: {"dow": 0-6, "hour": 0-23, "minute": 0-59}（0=周日，1=周一...6=周六）\n'
-    '- once_delay（N分钟后/N小时后/N天后执行一次）: {"delay_amount": N, "delay_unit": "m|h|d"}\n'
-    '- once_datetime（明确日期时间，如 2026/05/13 07:00、明天下午3点）: {"year": Y, "month": M, "day": D, "hour": 0-23, "minute": 0-59}\n'
-    "附加字段：\n"
-    "- duration_seconds（可选）：若同时提供了持续时间（如持续2分钟、2分钟内），输出秒数；否则省略\n"
-    "无法解析为任何类型时输出 {\"schedule_type\": \"unknown\"}。\n"
-    "只输出JSON，不要输出其他内容。"
-)
 
 _INTERVAL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 _DELAY_UNITS = {"m": 60, "h": 3600, "d": 86400}
@@ -78,6 +66,20 @@ async def parse_schedule_agentic(
     if not isinstance(parsed, dict):
         logger.info("schedule parse LLM unavailable — parse failed")
         return None
+
+    # P1.4: bind the parser to the versioned schedule.parse contract.
+    import json as _json
+    from app.prompts.contracts import ScheduleResult, parse_contract
+
+    contract, failure = parse_contract(
+        ScheduleResult, _json.dumps(parsed, ensure_ascii=False))
+    if failure is not None or contract is None:
+        logger.warning(
+            "schedule parse contract failed: %s",
+            failure.kind if failure else "schema",
+        )
+        return None
+    parsed = contract.model_dump(exclude_none=True)
 
     stype = str(parsed.get("schedule_type") or "").strip().lower()
     now = datetime.now(_TZ_CN)

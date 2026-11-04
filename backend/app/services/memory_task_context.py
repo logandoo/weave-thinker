@@ -77,7 +77,8 @@ async def build_task_memory_context(
                 logger.debug("task memory listwise filter failed (fallback)", exc_info=True)
         budget = max(int(budget_chars or 600), 100)
         if len(ctx) > budget:
-            ctx = ctx[:budget] + TASK_MEMORY_TRUNCATION_NOTE
+            from app.services.memory_retrieval_service import clip_preserving_notice
+            ctx = clip_preserving_notice(ctx, budget) + TASK_MEMORY_TRUNCATION_NOTE
         return f"[任务记忆]\n{ctx}"
     except Exception:
         logger.debug("task memory context failed (fail-open)", exc_info=True)

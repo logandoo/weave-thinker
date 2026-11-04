@@ -12,13 +12,17 @@ Tier 1（机械，OK/BAD/UNCERTAIN）：
   封锁该会话后续非证据写入（tool.before 门），释放条件：换会话 / TTL 过期，
   每次释放记入 ``tests/gate_audit.md``（绝不静默丢弃）。
 
-loop-guard（双通道，独立预算）：
+loop-guard 观察台账（双通道，双轨预算）：
 - 文本通道：尾部行组重复（周期 p 由数据推导）、裸递增序列（整数 / 双射
-  base-26 字母 ≥12 个）、无换行尾部的字符级周期重复（≥32 字符 ×4）。
-- 工具通道：连续 ≥4 个 no-op bash（echo/printf 字面量 / true / :）——
-  「宣告工具却只 echo」的意图-动作脱节。截断命令打断连续（截断可伪造字面量）。
-- 触发 → 请求中断（AgentLoop 迭代边界注入纠正指令；进程内语义）+ 预算
-  每会话每通道 ≤2 次，超出 log-only。``VIBEWEAVER_LOOPGUARD=off`` 关闭。
+  base-26 字母 ≥12 个）、无换行尾部的字符级周期重复（≥32 字符 ×4）、
+  counter 墙 + per-turn 64KB ceiling（纯检测函数在 `loop_detectors.py`）。
+- 工具通道：连续 ≥4 个 no-op bash（echo/printf 字面量 / true / :）。
+- 预算双轨（Governor v2 F2）：每用户回合 N=2（register_run 重置）+ 每会话
+  硬顶 M=8；episode 键控沿用 armed/fired_msg_ids。
+- 消费入口（2026-10-25 Governor v2）：文本观察由 `loop_governor_service.
+  watch_stream` 在生成点消费侧调用（事件总线 message.delta 发布保留但不再
+  挂观察监听）；工具观察由 governor 常驻钩子调用；命中后的升级/断流/熔断
+  归 `loop_governor_service.escalate`。``VIBEWEAVER_LOOPGUARD=off`` 关闭。
 
 全部观察 fail-open：观察者任何异常不得影响执行。MULTI-WORKER：进程内，
 RED latch 落盘兜底（同 hook_service 说明）。
@@ -30,6 +34,7 @@ import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,34 +46,47 @@ from app.services.agent_event_bus import AgentEvent, agent_event_bus
 
 logger = logging.getLogger(__name__)
 
-# ---- loop-guard 常量（对齐 audit.js）----
-LOOP_SEQ_MIN = 12
-LOOP_TAIL_SCAN = 98304
-LOOP_MAX_INTERVENTIONS = 2
-LOOP_CHAR_SEED = 32
-LOOP_CHAR_MIN_PERIOD = 32
-LOOP_CHAR_MAX_CANDIDATES = 16
-LOOP_MAX_LINE_PERIOD = 640
-NOOP_RUN_MIN = 4
-_DELTA_CHECK_CHARS = 256
-# D1 盲区波（wave9-10 / T24l）：字符级 gate、counter 墙、per-turn 上限、标点墙
-LOOP_CHAR_GATE_LINE = 256
-LOOP_SHAPE_MIN = 16
-LOOP_TURN_CEILING = 65536
-LOOP_PUNCT_WALL_MIN = 2048
+# ---- loop-guard 常量：纯检测本体已迁 loop_detectors（Governor v2 T6，共享
+# 底座）。此处仅保留观察/预算侧常量 + re-export 兼容面（既有测试与调用方经
+# aw.* 访问，语义零变化由 test_vibeweaver_audit.py 机检）。
+from app.services.loop_detectors import (  # noqa: F401
+    CYCLE_MIN_COPIES,
+    CYCLE_PERIOD_MAX,
+    LOOP_CHAR_GATE_LINE,
+    LOOP_CHAR_MAX_CANDIDATES,
+    LOOP_CHAR_MIN_PERIOD,
+    LOOP_CHAR_SEED,
+    LOOP_MAX_LINE_PERIOD,
+    LOOP_PUNCT_WALL_MIN,
+    LOOP_SEQ_MIN,
+    LOOP_SHAPE_MIN,
+    LOOP_TAIL_SCAN,
+    NOOP_RUN_MIN,
+    is_noop_bash_command,
+    loop_finding,
+    noop_bash_finding,
+    token_cycle_finding,
+)
 
-_BASH_META_RE = re.compile(r"[|&;<>`$(){}!\n\r]")
-_DIGITS_RE = re.compile(r"\d+")
-_LETTERS_RE = re.compile(r"[a-z]+")
-# JS \p{L}\p{N} 的 Python 等价：unicode 字母/数字（不含下划线）
-_ALNUM_U_RE = re.compile(r"[^\W_]", re.UNICODE)
-# 尾部噪声归一（流式 message/part 拼接留下的 \n/空格/NBSP/零宽字符）
-_WS_TAIL_RE = re.compile(r"[\s\u00a0\u200B-\u200D]+$")
-# 纯标点后缀（JS [^\p{L}\p{N}]+$ 的等价：非字母数字，含下划线）
-_TRAILING_PUNCT_RE = re.compile(r"[\W_]+$", re.UNICODE)
+LOOP_MAX_INTERVENTIONS = 2  # 兼容别名（=回合轨默认 N；新代码用双轨常量）
+# F2（2026-10-25 设计 §A4）：干预预算双轨——每用户回合 N（register_run 重置）
+# + 每会话硬顶 M（跨回合累计）。配置 [agent.loop_governor] 可覆盖默认。
+LOOP_TURN_INTERVENTIONS = 2
+LOOP_SESSION_INTERVENTIONS = 8
+LOOP_TURN_CEILING = 65536
+_DELTA_CHECK_CHARS = 256
+
 _GATE_TOKEN_RE = re.compile(r"HARD-GATE-[12]:\s*[A-Z0-9-]+=(?:pass|na)")
 _MEDIA_CITE_RE = re.compile(r"tests/(\S+\.(?:png|mp4|webm|wav))")
 _TABLE_HEADER = "| # |"
+_FINAL_RUN_EVIDENCE_RE = re.compile(
+    r"-[ \t]*final-run:[^\n]*--final[^\n]*pass=[1-9]\d*[ \t]*/[ \t]*fail=0(?![\d.])",
+    re.IGNORECASE,
+)
+_ASSERT_RUN_EVIDENCE_RE = re.compile(
+    r"-[ \t]*assert-run:[ \t]*assert_artifacts\.py:[ \t]*(?:all\s+[1-9]\d*\s+checks\s+pass|pass=[1-9]\d*/fail=0)",
+    re.IGNORECASE,
+)
 
 STATE_DIR = ".vibeweaver"
 AUDIT_STATE_FILE = "audit-state.json"
@@ -135,7 +153,8 @@ class SessionObservation:
     reasoning_tail: str = ""
     since_check: Dict[str, int] = field(default_factory=dict)  # channel -> chars since last detector run
     tool_observations: List[Dict[str, Any]] = field(default_factory=list)
-    interventions: Dict[str, int] = field(default_factory=dict)  # channel -> count
+    interventions: Dict[str, int] = field(default_factory=dict)  # channel -> 会话轨计数（M）
+    turn_interventions: Dict[str, int] = field(default_factory=dict)  # channel -> 回合轨计数（N，F2）
     last_finding: str = ""
     # D1：turn 上限 / message 边界重武装（JS noteMsg + turnChars + armed/fireMsgID）
     turn_chars: int = 0
@@ -145,8 +164,10 @@ class SessionObservation:
     armed: Dict[str, bool] = field(default_factory=dict)
 
 
-_observations: Dict[str, SessionObservation] = {}
-_active_runs: Dict[str, Any] = {}  # conversation_id -> AgentLoopState（中断用）
+# F9（2026-10-25 设计 §5）：OrderedDict 真 LRU——命中/重注册 move_to_end，
+# 容量满淘汰**最久未用**（旧实现按插入序弹出，误伤活跃会话）。
+_observations: "OrderedDict[str, SessionObservation]" = OrderedDict()
+_active_runs: "OrderedDict[str, Any]" = OrderedDict()  # conversation_id -> AgentLoopState（中断用）
 _MAX_OBSERVATIONS = 200
 # W12 P1#7/#8：观察性跟踪（不阻断）——技能激活 / C17 / terminal 写
 _skill_activations: Dict[str, str] = {}
@@ -179,323 +200,92 @@ def _remember_skill_activation(session_id: str, name: str) -> None:
 
 def _obs(session_id: str) -> SessionObservation:
     o = _observations.get(session_id)
-    if o is None:
-        if len(_observations) >= _MAX_OBSERVATIONS:
-            for key in list(_observations.keys())[:50]:
-                _observations.pop(key, None)
-        o = SessionObservation(session_id=session_id)
-        _observations[session_id] = o
+    if o is not None:
+        _observations.move_to_end(session_id)  # F9: 访问即最新
+        return o
+    while len(_observations) >= _MAX_OBSERVATIONS:
+        _observations.popitem(last=False)  # 淘汰最久未用
+    o = SessionObservation(session_id=session_id)
+    _observations[session_id] = o
     return o
 
 
 def register_run(conversation_id: str, state: Any) -> None:
     if conversation_id:
-        if len(_active_runs) >= _MAX_OBSERVATIONS and conversation_id not in _active_runs:
-            for key in list(_active_runs.keys())[:50]:
-                _active_runs.pop(key, None)
+        if conversation_id in _active_runs:
+            _active_runs.move_to_end(conversation_id)
+        else:
+            while len(_active_runs) >= _MAX_OBSERVATIONS:
+                _active_runs.popitem(last=False)  # F9: 真 LRU，不误伤活跃 run
         _active_runs[conversation_id] = state
+        # F2：新回合（用户消息边界）重置每回合干预预算 N；会话轨 M 保留。
+        # G6（评审 A-Minor-1）：episode 键 iter-N 跨回合复用——清 fired 闩锁
+        # （armed+fired_msg_ids）与回合字符计数，否则上回合 fired 的 armed 把
+        # 新回合首条退化流整回合静音（_note_msg 认不出回合边界）。
+        o = _observations.get(conversation_id)
+        if o is not None:
+            o.turn_interventions = {}
+            o.armed = {}
+            o.fired_msg_ids = {}
+            o.turn_chars = 0
+            o.turn_ceiling_at = 0
 
 
 def unregister_run(conversation_id: str) -> None:
     _active_runs.pop(conversation_id or "", None)
 
 
-# ---------------- 检测器（纯函数） ----------------
-
-def _tokenize_bash_literal(cmd: str) -> Optional[List[str]]:
-    tokens: List[str] = []
-    cur = ""
-    saw = False
-    i = 0
-    n = len(cmd)
-
-    def push() -> None:
-        nonlocal cur, saw
-        if saw:
-            tokens.append(cur)
-            cur = ""
-            saw = False
-
-    while i < n:
-        ch = cmd[i]
-        if ch == "\\" and i + 1 < n:
-            cur += cmd[i + 1]
-            saw = True
-            i += 2
-            continue
-        if ch == "'":
-            j = cmd.find("'", i + 1)
-            if j < 0:
-                return None
-            cur += cmd[i + 1:j]
-            saw = True
-            i = j + 1
-            continue
-        if ch == '"':
-            j = cmd.find('"', i + 1)
-            if j < 0:
-                return None
-            inner = cmd[i + 1:j]
-            if re.search(r"[`$]", inner):
-                return None
-            cur += inner
-            saw = True
-            i = j + 1
-            continue
-        if ch == "#" and not saw:
-            break
-        if ch.isspace():
-            push()
-            i += 1
-            continue
-        if _BASH_META_RE.match(ch):
-            return None
-        cur += ch
-        saw = True
-        i += 1
-    push()
-    return tokens
-
-
-def is_noop_bash_command(cmd: str) -> bool:
-    """纯叙事/no-op 命令判定。保守：存疑一律视作真命令。"""
-    if not isinstance(cmd, str):
-        return False
-    c = cmd.strip()
-    if not c:
-        return False
-    if re.search(r"[\r\n]", c):
-        return False
-    c = re.sub(r";\s*$", "", c)
-    if c in ("true", ":"):
-        return True
-    tokens = _tokenize_bash_literal(c)
-    if not tokens:
-        return False
-    head = tokens[0].split("/")[-1]
-    return head in ("echo", "printf")
-
-
-def noop_bash_finding(tools: List[Dict[str, Any]], min_run: int = NOOP_RUN_MIN) -> Optional[Dict[str, str]]:
-    """尾部连续 no-op bash 判定。同 pid 重观测去重；未知命令跳过；
-    截断命令打断连续。"""
-    if not tools:
-        return None
-    seen_pid = set()
-    run = 0
-    sample = ""
-    for t in reversed(tools):
-        if not isinstance(t, dict):
-            break
-        pid = t.get("pid")
-        if pid is not None and pid in seen_pid:
-            continue
-        if t.get("tool") != "bash":
-            break
-        cmd = t.get("command") if isinstance(t.get("command"), str) else ""
-        if not cmd.strip():
-            continue
-        if pid is not None:
-            seen_pid.add(pid)
-        if t.get("truncated") or not is_noop_bash_command(cmd):
-            break
-        run += 1
-        if not sample:
-            sample = cmd.strip()[:40]
-        if run >= min_run:
-            return {"kind": "noop-bash", "pattern": f"{run} consecutive no-op bash calls (e.g. {sample})"}
-    return None
-
-
-def _letters_to_index(s: str) -> int:
-    n = 0
-    for ch in s:
-        n = n * 26 + (ord(ch) - 96)
-    return n
-
-
-def _stepping_sequence(tail: str) -> Optional[Dict[str, str]]:
-    tokens = [t for t in re.split(r"\s+", tail.strip()) if t]
-    if len(tokens) < LOOP_SEQ_MIN:
-        return None
-    seq = tokens[-LOOP_SEQ_MIN:]
-    if all(_DIGITS_RE.fullmatch(t) for t in seq):
-        nums = [int(t) for t in seq]
-        if all(nums[i + 1] - nums[i] == 1 for i in range(len(nums) - 1)):
-            return {"kind": "sequence", "pattern": " ".join(seq)}
-    if all(_LETTERS_RE.fullmatch(t) for t in seq):
-        idxs = [_letters_to_index(t) for t in seq]
-        if all(idxs[i + 1] - idxs[i] == 1 for i in range(len(idxs) - 1)):
-            return {"kind": "sequence", "pattern": " ".join(seq)}
-    return None
-
-
-def _char_period_repeat(tail_in: str) -> Optional[Dict[str, str]]:
-    """字符级后缀周期（无换行尾部）。D1 升级：尾噪归一 + 标点墙豁免。
-
-    - 尾噪归一（D1.5）：流式/part 拼接的尾随空白（\\n/空格/NBSP/零宽字符）会让
-      端锚种子成为自身唯一出现 → 先归一再来判（JS charPeriodRepeat 同款）。
-    - 标点墙（D1.4）：纯标点后缀仅当墙 ≥ LOOP_PUNCT_WALL_MIN（按**墙自身**长度，
-      不是 tail 窗口——大文档末尾短横线/横幅必须保持干净）才豁免字母数字门槛。
-    """
-    min_p = LOOP_CHAR_MIN_PERIOD
-    tail = _WS_TAIL_RE.sub("", tail_in)
-    if len(tail) < min_p * 4:
-        return None
-    seed = tail[-LOOP_CHAR_SEED:]
-    punct_m = _TRAILING_PUNCT_RE.search(tail)
-    punct_wall = bool(punct_m) and len(punct_m.group(0)) >= LOOP_PUNCT_WALL_MIN
-    if not _ALNUM_U_RE.search(seed) and not punct_wall:
-        return None
-    max_p = min(1024, len(tail) // 4)
-    idx = len(tail) - LOOP_CHAR_SEED
-    for _n in range(LOOP_CHAR_MAX_CANDIDATES):
-        j = tail.rfind(seed, 0, idx)
-        if j < 0:
-            return None
-        base = idx - j
-        idx = j
-        starts: List[int] = []
-        if base >= min_p:
-            starts.append(base)
-        else:
-            m = -(-min_p // base)  # ceil
-            while m * base <= max_p and len(starts) < 4:
-                starts.append(m * base)
-                m += 1
-        for p in starts:
-            if p > max_p:
-                continue
-            last = tail[-p:]
-            if tail[-2 * p:-p] != last or tail[-3 * p:-2 * p] != last or tail[-4 * p:-3 * p] != last:
-                continue
-            flat = last.strip()
-            if len(flat) < 16:
-                continue
-            if not _ALNUM_U_RE.search(flat) and not punct_wall:
-                continue
-            return {"kind": "repeat", "pattern": re.sub(r"\s+", " ", flat)[:80]}
-    return None
-
-
-def _counter_shape_wall(tokens: List[str]) -> Optional[Dict[str, str]]:
-    """counter 墙（D1.2 / T24l）：尾 ≥16 行同 shape（数字段归一 #）且**每个**
-    数字段相对上一行严格 +1。
-
-    严格 +1 是 FP 关键：时间戳日志只有末段 tick、`page N of M` 的 M 恒定 →
-    自然排除；短同形列表（<16）与精确重复（行路径职责）保持干净。
-    """
-    if len(tokens) < LOOP_SHAPE_MIN:
-        return None
-    shape = lambda l: _DIGITS_RE.sub("#", l)  # noqa: E731
-    # 锚最后 3 行：墙后跟一行状态（"…×200\\nDone."）仍算墙（尾容差）
-    for a in range(len(tokens) - 1, max(-1, len(tokens) - 4), -1):
-        s_last = shape(tokens[a])
-        if s_last == tokens[a]:
-            continue
-        n = 0
-        prev: Optional[List[int]] = None
-        for i in range(a, -1, -1):
-            t = tokens[i]
-            if shape(t) != s_last:
-                break
-            r = [int(x) for x in _DIGITS_RE.findall(t)]
-            if prev is not None:
-                if len(r) != len(prev):
-                    break
-                if not all(prev[k] - r[k] == 1 for k in range(len(r))):
-                    break
-            prev = r
-            n += 1
-        if n >= LOOP_SHAPE_MIN:
-            return {"kind": "repeat", "pattern": s_last[:80] + f" ×{n} (counter run)"}
-    return None
-
-
-def loop_finding(text: str) -> Optional[Dict[str, str]]:
-    """文本退化纯检测（audit.js loopFinding 移植；D1 全形态）。"""
-    if not text or len(text) < 48:
-        return None
-    tail = text[-LOOP_TAIL_SCAN:]
-    lines = tail.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    # A) 尾部行组 ×3 周期重复（p 由数据推导）
-    if len(lines) >= 3:
-        last = lines[-1]
-        p_max = min(LOOP_MAX_LINE_PERIOD, len(lines) // 3)
-        for p in range(1, p_max + 1):
-            if len(lines) - 1 - 2 * p < 0:
-                break
-            if lines[-1 - p] != last or lines[-1 - 2 * p] != last:
-                continue
-            ok = True
-            for i in range(len(lines) - p, len(lines)):
-                if lines[i] != lines[i - p] or lines[i] != lines[i - 2 * p]:
-                    ok = False
-                    break
-            if not ok:
-                continue
-            group = lines[-p:]
-            flat = "\n".join(group).strip()
-            if len(flat) < 16:
-                continue
-            if p == 1:
-                if not _ALNUM_U_RE.search(last):
-                    continue
-                if len(lines) < 4 or lines[-4] != last:
-                    continue
-            return {"kind": "repeat", "pattern": re.sub(r"\s+", " ", flat)[:80]}
-    # B) 字符级周期（D1.6 gate256）：换行稀疏（近窗 <4 个换行）或最后内容行
-    #    ≥256 字符才进字符级扫描——newline-rich 上下文里的中短行（表格行/minified
-    #    行）不误报；行尾空白行不能遮蔽行内 runaway（读最后**内容**行）。
-    recent = tail[-2048:]
-    last_content_len = 0
-    for ln in reversed(lines):
-        if ln.strip():
-            last_content_len = len(ln)
-            break
-    if recent.count("\n") < 4 or last_content_len >= LOOP_CHAR_GATE_LINE:
-        hit = _char_period_repeat(tail)
-        if hit:
-            return hit
-    # C) 裸递增序列
-    seq = _stepping_sequence(tail)
-    if seq:
-        return seq
-    # D) counter 墙（增量变化型结构重复，SpecRA 46% 类）
-    tokens = [t.strip() for t in lines if t.strip()]
-    return _counter_shape_wall(tokens)
-
-
 # ---------------- claim↔产物交叉校验（Tier 1） ----------------
 
 def _current_log_block(log_text: str) -> str:
-    """当前任务块（最后 `## ` 块；B12 final-run 锚点的作用域）。"""
+    """Current task block, not merely the last heading.
+
+    A trailing `## Notes` section must not hide the completion artifact. Pick
+    the last `##` block that carries task evidence (`- iter`, final/assert
+    anchors, or a gate line); fall back to the last block when none exists.
+    """
     if not log_text or not isinstance(log_text, str):
         return ""
-    parts = re.split(r"^(?=## )", log_text, flags=re.MULTILINE)
+    parts = [p for p in re.split(r"^(?=## )", log_text, flags=re.MULTILINE) if p.strip()]
+    marker = re.compile(
+        r"(?m)^- (?:iter \d+ (?:PASS|FAIL)|final-run:|assert-run:)|\[Verification Gate\]"
+    )
+    for part in reversed(parts):
+        if marker.search(part):
+            return part
     return parts[-1] if parts else log_text
 
 
 def audit_final_output(content: str, root: Path) -> Dict[str, Any]:
-    """终局声明核对。verdict: ok | bad | skip（无 [Verification Gate] = skip）。"""
-    if not content or "[Verification Gate]" not in content:
-        return {"verdict": "skip", "reasons": []}
-    reasons: List[str] = []
-    if "HARD-GATE-1" not in content or "HARD-GATE-2" not in content:
-        reasons.append("claim check: [Verification Gate] 缺 HARD-GATE-1/HARD-GATE-2 字面 token")
+    """终局声明核对。verdict: ok | bad | skip（无 [Verification Gate] = skip）。
+
+    Host COV-0 forbids the completion ritual in the user-visible answer. The
+    claim surface is therefore the assistant text OR the current
+    `tests/verification_log.md` task block; both are machine-readable and the
+    latter is where the host writes the gate line/table.
+    """
+    content = content or ""
     log = ""
     try:
         log = (root / "tests" / "verification_log.md").read_text(encoding="utf-8", errors="replace")
     except OSError:
         pass
-    # D6/B12（wave17/audit-core.js:570-577）：完成声明必须携带 final-run 证据——
-    # 当前任务块含 `- final-run: --final …` 行（物理门不可能替跑 --final，此日志行
-    # 是「完成时机组 19 真的机检执行过」的唯一机器锚点）。
-    if not re.search(r"-[ \t]*final-run:[ \t]*--final\b", _current_log_block(log), re.IGNORECASE):
+    evidence_block = _current_log_block(log)
+    claim_text = content
+    if "[Verification Gate]" in evidence_block:
+        claim_text = (content + "\n" + evidence_block).strip()
+    if "[Verification Gate]" not in claim_text:
+        return {"verdict": "skip", "reasons": []}
+    reasons: List[str] = []
+    if "HARD-GATE-1" not in claim_text or "HARD-GATE-2" not in claim_text:
+        reasons.append("claim check: [Verification Gate] 缺 HARD-GATE-1/HARD-GATE-2 字面 token")
+    # D6/B12（wave17/audit-core.js:570-577）：完成声明必须携带可绑定的 final-run
+    # 证据——当前任务块含 pass>=1/fail=0 的 `- final-run:` 行，且邻近有
+    # assert-run 输出行。只有 typed line 不算执行证据。
+    if not (_FINAL_RUN_EVIDENCE_RE.search(evidence_block) and _ASSERT_RUN_EVIDENCE_RE.search(evidence_block)):
         reasons.append(
-            "claim check: B12 完成锚点缺失——当前任务块无 `- final-run: --final …` 行（组 19 未机检执行）"
+            "claim check: B12 完成锚点缺失/不可绑定——当前任务块需 `- final-run: --final … pass=N/fail=0` "
+            "与 `- assert-run: assert_artifacts.py: …`"
         )
     # D7/H14 C8：未入账的禁止裸命令（COV-2 script-only）→ 首次完成声明 BAD；
     # 随即入账（自清可恢复——同 root 已记录不再标红，JS c8Flagged 去重同语义）。
@@ -519,20 +309,20 @@ def audit_final_output(content: str, root: Path) -> Dict[str, Any]:
             )
     except Exception:
         pass
-    if re.search(r"Tests executed with artifacts:\s*yes", content):
+    if re.search(r"Tests executed with artifacts:\s*yes", claim_text):
         if not re.search(r"^- iter \d+ (PASS|FAIL):", log, re.M):
             reasons.append("claim check: 声明 Tests executed with artifacts: yes 但 tests/verification_log.md 无 iter 条目")
-    if re.search(r"assert_artifacts\.py:\s*pass=\d+/fail=0", content):
+    if re.search(r"assert_artifacts\.py:\s*pass=\d+/fail=0", claim_text):
         if not (root / "tests" / "assert_artifacts.py").exists():
             reasons.append("claim check: 声明 assert_artifacts.py: fail=0 但 tests/assert_artifacts.py 不在盘上")
-    for m in _MEDIA_CITE_RE.finditer(content):
+    for m in _MEDIA_CITE_RE.finditer(claim_text):
         p = root / "tests" / m.group(1)
         try:
             if p.stat().st_size <= 0:
                 reasons.append(f"claim check: 引用媒体缺失/空 tests/{m.group(1)}")
         except OSError:
             reasons.append(f"claim check: 引用媒体缺失/空 tests/{m.group(1)}")
-    if _TABLE_HEADER not in content:
+    if _TABLE_HEADER not in claim_text:
         reasons.append("claim check: 声明 [Verification Gate] 但无 8 列完成表头（Class CODE 应有）")
     if reasons:
         return {"verdict": "bad", "reasons": reasons}
@@ -559,7 +349,7 @@ def _save_audit_state(root: Path, st: Dict[str, Any]) -> None:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(vibeweaver_state.redact_state(st), ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
     except OSError as exc:
         logger.warning("audit state save failed: %s", exc)
@@ -704,6 +494,18 @@ def _guard_check(
     return finding
 
 
+def _budget_limits() -> Tuple[int, int]:
+    """F2 双轨预算上限（配置尽力读——观察者 fail-open；stub 配置走默认）。"""
+    try:
+        cfg = get_config()
+        return (
+            int(getattr(cfg, "agent_loop_governor_turn_interventions", LOOP_TURN_INTERVENTIONS)),
+            int(getattr(cfg, "agent_loop_governor_session_interventions", LOOP_SESSION_INTERVENTIONS)),
+        )
+    except Exception:
+        return LOOP_TURN_INTERVENTIONS, LOOP_SESSION_INTERVENTIONS
+
+
 def request_interrupt(session_id: str, conversation_id: str, feedback: str, channel: str) -> bool:
     """请求中断当前 run（迭代边界注入纠正指令）。预算耗尽返回 False（log-only）。"""
     o = _obs(session_id)
@@ -717,21 +519,25 @@ def request_interrupt(session_id: str, conversation_id: str, feedback: str, chan
         # （JS 同语义：onDegenerate 不存在 = 守卫不激活，无幻影计数）。
         logger.warning("loop-guard intervention requested but no active run (conv=%s)", conversation_id)
         return False
-    used = o.interventions.get(channel, 0)
+    used = o.interventions.get(channel, 0)  # 会话轨（M）
+    used_turn = o.turn_interventions.get(channel, 0)  # 回合轨（N，F2）
+    turn_n, sess_m = _budget_limits()
     root = _guard_root(conversation_id or session_id)
-    if used >= LOOP_MAX_INTERVENTIONS:
+    if used_turn >= turn_n or used >= sess_m:
         logger.warning(
-            "degenerate generation detected (%s) — intervention budget exhausted (%d/session/%s), log-only",
-            o.last_finding, used, channel,
+            "degenerate generation detected (%s) — intervention budget exhausted "
+            "(turn %d/%d, session %d/%d, %s), log-only",
+            o.last_finding, used_turn, turn_n, used, sess_m, channel,
         )
         vibeweaver_state.record_loop_guard_event(root, channel, suppressed=True)
         return False
     o.interventions[channel] = used + 1
+    o.turn_interventions[channel] = used_turn + 1
     try:
         state.loop_guard_feedback = feedback
         logger.info(
-            "loop-guard intervention armed (%d/%d/%s) conv=%s",
-            used + 1, LOOP_MAX_INTERVENTIONS, channel, conversation_id,
+            "loop-guard intervention armed (turn %d/%d, session %d/%d, %s) conv=%s",
+            used_turn + 1, turn_n, used + 1, sess_m, channel, conversation_id,
         )
         kind, _, pattern = (o.last_finding or "").partition(":")
         vibeweaver_state.record_loop_guard_event(root, channel, kind=kind, pattern=pattern)
@@ -741,6 +547,23 @@ def request_interrupt(session_id: str, conversation_id: str, feedback: str, chan
 
 
 # ---------------- 事件观察入口 ----------------
+
+def text_degeneration_finding(tail: str) -> Optional[Dict[str, str]]:
+    """D1 组合检测（一份实现两处武装）：四条既有语法形态 + rotation-invariant
+    token-cycle（vllm-mlx 参数走 `[agent.loop_governor]` 配置，读失败退默认）。
+    审计 PoC 的多行/周期中部截断形态只有 cycle 分支能抓——旧观察入口只跑
+    loop_finding 时 D1 主打为零（A4.9 评审 I1）。"""
+    finding = loop_finding(tail)
+    if finding is not None:
+        return finding
+    try:
+        cfg = get_config()
+        period_max = int(getattr(cfg, "agent_loop_governor_cycle_period_max", CYCLE_PERIOD_MAX))
+        min_copies = int(getattr(cfg, "agent_loop_governor_cycle_min_copies", CYCLE_MIN_COPIES))
+    except Exception:
+        period_max, min_copies = CYCLE_PERIOD_MAX, CYCLE_MIN_COPIES
+    return token_cycle_finding(tail, period_max=period_max, min_copies=min_copies)
+
 
 def observe_text_delta(
     session_id: str, delta: str, channel: str = "content", msg_id: str = ""
@@ -771,7 +594,15 @@ def observe_text_delta(
     if o.since_check[key] < _DELTA_CHECK_CHARS:
         return None
     o.since_check[key] = 0
-    return _guard_check(o, key, loop_finding(tail), session_id)
+    return _guard_check(o, key, text_degeneration_finding(tail), session_id)
+
+
+def _bounded_observation_command(command: str, cap: int = 8192) -> str:
+    """保留命令头尾与原始长度，避免长参数在重复观测中持续复制/驻留。"""
+    if len(command) <= cap:
+        return command
+    half = (cap - 64) // 2
+    return command[:half] + f"…[command truncated; original chars={len(command)}]…" + command[-half:]
 
 
 def observe_tool_call(
@@ -788,7 +619,7 @@ def observe_tool_call(
     _note_msg(o, msg_id)
     o.tool_observations.append({
         "tool": "bash" if tool_name == "terminal" else tool_name,
-        "command": command if isinstance(command, str) else "",
+        "command": _bounded_observation_command(command) if isinstance(command, str) else "",
         "truncated": bool(truncated),
     })
     if len(o.tool_observations) > 200:
@@ -859,10 +690,8 @@ async def _audit_tool_after(ctx: hook_service.ToolHookContext) -> Optional[hook_
                 ])
     except Exception:
         pass
-    finding = observe_tool_call(obs_key, "terminal", command, msg_id=ctx.turn_key or "")
-    if finding:
-        fb = _intervention_text(finding, "tools")
-        request_interrupt(obs_key, ctx.conversation_id, fb, "tools")
+    # Governor v2 · A5（2026-10-25）：noop-bash 观察/干预移交
+    # loop_governor_service._gov_tool_after（常驻挂载，不随 vibeweaver 开关）。
     # W12 P1#8：terminal 写观察（设计边界：bash 写不设门）——保守模式且会话有
     # active 项目且命令提及项目路径/名 → 每会话一次告警日志（不阻断、不影响结果）。
     try:
@@ -920,19 +749,9 @@ async def _event_listener(event: AgentEvent) -> None:
             name = str((getattr(event, "data", None) or {}).get("name") or "")
             _remember_skill_activation(str(getattr(event, "session_id", "") or ""), name)
             return
-        if event.type == "message.delta":
-            data = event.data if isinstance(event.data, dict) else {}
-            raw_channel = str(data.get("channel") or "content")
-            finding = observe_text_delta(
-                event.session_id,
-                str(data.get("delta") or ""),
-                channel=raw_channel,
-                msg_id=str(data.get("msg_id") or ""),
-            )
-            if finding:
-                ch = "reasoning" if raw_channel == "reasoning" else "text"
-                fb = _intervention_text(finding, ch)
-                request_interrupt(event.session_id, event.session_id, fb, ch)
+        # Governor v2 · A1（2026-10-25）：message.delta 文本观察**不再挂发布侧
+        # 监听**——loop_governor_service.watch_stream 在所有生成点消费侧观察
+        # （「忘记发布」结构性消除）。发布点保留（事件总线契约/遥测面）。
     except Exception as exc:
         logger.debug("audit event listener failed-open: %s", exc)
 

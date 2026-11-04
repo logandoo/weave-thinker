@@ -14,7 +14,23 @@ export interface Message {
   /** 渐进落库交付状态（2026-10-06）：'final' 默认 | 'interrupted' 进程死亡/断连
       中断的残稿（渲染「已中断」徽标）。streaming 在途行不下发。 */
   delivery_status?: 'final' | 'interrupted'
+  /** 2026-11-01 插话内联：assistant 消息上的边界侧车（JSON 字符串，DB 原样）。 */
+  interjection_items?: string | null
+  /** user 插话行渲染归属的 assistant 消息 id；null/缺省 = 旧式顶层气泡。 */
+  embedded_in_message_id?: string | null
   created_at: string
+}
+
+/** 一条插话在 assistant 时间线中的真实位置（after_index 为 display_sequence
+ *  插入点；after_char 为 content_segments 拼接后的字符偏移，供 payload 桩
+ *  回退切段）。 */
+export interface InterjectionDisplayItem {
+  type: 'interjection'
+  message_id: string
+  content: string
+  created_at?: string | null
+  after_index?: number
+  after_char?: number
 }
 
 export interface SearchResult {
@@ -134,9 +150,16 @@ export interface DisplaySequenceItem {
   subtask_id?: string
   subtask_name?: string
   reasoning_content?: string
+  /** P0 R2: parked pre-tool prose.  It is kept for evidence (A4.9 I2) but is
+   *  a draft/process unit, never a second main answer. */
+  superseded?: boolean
   // P2-1（评审 I5）：ToolPartCard 展开截断项时取回 payload 全文所需的定位
   message_id?: string
   conversation_id?: string
+  // 2026-11-01 插话内联边界
+  created_at?: string | null
+  after_index?: number
+  after_char?: number
 }
 
 /** F1-1 part protocol events (SSE protocol version 2) */
@@ -336,6 +359,8 @@ export interface DeathmatchPlanStep {
   id: string
   description: string
   status: string
+  // R2/R4：可见卡住标记（verifier 判完成但证据闸连拦 N 次的步骤）
+  stuck?: boolean
 }
 
 export interface DeathmatchVerdict {
@@ -503,7 +528,19 @@ export interface AgentTaskInfo {
   id: string
   title: string | null
   goal: string
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+  status:
+    | 'pending'
+    | 'claimed'
+    | 'running'
+    | 'resumable'
+    | 'waiting_input'
+    | 'waiting_auth'
+    | 'waiting_budget'
+    | 'cancelling'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
+    | 'timed_out'
   progress: number
   iterations_done: number
   iterations_max: number
@@ -515,6 +552,64 @@ export interface AgentTaskInfo {
   created_at: string | null
   started_at: string | null
   completed_at: string | null
+  // Voice delegation / separate_v1 additive fields (2026-11-04)
+  source_conversation_id?: string | null
+  execution_conversation_id?: string | null
+  execution_mode?: string | null
+  origin_kind?: string | null
+  assistant_id?: string | null
+  assistant_name?: string | null
+  status_version?: number
+  reasoning_status?: string | null
+  requested_reasoning_effort?: string | null
+  effective_reasoning_effort?: string | null
+  degradation_reason?: string | null
+  output_message_id?: string | null
+  usage_meta?: Record<string, unknown> | null
+  waiting_reason?: Record<string, unknown> | null
+  workspace_mode?: string | null
+  workspace_meta?: Record<string, unknown> | null
+  merge_status?: string | null
+}
+
+export interface AgentTaskActiveInfo {
+  task_id: string
+  status: AgentTaskInfo['status']
+  status_version: number
+  waiting_reason?: Record<string, unknown> | null
+  assistant_name?: string | null
+  execution_conversation_id?: string | null
+}
+
+export interface AgentTaskNotification {
+  event_id: string
+  logical_task_id: string | null
+  task_id: string | null
+  event_type: 'terminal' | 'input_required' | 'auth_required' | 'budget_required'
+  status: string
+  status_version: number
+  assistant_name: string | null
+  title: string | null
+  execution_conversation_id: string | null
+  output_message_id: string | null
+  delivery_channel: string | null
+  outbox_status: string
+  created_at: string | null
+}
+
+export interface AgentTaskSummaryResponse {
+  summary: string | null
+  cached: boolean
+  result_hash: string
+  status: string
+  assistant_name: string
+  execution_conversation_id: string | null
+  output_message_id: string | null
+  part: number
+  part_count: number
+  has_more: boolean
+  result_missing: boolean
+  message?: string
 }
 
 export interface AgentTaskSubmitResponse {

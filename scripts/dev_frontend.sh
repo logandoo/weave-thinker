@@ -13,10 +13,12 @@ PORT="${1:-8159}"
 
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
-    if ps -p "$PID" > /dev/null 2>&1; then
+    if ps -p "$PID" > /dev/null 2>&1 \
+        && ps -o command= -p "$PID" 2>/dev/null | grep -q 'vite'; then
         echo "前端 dev server 已在运行 (PID: $PID, port: $PORT)"
         exit 0
     fi
+    echo "清理失效的 PID 文件 (PID: $PID 已不是 Vite 进程)"
     rm -f "$PID_FILE"
 fi
 

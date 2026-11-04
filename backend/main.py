@@ -19,7 +19,7 @@ logging.basicConfig(
 
 from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api, user_settings, sync as sync_api, citations as citations_api, server_admin
 from app.db.database import init_db, AsyncSessionLocal
-from app.core.config import get_config, clear_config_cache
+from app.core.config import get_config, clear_config_cache, production_security_errors
 from app.services.agent_scheduler import agent_scheduler
 from app.services.agent_worker import agent_worker
 from app.services.export_worker import export_worker
@@ -73,7 +73,9 @@ app.include_router(chat.router)
 app.include_router(conversation.router)
 app.include_router(server_admin.router)
 from app.api import message_payloads as message_payloads_api
+from app.api import mcp as mcp_api
 app.include_router(message_payloads_api.router)
+app.include_router(mcp_api.router)
 app.include_router(assistant.router)
 app.include_router(asr.router)
 app.include_router(admin.router)
@@ -129,6 +131,58 @@ _durable_job_worker = None  # durable job worker 句柄（lifespan 启停）
 async def startup_event():
     if not config.security_jwt_secret_key:
         raise RuntimeError("JWT secret key is not configured")
+    # F2（2026-10-26）：启动清扫上一代遗留的工具子进程组（SIGKILL/崩溃后兜底；
+    # 签名不匹配 fail-safe 不杀，见 spawn_registry）
+    try:
+        from app.services.spawn_registry import sweep_orphans as _spawn_sweep
+        await _spawn_sweep()
+    except Exception:
+        logging.getLogger(__name__).warning("spawn sweep_orphans failed", exc_info=True)
+    # P0 TMA-NM: a tenant id without the experimental opt-in is a refusal —
+    # the filesystem segment is not an isolation guarantee (no DB/RLS).
+    from app.services.tenant_service import (
+        multi_tenant_experimental as tenant_mode_enabled,
+        tenant_config_errors,
+    )
+    _tenant_errors = tenant_config_errors()
+    if _tenant_errors:
+        raise RuntimeError("Unsafe tenant configuration: " + "; ".join(_tenant_errors))
+    if (
+        (config.memory_provenance_strict or tenant_mode_enabled())
+        and not config.memory_authority_key_ready
+    ):
+        raise RuntimeError(
+            "memory authority flags require a non-dev >=32-char "
+            "[security].memory_hmac_key (or a strong JWT secret): "
+            "the tracked dev key can forge origin=user"
+        )
+    if not str(config.security.get("memory_hmac_key", "") or "").strip():
+        logger.warning(
+            "SECURITY: memory provenance HMAC derives from jwt_secret_key; "
+            "set [security].memory_hmac_key for independent rotation"
+        )
+    if config.tma_mode != "off":
+        try:
+            from app.services.verdict_log_service import verdict_key_status
+            if verdict_key_status() == "dev":
+                logger.warning(
+                    "SECURITY: TMA verdict chain uses a dev/public HMAC key "
+                    "(key_id=v1-dev); the audit chain is structurally valid but forgeable"
+                )
+        except Exception:
+            logger.debug("verdict key status check failed", exc_info=True)
+    # P0 S2: production-only fail-closed guard.  Local dev (WT_ENV unset)
+    # keeps the tracked single-user bypass choice; a public deployment opts in
+    # with WT_ENV=production and must not boot from the unsafe template.
+    _prod_errors = production_security_errors(config)
+    if _prod_errors:
+        raise RuntimeError("Unsafe production configuration: " + "; ".join(_prod_errors))
+    if config.super_admin_bypass and not os.environ.get("WT_ENV"):
+        logger.warning(
+            "SECURITY: super_admin_bypass=true is active with WT_ENV unset. "
+            "This is a single-user/local-dev choice; public deployments must set "
+            "WT_ENV=production (the startup guard then rejects host-level bypass)."
+        )
 
     # W18 G8（PLAN §11）：多 worker 自检——设备执行注册表/配对码为进程内态，
     # workers>1 即禁用 client_exec 并 ERROR 告警。
@@ -139,6 +193,13 @@ async def startup_event():
     # 的超限 tool_results/reasoning_content/tool_calls 自动外置到 message_payloads。
     from app.services.message_payload_service import install_message_payload_hook
     install_message_payload_hook()
+
+    # 2026-11-01: [mcp.servers.*] hot reload (config.toml watch; no restart).
+    try:
+        from app.tools.mcp_client import start_mcp_hot_reload
+        start_mcp_hot_reload()
+    except Exception:
+        logger.warning("MCP hot reload startup failed (tools still load once)", exc_info=True)
 
     def _on_sighup_reload_config(signum, frame):
         clear_config_cache()
@@ -315,6 +376,13 @@ async def startup_event():
         logger.info("vibeweaver stop-guard hooks: %s", _vw_sg_summary)
     except Exception:
         logger.exception("vibeweaver hook installation failed (fail-open)")
+    # 循环 Governor v2（设计 docs/DESIGN_20261025_loop_guard_v2.md §A5）：
+    # Tier A 运行时防线**无条件挂载**——关掉 vibeweaver 不再连产品防线一起关掉。
+    try:
+        from app.services.loop_governor_service import install as _lgov_install
+        logger.info("loop governor: %s", _lgov_install())
+    except Exception:
+        logger.exception("loop governor installation failed (fail-open)")
 
 
 @app.on_event("shutdown")
@@ -353,6 +421,24 @@ async def shutdown_event():
     try:
         from app.services.process_session_service import process_manager
         await process_manager.shutdown_all()
+    except Exception:
+        pass
+    # F2（2026-10-26）：回收登记在案的工具子进程组（terminal/code_exec 后台子孙）
+    try:
+        from app.services.spawn_registry import shutdown_all as _spawn_shutdown_all
+        await _spawn_shutdown_all()
+    except Exception:
+        logging.getLogger(__name__).warning("spawn shutdown_all failed", exc_info=True)
+    # fix-round I3：死亡模式写-through drain 接停机——在飞目标列 UPDATE
+    # 不得因停机丢失（B-8/D-15 落库面）；5s 超时兜底，drain 挂死不拖停机。
+    try:
+        from app.services.deathmatch_write_through import drain_write_through
+        await asyncio.wait_for(drain_write_through(), timeout=5)
+    except Exception:
+        pass
+    try:
+        from app.tools.mcp_client import stop_mcp_hot_reload
+        stop_mcp_hot_reload()
     except Exception:
         pass
     await close_shared_async_client()

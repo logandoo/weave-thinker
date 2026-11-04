@@ -51,7 +51,19 @@ async def workspace_glob(args: Dict[str, Any], **kwargs) -> str:
 
     from app.services.workspace_service import ensure_user_workspace
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
-    workspace_root = str(Path(workspace.root_path).resolve())
+    user_root = Path(workspace.root_path).resolve()
+    workspace_root = str(user_root)
+    override = str(kwargs.get("workspace_path") or "").strip()
+    if override:
+        candidate = Path(override).resolve()
+        try:
+            candidate.relative_to(user_root)
+            workspace_root = str(candidate)
+        except ValueError:
+            return json.dumps(
+                {"error": "任务工作区路径超出用户工作区，禁止枚举", "success": False},
+                ensure_ascii=False,
+            )
 
     pattern = str(args.get("pattern") or "*").strip()
     if not pattern:

@@ -51,6 +51,7 @@ class User(Base):
     asr_hotwords = relationship("UserAsrHotword", back_populates="user", cascade="all, delete-orphan")
     skills = relationship("UserSkill", back_populates="user", cascade="all, delete-orphan")
     model_providers = relationship("UserModelProvider", back_populates="user", cascade="all, delete-orphan")
+    mcp_servers = relationship("UserMcpServer", back_populates="user", cascade="all, delete-orphan")
 
 
 class UserModelProvider(Base):
@@ -89,6 +90,36 @@ class UserModelProvider(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="model_providers")
+
+
+class UserMcpServer(Base):
+    """用户级 MCP server（2026-11-01）。
+
+    每个用户拥有自己的 stdio/HTTP MCP server；运行期注册为
+    `mcp_u<uid8>_<server>_<tool>`，``ToolEntry.owner_user_id`` 限定可见性。
+    ``api_key``/``env_json`` 为写侧凭据，GET 只回掩码；``args_json`` 是 JSON
+    数组（stdio 参数），``env_json`` 是 JSON 对象。全局 ``[mcp.servers.*]``
+    继续存在，二者互不影响（全局热重载不会触碰本表注册的工具）。
+    """
+    __tablename__ = "user_mcp_servers"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_user_mcp_servers_user_name"),
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(64), nullable=False)
+    transport = Column(String(10), nullable=False, default="http")  # http | stdio
+    url = Column(String(1000), nullable=True)
+    api_key = Column(String(1000), nullable=True)
+    command = Column(String(1000), nullable=True)
+    args_json = Column(Text, nullable=True)
+    env_json = Column(Text, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="mcp_servers")
 
 
 class Assistant(Base):
@@ -219,6 +250,11 @@ class Conversation(Base):
     # plan_audit / comparator / local_patch / replan / statement_violation /
     # human_gate / finalized_without_step_evidence / ...
     deathmatch_events = Column(JSON, nullable=True)
+    # W2 证据视图 v1（2026-10-14，ACG 2609.32754）：证据单元归档
+    # [{id, kind: OBSERVED|FACT|FAIL|CLAIM|PATCH_SUMMARY, source: judge|verifier,
+    # step_id, text(截300), ts, attributed}]，cap 200 保留最新。A3 勘正：
+    # derived state，不入 DEATHMATCH_SYNC_FIELDS（不同步客户端）。
+    deathmatch_evidence_units = Column(JSON, default=list)
     # W2b: consecutive no-progress replans (global convergence circuit breaker;
     # reset on any progress). Cap -> resumable human_gate.
     deathmatch_no_progress_replans = Column(Integer, default=0)
@@ -267,9 +303,23 @@ class Message(Base):
     # final=正常完成（含用户主动 stop 的部分保存）；interrupted=进程死亡/
     # 断连等非预期中断（前端「已中断」徽标）。
     delivery_status = Column(String(16), nullable=False, default="final", index=True)
+    # 2026-11-01 插话内联定位：assistant 行上的小型侧车（JSON 数组，每项
+    # {message_id,content,created_at,after_index,after_char}）。tool_results 可能
+    # 被外置成桩，侧车列保证前端始终拿得到插话边界；user 行的
+    # embedded_in_message_id 指向渲染它的 assistant 行（置空 = 旧式顶层气泡）。
+    interjection_items = Column(Text, nullable=True)
+    embedded_in_message_id = Column(String(36), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     conversation = relationship("Conversation", back_populates="messages")
+    # 2026-10-22（60 后台任务 3af90d5a FK 违规根修）：UOW 的 INSERT 依赖序只由
+    # relationship() 依赖处理器建立（canonical SQLAlchemy 行为——表级 FK 仅影响
+    # create_all 排序）。此前 Message↔MessagePayload 无 relationship，新 Message
+    # 超限字段同 flush 外置时 payload INSERT 先行 → message_payloads_message_id_
+    # fkey 违规。passive_deletes=True：删除语义仍交给 DB CASCADE（ondelete=
+    # "CASCADE"），ORM 侧零行为变更——此 relationship 只为建立 UOW 依赖序。
+    payloads = relationship(
+        "MessagePayload", back_populates="message", passive_deletes=True)
 
 
 class MessagePayload(Base):
@@ -296,6 +346,11 @@ class MessagePayload(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("message_id", "field", name="uq_message_payloads_msg_field"),)
+
+    # 见 Message.payloads 注记（2026-10-22 FK 根修：仅为 UOW 依赖序而建，
+    # passive_deletes=True 保持 DB CASCADE 删除语义不变）。
+    message = relationship(
+        "Message", back_populates="payloads", passive_deletes=True)
 
 
 class MessageAttempt(Base):
@@ -413,6 +468,10 @@ class AgentDream(Base):
     source_cluster_count = Column(Integer, nullable=False, default=0)
     metadata_json = Column(Text, nullable=True)
     dream_type = Column(String(20), nullable=False, default="consolidation")
+    # W3-2（记忆/长程 v2，2026-10-23）：dream 安全——入库前注入扫描标记 + 派生
+    # taint（继承来源最严 taint）；scanned=FALSE / 高 taint 的行不进入注入
+    provenance_taint = Column(String(16), nullable=True)
+    scanned = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     agent_state = relationship("UserAgentState", back_populates="dreams")
@@ -437,6 +496,11 @@ class MemoryConcept(Base):
     recurrence_count = Column(Integer, nullable=False, default=0)
     last_recurrence_at = Column(DateTime, nullable=True)
     hot_forget_count = Column(Integer, nullable=False, default=0)
+    # W5-3（记忆/长程 v2，2026-10-23）：保留/淘汰。retention_score 由
+    # scripts/backfill_retention_score.py 回填、memory_retention_service 维护；
+    # fidelity_state: full → compressed → archived（降级 > 删除，P2 可逆）
+    retention_score = Column(Float, nullable=False, default=0.0)
+    fidelity_state = Column(String(16), nullable=False, default="full")
     status = Column(String(20), nullable=False, default="active")
     source_type = Column(String(50), nullable=False, default="extracted")
     source_raw_ids = Column(Text, nullable=True)
@@ -593,6 +657,12 @@ class MemoryRecallLog(Base):
     truncated = Column(Boolean, nullable=False, default=False)
     elapsed_ms = Column(Integer, nullable=False, default=0)
     cache_hit = Column(Boolean, nullable=False, default=False)
+    # M2b（论文 2609.37559 APM-Bench）：零命中遥测（仅元数据）
+    miss = Column(Boolean, nullable=False, default=False)
+    providers_queried = Column(Text, nullable=True)  # JSON list
+    # W2-3（2026-10-23）：injection_min_relevance 门槛拒绝面（shadow 可观测，
+    # 误杀审计口径见 memory_baseline_service.quarantine_stats）
+    rejects_json = Column(Text, nullable=True)  # JSON list
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -722,7 +792,144 @@ class AgentTask(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # ── separate_v1 execution mode (voice delegation, 2026-11-04) ─────────
+    # NULL execution_mode = legacy behavior (conversation_id owns history,
+    # result write-back and notification origin). separate_v1 keeps C1 and C2
+    # permanently separate and freezes its execution config at submission.
+    source_conversation_id = Column(
+        String(36), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)
+    source_message_id = Column(
+        String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    execution_conversation_id = Column(
+        String(36), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True)
+    goal_message_id = Column(
+        String(36), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    execution_mode = Column(String(20), nullable=True)   # NULL=legacy; separate_v1
+    origin_kind = Column(String(20), nullable=True)      # voice / chat / scheduled
+    execution_config = Column(Text, nullable=True)       # JSON Execution Manifest
+    idempotency_key = Column(String(128), nullable=True)
+    request_fingerprint = Column(String(64), nullable=True)
+    attempt_id = Column(String(36), nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+    cancel_requested_at = Column(DateTime, nullable=True)
+    status_version = Column(Integer, nullable=False, default=0)
+    output_message_id = Column(String(36), nullable=True)
+    reasoning_status = Column(String(20), nullable=True)  # requested/fulfilled/degraded/unavailable/disabled
+    runtime_meta = Column(Text, nullable=True)
+    usage_meta = Column(Text, nullable=True)
+
+    # ── Wave 2 (2026-11-04): waiting states / worktree / merge ────────────
+    # waiting_reason = JSON {kind, question, tool_name, action_fingerprint,
+    # expires_at}; only meaningful while status is waiting_input/auth/budget.
+    waiting_reason = Column(Text, nullable=True)
+    workspace_mode = Column(String(20), nullable=True)   # scratch | worktree
+    workspace_meta = Column(Text, nullable=True)         # JSON worktree/branch/commit
+    merge_status = Column(String(20), nullable=True)     # none|merged|conflict
+    last_attempt_started_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_agent_tasks_user_idempotency", "user_id", "idempotency_key",
+            unique=True,
+        ),
+        Index(
+            "uq_agent_tasks_execution_conversation", "execution_conversation_id",
+            unique=True,
+        ),
+    )
+
     parent = relationship("AgentTask", remote_side="AgentTask.id", backref="subtasks")
+
+
+class VoiceNotificationOutbox(Base):
+    """Durable completion notices for voice-originated background tasks.
+
+    A row is written even when no WebSocket is active. `pending` means the
+    notice still needs an audible delivery attempt; only a client playback
+    drain advances it to `delivered` (enqueue/sent alone is not delivery).
+    """
+    __tablename__ = "voice_notification_outbox"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # task_id is nullable + SET NULL: the 7-day AgentTask retention cleanup must
+    # never cascade-delete a pending notice. logical_task_id stays addressable.
+    task_id = Column(String(36), ForeignKey("agent_tasks.id", ondelete="SET NULL"), nullable=True)
+    logical_task_id = Column(String(36), nullable=True)
+    recipient_user_id = Column(String(36), nullable=True, index=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # conversation_id = delivery conversation (legacy contract). New code also
+    # records the origin C1 and the long-lived execution C2.
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True, index=True)
+    origin_conversation_id = Column(String(36), nullable=True)
+    execution_conversation_id = Column(String(36), nullable=True, index=True)
+    output_message_id = Column(String(36), nullable=True)
+    event_type = Column(String(32), nullable=False, default="terminal")
+    status_version = Column(Integer, nullable=False, default=0)
+    delivery_channel = Column(String(16), nullable=True, default="voice")
+    delivery_attempt_id = Column(String(36), nullable=True)
+    delivery_lease_owner = Column(String(64), nullable=True)
+    delivery_lease_expires_at = Column(DateTime, nullable=True)
+    dismissed_at = Column(DateTime, nullable=True)
+    status = Column(String(16), nullable=False, default="pending")
+    task_status = Column(String(16), nullable=False)
+    payload = Column(Text, nullable=False, default="{}")
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_attempt_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index(
+            "uq_voice_notification_outbox_event",
+            "recipient_user_id", "logical_task_id", "status_version", "event_type",
+            unique=True,
+        ),
+    )
+
+
+class AgentTaskPermit(Base):
+    """One-time, task-scoped act-gate permit (Wave 2, P1).
+
+    Created only by an explicit user action (Web approval or a real voice
+    turn). The worker consumes it in the act-gate approval callback; replay or
+    expiry fails closed. The permit never grants blanket authority: it binds
+    task + tool + canonical action fingerprint.
+    """
+    __tablename__ = "agent_task_permits"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id = Column(String(36), ForeignKey("agent_tasks.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    tool_name = Column(String(120), nullable=False)
+    action_fingerprint = Column(String(64), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    consumed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_agent_task_permits_task", "task_id", "consumed_at"),
+    )
+
+
+class AgentTaskSummary(Base):
+    """Cached tool-less summary keyed by (logical_task_id, result_hash)."""
+    __tablename__ = "agent_task_summaries"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    logical_task_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    result_hash = Column(String(64), nullable=False)
+    part_index = Column(Integer, nullable=False, default=0)
+    summary = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "logical_task_id", "result_hash", "part_index",
+            name="uq_agent_task_summary_hash"),
+    )
 
 
 class DurableJob(Base):
@@ -1112,6 +1319,246 @@ class SyncConflict(Base):
     reason = Column(String(40), nullable=False)  # lww_remote_newer | lww_local_newer | skipped_remote | apply_error
     local_updated_at = Column(DateTime, nullable=True)
     remote_updated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ConversationPinnedConstraint(Base):
+    """W1-2（记忆/长程 v2，2026-10-23）：压缩后原样重放的用户约束（P1 来源先于
+    召回 / B1 约束固定信任门）。仅 source_role=user + provenance≥trusted 可入；
+    pin 前过 injection scan；每会话上限 [memory.constraints] max_pins=20；
+    revoked_at 非空 = 已撤销（可逆，P2），UI 可见可撤销（P5）。按 user_id 擦除。"""
+
+    __tablename__ = "conversation_pinned_constraints"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    text = Column(Text, nullable=False)
+    source_message_id = Column(String(36), nullable=True)
+    source_role = Column(String(20), nullable=False, default="user")
+    provenance = Column(String(20), nullable=False, default="trusted")
+    scope = Column(String(20), nullable=False, default="conversation")
+    pinned_by = Column(String(20), nullable=False, default="user")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by = Column(String(20), nullable=True)
+
+
+class DeletionManifest(Base):
+    """W0-4（记忆/长程 v2，2026-10-23）：遗忘请求清单 + 残余证据（B4 遗忘闭环）。
+    D1=a memory-only：删记忆层，保留对话/笔记（scope_json 明示保留面）。
+    保留审计（residual_json 只存命中位置/计数，不含正文）。按 user_id 擦除。"""
+
+    __tablename__ = "deletion_manifests"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    request_id = Column(String(64), nullable=False)
+    scope_json = Column(JSONB, nullable=False, default=dict)
+    status = Column(String(20), nullable=False, default="pending")
+    residual_json = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class DreamRepairReport(Base):
+    """W3-3（记忆/长程 v2，2026-10-23）：梦境 probe→hit/miss→只修 miss 的可验证
+    记录（hit@k before/after + cost_tokens，P6 成本是验收项）。默认关，14 天无
+    正收益自动回退方案 B（W3-4）。按 user_id 擦除。"""
+
+    __tablename__ = "dream_repair_reports"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    run_date = Column(String(10), nullable=False)
+    probe_count = Column(Integer, nullable=False, default=0)
+    hit_count = Column(Integer, nullable=False, default=0)
+    miss_count = Column(Integer, nullable=False, default=0)
+    repairs_json = Column(JSONB, nullable=False, default=list)
+    hit_at_k_before = Column(Float, nullable=True)
+    hit_at_k_after = Column(Float, nullable=True)
+    cost_tokens = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class StepCheckpoint(Base):
+    """W4-1（记忆/长程 v2，2026-10-23）：死磕步骤对齐回退三元组
+    (step_id, context_cursor, snapshot_id)（AgentRewind 2608.14380）。随会话删。"""
+
+    __tablename__ = "step_checkpoints"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    deathmatch_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    step_id = Column(String(64), nullable=False)
+    context_cursor = Column(Integer, nullable=False, default=0)
+    snapshot_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class MemoryEvalRun(Base):
+    """W0-2（记忆/长程 v2，2026-10-23）：离线评测结果落库（测试/影子库口径，
+    不进生产判定；确定性 gold 为主，judge 只辅助——REFLECT <55%）。"""
+
+    __tablename__ = "memory_eval_runs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id = Column(String(64), nullable=False)
+    suite = Column(String(64), nullable=False)
+    arm = Column(String(64), nullable=False)
+    metrics_json = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class TaintState(Base):
+    """P1a TMA-NM: monotonic per-conversation taint (M2)."""
+
+    __tablename__ = "taint_states"
+
+    conversation_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False, default="", index=True)
+    max_taint = Column(String(20), nullable=False, default="trusted")
+    sources_json = Column(JSON, nullable=False, default=list)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ArtifactTaint(Base):
+    """P1d: per-artifact provenance for notes/session-derived memory (M2)."""
+
+    __tablename__ = "artifact_taint"
+
+    user_id = Column(String(36), primary_key=True)
+    artifact_type = Column(String(32), primary_key=True)
+    artifact_id = Column(String(64), primary_key=True)
+    tenant_id = Column(String(64), nullable=False, default="")
+    taint = Column(String(20), nullable=False, default="untrusted")
+    origin = Column(String(40), nullable=False, default="legacy_untrusted")
+    parent_ids = Column(JSONB, nullable=False, default=list)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MemoryVerdict(Base):
+    """P1a TMA-NM: append-only verdict hash chain (M4)."""
+
+    __tablename__ = "memory_verdicts"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # tenant_id/conversation_id are covered by the composite indexes below;
+    # single-column indexes on their leading column would be redundant.
+    tenant_id = Column(String(64), nullable=False, default="")
+    seq = Column(Integer, nullable=False, default=0)
+    user_id = Column(String(36), nullable=False, default="", index=True)
+    conversation_id = Column(String(36), nullable=False, default="")
+    action_fingerprint = Column(String(64), nullable=False, default="", index=True)
+    tool_name = Column(String(80), nullable=False, default="")
+    decision = Column(String(20), nullable=False)
+    reason = Column(Text, nullable=False, default="")
+    taint = Column(String(20), nullable=False, default="untrusted")
+    corroborators = Column(JSON, nullable=False, default=list)
+    mode = Column(String(20), nullable=False, default="shadow")
+    blocked = Column(Boolean, nullable=False, default=False)
+    created_at_epoch = Column(BigInteger, nullable=False, default=0)
+    prev_hash = Column(String(64), nullable=False, default="")
+    entry_hash = Column(String(64), nullable=False, unique=True)
+    sig = Column(String(64), nullable=False, default="")
+    key_id = Column(String(20), nullable=False, default="v1")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "seq", name="uq_memory_verdict_tenant_seq"),
+    )
+
+
+class MemoryVerdictHead(Base):
+    """P1a TMA-NM: chain head serialised with FOR UPDATE on append."""
+
+    __tablename__ = "memory_verdict_heads"
+
+    tenant_id = Column(String(64), primary_key=True)
+    last_hash = Column(String(64), nullable=False, default="")
+    last_seq = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MemoryVerdictRedacted(Base):
+    """P2: hash-only tombstone for a pruned verdict (sensitive payload removed)."""
+
+    __tablename__ = "memory_verdict_redacted"
+
+    tenant_id = Column(String(64), primary_key=True, default="")
+    seq = Column(Integer, primary_key=True, default=0)
+    prev_hash = Column(String(64), nullable=False, default="")
+    entry_hash = Column(String(64), nullable=False, default="")
+    key_id = Column(String(20), nullable=False, default="v1")
+
+
+class MemoryVerdictRetention(Base):
+    """P2: signed, monotonic boundary over the pruned verdict prefix."""
+
+    __tablename__ = "memory_verdict_retention"
+
+    tenant_id = Column(String(64), primary_key=True)
+    pruned_through_seq = Column(Integer, nullable=False, default=0)
+    boundary_hash = Column(String(64), nullable=False, default="")
+    boundary_prev_hash = Column(String(64), nullable=False, default="")
+    sig = Column(String(64), nullable=False, default="")
+    key_id = Column(String(20), nullable=False, default="v1")
+    updated_at_epoch = Column(BigInteger, nullable=False, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+
+class InjectionQuarantine(Base):
+    """P3: hash-only quarantine telemetry for detector hits (no raw text)."""
+
+    __tablename__ = "injection_quarantine"
+
+    id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(64), nullable=False, default="", index=True)
+    user_id = Column(String(36), nullable=False, default="")
+    conversation_id = Column(String(36), nullable=False, default="")
+    channel = Column(String(40), nullable=False, default="")
+    tool_name = Column(String(80), nullable=False, default="")
+    origin = Column(String(40), nullable=False, default="")
+    content_hash = Column(String(64), nullable=False, default="", index=True)
+    detector = Column(String(80), nullable=False, default="")
+    score = Column(Float, nullable=False, default=0.0)
+    reason = Column(Text, nullable=False, default="")
+    mode = Column(String(20), nullable=False, default="shadow")
+    created_at_epoch = Column(BigInteger, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class MemoryActionToken(Base):
+    """P1d: one-time cryptographic user-authorisation token."""
+
+    __tablename__ = "memory_action_tokens"
+
+    token_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(64), nullable=False, default="")
+    user_id = Column(String(36), nullable=False, default="")
+    conversation_id = Column(String(36), nullable=False, default="")
+    action_fingerprint = Column(String(64), nullable=False, default="")
+    tool_name = Column(String(80), nullable=False, default="")
+    nonce = Column(String(64), nullable=False, unique=True)
+    issued_at_epoch = Column(BigInteger, nullable=False, default=0)
+    expires_at_epoch = Column(BigInteger, nullable=False, default=0)
+    used_at_epoch = Column(BigInteger, nullable=False, default=0)
+    sig = Column(String(64), nullable=False, default="")
+
+
+class MemoryVerdictCheckpoint(Base):
+    """P1c TMA-NM: signed Merkle checkpoint over a verdict-chain prefix."""
+
+    __tablename__ = "memory_verdict_checkpoints"
+
+    tenant_id = Column(String(64), primary_key=True)
+    seq = Column(Integer, primary_key=True)
+    merkle_root = Column(String(64), nullable=False, default="")
+    last_hash = Column(String(64), nullable=False, default="")
+    sig = Column(String(64), nullable=False, default="")
+    key_id = Column(String(20), nullable=False, default="v1")
+    witness_required = Column(Boolean, nullable=False, default=False)
+    created_at_epoch = Column(BigInteger, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

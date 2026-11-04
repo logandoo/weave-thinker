@@ -56,3 +56,19 @@
   visibility: visible;
   transition-delay: 1s;
 }
+
+/* 菜单打开时隐藏触发按钮的说明气泡：它会压在面板标题上（mono/ink 实拍可见） */
+.editor-toolbar button[data-tip][aria-expanded="true"]::after,
+.zen-note-toolbar button[data-tip][aria-expanded="true"]::after {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  transition: none !important;
+}
+
+/* 窄屏无 hover：说明气泡不参与布局，避免固定在错误坐标 */
+@media (max-width: 767px) {
+  .editor-toolbar button[data-tip]::after,
+  .zen-note-toolbar button[data-tip]::after {
+    display: none !important;
+  }
+}

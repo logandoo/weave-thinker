@@ -28,6 +28,19 @@ export interface StreamStatusResult {
   error?: boolean
 }
 
+/** 插话 commit-echo 载荷（B2/B3）：服务端落库行 + 客户端生成的配对 id。 */
+export interface InterjectionEcho {
+  id: string | null
+  conversation_id: string
+  content: string
+  created_at: string | null
+  /** W26（B3）：插话 POST 携带的 client_message_id 回带；旧客户端/旧队列项可为空。 */
+  client_message_id?: string | null
+  /** 2026-11-01 内联定位：渲染归属的 assistant 行 id + 时间线插入项。 */
+  embedded_in_message_id?: string | null
+  display_item?: Record<string, unknown> | null
+}
+
 /** Replay snapshot payload from POST /chat/stream/resume. */
 export interface ReplayPayload {
   /** SSE protocol version. >= 2 means display_sequence items carry part_id
@@ -47,9 +60,14 @@ export interface ReplayPayload {
   search_failed: any | null
   iteration: any
   context_info?: ContextInfo
+  /** W26（B2）：断连期 commit 的插话 echo —— 前端据此确认 pending（否则
+   *  终态冲刷重发 → 双气泡）。旧后端缺省时为空数组语义。 */
+  interjections_committed?: InterjectionEcho[]
   status: string
   is_running: boolean
   db_message_id: string | null
+  /** 2026-11-01: in-flight assistant row id (hide its embedded user row). */
+  streaming_message_id?: string | null
 }
 
 /** Handler bundle for streamChat. Options-object form replaces the previous
@@ -60,6 +78,8 @@ export interface StreamHandlers {
   onMessage: (content: string) => void
   onDone: (conversationId: string, messageId: string, title?: string, toolResults?: string | null, searchFailed?: boolean, taskSubmitted?: boolean) => void
   onError: (error: string) => void
+  /** Raw HTTP status for transport-sensitive actions (e.g. stop acceptance). */
+  onHttpStatus?: (status: number) => void
   onReasoning?: (content: string) => void
   onToolStatus?: (status: ToolStatus) => void
   signal?: AbortSignal
@@ -81,7 +101,7 @@ export interface StreamHandlers {
   /** 静默质检（audit_reset）同步：后端打回了已流式展示的草稿并重置其累加器，
    *  客户端据此丢弃草稿文本（时间线清创+content 重置），否则 done 气泡会包含
    *  全部被拒草稿（conv 827a6f78 turn-B）。 */
-  onAuditReset?: () => void
+  onAuditReset?: (opts?: { keepText?: string }) => void
   onPartStarted?: (part: PartStartedEvent) => void
   onPartDelta?: (part: PartDeltaEvent) => void
   onPartUpdated?: (part: PartUpdatedEvent) => void
@@ -95,7 +115,7 @@ export interface StreamHandlers {
   onConversationSuperseded?: () => void
   /** 插话 commit-echo：后端在迭代边界把用户插话注入消息列表并落库后广播。
    *  前端据此把乐观插话气泡替换为服务器确认的用户消息。 */
-  onInterjectionCommitted?: (payload: { id: string | null; conversation_id: string; content: string; created_at: string | null }) => void
+  onInterjectionCommitted?: (payload: InterjectionEcho) => void
 }
 
 export interface ResumeHandlers extends StreamHandlers {
@@ -285,7 +305,13 @@ export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
     // Silent-QC reset sync (conv 827a6f78 turn-B): the backend rejected the
     // streamed draft and reset its accumulators — the client drops the draft
     // text from its timeline/accumulators (handler-side surgery).
-    h.onAuditReset()
+    // keep_stitch（2026-10-14 输出单元契约）：可恢复重试仅回退失败残稿——
+    // 携 keep_text（链锚）交由 handler 按锚截断，链文本不得蒸发。
+    if (data.keep_stitch) {
+      h.onAuditReset({ keepText: String(data.keep_text || '') })
+    } else {
+      h.onAuditReset()
+    }
   }
 
   if (data.ping) {

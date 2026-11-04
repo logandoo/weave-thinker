@@ -5,30 +5,17 @@
 
 > Companion rulebook for [SKILL.md](SKILL.md). **Read IN FULL (Read Contract R1
 > in SKILL.md) on any task that touches code, BEFORE the first code action** —
-> it holds the full protocol text behind the SKILL.md binding stubs: §A4.1
-> (capture-driven verification loop), §A4.6 (systematic debugging), and the
-> canonical text of §A4.7 (COV-6), §A4.7b, §A4.8, §A4.9 (COV-8), plus
-> §A4.10 (stall escape) and §A4.11 (PAUSED/modes, COV-12). If in conflict
-> with §1 covenants in SKILL.md, the
-> covenants prevail. Section numbers are preserved so cross-references
-> (`A4.1`, `A4.6`, `A4.8`, …) keep resolving.
+> it holds the full text behind the SKILL.md stubs (§A4.1 · §A4.1.1 · §A4.1.2
+> · §A4.6 · §A4.7/§A4.7b · §A4.8 · §A4.9 · §A4.10; §A4.11 = summary, full
+> contract: WORKFLOWS_EXTENDED §M/§P). If in conflict
+> with §1 covenants in SKILL.md, the covenants prevail. Section numbers are
+> preserved so cross-references (`A4.1`, `A4.6`, …) keep resolving.
 
 ## Contents
 
-- **§A4.1 Capture-Driven Verification Loop** — full protocol: verifier probe
-  (model-native self-probe → mm-sensor → direct read), acceptance gate,
-  capture + grading call tables, runtime degradation, decision rules,
-  convergence
-- **§A4.1.1 Visual Verification Protocol** — mandatory grading chain for the
-  model-native verifier (observation-first · per-criterion verdicts · DOM
-  cross-check · UNCERTAIN=FAIL)
-- **§A4.6 Systematic Debugging — Four Phases** + escalation
-- **§A4.7 Backend-Only Task: API Doc-Driven Test Loop** (COV-6 canonical)
-- **§A4.7b Workflow Scenario Tests** (task-level backend verification)
-- **§A4.8 TDD for Logic-Bearing Code**
-- **§A4.9 Independent Code Review (Major Changes)** (COV-8 canonical)
-- **§A4.10 Stall Escape: Parameterize, Differential-Test, Dual-Path**
-  (companion to COV-7)
+- §A4.1 loop · §A4.1.1 model-native grading · §A4.1.2 design-copy fidelity
+- §A4.6 debugging · §A4.7/§A4.7b backend · §A4.8 TDD · §A4.9 review ·
+  §A4.10 stall escape · §A4.11 PAUSED/modes (templates: APPENDIX §A4.7b/§A4.1.2)
 
 ---
 
@@ -62,25 +49,25 @@ probe is the single source of truth, not a filesystem/config guess).
      ALLOWED for this probe artifact only** — the mm-sensor Read-ban applies
      to grading captured media, not to the probe. Read the PNG BEFORE
      running `--check` (the token is random per run — nothing to recall).
-  3. Report what you actually perceive: exact token + color name. If the
-     Read errors (`Cannot read image …`) or you genuinely cannot extract the
-     token/color, report that honestly — a failed probe is a valid result.
-   4. Validate: `python3 {VW_DIR}/scripts/mm_probe.py --check <token> <color>`.
-      - **exit 0 (PASS)** → the model IS image-perceptive → announce
-        `Verifier: model-native [image]`. PASS criterion: color exact AND
-        >= 5 of 6 token chars in exact positions (a blind guesser scores
-        ~0-1/6, so the gate is unpassable without real perception, while one
-        isolated slip no longer disqualifies a vision-capable model).
-        Screenshots are graded via the
-        Read tool under **§A4.1.1 Visual Verification Protocol**
-        (observation-first · per-criterion verdicts · DOM/log cross-check ·
-        UNCERTAIN=FAIL) — the countermeasure to self-grading bias.
+  3. Report what you actually perceive (exact token + color). If the Read
+     errors or you cannot extract them, report that honestly — a failed
+     probe is a valid result.
+  4. Validate: `python3 {VW_DIR}/scripts/mm_probe.py --check <token> <color>`.
+     - **exit 0 (PASS)** → the model IS image-perceptive → announce
+       `Verifier: model-native [image]`. PASS criterion: color exact AND
+       >= 5 of 6 token chars in exact positions (a blind guesser scores
+       ~0-1/6, so the gate is unpassable without real perception, while one
+       isolated slip no longer disqualifies a vision-capable model).
+       Screenshots are graded via the
+       Read tool under **§A4.1.1 Visual Verification Protocol**
+       (observation-first · per-criterion verdicts · DOM/log cross-check ·
+       UNCERTAIN=FAIL) — the countermeasure to self-grading bias.
      - **exit 1 (FAIL)** → the model is NOT image-perceptive → Step 0b.
      - **exit 2 / error** → fix the probe invocation, re-run; on repeat
        failure treat as FAIL (0b).
-  5. Record the result in `tests/verification_log.md`:
-     `- probe: model-native PASS (probe_vision.png)` or
-     `- probe: model-native FAIL → mm-sensor`.
+  5. Record in `tests/verification_log.md`: `- probe: model-native PASS
+     (probe_vision.png)` or `- probe: model-native FAIL → mm-sensor`.
+     Design-copy tasks MAY add the comparative sub-probe (APPENDIX §A4.1.2).
 - **Step 0b — mm-sensor probe (only when 0a FAILED):** check `available_skills`
   for `mm-sensor` (opencode injects this list; it is authoritative).
   - **`mm-sensor` IS in available_skills** → MANDATORY independent verifier.
@@ -194,11 +181,8 @@ criteria. ONE criterion = ONE pass/fail sentence a verifier can answer yes/no.
    then one numbered line per criterion. Example:
    ```markdown
    > cap=5  stall=3×
-
-   # Acceptance Criteria — Login Page
-   1. Username input field exists and is empty on load
-   2. "Sign In" button is visible and enabled
-   3. No error/warning banner is shown on initial load
+   1. Username input exists and is empty on load
+   2. "Sign In" button visible and enabled
    ```
 2. Gate on clarity:
    - **Vague/ambiguous** (criteria not derived confidently) → STOP and ask the
@@ -210,18 +194,21 @@ criteria. ONE criterion = ONE pass/fail sentence a verifier can answer yes/no.
 
 **Step 2 — Act + Capture (modality-aware):** Playwright performs the
 operation; capture evidence per the verifier mode announced in Step 0.
-Save to `tests/` with descriptive names. Template: [APPENDIX.md §A1](APPENDIX.md).
+Save to `tests/` with descriptive names. Template: [APPENDIX.md §A4.5](APPENDIX.md).
 
-**Narration ≠ execution (binding):** a tool call announced in prose ("now I
-will Read the screenshot", "grading") is NOT the call — only an emitted tool
-invocation is. Never `echo`/`printf` intent markers as bash calls; if your
-reasoning names a tool, the next emission is THAT tool call. Bare literal
-`echo`/`printf` narration runs (≥4 consecutive, no side effects) are
-mechanically interrupted (loop-guard `noop-bash`); the interrupt IS the
-stall declaration (§A4.10 — log `- stall: noop-bash …` before any completion
-output). Decorated variants (`>`/`|`/`$(…)`/chained) and interleaved
-real-action loops are known gaps — the interrupt covers bare narration
-runs, not every degenerate shape.
+**Narration ≠ execution (binding):** a tool call announced in prose is NOT
+the call — only an emitted tool invocation is. Never `echo`/`printf` intent
+markers as bash calls; if your reasoning names a tool, the next emission is
+THAT tool call. Bare literal `echo`/`printf` narration runs (≥4 consecutive,
+no side effects) are mechanically interrupted (loop-guard `noop-bash`); the
+interrupt IS the stall declaration (§A4.10 — log `- stall: noop-bash …`).
+**Repetition ≠ progress:** re-issuing the SAME call with the SAME arguments
+(≥4 distinct calls, any tool) is `identical-tool-run`. Varied-args same-tool
+streaks are bulk work, not a loop signal; `tool-frequency` is opt-in
+(`loopGuardToolFrequencyMin` ≥4; default off). Each interrupt IS the stall
+declaration.
+Decorated variants (`>`/`|`/`$(…)`/chained) and interleaved real-action
+loops are known gaps.
 
 Capture set per mode (mm-sensor loaded):
 
@@ -237,7 +224,7 @@ Capture rules:
 - **Video**: `context.record_video` (webm, e.g. 1280×720); one video per
   user flow, recording the WHOLE Act sequence. Transcode webm → mp4 (ffmpeg)
   for grading (keep the raw webm); no ffmpeg → grade the webm directly
-  (frame-sampling, lossy). Stable name: `tests/<flow>.mp4` (APPENDIX §A1).
+  (frame-sampling, lossy). Name: `tests/<flow>.mp4` (APPENDIX §A4.5).
 - **Audio**: inject the Web Audio capture script BEFORE page load
   (`add_init_script`), dump via `page.evaluate` at flow end, assemble a WAV
   in Python (`wave` module). Requires Chromium flag
@@ -260,12 +247,12 @@ NOT by guessing:
 | `mm-sensor [image]` | `vision.py tests/<flow>.png` per screenshot (original loop) |
 | `direct read` | DOM/log inspection primary (Step 0c); screenshots Read only as artifacts |
 
-Runtime degradation (mm-sensor modes only — model-native/direct read have
-no external-media fallback; §A4.1.1 rules 4-5 apply instead):
+Runtime degradation (mm-sensor modes only — model-native/direct read apply
+§A4.1.1 rules 4-5 instead):
 - Video graded but API returns `model_no_capability` / modality error →
-  mm-sensor auto-falls back to frame-sampling (output marked
-  `fallback: video→image`); treat the result as image-grade evidence and
-  re-grade the terminal screenshot at `--detail high`.
+  mm-sensor auto-falls back to frame-sampling (marked
+  `fallback: video→image`); treat as image-grade evidence and re-grade the
+  terminal screenshot at `--detail high`.
 - Audio graded but mm-sensor returns the `skipped` marker
   (`data-skipped="model_no_audio_capability"` in HTML / `skipped` field in
   JSON — audio has no fallback, mm-sensor reports it as a skip-with-
@@ -345,6 +332,40 @@ should work" assumptions are NOT valid substitutes.
 
 ---
 
+## A4.1.2 Design-Copy Fidelity — measure-then-judge ★
+
+**Applies when acceptance criteria name copy fidelity** (pixel similarity ·
+element size/position · overlap/occlusion · "copy this HTML/screenshot").
+Tiers run IN ADDITION to §A4.1 (verifier modes unchanged — T1/T2 are
+instrumental). Geometry/occlusion/size criteria can ONLY be certified by
+T1/T2: a VLM verdict never certifies geometry.
+
+- **T0 — identical capture conditions.** Both sides render in the same
+  browser at the same viewport + DPR, animations frozen, fonts
+  awaited, caret hidden, dynamic regions masked; recipes + DOM-dump snippet
+  in [APPENDIX §A4.1.2](APPENDIX.md).
+- **T1 — geometry/occlusion (instrument).** Box dumps from both sides →
+  `python3 scripts/ui_fidelity.py boxes REF.json CAND.json --out tests
+  --tol-px 2`: per-element Δsize/Δposition, missing/extra elements,
+  non-containment overlaps, `occluded_by` (sampled at capture). Image
+  reference: extract regions via `refboxes` (§A4.1.2) and compare against
+  them instead.
+- **T2 — pixel (instrument).** Same-condition screenshots →
+  `python3 scripts/ui_fidelity.py diff REF.png CAND.png --out tests
+  --max-diff-percent <user threshold>` — pixelmatch v5.3.0 (YIQ+AA),
+  diff image + clusters; exit 3 (size mismatch) is a failure.
+- **T3 — semantics (§A4.1.1 as-is).** The VLM grades semantics, MAY use
+  T1/T2 clusters to localize — never overrides T1/T2.
+
+**Loop + evidence:** failures iterate under §A4.1 (cap=5 / stall=3× —
+`diagnosis:` cites the cluster/Δ row). Cite the concrete generated files by
+name in `tests/verification_log.md` (the cited-evidence group checks named
+PNG paths; never cite a glob — it is checked literally). Thresholds are
+user-owned criteria; in AUTO derive conservative defaults + ADR. Skip only
+when no criterion names fidelity — state it.
+
+---
+
 ## A4.6 Systematic Debugging — Four Phases ★
 
 **No fixes without root-cause investigation first.** For ANY bug-fix task,
@@ -360,9 +381,8 @@ boundary diagnostics. Complete each phase before the next.
   reproducible → gather more data, don't guess.
 - Check recent changes — `git diff`, recent commits, new deps, config/env
   changes.
-- **Multi-component systems** (CI → build → service → database): add diagnostic
-  logging at each component boundary, run once, let evidence show which layer
-  breaks. Then investigate that layer.
+- **Multi-component systems** (CI → build → service → database): log at each
+  boundary, run once, let evidence show the broken layer.
 - **Error deep in the stack:** trace the bad value backward — where does it
   originate, who called with it — until the source is found. Fix at the
   source, not at the symptom.
@@ -465,21 +485,8 @@ the happy path, one auth-failure path, and one state-transition error
 (e.g. unauthorized update, insufficient balance, duplicate key).
 
 **Step 2 — Write them as re-runnable files** under `tests/workflows/*.py`
-(httpx/requests, plain asserts, one scenario per file). Template:
-
-```python
-# tests/workflows/test_registration_flow.py
-def test_register_then_create_then_persist(base_url, clean_state):
-    r = httpx.post(f"{base_url}/api/register", json={"user": "u1", "pw": "x"})
-    assert r.status_code == 201                       # entry call
-    token = r.json()["token"]
-    r = httpx.post(f"{base_url}/api/items",
-                   headers={"Authorization": f"Bearer {token}"}, json={...})
-    assert r.status_code == 201, r.text               # cross-endpoint dependency
-    r = httpx.get(f"{base_url}/api/items/1",
-                  headers={"Authorization": f"Bearer {token}"})
-    assert r.json()["owner"] == "u1"                  # state transition verified
-```
+(httpx/requests, plain asserts, one scenario per file). Re-runnable
+skeleton with clean-state fixtures: template in [APPENDIX §A4.7b](APPENDIX.md).
 
 **Step 3 — Three hard rules (non-negotiable):**
 1. **Clean start state** — each workflow run starts from a known state: reset
@@ -489,13 +496,12 @@ def test_register_then_create_then_persist(base_url, clean_state):
    what the call CHANGED (a query, a side effect, or the precondition of the
    next call). Status-code-only workflows miss the actual task contract.
 3. **Trace on disk — real HTTP, not service-direct** — each run appends
-   per-step request/response/assert results to `tests/workflows/<flow>.trace.log`.
-   The trace is the loop's convergence evidence and the A4.9 reviewer's raw
-   material. **A service-level direct call (importing the service class and
-   calling it in-process) is NOT a workflow trace**: it bypasses routing,
-   auth middleware, and serialization — the layers where integration bugs
-   live. If the change flows through the HTTP API, the workflow MUST run
-   real HTTP against the server started via `script/` (COV-2).
+   per-step results to `tests/workflows/<flow>.trace.log` (the loop's
+   convergence evidence + the A4.9 reviewer's raw material). **A
+   service-level direct call is NOT a workflow trace**: it bypasses routing,
+   auth middleware, and serialization — where integration bugs live. When
+   the change flows through the HTTP API, the workflow MUST run real HTTP
+   against the server started via `script/` (COV-2).
 
 **Step 4 — Run the workflow loop:** start backend via `script/` (COV-2), run
 the workflow suite, and iterate with the SAME loop discipline as A4.7 Step 5:
@@ -549,7 +555,7 @@ not visible in the spec/starter is NOT invented — record it as an open questio
 and resolve it (GUIDED) or mark the criterion unverified (AUTO ADR); a test
 that invents an interface is a false oracle. **Checker contract:** a project
 checker (`script/check.sh` / `tests/check.py`) is the loop's feedback — quote
-its pass line, never edit tests to pass. Templates: APPENDIX.md §A11.
+its pass line, never edit tests to pass. Templates: APPENDIX §A4.8.
 
 **The cycle (RED → GREEN → minimal):**
 1. **RED — write ONE failing test** for the next small behavior. One
@@ -673,7 +679,12 @@ escalation) · **≥4 consecutive no-op bash calls** — bare `echo`/`printf`
 narration markers standing in for an announced tool call; the loop-guard's
 `noop-bash` finding interrupts this mechanically, and the interrupt itself
 IS a stall declaration (log `- stall: noop-bash …` and take the escape
-below). **Any two signals → declare the stall explicitly in the log**
+below). **≥4 consecutive identical tool calls** (same tool + canonical args,
+MCP included; pid re-observations don't count) → `identical-tool-run`
+interrupt. `tool-frequency` needs explicit `loopGuardToolFrequencyMin`;
+bulk work isn't a loop. Interrupts are stall declarations
+(log `- stall: <kind> …`, take the escape below). **Any two signals → declare
+the stall explicitly in the log**
 (`- stall: <signals> — stopping pure iteration`). An undeclared stall
 becomes silent guessing, which looks exactly like reasoning right up until
 it is wrong.
@@ -690,8 +701,8 @@ it is wrong.
 3. Every candidate stays live until evidence kills it. A killed candidate
    gets recorded with the evidence that killed it (→ memory ❌ per
    MEMORY_RULES.md §A7.7). No premature favourites.
-4. Name **the cheapest test that could refute each candidate.** A test that
-   could not have come out the other way is not a test — it is a ceremony.
+4. Name **the cheapest test that could refute each candidate** (a test that
+   cannot fail is a ceremony).
 
 ### TRUST-AND-VERIFY — differential testing with an independent reference
 
@@ -747,28 +758,18 @@ primitives (→ §A4.6 escalation to the user).
 
 ## A4.11 PAUSED Protocol & Operating Modes (COV-12 companion)
 
-**Modes.** Every task declares `Mode: AUTO` (default) or `Mode: GUIDED`
-in ZERO. Modes govern ONLY Class-I interaction points; the evidence gates
-(COV-1/2/5/7, assert exit-0, A4.9, Memory Gate) are mode-invariant — neither
-mode turns a FAIL into a PASS.
-
-**Class-I points** (mode-dependent): I1 ambiguous request → GUIDED asks /
-AUTO derives the most conservative interpretation → ADR · I2 vague
-acceptance criteria → GUIDED asks / AUTO derives strict criteria from the
-request's explicit words → ADR · I3 Design Gate A/B → GUIDED confirms /
-AUTO records the approach as ADR · I4 baseline pre-existing failures →
-GUIDED awaits decision / AUTO proceeds only with failures provably out of
-task scope (named) · I5 mid-loop criterion edit → GUIDED asks / AUTO ADR
-quotes the exact edit · I6 cap/stall → GUIDED reports / AUTO shifts via
-§A4.10 first, PAUSED packet only on a SECOND capped sub-problem.
-
-**Class-E hard stops** (BOTH modes — AUTO never auto-decides): COV-11
-untrusted-content conflict · production deploy / release to real users ·
-destructive or irreversible ops outside the project tree (force-push, data
-deletion, infra mutation) · credential exposure beyond what the task
-provided · `assert_artifacts.py` exit 1 with no legal repair path ·
-anything the user asked to be consulted on.
-
+Full contract: WORKFLOWS_EXTENDED §M/§P (R9). Summary:
+**Modes** — every task declares `Mode: AUTO` (default) or `Mode: GUIDED` in
+ZERO; modes govern ONLY Class-I interaction points (I1 ambiguous request ·
+I2 vague acceptance criteria · I3 Design Gate A/B · I4 baseline pre-existing
+failures · I5 mid-loop criterion edit · I6 cap/stall — AUTO shifts via
+§A4.10 first, PAUSED packet only on a SECOND capped sub-problem), NEVER the
+evidence gates (COV-1/2/5/7, assert exit-0, A4.9, Memory Gate).
+**Class-E hard stops (BOTH modes, never auto-decided):** COV-11
+untrusted-content conflict · production deploy/release to real users ·
+destructive or irreversible ops outside the project tree · credential
+exposure beyond what the task provided · `assert_artifacts.py` exit 1 with
+no legal repair path · anything the user asked to be consulted on.
 **ADR format** (`tests/decisions.md`, append-only):
 ```
 ## D-3 | <ISO time> | iter 2
@@ -776,19 +777,13 @@ trigger: <Class-I point> | options: <2-3> | chosen: <safest>
 why: <one falsifiable clause> | revisit-if: <invalidating condition>
 ```
 Completion adds `[Decisions] N auto-decisions → tests/decisions.md` before
-the table. User veto of an ADR = feedback memory (A7.9) + redo next wave.
-
-**PAUSED packet** (both modes, any stop — SKILL.md §3.4): write
-`tests/paused_state.md` AND end the turn with the same one-liner:
-```
-[PAUSED] gate=<name> | question=<one line> | options=<2-3> | default-if-continue=<option> | state=<wave, files touched, next step>
-```
-**Resume contract:** user "continue" = approval of `default-if-continue`
-(NOT a re-plan). On resume: clear `paused_state.md`, append
-`- resumed: <default> approved` to `verification_log.md`, continue from
-`state:`. Re-entry order: paused_state → acceptance.md (full) →
-verification_log tail (~40 lines) → §1 covenant.
-
+the table. User veto of an ADR = feedback memory (A7.9) + redo.
+**PAUSED packet** (any stop — SKILL.md §3.4): write `tests/paused_state.md`
+AND end the turn with the same
+`[PAUSED] gate=<name> | question=<one line> | options=<2-3> | default-if-continue=<option> | state=<wave, files touched, next step>`
+one-liner. Resume: user "continue" approves `default-if-continue` (NOT a
+re-plan); clear the file, append `- resumed: <default> approved` to
+`verification_log.md`, continue from `state:`. Re-entry: SKILL.md §3.3.
 **AUTO runaway bound:** at most ONE extra autonomous direction per stop
 type; ≥3 ADRs on the SAME sub-problem → next stop escalates to PAUSED
-regardless of mode — the mode buys autonomy, not license to spin.
+regardless of mode.

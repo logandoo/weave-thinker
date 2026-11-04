@@ -7,10 +7,9 @@
 模型判版式（裁剪/重叠/可读性）→ 结论并入 verifier issues。文本诊断看不见
 的版式失败由此可检。
 
-配置面（管理员/开发者可选）：
-- config_model.toml `[endpoints.vlm]` 独立多模态端点（空占位=未配置；purpose "vlm"）
-- `[deathmatch] visual_critic_enabled`（默认 false）
-
+视觉端点解析（2026-11-01 起）：**主模型探针优先**——当前死磕回合的助手模型
+持有 `.endpoint` 时先探它，其次 `[endpoints.vlm]`；探针不通过才回落独立视觉
+端点（`[deathmatch] visual_critic_enabled` 默认 false）。
 任何一层未启用/未配置/失败 → fail-open 返回 None，绝不影响判定链。
 """
 import asyncio
@@ -28,15 +27,16 @@ logger = logging.getLogger(__name__)
 VISUAL_EXTENSIONS = frozenset({".html", ".htm", ".svg"})
 
 _VLM_TIMEOUT_SECONDS = 120.0
+# 版式判定是短 JSON；思考模型会把预算烧在 reasoning 上，给足但仍设上界。
+_VLM_MAX_TOKENS = 1024
 _MAX_ISSUES = 6
 
 
 async def _resolve_vlm(assistant_llm=None) -> Optional[object]:
-    """视觉端点解析（vlm 已配置 → 用它；未配置 → 主模型能力探针 → 无则 None）。
+    """视觉端点解析（2026-11-01：主模型探针优先 → 失败才回落 [endpoints.vlm]）。
 
-    2026-09-15：vlm 未配置时不再直接跳过——主模型探针有视觉则用主模型做版式
-    批评（需求：视觉任务优先探针主模型）。``assistant_llm``（死磕回合的助手
-    模型客户端）持有 .endpoint 时优先探它，否则 registry 主端点。"""
+    ``assistant_llm``（死磕回合的助手模型客户端）持有 .endpoint 时优先探它，
+    否则 registry 主端点；主模型经行为探针确认有视觉就直接用它做版式批评。"""
     from app.model_gateway.vision_probe import resolve_vision_endpoint
     main_ep = getattr(assistant_llm, "endpoint", None)
     ep, reason = await resolve_vision_endpoint(main_endpoint=main_ep)
@@ -71,10 +71,12 @@ def _screenshot_html(file_path: str) -> Optional[bytes]:
 
 
 async def _call_vlm(ep, image_png: bytes, step: Dict[str, Any], goal: str) -> Optional[Dict[str, Any]]:
-    """Send the screenshot + step expectations to the multimodal endpoint
-    (OpenAI-compatible vision message). Returns parsed JSON or None."""
+    """Send the screenshot + step expectations to the vision endpoint and parse
+    JSON. A4.9 R2-I6：改走 model_gateway（`complete_chat_parts`）而不是裸
+    `openai.AsyncOpenAI`——主模型优先后，端点常常是思考模型，裸客户端不套
+    thinking profile / max_tokens，reasoning-only 回复会让判定静默变 None。"""
     try:
-        import openai
+        from app.model_gateway import factory
         prompt = (
             "你是交付物版式审查员。下面是某个任务步骤产出的渲染截图。\n"
             f"任务目标（节选）: {(goal or '')[:400]}\n"
@@ -84,23 +86,22 @@ async def _call_vlm(ep, image_png: bytes, step: Dict[str, Any], goal: str) -> Op
             '只输出JSON：{"layout_ok": true|false, "issues": ["问题1", ...]}'
         )
         b64 = base64.b64encode(image_png).decode("ascii")
-        async with openai.AsyncOpenAI(
-            base_url=ep.base_url,
-            api_key=ep.api_key or "no-key",
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ],
+        }]
+        # 空 Key 绝不回落主密钥（同 vision_interpret / 探针约定）；is_custom=True
+        # 保证用该端点自己的 base_url（A4.9 R2-I4）。
+        ep_wired = ep.with_overrides(api_key=ep.api_key or "no-key", is_custom=True)
+        llm = factory.build_llm_service(ep_wired)
+        raw, _reasoning = await asyncio.wait_for(
+            llm.complete_chat_parts(messages, temperature=0, max_tokens=_VLM_MAX_TOKENS),
             timeout=_VLM_TIMEOUT_SECONDS,
-        ) as client:
-            resp = await client.chat.completions.create(
-                model=ep.model_name,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    ],
-                }],
-                temperature=0,
-            )
-        raw = (resp.choices[0].message.content or "").strip()
+        )
+        raw = (raw or "").strip()
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end <= start:
             return None
@@ -126,10 +127,10 @@ async def critique_visual_artifacts(
 ) -> Optional[Dict[str, Any]]:
     """Critique the first visual artifact among `files` (this turn's new/changed
     files). Returns {"layout_ok": bool, "issues": [...]} or None (fail-open:
-    disabled / unconfigured / not visual / any error)."""
-    ep = await _resolve_vlm(assistant_llm)
-    if ep is None:
-        return None
+    disabled / unconfigured / not visual / any error).
+
+    A4.9 R1-I2/R2-I4：端点解析（现含主模型探针，最坏 60s）必须放在「本轮真的
+    有可视交付物」判定之后——否则没有 .html/.svg 的步骤也要白白探一次。"""
     target = None
     for f in files or []:
         path = str(f.get("path") or "")
@@ -137,6 +138,9 @@ async def critique_visual_artifacts(
             target = path if os.path.isabs(path) else os.path.join(workspace_path, path)
             break
     if not target or not os.path.exists(target):
+        return None
+    ep = await _resolve_vlm(assistant_llm)
+    if ep is None:
         return None
     png = await asyncio.to_thread(_screenshot_html, target)
     if not png:

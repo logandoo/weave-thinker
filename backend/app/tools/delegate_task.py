@@ -17,8 +17,17 @@ config = get_config()
 
 DELEGATE_BLOCKED_TOOLS = frozenset([
     "delegate_task",
+    "delegate_agent_task",
+    "background_task",
     "clarify",
     "memory",
+    # A subagent must never control the parent's/other delegated tasks.
+    "list_agent_tasks",
+    "get_agent_task",
+    "cancel_agent_task",
+    "steer_agent_task",
+    "summarize_agent_task",
+    "open_agent_task_result",
 ])
 
 MAX_DELEGATION_DEPTH = 2
@@ -61,6 +70,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     workspace_path: str = "",
     role: str = "leaf",
+    available_tools: Optional[List[str]] = None,
 ) -> str:
     parts = [
         "You are a focused subagent working on a specific delegated task.",
@@ -83,13 +93,25 @@ def _build_child_system_prompt(
         parts.append(
             "\nROLE: You are a leaf agent. You cannot delegate tasks — complete the work directly."
         )
+    tools = set(available_tools or [])
+    described = []
+    if "web_search" in tools:
+        described.append("web_search (for searching the web)")
+    if "browser" in tools:
+        described.append("browser (for browsing web pages)")
+    if "execute_code" in tools:
+        described.append("execute_code (for running Python code)")
+    if described:
+        tool_sentence = "You have access to " + ", ".join(described) + ". "
+    else:
+        tool_sentence = "Use only the tools present in your tool schema. "
     parts.append(
         "\nComplete this task using the tools available to you. "
-        "You have access to web_search (for searching the web), browser (for browsing web pages), "
-        "and execute_code (for running Python code). "
-        "IMPORTANT: When you are uncertain about facts, data, or need up-to-date information, "
-        "you MUST use web_search to find the answer rather than guessing. "
-        "Never fabricate information — search first.\n"
+        + tool_sentence
+        + "IMPORTANT: When you are uncertain about facts, data, or need up-to-date information, "
+        "you MUST use web_search to find the answer rather than guessing "
+        "when web_search is available; never fabricate information. "
+        "If a tool is not in your schema, do not claim to have used it.\n"
         "When finished, provide a clear, concise summary of:\n"
         "- What you did\n"
         "- What you found or accomplished\n"
@@ -136,7 +158,7 @@ async def _run_child_agent(
             factory.derive_child_endpoint(parent_llm)
         )
 
-    child_system = _build_child_system_prompt(goal, context, workspace_path, role)
+    child_system = ""  # built after the offered tool set is known (P0.3)
     blocked = _get_child_blocked_tools(depth, role)
 
     child_tool_names = set(
@@ -150,6 +172,10 @@ async def _run_child_agent(
         child_tool_names &= toolset_names
 
     child_tool_schemas = registry.get_definitions(child_tool_names)
+    child_system = _build_child_system_prompt(
+        goal, context, workspace_path, role,
+        available_tools=sorted(child_tool_names),
+    )
 
     try:
         from app.services.agent_loop import AgentLoop
@@ -172,6 +198,7 @@ async def _run_child_agent(
             ),
             enable_reasoning=False,
             session_factory=AsyncSessionLocal,
+            user_id=str(getattr(kwargs.get("user"), "id", "") or "") or None,
         )
         # W17 轮次门控：继承父轮激活态（缺省 True=旧行为）
         loop.vibeweaver_active = bool(kwargs.get("_vibeweaver_active", True))

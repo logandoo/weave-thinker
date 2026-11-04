@@ -91,7 +91,15 @@ def _json_or_none(value: Any) -> Optional[str]:
 async def _write_row(user_id: str, conversation_id: Optional[str], query_hash: str,
                      candidate_ids: Optional[list], tier_scores: Optional[dict],
                      gate_score: float, budget_chars: int, injected_chars: int,
-                     truncated: bool, elapsed_ms: int, cache_hit: bool) -> None:
+                     truncated: bool, elapsed_ms: int, cache_hit: bool,
+                     miss: bool = False,
+                     providers_queried: Optional[list] = None,
+                     rejects: Optional[list] = None) -> None:
+    """A7（W3 M3a 台账口径钉死）：`candidate_ids` = 本轮**注入集**（已过注入
+    门槛并实际注入的候选 id），不是全候选池——下游 join（修订候选报告
+    scripts/memory_eval_report.py revision）一律以此为准。
+    W2-3（2026-10-23）：`rejects` = injection_min_relevance 门槛拒绝面
+    （shadow 可观测，rejects_json 落档；误杀审计口径见 memory_baseline_service）。"""
     try:
         async with AsyncSessionLocal() as session:
             session.add(MemoryRecallLog(
@@ -106,6 +114,10 @@ async def _write_row(user_id: str, conversation_id: Optional[str], query_hash: s
                 truncated=bool(truncated),
                 elapsed_ms=int(elapsed_ms or 0),
                 cache_hit=bool(cache_hit),
+                # M2b（APM-Bench）：零命中遥测元数据（评测台统计零命中率）
+                miss=bool(miss),
+                providers_queried=_json_or_none(providers_queried),
+                rejects_json=_json_or_none(rejects),
             ))
             await session.commit()
     except Exception:
@@ -115,7 +127,10 @@ async def _write_row(user_id: str, conversation_id: Optional[str], query_hash: s
 def record_recall_log_bg(user_id: str, conversation_id: Optional[str], query_hash: str,
                          candidate_ids: Optional[list], tier_scores: Optional[dict],
                          gate_score: float, budget_chars: int, injected_chars: int,
-                         truncated: bool, elapsed_ms: int, cache_hit: bool) -> None:
+                         truncated: bool, elapsed_ms: int, cache_hit: bool,
+                         miss: bool = False,
+                         providers_queried: Optional[list] = None,
+                         rejects: Optional[list] = None) -> None:
     """fire-and-forget：调用方永不等待；异常永不外泄。"""
     try:
         cfg = get_config().memory
@@ -131,6 +146,7 @@ def record_recall_log_bg(user_id: str, conversation_id: Optional[str], query_has
         task = loop.create_task(_write_row(
             user_id, conversation_id, query_hash, candidate_ids, tier_scores,
             gate_score, budget_chars, injected_chars, truncated, elapsed_ms, cache_hit,
+            miss=miss, providers_queried=providers_queried, rejects=rejects,
         ))
         _write_tasks.add(task)
         task.add_done_callback(_write_tasks.discard)

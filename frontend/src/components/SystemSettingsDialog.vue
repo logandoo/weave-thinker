@@ -49,6 +49,12 @@
                     <line x1="12" y1="18" x2="12" y2="12"/>
                     <line x1="9" y1="15" x2="15" y2="15"/>
                   </template>
+                  <template v-else-if="tab.key === 'mcp'">
+                    <rect x="2" y="7" width="20" height="10" rx="2"/>
+                    <line x1="7" y1="7" x2="7" y2="17"/>
+                    <line x1="12" y1="7" x2="12" y2="17"/>
+                    <line x1="17" y1="7" x2="17" y2="17"/>
+                  </template>
                   <template v-else-if="tab.key === 'memory'">
                     <path d="M12 2a7 7 0 0 0-7 7c0 2.4 1.2 4.5 3 5.7V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.3c1.8-1.2 3-3.3 3-5.7a7 7 0 0 0-7-7z"/>
                     <line x1="9" y1="22" x2="15" y2="22"/>
@@ -108,6 +114,10 @@
                   @close="close"
                   @updated="handleSkillsUpdated"
                 />
+              </div>
+
+              <div v-else-if="activeTab === 'mcp'" class="tab-panel">
+                <McpServerPanel embedded />
               </div>
 
               <div v-else-if="activeTab === 'memory'" class="tab-panel">
@@ -170,6 +180,7 @@ import MemoryPanel from './MemoryPanel.vue'
 import SkinPanel from './SkinPanel.vue'
 import UserInfoPanel from './UserInfoPanel.vue'
 import ModelProviderPanel from './ModelProviderPanel.vue'
+import McpServerPanel from './McpServerPanel.vue'
 import type { HotwordItem } from '@/api/asr'
 
 interface Permissions {
@@ -205,6 +216,7 @@ const tabs = [
   { key: 'hotwords', label: '热词配置' },
   { key: 'permissions', label: '权限管理' },
   { key: 'skills', label: '技能管理' },
+  { key: 'mcp', label: 'MCP' },
   { key: 'memory', label: '记忆管理' },
   { key: 'skins', label: '皮肤选择' },
   { key: 'device-exec', label: '设备执行' },

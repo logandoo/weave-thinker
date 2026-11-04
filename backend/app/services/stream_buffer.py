@@ -39,6 +39,10 @@ _STALE_SNAPSHOT_SECONDS = 180
 _MAX_CONTENT_CHARS = 500_000
 _MAX_REASONING_CHARS = 200_000
 _MAX_ACCUMULATED_SEGMENTS = 10_000
+# W26（B2）：插话 commit-echo 的数量上限（resume replay 确认信号）。
+# 20 × 单条上限 8000 字符 ≈ 160KB 最坏情况，低于 content 累积上限（500k），
+# 避免 replay/15s 跨 worker 快照被 echo 撑大。
+_MAX_INTERJECTION_ECHOES = 20
 
 # Localized titles for tool_call display in resumed/replayed streams.
 # Keep in sync with TOOL_NAME_MAP in frontend/src/components/ChatArea.vue.
@@ -85,6 +89,10 @@ class ConversationBuffer:
     # 每轮上下文 token 用量估算（context_info 事件的最新值）——resume 快照
     # 需携带它，否则重连后的客户端头部徽章丢失。
     context_info: Optional[dict] = None
+    # W26（B2）：已 commit 的插话 echo。buffer 是 resume-replay 权威 —— 断连期
+    # commit 的插话若只走广播，重连后前端 pending 永不确认 → 终态冲刷重发 →
+    # 双气泡。与 tool_calls 等同为有界累积的结构化载荷。
+    interjections_committed: List[dict] = field(default_factory=list)
     # F1-1: part_id -> display_sequence item reference, for O(1) in-place
     # part_delta / part_updated mutation. Rebuilt after segment truncation.
     _part_index: Dict[str, dict] = field(default_factory=dict)
@@ -95,6 +103,10 @@ class ConversationBuffer:
     error: Optional[str] = None
     done_data: Optional[dict] = None
     db_message_id: Optional[str] = None
+    # 2026-11-01: the in-flight assistant row id (set by the transport). The
+    # replay payload lets the client hide a committed interjection user row
+    # while its assistant parent is still streaming.
+    streaming_message_id: Optional[str] = None
 
     # Book-keeping
     created_at: float = field(default_factory=time.time)
@@ -195,10 +207,12 @@ class ConversationBuffer:
             "search_failed": self.search_failed,
             "iteration": self.iteration,
             "context_info": self.context_info,
+            "interjections_committed": list(self.interjections_committed),
             "status": self.status,
             "is_running": self.is_running,
             "error": self.error,
             "db_message_id": self.db_message_id,
+            "streaming_message_id": self.streaming_message_id,
         }
 
     def to_snapshot(self) -> dict:
@@ -216,11 +230,13 @@ class ConversationBuffer:
             "search_failed": self.search_failed,
             "iteration": self.iteration,
             "context_info": self.context_info,
+            "interjections_committed": list(self.interjections_committed),
             "is_running": self.is_running,
             "is_done": self.status == "complete",
             "error": self.error,
             "status": self.status,
             "db_message_id": self.db_message_id,
+            "streaming_message_id": self.streaming_message_id,
             "done_data": self.done_data if self.status == "complete" else None,
         }
 
@@ -427,6 +443,42 @@ class ConversationBuffer:
                 self.search_failed = event["search_failed"]
                 delta = {"seq": self._next_seq, "type": "search_failed", "data": event["search_failed"]}
 
+            elif "interjection_committed" in event:
+                # W26（B2）：插话 commit-echo 是 resume-replay 的权威确认信号。
+                # 断连期 commit 的插话只走广播会永久丢失（前端 pending 永不
+                # 确认 → 终态冲刷重发 → 双气泡），故归一化为稳定载荷入列。
+                payload = event["interjection_committed"] or {}
+                norm: Dict[str, Any] = {
+                    "id": payload.get("id"),
+                    "conversation_id": payload.get("conversation_id") or self.conversation_id,
+                    "content": str(payload.get("content") or ""),
+                    "created_at": payload.get("created_at"),
+                }
+                if payload.get("client_message_id"):
+                    norm["client_message_id"] = str(payload["client_message_id"])
+                # 2026-11-01: additive-only keys — legacy replay contract
+                # tests compare the exact payload and must not see None fields.
+                if payload.get("embedded_in_message_id"):
+                    norm["embedded_in_message_id"] = payload["embedded_in_message_id"]
+                if payload.get("display_item"):
+                    norm["display_item"] = payload["display_item"]
+                self.interjections_committed.append(norm)
+                if len(self.interjections_committed) > _MAX_INTERJECTION_ECHOES:
+                    self.interjections_committed = self.interjections_committed[-_MAX_INTERJECTION_ECHOES:]
+                # 2026-11-01 inline placement: resume/replay must reconstruct the
+                # exact timeline position (the echo alone is not enough).
+                _ij_item = norm.get("display_item")
+                if isinstance(_ij_item, dict):
+                    _mid = _ij_item.get("message_id")
+                    if not any(
+                        isinstance(it, dict)
+                        and it.get("type") == "interjection"
+                        and it.get("message_id") == _mid
+                        for it in self.display_sequence
+                    ):
+                        self.display_sequence.append(dict(_ij_item))
+                delta = {"seq": self._next_seq, "type": "interjection_committed", "data": norm}
+
             elif "done" in event:
                 self.is_running = False
                 self.status = "complete"
@@ -630,11 +682,13 @@ class StreamBufferManager:
                 buf.status = snap.get("status", "incomplete")
                 buf.is_running = snap.get("is_running", False)
                 buf.db_message_id = snap.get("db_message_id")
+                buf.streaming_message_id = snap.get("streaming_message_id")
                 buf._rendered_content_len = snap.get("rendered_content_len", 0)
                 buf.tool_calls = [dict(tc) for tc in snap.get("tool_calls", [])]
                 buf.tool_results = [dict(tr) for tr in snap.get("tool_results", [])]
                 buf.agent_steps = [dict(s) for s in snap.get("agent_steps", [])]
                 buf.display_sequence = [dict(d) for d in snap.get("display_sequence", [])]
+                buf.interjections_committed = [dict(x) for x in snap.get("interjections_committed", [])]
                 buf._sse_connection_count = 0
                 async with self._lock:
                     self._buffers[conversation_id] = buf
@@ -723,6 +777,7 @@ class StreamBufferManager:
                     "tool_results": [dict(tr) for tr in buf.tool_results],
                     "agent_steps": [dict(s) for s in buf.agent_steps],
                     "display_sequence": [dict(d) for d in buf.display_sequence],
+                    "interjections_committed": [dict(x) for x in buf.interjections_committed],
                 }
                 # NOTE: never touch buf._last_write here — it is activity
                 # bookkeeping for zombie detection (append() updates it on

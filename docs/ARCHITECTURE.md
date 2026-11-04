@@ -199,7 +199,7 @@ weave-thinker/
 | skill_view / skill_manage / skill_run_script | 技能系统（加载 SKILL.md 手册 / 创建用户技能 / 执行技能捆绑脚本） |
 | MCP 工具 | 按 `[mcp]` 配置动态注册 |
 
-**技能系统**：`backend/skills/` 11 个系统技能（browser/code_execution/docx_manipulation/echarts_chart/file_parsing/media_playback/pptx_manipulation/rempilot-mcp/vibeweaver/web_search/xlsx_manipulation，各含 SKILL.md），`skill_tools.py` 双源解析（系统技能优先 → 用户 DB `user_skills`+`skill_files`）并注入系统提示词；`skill_evolution_service.py` 在工具高频使用后建议沉淀新技能。
+**技能系统**：`backend/skills/` 11 个系统技能（browser/code_execution/docx_manipulation/echarts_chart/file_parsing/media_playback/pptx_manipulation/mcp-server-mcp/vibeweaver/web_search/xlsx_manipulation，各含 SKILL.md），`skill_tools.py` 双源解析（系统技能优先 → 用户 DB `user_skills`+`skill_files`）并注入系统提示词；`skill_evolution_service.py` 在工具高频使用后建议沉淀新技能。
 
 **设备执行路由**：会话执行环境为客户端设备时，白名单内的文件/进程类工具经 `remote_dispatch_router` 以 JSON-RPC over 出站 WS（`/api/device/ws`）转到已配对设备本机执行（`registry.dispatch` 单缝接入，agent loop / 语音 / 后台任务 / 定时任务 / 子代理全调用面自动继承）；服务端自有工具（搜索/记忆/笔记/定时等）保持云端语义，暂缓类（`browser_*` / `job_*`）fail-closed 拒绝，设备离线时明确报错、不静默改道云端。
 

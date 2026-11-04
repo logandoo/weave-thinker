@@ -115,68 +115,6 @@ def _track_detached_task(task: asyncio.Task, conv_id: str) -> None:
         task.add_done_callback(lambda _t: asyncio.ensure_future(_cleanup()))
 
 
-async def _persist_deathmatch_failure(
-    conversation_id: str,
-    deathmatch_mgr,
-    reason: str,
-    message: str,
-    *,
-    expected_agent_state=None,
-) -> None:
-    """Persist a deathmatch goal-loop failure as a visible paused terminal
-    state so the user sees WHY the loop stopped and can resume.
-
-    conv 6b0faf81: the detached agent task crashed mid-loop (no terminal
-    message, deathmatch_status left "active"); only the GET reconcile
-    flipped it to "paused" ~18 minutes later with no explanation. Any
-    exception/cancel in the goal loop must leave an explicit, visible,
-    resumable state instead of a silent zombie.
-
-    Safety guards (A4.9 review 2026-08-07):
-    - NEVER clobber a deliberate terminal state: done / human_gate /
-      partial_complete carry structured semantics (gate reports, partial
-      summaries, deliverables) that a later exception in the same task's
-      finalization must not overwrite.
-    - When ``expected_agent_state`` is given, only persist if the registry
-      still holds OUR run (identity check). A superseded task (its slot
-      re-reserved by a newer /chat/stream) must not flip the conversation to
-      paused after the new run already set it active.
-    """
-    if deathmatch_mgr is None:
-        return
-    try:
-        if expected_agent_state is not None:
-            from app.services.active_agent_registry import ActiveAgentRegistry
-            _reg = ActiveAgentRegistry.get_instance()
-            _cur = await _reg.get(conversation_id)
-            if _cur is not expected_agent_state:
-                logger.info(
-                    "Deathmatch failure persist skipped: agent state superseded for %s",
-                    conversation_id,
-                )
-                return
-        async with AsyncSessionLocal() as _fail_db:
-            _fail_conv = await _fail_db.get(Conversation, conversation_id)
-            if _fail_conv is None or not _fail_conv.deathmatch_mode:
-                return
-            if _fail_conv.deathmatch_status in ("done", "human_gate", "partial_complete"):
-                return
-            _fail_conv.deathmatch_status = "paused"
-            _fail_conv.deathmatch_reason = reason
-            _fail_conv.updated_at = datetime.utcnow()
-            _fail_msg = Message(
-                conversation_id=conversation_id,
-                role="assistant",
-                content=message,
-            )
-            _fail_db.add(_fail_msg)
-            await _fail_db.commit()
-            logger.info(
-                "Deathmatch failure persisted (conv=%s): status=paused reason=%s",
-                conversation_id, reason[:120],
-            )
-    except Exception:
-        logger.exception("Failed to persist deathmatch failure state for %s", conversation_id)
 
 
 _DIGEST_ARCHIVE_RE = _re.compile(r"【全文存档】(\S+)")
@@ -587,6 +525,32 @@ def _transform_tool_loop_results(
 
     search_failed = _search_call_count > 0 and _search_success_count == 0
 
+    # F4/I3（2026-11-01 审计）：持久化步骤带上 status，避免"后端已知超时、
+    # 回放却一律 completed"。判定复用后端同一个纯函数（工具自报 timed_out），
+    # 前端 `deriveToolStatus` 只作旧数据的兜底。
+    from app.services.tool_payload_status import payload_is_timeout as _payload_timeout
+    # 复核 M1：预算折叠后的内容是 <persisted-output> 桩，不能再靠内容嗅探
+    # （桩不以 "{" 开头）——优先用本次调用已在 SSE/台账侧算好的 error 标记。
+    _err_by_call = {
+        (tr.get("call_id") or ""): bool(tr.get("error"))
+        for tr in tool_results_accumulated
+        if tr.get("call_id")
+    }
+    for _step in agent_steps_list:
+        if "status" in _step:
+            continue
+        _name = str(_step.get("name") or "")
+        if _name in _err_by_call:
+            _step["status"] = "error" if _err_by_call[_name] else "completed"
+        else:
+            # 兜底：老数据没有 error 标记；`_step["name"]` 是 call_id 而非工具名，
+            # 因此这里不做工具白名单（形状校验仍要求 return_code==-1）。
+            _step["status"] = (
+                "error"
+                if _payload_timeout(_step.get("content") or "")
+                else "completed"
+            )
+
     payload: dict = {
         "rounds": rounds_list,
         "results": results_list,
@@ -642,6 +606,25 @@ class ProgressiveFlusher:
         except Exception:
             logger.debug("progressive flush schedule failed (fail-open)", exc_info=True)
 
+    def tick(self, text: str) -> None:
+        """证据刷新（2026-11-01，conv 861cb5af）：纯工具型长任务正文长期为空，
+        `feed()` 永远不触发 → 进程被杀时在途行连工具调用/结果都没有。
+
+        这里按时间间隔强制刷一次**当前快照**（正文 + 工具调用/结果 + 思考由
+        writer 从 run 状态取）；与 feed 共用单 flight 与最小间隔，避免写放大。
+        """
+        if self._clock() - self._last_flush_at < self._min_seconds:
+            return
+        if self._pending is not None and not self._pending.done():
+            return
+        self._last_flush_at = self._clock()
+        self._last_len = len(text or "")
+        snapshot = text
+        try:
+            self._pending = asyncio.get_running_loop().create_task(self._writer(snapshot))
+        except Exception:
+            logger.debug("progressive evidence tick failed (fail-open)", exc_info=True)
+
     def reset(self) -> None:
         """打回边界（audit_reset）：被拒草稿不进在途行（它已入 message_attempts
         台账）——累加基线归零，让下一稿的增量刷写正常工作。"""
@@ -664,108 +647,81 @@ class ProgressiveFlusher:
             logger.debug("progressive revert failed (fail-open)", exc_info=True)
 
 
-async def _save_assistant_terminal(
-    db,
-    *,
-    conversation_id: str,
-    content: str,
-    reasoning: str | None,
-    tool_results: str | None,
-    tool_calls: str | None,
-    context_info,
-    status: str = "final",
-) -> Message:
-    """终态落库（2026-10-06 渐进落库）：本会话若存在 delivery_status='streaming'
-    的在途行则 update-in-place（翻 status），否则插入新行（旧行为兜底——
-    死磕按轮落库等未建 streaming 行的路径）。
 
-    返回落库行（调用方负责 commit/refresh，与既有路径一致）。
+
+
+
+
+
+def _split_pre_tool_prose(assistant_content: str, gate, stitch_active: bool) -> tuple[str, str]:
+    """工具边界处预工具散文的输出单元处置（用户裁定 2026-10-14）。
+
+    「只有在真正是长输出被截断时才拼接，不然就是正常的多轮次输出。」
+
+    - stitch_active=True（finish_reason=length 续写链，唯一合法拼接）：
+      链上文本全量保留于终局答案（conv 4e159a79 小说 1-6 块契约），不停车。
+    - 否则：预工具散文是独立输出单元——已展示部分（gate 释放/未武装直发）
+      停车进 display_sequence 时间线（过程区），**不拼进终局答案**；
+      从未展示的 hold 仍丢弃（conv 149ce886 占位/复述散文契约不变）。
+
+    返回 (kept_for_final, parked_for_timeline)。held 恒为 assistant_content
+    的未展示后缀；endswith 失配时保守视为全部已展示。"""
+    if stitch_active:
+        return assistant_content, ""
+    unshown = getattr(gate, "held", "") or ""
+    if not unshown:
+        shown = assistant_content
+    elif assistant_content.endswith(unshown):
+        shown = assistant_content[: len(assistant_content) - len(unshown)]
+    else:
+        shown = assistant_content
+    return "", shown
+
+
+def _parked_prose_item(text: str) -> dict:
+    """Build the persisted timeline item for already-shown pre-tool prose.
+
+    P0 R2 (conv 08249cf0): the text must remain (A4.9 I2 — the user saw it),
+    but it is a DRAFT/process unit, not a second answer.  ``superseded`` lets
+    the frontend collapse it into the process/draft area while keeping the
+    terminal answer as the only main content.
     """
-    row = (await db.execute(
-        select(Message)
-        .where(Message.conversation_id == conversation_id,
-               Message.delivery_status == "streaming")
-        .order_by(Message.created_at.desc())
-        .limit(1)
-    )).scalars().first()
-    if row is None:
-        row = Message(
-            conversation_id=conversation_id,
-            role="assistant",
-            content=content,
-            reasoning_content=reasoning or None,
-            tool_results=tool_results,
-            tool_calls=tool_calls,
-            context_info=context_info,
-            delivery_status=status,
-        )
-        db.add(row)
-        return row
-    row.content = content
-    row.reasoning_content = reasoning or None
-    row.tool_results = tool_results
-    row.tool_calls = tool_calls
-    if context_info is not None:
-        row.context_info = context_info
-    row.delivery_status = status
-    return row
-
-
-async def mark_interrupted_streams(db) -> int:
-    """启动 sweep（B）：进程死亡遗留的 streaming 行——
-    有正文的翻 interrupted（部分正文+徽标展示）；空壳（内容为零——杀在工具
-    阶段/首 token 前）直接删除（空 bubble 无信息，展示即噪音）。
-    返回翻 interrupted 的行数。
-
-    部署约束（A4.9 r1 I1）：本 sweep 无实例归属——**同一数据库只支持单实例
-    运行本服务**（多实例共库时 A 实例重启会把 B 实例的在途行翻 interrupted）。
-    同库多副本（如 weave_blah 旧版）不建 streaming 行，不受影响。
-
-    W4 项5（2026-10-06）：翻转/删除必须走 ORM 实例路径而非 Core bulk DML——
-    bulk update()/delete() 不触发 mapper 事件（仅 flush 逐对象触发），sync_capture
-    捕获不到 streaming→interrupted 的终态翻转，残稿跨设备不可见直至全量 resync，
-    与 sync_capture「翻 terminal 后由当次提交正常发射」承诺相悖。ORM 翻转经
-    after_update 发射（_emit 将 update coerce 为 create）；空壳 ORM 删除的
-    after_delete 被 _emit 的 streaming 守卫抑制（该行 create 从未发射，delete
-    也不该发射/留墓碑）。
-    """
-    rows = (await db.execute(
-        select(Message)
-        .where(Message.delivery_status == "streaming")
-    )).scalars().all()
-    flipped = 0
-    for row in rows:
-        if row.content:
-            row.delivery_status = "interrupted"
-            flipped += 1
-        else:
-            await db.delete(row)
-    return flipped
+    return {"type": "text", "content": text, "superseded": True}
 
 
 def _drop_unshown_pre_tool_prose(assistant_content: str, gate) -> str:
-    """工具调用边界只丢弃「从未推送给客户端」的预工具散文。
+    """兼容入口：非拼接链语义下工具边界的 kept 恒为空串（散文全部停车/丢弃）。
+    保留函数名以稳定旧调用面；实际装配一律走 _split_pre_tool_prose。"""
+    kept, _parked = _split_pre_tool_prose(assistant_content, gate, stitch_active=False)
+    return kept
 
-    gate.held 里停着的是被 hold、从未经 SSE 送达用户的文本——按契约丢弃
-    （conv 149ce886 的占位/复述散文）。已流式送达用户的文本一律保留：
-    - gate 未武装的直发流（coordinator 预判无工具、模型自发调 calculate）；
-    - hold-cap 释放后的后续直发（on_tool_call()/_clear() 会把 cap_released
-      复位，旧判定在第二个工具边界把已保留散文整段抹掉）；
-    - iteration_done(0) 释放的截断 head（_clear() 同样复位 cap_released）。
 
-    conv 4e159a79（2026-10-01）：截断续写轮的前半场（一~六块正文）在续写
-    轮调用 calculate 时被整段清空，落库只剩尾段「的## 七、势力组织（续）
-    …」，done 刷新后用户已见的 1-6 块被替换删除。旧判定
-    `if not _pre_tool_gate.cap_released: assistant_content = ""` 即根因。
+def _last_measured_prompt_tokens(messages) -> int:
+    """Most recent provider-reported prompt_tokens from stored context_info.
 
-    held 恒为 assistant_content 的未展示后缀（两处累加同一 _clean_content）；
-    endswith 失配（理论上不可达）时保守保留全部文本——宁可多存不丢。"""
-    unshown = getattr(gate, "held", "") or ""
-    if not unshown:
-        return assistant_content
-    if assistant_content.endswith(unshown):
-        return assistant_content[: len(assistant_content) - len(unshown)]
-    return assistant_content
+    2026-10-18 (conv dca19082): seeds AgentLoop's compression calibration so
+    the first iteration of a turn does not trust the inflated rough estimate.
+    `context_info` is stored as a JSON string on assistant rows.
+    """
+    for msg in reversed(list(messages or [])):
+        try:
+            if getattr(msg, "role", "") != "assistant":
+                continue
+            ci = getattr(msg, "context_info", None)
+            if isinstance(ci, str):
+                ci = json.loads(ci) if ci.strip() else None
+            if isinstance(ci, dict):
+                # Only provider-measured values may seed calibration. Several
+                # producers store rough estimates under the same `tokens` key;
+                # seeding from one can suppress compression for the whole turn.
+                if ci.get("measured") is not True:
+                    continue
+                tokens = ci.get("tokens")
+                if tokens:
+                    return int(tokens)
+        except Exception:
+            continue
+    return 0
 
 
 def _display_sequence_keep_evidence(seq):
@@ -785,242 +741,36 @@ def _display_sequence_keep_evidence(seq):
             break
     kept = []
     for i, it in enumerate(items):
-        if isinstance(it, dict) and it.get("type") == "text" and i > last_tool:
+        if (
+            isinstance(it, dict)
+            and it.get("type") == "text"
+            and i > last_tool
+            and not it.get("superseded")
+        ):
             continue
         kept.append(it)
     return kept
 
 
-async def _render_answer_citations(
-    content: str,
-    tool_results_json: str | None,
-    style_id: str | None = None,
-) -> tuple[str, str | None]:
-    """M4：终稿出货时产出 citations 载荷（服务端样式化 reference + in_text 映射）。
+from app.api.chat_persistence import (  # P5.3 move-only re-exports
+    _delete_empty_streaming_row,
+    _save_assistant_terminal,
+    interjection_items_from_buffer,
+    mark_interrupted_streams,
+)
 
-    - content 保持 [N] 撰写语法（ADR D-1：neutralize_historical_citations /
-      sanitize / 前端重排链路不变）；载荷携带逐条规范 reference 与文内族形态
-      （由 render_citations 的 CSL 输出提取），前端按载荷展示（卡片=reference、
-      四族角标），杜绝双重重排。
-    - style_id 取助手级 citation_style → 全局默认（resolve_style_id）。
-    - 零引用不产出载荷（F3）；tr_json 已有 citations 时直接返回（幂等，防
-      多路径重复渲染）。
-    """
-    if not tool_results_json:
-        return content, tool_results_json
-    try:
-        tr_obj = json.loads(tool_results_json)
-    except (json.JSONDecodeError, TypeError):
-        return content, tool_results_json
-    if not isinstance(tr_obj, dict) or tr_obj.get("citations"):
-        return content, tool_results_json
-    results = tr_obj.get("results") or []
-    if not isinstance(results, list) or not results:
-        return content, tool_results_json
+from app.api.chat_persistence import (
+    _delete_message_slice,
+    _persist_deathmatch_failure,
+)
+from app.api.chat_targets import _resolve_execution_target_for_conversation
 
-    def _sync() -> tuple[str, str | None]:
-        from app.services.citation_style_service import (
-            STYLE_REGISTRY,
-            render_citations,
-            render_entry_references,
-            resolve_style_id,
-        )
-
-        sid = resolve_style_id(style_id)
-
-        def _id_key(v):
-            # A4.9 ⑤：render_citations 接受数字字符串 id（_is_int_id）——载荷键
-            # 与之对齐，避免 string id 条目被静默丢弃。
-            if isinstance(v, str) and v.isdigit():
-                return int(v)
-            return v
-
-        # C4（遗留清零）：重复 id（畸形数据）首见胜——防 last-wins 串用他人
-        # reference；生产 _transform 顺序编号不可能重复，此为防御层。
-        _seen_ids: set = set()
-        deduped: list = []
-        for _e in results:
-            if not isinstance(_e, dict):
-                continue
-            _k = _id_key(_e.get("id"))
-            if _k is None:
-                continue
-            if _k in _seen_ids:
-                logger.warning(
-                    "answer citations: duplicate tool_results id %r — keeping first entry", _k,
-                )
-                continue
-            _seen_ids.add(_k)
-            deduped.append(_e)
-        if not deduped:
-            return content, tool_results_json
-
-        rendered = render_citations(content or "", deduped, style_id=sid)
-        used = rendered.used_ids
-        if not used:
-            return content, tool_results_json
-        by_id = {
-            _id_key(e.get("id")): e
-            for e in deduped
-            if isinstance(e, dict) and e.get("id") is not None
-        }
-        ordered = [by_id[i] for i in used if i in by_id]
-        refs = render_entry_references(ordered, style_id=sid)
-        ref_by_id = {_id_key(r.get("id")): r for r in refs}
-        entries = []
-        for idx, e in enumerate(ordered):
-            eid = _id_key(e.get("id"))
-            ref = ref_by_id.get(eid) or {}
-            entries.append({
-                "id": eid,
-                "num": idx + 1,
-                "in_text": rendered.old_to_new.get(eid) or "",
-                "reference": ref.get("reference") or "",
-                "url": e.get("url") or "",
-                "title": e.get("title") or "",
-                "snippet": (e.get("snippet") or "")[:300],
-                "author": e.get("author") or "",
-                "year": str(e.get("year") or ""),
-            })
-        tr_obj["citations"] = {
-            "style_id": sid,
-            "family": rendered.family,
-            "heading": (STYLE_REGISTRY.get(sid) or {}).get("heading") or "参考文献",
-            "entries": entries,
-        }
-        return content, json.dumps(tr_obj, ensure_ascii=False)
-
-    try:
-        return await asyncio.to_thread(_sync)
-    except Exception:
-        logger.exception("answer citation payload failed (keeping original)")
-        return content, tool_results_json
-
-
-def _build_content_fallback(joined_content: str, tool_results_json: str | None) -> str:
-    if joined_content:
-        return joined_content
-    if not tool_results_json:
-        return ""
-    try:
-        tr_obj = json.loads(tool_results_json)
-        results = tr_obj.get("results") or []
-        parts = []
-        for r in results:
-            result_text = r.get("result") or ""
-            if not isinstance(result_text, str) or not result_text.strip():
-                continue
-            first_line = result_text.strip().split("\n")[0][:300]
-            if first_line:
-                parts.append(first_line)
-        if parts:
-            return "\n\n".join(parts)
-    except Exception:
-        pass
-    return ""
-
-
-async def _sanitize_cited_content(
-    content: str,
-    tool_results_json: str | None,
-) -> tuple[str, str | None]:
-    """Remove [N] citations that reference no real fetched source before the
-    content is persisted. Grounded-citations port (hermes-agent verify step):
-    every [N] in the final answer must exist in the turn's citation ledger
-    (registered from the actual web_search tool results). Fabricated markers
-    are removed with LLM-judged enumeration protection (see
-    CitationLedger.sanitize_texts — [3]个要点 must survive).
-
-    Sanitizes EVERY persisted text surface: the message ``content`` AND the
-    ``content_segments``/``display_sequence`` text items inside
-    ``tool_results_json`` (the frontend renders the display_sequence, so a
-    content-only sanitize left dead [25]-style markers visible — conv
-    8629bdfe). Returns ``(content, tool_results_json)`` — both sanitized.
-
-    Operates on the TRANSFORMED tool_results JSON (whose results[] is
-    deduped by normalized URL in ledger order), so id alignment is
-    guaranteed: results[id-1] == the URL the model's [id] cites.
-    """
-    if not content and not tool_results_json:
-        return content, tool_results_json
-    try:
-        tr_obj = None
-        if tool_results_json:
-            tr_obj = json.loads(tool_results_json)
-        results = (tr_obj or {}).get("results") or []
-        if not isinstance(results, list):
-            results = []
-        # conv 3b58af5b (R3b): the old guard early-returned whenever results
-        # was empty — exactly the search-engine-failed case, leaving dangling
-        # [N] markers the frontend cannot resolve. The docstring contract is
-        # "strip [N] when any search ran": activity is now detected from
-        # agent_steps too, and an EMPTY ledger proceeds so every [N] marker
-        # goes through the enumeration disambiguation and true citations are
-        # stripped. A turn with no tool activity at all stays untouched.
-        has_activity = bool(results) or bool((tr_obj or {}).get("agent_steps"))
-        if not has_activity:
-            return content, tool_results_json
-        ledger = CitationLedger()
-        # A4.9 Important-4（引文改造 M4）：无 URL 条目（古籍/书籍）必须同序注册，
-        # 否则 ledger.size < len(results)、[N] 校验错位（合法引用被剥/越界误判）。
-        for r in results:
-            if not isinstance(r, dict):
-                continue
-            ledger.register(
-                r.get("url") or "",
-                title=r.get("title") or "",
-                snippet=r.get("snippet") or "",
-                author=r.get("author") or None,
-                year=str(r.get("year") or "") or None,
-                # C1：与入账侧同参派生键（多卷/多版本不合并、位置不位移）
-                edition=r.get("edition") or None,
-                volume=r.get("volume") or None,
-                container=r.get("container") or None,
-            )
-
-        # Collect every text surface in one shot, keeping the SAME order as
-        # the write-back loop below (content first, then content_segments,
-        # then display_sequence text items).
-        surfaces: list[str] = [content]
-        if tr_obj:
-            _segs = tr_obj.get("content_segments")
-            if isinstance(_segs, list):
-                surfaces.extend(s for s in _segs if isinstance(s, str))
-            _ds = tr_obj.get("display_sequence")
-            if isinstance(_ds, list):
-                surfaces.extend(
-                    it.get("content") for it in _ds
-                    if isinstance(it, dict) and it.get("type") == "text"
-                    and isinstance(it.get("content"), str)
-                )
-        sanitized = await ledger.sanitize_texts(surfaces)
-        new_content = sanitized[0]
-        new_tr = tool_results_json
-        if tr_obj is not None:
-            _changed = sanitized[0] != surfaces[0]
-            _idx = 1
-            _segs = tr_obj.get("content_segments")
-            if isinstance(_segs, list):
-                for i, s in enumerate(_segs):
-                    if isinstance(s, str):
-                        if sanitized[_idx] != s:
-                            _segs[i] = sanitized[_idx]
-                            _changed = True
-                        _idx += 1
-            _ds = tr_obj.get("display_sequence")
-            if isinstance(_ds, list):
-                for it in _ds:
-                    if isinstance(it, dict) and it.get("type") == "text" and isinstance(it.get("content"), str):
-                        if sanitized[_idx] != it["content"]:
-                            it["content"] = sanitized[_idx]
-                            _changed = True
-                        _idx += 1
-            if _changed:
-                new_tr = json.dumps(tr_obj, ensure_ascii=False)
-        return new_content, new_tr
-    except Exception:
-        logger.exception("citation sanitize failed (keeping original)")
-        return content, tool_results_json
+from app.api.chat_citations import (  # P5.3 move-only re-export
+    _build_content_fallback,
+    _render_answer_citations,
+    _sanitize_cited_content,
+    strip_stop_citation_echo,
+)
 
 
 async def _localize_media_for_persist(
@@ -1155,6 +905,30 @@ async def _load_conversation_messages(db: AsyncSession, conversation_id: str, li
     return await resolve_message_fields(rows, db)
 
 
+async def _trim_target_status(db: AsyncSession, message_id: str,
+                              conversation_id: str | None = None) -> str | None:
+    """404 区分（2026-10-17 判据#2，conv 92398a80）：目标行的 delivery_status
+    （含 streaming 残留行——_load_conversation_messages 会将其滤除）。
+
+    会话收敛（评审 M1）：带 conversation_id 时按会话限定——他会话 id 视同
+    不存在，消除「该 UUID 存在且在生成」的 1-bit 跨会话状态 oracle。"""
+    stmt = select(Message.delivery_status).where(Message.id == message_id)
+    if conversation_id:
+        stmt = stmt.where(Message.conversation_id == conversation_id)
+    res = await db.execute(stmt)
+    return res.scalar_one_or_none()
+
+
+def _trim_missing_detail(status: str | None, kind: str) -> str:
+    """trim 404 的可区分文案：streaming 残留行（stop/中断未保存，刷新自愈）
+    vs 目标真不存在（被删/合成 id）。kind ∈ regenerate|edit。"""
+    if status == "streaming":
+        if kind == "regenerate":
+            return "该回答的生成被中断且未保存成功，无法对其重新生成，请刷新会话后重试"
+        return "该消息状态已变化，请刷新会话后重试"
+    return "待重新生成的消息不存在" if kind == "regenerate" else "待编辑的消息不存在"
+
+
 async def _trim_messages_for_regeneration(
     db: AsyncSession,
     *,
@@ -1168,61 +942,35 @@ async def _trim_messages_for_regeneration(
         -1,
     )
     if target_index == -1:
-        raise HTTPException(status_code=404, detail="待重新生成的消息不存在")
+        _st = await _trim_target_status(db, regenerate_from_message_id, conversation_id=conversation_id)
+        raise HTTPException(status_code=404, detail=_trim_missing_detail(_st, "regenerate"))
 
     target_message = conversation_messages[target_index]
     if target_message.role != "assistant":
         raise HTTPException(status_code=400, detail="只能重新生成助手消息")
 
-    await _delete_message_slice(db, conversation_messages[target_index:], user_id=user_id)
-    return conversation_messages[:target_index]
+    # 2026-11-01: inline interjections from this run were anchored BEFORE the
+    # assistant row (created_at = anchor+1ms), so they sit before target_index
+    # and would survive a naive [target:] trim as orphan top-level user rows.
+    deleted_assistant_ids = {
+        m.id for m in conversation_messages[target_index:] if m.role == "assistant"
+    }
+    orphan_interjections = [
+        m for m in conversation_messages[:target_index]
+        if m.role == "user"
+        and getattr(m, "embedded_in_message_id", None) in deleted_assistant_ids
+    ]
+    await _delete_message_slice(
+        db,
+        orphan_interjections + conversation_messages[target_index:],
+        user_id=user_id,
+    )
+    return [
+        m for m in conversation_messages[:target_index]
+        if m not in orphan_interjections
+    ]
 
 
-async def _delete_message_slice(db: AsyncSession, slice_rows, user_id: str | None = None) -> None:
-    """按 id 批量删除消息切片——不碰 ORM 实例、不自带 commit。
-
-    2026-10-04 conv 4e159a79 编辑重发 500：conv-open 波后 `_load_conversation_messages`
-    经 resolve_message_fields 对外置 stub 行返回 SimpleNamespace 拷贝，`db.delete(拷贝)`
-    抛 UnmappedInstanceError→500。改为 id 批量 DELETE（payload 行随 messages FK
-    ON DELETE CASCADE 清理）。
-
-    事务边界：**编辑路径**由调用方与新用户消息插入同一次 commit（其间失败回滚即
-    完整恢复，见 test_trim_edit_defers_commit_atomic_replace）；**regenerate 路径**
-    的删除随调用方 sort_order 提交点落库——替代的助手回复由 agent 循环在流中晚于
-    提交生成，生成失败时旧答案不恢复（删先于建为该架构固有时序，旧实现同序且更早
-    提交，本波不改，见 tests/decisions.md D-q6）。
-    """
-    ids = [row.id for row in slice_rows if getattr(row, "id", None)]
-    if not ids:
-        return
-    # 分块 IN：超长会话编辑头消息时单语句参数量撞 PG 绑定上限（65535）。
-    for i in range(0, len(ids), 500):
-        await db.execute(sa_delete(Message).where(Message.id.in_(ids[i:i + 500])))
-    if user_id:
-        # BUG-B（2026-10-09 用户报告「编辑/重发后新回答仍称我已经…」）：DB 切片
-        # 删除正确，但 subconscious_log 已摄入的「用户+助手各 500 字」原始单元不随
-        # 消息删除失效（调度器 15min 水位摄入），检索层随即将已删轮次重放进新尝试
-        # 的上下文。source_ids 记录来源消息 id（JSON 文本）——按引用同源 purge，
-        # LIKE '%"{id}"%' 引号定界防子串误伤；仅同用户，file_memory/无关行不动。
-        # 与消息删除同事务（不自带 commit），回滚即完整恢复。
-        from app.db.database import SubconsciousLog
-        from sqlalchemy import or_ as _or
-        for i in range(0, len(ids), 500):
-            chunk = ids[i:i + 500]
-            await db.execute(
-                sa_delete(SubconsciousLog).where(
-                    SubconsciousLog.user_id == user_id,
-                    _or(*[SubconsciousLog.source_ids.like(f'%"{mid}"%') for mid in chunk]),
-                )
-            )
-        # 检索会话缓存（5min TTL，key=最近 3 user query 哈希）：regenerate 同 key
-        # 命中会重放删除前的记忆上下文——随切片删除一起失效。进程内字典操作，
-        # 失败不阻断删除主路径。
-        try:
-            from app.services.memory_retrieval_service import invalidate_session_cache_for_user
-            invalidate_session_cache_for_user(user_id)
-        except Exception:
-            logger.debug("invalidate_session_cache_for_user failed for user=%s", user_id, exc_info=True)
 
 
 async def _trim_messages_for_edit(
@@ -1241,7 +989,8 @@ async def _trim_messages_for_edit(
         -1,
     )
     if target_index == -1:
-        raise HTTPException(status_code=404, detail="待编辑的消息不存在")
+        _st = await _trim_target_status(db, edit_message_id, conversation_id=conversation_id)
+        raise HTTPException(status_code=404, detail=_trim_missing_detail(_st, "edit"))
 
     target_message = conversation_messages[target_index]
     if target_message.role != "user":
@@ -1251,36 +1000,6 @@ async def _trim_messages_for_edit(
     return conversation_messages[:target_index]
 
 
-async def _resolve_execution_target_for_conversation(
-    db: AsyncSession, current_user, conversation, request_target
-) -> None:
-    """W16 设备执行模式：执行环境创建即定（D-6）。
-
-    无值首设 adopt；已有值与请求不一致 → 400（切换=新建会话）；
-    device:<id> 须属主+未撤销（IDOR fail-closed）。"""
-    from fastapi import HTTPException as _HTTPException
-
-    from app.services import client_device_service as _cds
-
-    req_target = None
-    if request_target:
-        try:
-            req_target = _cds.normalize_execution_target(request_target)
-        except ValueError as exc:
-            raise _HTTPException(status_code=422, detail=str(exc))
-    conv_target = getattr(conversation, "execution_target", None)
-    if req_target and conv_target and req_target != conv_target:
-        raise _HTTPException(
-            status_code=400,
-            detail="执行环境已固定：切换云端/客户端执行环境请新建会话",
-        )
-    if req_target and not conv_target:
-        try:
-            await _cds.assert_device_usable(db, current_user.id, req_target)
-        except LookupError as exc:
-            raise _HTTPException(status_code=400, detail=str(exc))
-        conversation.execution_target = req_target
-        await db.commit()
 
 
 @router.post("/stream")
@@ -1290,3494 +1009,9 @@ async def chat_stream(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    conversation_id = request.conversation_id
-    assistant_id = request.assistant_id
+    from app.api.chat_stream_transport import stream_chat_response
 
-    # 部署排空（2026-10-06，conv ae9aa092 P2）：drain 中的进程拒收新 run——
-    # stop.sh 排空窗口内的新请求打给新进程/稍后重试。必须在任何写库（会话
-    # 创建/用户消息落库/chat_session）之前：503 不得留下半拉子持久化状态。
-    if _agent_registry.is_draining:
-        raise HTTPException(
-            status_code=503,
-            detail="server is draining for restart — please retry in a few seconds",
-            headers={"Retry-After": "5"},
-        )
-
-    # Capture user identity scalars UP FRONT: later code paths (media
-    # localization in self-save / interrupted-save) run after the request
-    # session may have rolled back, which EXPIRES current_user (rollback
-    # expiry ignores expire_on_commit=False) — attribute access there would
-    # raise DetachedInstanceError and silently drop the message being saved.
-    _user_id_local: str = current_user.id
-    _username_local: str | None = current_user.username
-
-    chat_session = ChatSession(
-        user_id=current_user.id,
-        conversation_id=None,
-        assistant_id=assistant_id,
-        started_at=datetime.utcnow(),
-        message_count=0
-    )
-    db.add(chat_session)
-    await db.flush()
-
-    assistant = None
-    if assistant_id:
-        result = await db.execute(
-            select(Assistant).where(
-                Assistant.id == assistant_id,
-                Assistant.user_id == current_user.id
-            )
-        )
-        assistant = result.scalar_one_or_none()
-
-    if conversation_id:
-        result = await db.execute(
-            select(Conversation).where(
-                Conversation.id == conversation_id,
-                Conversation.user_id == current_user.id
-            )
-        )
-        conversation = result.scalar_one_or_none()
-        if conversation and not assistant and conversation.assistant_id:
-            fallback_result = await db.execute(
-                select(Assistant).where(
-                    Assistant.id == conversation.assistant_id,
-                    Assistant.user_id == current_user.id
-                )
-            )
-            assistant = fallback_result.scalar_one_or_none()
-            if assistant:
-                assistant_id = conversation.assistant_id
-        if not conversation:
-            conversation = Conversation(
-                user_id=current_user.id,
-                title="新对话",
-                assistant_id=assistant_id
-            )
-            db.add(conversation)
-            await db.commit()
-            await db.refresh(conversation)
-            conversation_id = conversation.id
-        elif assistant_id and conversation.assistant_id is None:
-            conversation.assistant_id = assistant_id
-            await db.commit()
-    else:
-        conversation = Conversation(
-            user_id=current_user.id,
-            title="新对话",
-            assistant_id=assistant_id
-        )
-        db.add(conversation)
-        await db.commit()
-        await db.refresh(conversation)
-        conversation_id = conversation.id
-
-    chat_session.conversation_id = conversation_id
-    await db.commit()
-
-    # W16 设备执行模式：执行环境创建即定（D-6，docs/PLAN_device_execution_mode.md §6.1）。
-    await _resolve_execution_target_for_conversation(
-        db, current_user, conversation, getattr(request, "execution_target", None)
-    )
-
-    # 4.8 session lock: at most one active agent per conversation. A second
-    # POST while an agent is still running would spawn a concurrent loop
-    # writing to the same conversation (double-saved messages, polluted
-    # stream state, racing DB writes). reserve() atomically claims the slot
-    # BEFORE the user message insert — closing the check-then-act race
-    # between guard and agent start. Cross-worker liveness is covered by the
-    # buffer check (stale/dead-worker running-claims are distrusted there).
-    _reserved_agent_state = await _agent_registry.reserve(conversation_id)
-    _agent_busy = _reserved_agent_state is None
-    if not _agent_busy:
-        try:
-            _existing_buf = await stream_buffer_manager.get_buffer(conversation_id, current_user.id)
-            _agent_busy = _existing_buf is not None and _existing_buf.is_running
-        except Exception:
-            _agent_busy = False
-        if _agent_busy:
-            # Buffer says a run is alive (possibly on another worker) — the
-            # local reservation we just took must be released. Identity-checked
-            # release that never touches shared state (the live run's
-            # cross-worker snapshots belong to the other worker).
-            if _reserved_agent_state is not None:
-                await _agent_registry.release_reservation(conversation_id, _reserved_agent_state)
-                _reserved_agent_state = None
-    if _agent_busy:
-        logger.info("Rejected concurrent /stream for conversation %s (agent already running)", conversation_id)
-
-        async def _busy_events():
-            yield {
-                "event": "error",
-                "data": json.dumps({
-                    "error": "该会话已有正在进行的回答，请等待其完成或先停止。",
-                    "code": "conversation_busy",
-                    "conversation_id": conversation_id,
-                }, ensure_ascii=False),
-            }
-
-        return EventSourceResponse(_busy_events())
-
-    user_message = None  # 仅「新用户消息」轮（普通/编辑）绑定；regenerate 不产生新消息
-    if request.regenerate_from_message_id:
-        try:
-            conversation_messages = await _trim_messages_for_regeneration(
-                db,
-                conversation_id=conversation_id,
-                regenerate_from_message_id=request.regenerate_from_message_id,
-                user_id=current_user.id,
-            )
-            # 重新生成 = 该会话的最新操作（2026-09-26 用户指令）：解除拖拽钉住
-            # （sort_order 置 0），使其在 (sort_order asc, 最近活动 desc) 排序下回到
-            # 所在分组/时间分类最上方；活动时间键随新助手消息落库后的
-            # MAX(messages.created_at)（全角色口径，conversation.py）推进。
-            # updated_at 由 onupdate 自动推进，不在这里显式写（A4.9 R1 M-5：排序
-            # 不变式不允许 updated_at 显式驱动）。
-            # 值守卫（余留清零波）：sort_order 已为 0 时跳过赋值——同值照发
-            # 事件但跳 onupdate，会产生带旧 ts 的幻影事件被 LWW 等值判 STALE（§3.1）。
-            if conversation.sort_order:
-                conversation.sort_order = 0
-            await db.commit()
-        except BaseException:
-            # 同编辑路径：setup 失败不占会话槽位（shield 防二次取消复漏）。
-            if _reserved_agent_state is not None:
-                try:
-                    await asyncio.shield(_agent_registry.release_reservation(
-                        conversation_id, _reserved_agent_state))
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
-                _reserved_agent_state = None
-            raise
-    elif request.edit_message_id:
-        try:
-            conversation_messages = await _trim_messages_for_edit(
-                db,
-                conversation_id=conversation_id,
-                edit_message_id=request.edit_message_id,
-                user_id=current_user.id,
-            )
-            # Save the new user message
-            user_message = Message(
-                conversation_id=conversation_id,
-                role="user",
-                content=request.messages[-1].content
-            )
-            conversation.updated_at = datetime.utcnow()
-            # 继续旧会话后置顶（2026-09-15）：新用户消息 = 会话成为「最新活动」。
-            # sort_order 置 0 使其在 (sort_order asc, 最近用户消息 desc) 排序下跳到
-            # 所在分组/时间分类最上方（前端乐观置顶 + 刷新后由本写入保持一致）。
-            # 值守卫（对齐 regenerate 分支 §3.1）：已为 0 跳过赋值，免幻影 STALE 事件。
-            if conversation.sort_order:
-                conversation.sort_order = 0
-            db.add(user_message)
-            await db.commit()
-            # reload 也在保护圈内：此前若失败（DB 抖动/取消），删+建已落库、
-            # 槽位必须释放，否则 180s provisional TTL 内重试被 conversation_busy 挡。
-            conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
-        except BaseException:
-            # 编辑 setup 失败（404/400 校验、DB 异常、取消）不占会话槽位：
-            # identity-checked 释放，不碰共享态；shield 防二次取消在释放途中
-            # 再抛 CancelledError 复漏槽位（同 _release_setup_slot_safely 口径）。
-            if _reserved_agent_state is not None:
-                try:
-                    await asyncio.shield(_agent_registry.release_reservation(
-                        conversation_id, _reserved_agent_state))
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
-                _reserved_agent_state = None
-            raise
-    else:
-        user_message = Message(
-            conversation_id=conversation_id,
-            role="user",
-            content=request.messages[-1].content
-        )
-        conversation.updated_at = datetime.utcnow()
-        conversation.sort_order = 0
-        db.add(user_message)
-        await db.commit()
-        conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
-
-    latest_user_query = next(
-        (message.content for message in reversed(conversation_messages) if message.role == "user"),
-        request.messages[-1].content if request.messages else "",
-    )
-
-    # §5.4 澄清检测：全 agentic —— 每条新用户消息无条件 fire-and-forget 异步 LLM
-    # 判定（2026-09-20 用户指令：删除关键词预分类闸门 `detect_signal`；漏检=纠正
-    # 永不处理，成本暂不考虑。LLM 自行判定 is_correction，非纠正则零业务写入）。
-    # regenerate 是对旧轮的重新生成，不重复检测（也不存在新 user_message）。
-    try:
-        from app.core.config import get_config as _gc_clar
-        from app.services.memory_runtime_state import memory_runtime_enabled as _mem_rt_clar
-        _cfg_clar = _gc_clar()
-        if (
-            _mem_rt_clar(_cfg_clar)
-            and not request.regenerate_from_message_id
-            and (latest_user_query or "").strip()
-        ):
-            from app.services.memory_clarification_service import process_clarification
-            _clar_uid = current_user.id
-            _clar_conv = conversation_id
-            _clar_msg_id = getattr(user_message, "id", None)
-            _clar_text = latest_user_query
-
-            async def _clarification_bg():
-                try:
-                    from app.db.database import AsyncSessionLocal as _ASL
-                    async with _ASL() as _cdb:
-                        await process_clarification(
-                            _cdb, _clar_uid, _clar_text,
-                            conversation_id=_clar_conv, message_id=_clar_msg_id)
-                except Exception:
-                    logger.debug("background clarification failed", exc_info=True)
-
-            _ct = asyncio.create_task(_clarification_bg())
-            _clarification_tasks.add(_ct)
-            _ct.add_done_callback(_clarification_tasks.discard)
-    except Exception:
-        logger.debug("clarification scheduling failed", exc_info=True)
-
-    # DEATHMATCH lifecycle handling
-    if request.deathmatch_action:
-        dm_mgr = DeathmatchManager(conversation)
-        if request.deathmatch_action == "start":
-            # D3 (2026-08-31 autonomy wave): re-enabling deathmatch with a
-            # PARKED task (paused / human_gate / partial_complete, or a
-            # mid-grilling park) RESUMES that task instead of restarting
-            # from grilling. Only a done round or a fresh conversation
-            # proceeds to intent classification / a new grilling round.
-            if conversation.deathmatch_status in ("paused", "human_gate", "partial_complete", "grilling") and (
-                conversation.deathmatch_goal
-                or conversation.deathmatch_grilling_complete
-                or conversation.deathmatch_status == "grilling"
-            ):
-                _status_before_resume = conversation.deathmatch_status
-                if conversation.deathmatch_status == "partial_complete":
-                    dm_mgr.resume_from_partial()
-                else:
-                    dm_mgr.resume()
-                logger.info(
-                    "Deathmatch re-enabled: resumed parked task for conversation %s (status=%s)",
-                    conversation_id, _status_before_resume,
-                )
-                await db.commit()
-            # If a previous deathmatch round has completed, preserve its compressed
-            # summary before deciding whether to start a fresh grilling phase.
-            else:
-                if conversation.deathmatch_status == "done" and not conversation.deathmatch_context_summary:
-                    await dm_mgr.compress_conversation_context(db)
-                # When the user explicitly starts deathmatch after a completed round,
-                # use the sub-agent intent classifier to decide whether this is a new
-                # task (NEW_ROUND/CLARIFY) or just a discussion of the previous result
-                # (DISCUSS). This prevents re-entering grilling for messages like
-                # "你觉得写得怎么样？".
-                if (
-                    conversation.deathmatch_status == "done"
-                    and conversation.deathmatch_context_summary
-                ):
-                    intent = await dm_mgr.classify_intent(latest_user_query, db)
-                    if intent == "NEW_ROUND":
-                        await dm_mgr.compress_conversation_context(db)
-                        dm_mgr.activate_grilling()
-                    elif intent == "REVISE":
-                        dm_mgr.begin_revision(latest_user_query)
-                    elif intent == "CLARIFY":
-                        dm_mgr.activate_grilling()
-                    # DISCUSS: keep deathmatch off; normal mode will carry the summary.
-                else:
-                    # Starting deathmatch from normal mode (or a stale state). Capture
-                    # the existing conversation context first so the grilling phase can
-                    # see what was discussed before the mode switch.
-                    if not conversation.deathmatch_context_summary:
-                        await dm_mgr.compress_conversation_context(db)
-                    dm_mgr.activate_grilling()
-                await db.commit()
-        elif request.deathmatch_action == "stop":
-            # Compress context before exiting deathmatch so the conversation can
-            # continue in normal mode with background context.
-            if conversation.deathmatch_status in ("active", "done"):
-                await dm_mgr.compress_conversation_context(db)
-            dm_mgr.deactivate()
-            await db.commit()
-        elif request.deathmatch_action == "pause":
-            dm_mgr.pause()
-            await db.commit()
-        elif request.deathmatch_action == "resume":
-            dm_mgr.resume()
-            await db.commit()
-    elif request.deathmatch_mode:
-        # Frontend says deathmatch is ON but no explicit action — ensure grilling
-        # is active.  If the conversation is not already in "grilling" or
-        # "active" goal-loop phase, force it into grilling so the user always
-        # gets asked clarification questions first.
-        if conversation.deathmatch_status == "active":
-            # Goal loop is active but idle (between runs). A user message here
-            # may be a side question about the results rather than a push to
-            # continue. Classify intent: DISCUSS → pause the loop so the agent
-            # just answers the question once instead of re-igniting the goal
-            # loop; NEW_ROUND/CLARIFY → keep the loop active (current behavior).
-            # Bare resume commands ("继续" etc.) never pause — they mean
-            # "keep going", especially when the loop is zombie-active (the
-            # runner died and the status just hasn't been reconciled yet).
-            # The grilling-complete kickoff message ("目标已明确，请开始执行：…",
-            # auto-sent by the frontend right after grilling completes) must
-            # never be classified either — it IS the goal-loop start signal;
-            # classifying it as DISCUSS paused the loop with 0 turns (conv
-            # 51d74833).
-            dm_mgr = DeathmatchManager(conversation)
-            _q = latest_user_query.strip().lower()
-            _is_resume_cmd = len(_q) <= 12 and any(
-                h in _q for h in ("继续", "接着", "resume", "continue", "go on")
-            )
-            _is_goal_kickoff = latest_user_query.strip().startswith("目标已明确，请开始执行")
-            if not _is_resume_cmd and not _is_goal_kickoff:
-                intent = await dm_mgr.classify_intent(latest_user_query, db)
-                if intent == "DISCUSS":
-                    dm_mgr.pause(reason="user-discussion")
-                    await db.commit()
-                    logger.info(
-                        "Deathmatch paused for discussion message in conversation %s",
-                        conversation_id,
-                    )
-                elif intent == "REVISE":
-                    # User dissatisfaction/rework while the loop is active:
-                    # keep running — the message itself is corrective input.
-                    logger.info(
-                        "Deathmatch kept active for revision message in conversation %s",
-                        conversation_id,
-                    )
-        elif conversation.deathmatch_status not in ("grilling", "active"):
-            dm_mgr = DeathmatchManager(conversation)
-            if conversation.deathmatch_status in ("paused", "human_gate"):
-                # D2 (2026-08-31 autonomy wave): ANY user message while
-                # paused/gated resumes the goal loop — supplemental content
-                # becomes steering input for the next turn (补充即恢复).
-                # Stopping is done via the mode toggle (stop action), not
-                # via DISCUSS gating.
-                dm_mgr.resume()
-                logger.info(
-                    "Deathmatch resumed from %s for conversation %s (any-message-resume)",
-                    conversation.deathmatch_status, conversation_id,
-                )
-            elif conversation.deathmatch_status == "partial_complete":
-                # "partial_complete" = the goal is mostly done but stalled.
-                # User sending a message means "continue pushing toward the goal".
-                # Resume WITHOUT resetting the stall counter so repeated stalls
-                # escalate to human_gate.
-                dm_mgr.resume_from_partial()
-                logger.info(
-                    "Deathmatch resumed from partial_complete for conversation %s (stall count preserved)",
-                    conversation_id,
-                )
-            elif conversation.deathmatch_context_summary:
-                # "done" or other non-active state with a prior summary: use the
-                # sub-agent intent classifier to decide new round vs discuss.
-                intent = await dm_mgr.classify_intent(latest_user_query, db)
-                if intent == "NEW_ROUND":
-                    await dm_mgr.compress_conversation_context(db)
-                    dm_mgr.activate_grilling()
-                elif intent == "REVISE":
-                    # 2026-09-20 (conv a104fbc5): a critique/rework instruction
-                    # on a completed round reopens execution instead of
-                    # degenerating into a fact-check chat with no revision.
-                    dm_mgr.begin_revision(latest_user_query)
-                elif intent == "CLARIFY":
-                    dm_mgr.activate_grilling()
-                else:
-                    # DISCUSS: keep deathmatch off, normal mode will carry summary.
-                    pass
-            else:
-                # No prior summary yet: capture the existing normal-mode context
-                # before entering grilling so the first round can reference it.
-                await dm_mgr.compress_conversation_context(db)
-                dm_mgr.activate_grilling()
-            await db.commit()
-    # Safety net: if conversation has deathmatch_mode=True from a previous
-    # session but the status is stale (not grilling/active/paused/done), reactivate
-    # grilling so the user always gets the clarification flow.  We exclude "done"
-    # because a completed round is an intentional terminal state; re-entry must be
-    # decided by the intent classifier above, not forced here.
-    if (
-        conversation.deathmatch_mode
-        and conversation.deathmatch_status not in ("grilling", "active", "paused", "done", "human_gate", "partial_complete")
-    ):
-        dm_mgr = DeathmatchManager(conversation)
-        dm_mgr.activate_grilling()
-        await db.commit()
-        # Reload conversation_messages after deathmatch state change
-        conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
-
-    llm_service = agent_service.create_llm_service(assistant)
-
-    # 模型网关（A4.9 复审 Critical-1）：wire 层 provider_type 以解析端点
-    # 为准 —— model_alias 助手的 DB 旧列与新模型无关；legacy inline 端点
-    # 携带旧列值，行为不变。嵌套闭包（_ensure_title 等）共享此值。
-    from app.model_gateway.factory import wire_provider_type
-    _wire_provider_type = wire_provider_type(
-        llm_service, getattr(assistant, "provider_type", "deepseek") or "deepseek"
-    )
-
-    # P0 (2026-08-21, user requirement): coordinator/audit/aux LLM calls
-    # inherit the assistant's model settings. Custom-model assistants get
-    # their main client as coordinator; non-custom keep the operator's
-    # global aux keys. The task-local aux override below makes every in-loop
-    # AuxiliaryClient (classifiers/judges/error classify/compression) follow
-    # the same rule — contextvars are task-scoped, so no explicit reset is
-    # needed when the request task ends.
-    coordinator_llm = agent_service.resolve_aux_model_context(assistant, llm_service)
-    if assistant is not None and should_use_custom_model(assistant):
-        from app.services.auxiliary_client import set_aux_llm_override
-        set_aux_llm_override(llm_service)
-
-    import re as _re
-    skill_match = _re.search(r'\[skill:([a-zA-Z0-9_-]+)\]\s*(.*?)(?=\[skill:|$)', latest_user_query, _re.DOTALL)
-    skill_content = None
-    skill_files = None
-    if skill_match:
-        skill_name = skill_match.group(1)
-        skill_args = skill_match.group(2) or ''
-        try:
-            # Unified dual-source resolver: system skills (backend/skills/*)
-            # first, then user DB skills. See loop_improve.md Phase 1.3.
-            resolved = await resolve_skill(skill_name, current_user)
-            if resolved:
-                skill_content = resolved["content"]
-                if resolved.get("files"):
-                    skill_files = resolved["files"]
-                skill_marker = f"[skill:{skill_name}] {skill_args}".strip()
-                replacement = f"[使用技能: {skill_name}]\n{skill_args}".strip()
-                latest_user_query = latest_user_query.replace(skill_marker, replacement, 1)
-                conversation_messages[-1].content = latest_user_query
-            else:
-                logger.warning(f"Skill '{skill_name}' not found for user {current_user.id}")
-        except Exception as e:
-            logger.error(f"Failed to load skill '{skill_name}': {e}")
-
-    # Deterministic skill injection for uploaded files: when the user message
-    # carries a [file-ref:...] marker and no explicit [skill:...] marker was
-    # resolved, inject the file_parsing skill so the parsing workflow rules
-    # are always present for file tasks (no reliance on model self-trigger).
-    if not skill_content and _re.search(r'\[file-ref:', latest_user_query):
-        try:
-            resolved = await resolve_skill("file_parsing", current_user)
-            if resolved:
-                skill_content = resolved["content"]
-                if resolved.get("files"):
-                    skill_files = resolved["files"]
-        except Exception as e:
-            logger.error(f"Failed to load file_parsing skill: {e}")
-
-    search_query, note_context_for_search = extract_search_query_and_note_context(latest_user_query)
-    message_count = 1
-    # P1-①（2026-10-04）：本轮注入的记忆 id（_memory_ctx 回填；终局步据此判采纳回写）
-    _injected_mem_ids: list[str] = []
-    _adoption_tasks: set = set()
-
-    async def _ensure_title(refreshed_conversation, full_response: str) -> str | None:
-        """Generate a title for a brand-new conversation and persist it.
-        Always returns a non-default title when called on a '新对话' row, using
-        the fallback derivation if the LLM call fails. Safe to call multiple
-        times (a no-op when the title has already been updated)."""
-        if not refreshed_conversation or refreshed_conversation.title != "新对话":
-            return refreshed_conversation.title if refreshed_conversation else None
-        try:
-            # P0 / A4.9 Minor-7: provider-config assistants (qwen3.8_vllm
-            # with an empty row-level URL) resolve through the main client —
-            # the title LLM must not fall back to global deepseek.
-            title_generator = TitleGeneratorService(
-                **agent_service.title_generator_kwargs(assistant, llm_service),
-                provider_type=_wire_provider_type,
-            )
-            _title_query = search_query or latest_user_query or ""
-            generated_title: str | None = None
-            try:
-                generated_title = await title_generator.generate_title(
-                    user_query=_title_query,
-                    assistant_response=full_response or "",
-                )
-            except Exception:
-                import traceback as _tb
-                _tb.print_exc()
-                generated_title = None
-
-            if not generated_title:
-                generated_title = await title_generator.get_fallback_title(_title_query)
-            # Extra safety: never leave "新对话" if we got here.
-            if not generated_title or generated_title == "新对话":
-                _src = (_title_query or full_response or "").strip()
-                if _src:
-                    generated_title = _src[:16]
-                else:
-                    generated_title = "未命名会话"
-
-            refreshed_conversation.title = generated_title
-            await db.commit()
-            return generated_title
-        except Exception:
-            import traceback as _tb
-            _tb.print_exc()
-            return refreshed_conversation.title if refreshed_conversation else None
-
-    async def _finalize_and_emit_done(
-        *,
-        assistant_message_id: str | None,
-        final_content: str,
-        final_tool_results_json: str | None,
-        fallback: bool = False,
-    ):
-        """Unified terminal step: regenerate title if needed, push done event
-        with the FINAL title (so the frontend never has to wait for a separate
-        title_update event to display it), then optionally emit title_update
-        for existing client-side listeners. Used by every exit path."""
-        refreshed = None
-        try:
-            conv_result = await db.execute(
-                select(Conversation).where(Conversation.id == conversation_id)
-            )
-            refreshed = conv_result.scalar_one_or_none()
-        except Exception:
-            refreshed = conversation
-
-        final_title = await _ensure_title(refreshed, final_content)
-
-        # P1-① 采纳反馈闭环（fire-and-forget，fail-open）：最终回答引用了本轮
-        # 注入的记忆证据（名/别名命中）→ 权重/边权回写（memory_adoption_service）。
-        if _injected_mem_ids and (final_content or "").strip():
-            try:
-                from app.services.memory_adoption_service import spawn_answer_adoption
-                _task = spawn_answer_adoption(
-                    current_user.id, list(_injected_mem_ids), final_content)
-                _adoption_tasks.add(_task)
-                _task.add_done_callback(_adoption_tasks.discard)
-            except Exception:
-                logger.debug("adoption scheduling failed (fail-open)", exc_info=True)
-
-        # Compress tool_results for the SSE done event. The full payload is
-        # already persisted in the DB; a huge string (> 30 KB with browser
-        # page content) would cause frontend JSON.parse to fail silently and
-        # skip the done event entirely, leaving no assistant bubble rendered.
-        # Instead of truncating (which breaks JSON), strip the large
-        # agent_steps and keep only results/rounds needed for citation rendering.
-        safe_tool_results = final_tool_results_json
-        if final_tool_results_json and len(final_tool_results_json) > 8192:
-            try:
-                tr_obj = json.loads(final_tool_results_json)
-                slim = {k: v for k, v in tr_obj.items() if k != "agent_steps"}
-                safe_tool_results = json.dumps(slim, ensure_ascii=False)
-                if len(safe_tool_results) > 8192:
-                    slim["results"] = slim.get("results", [])[:20]
-                    safe_tool_results = json.dumps(slim, ensure_ascii=False)
-                if len(safe_tool_results) > 8192:
-                    for r in slim.get("results", []):
-                        if isinstance(r.get("result"), str) and len(r["result"]) > 500:
-                            r["result"] = r["result"][:500] + "...[truncated]"
-                    safe_tool_results = json.dumps(slim, ensure_ascii=False)
-            except (json.JSONDecodeError, TypeError):
-                safe_tool_results = json.dumps({"results": [], "error": "tool_results too large, stripped for SSE"}, ensure_ascii=False)
-
-        payload = {
-            "conversation_id": conversation_id,
-            "message_id": assistant_message_id,
-            "title": final_title,
-            "tool_results": safe_tool_results,
-            "done": True,
-        }
-        if fallback:
-            payload["fallback"] = True
-        yield {"event": "done", "data": json.dumps(payload)}
-
-        # Keep the legacy title_update event for clients that still listen
-        # to it — but it is purely cosmetic now, since `done` already
-        # carries the final title.
-        try:
-            if not await req.is_disconnected():
-                yield {"event": "message", "data": json.dumps({
-                    "title_update": {
-                        "conversation_id": conversation_id,
-                        "title": final_title,
-                    },
-                })}
-        except Exception:
-            pass
-
-    async def event_generator():
-        nonlocal message_count
-        full_response = ""
-        full_reasoning = ""
-        tool_results_json = None
-        # PHASE 2B: serialized OpenAI-style tool_calls list for persistence.
-        tool_calls_json: str | None = None
-        _cap_tool_calls: str | None = None
-        agent_steps: list[dict] = []
-        thinking_history: list[dict] = []
-        sub_agent_outputs: dict[str, dict[str, str]] = {}
-        task_plan_data: dict | None = None
-        response_saved = False
-        client_disconnected = False
-        detached_agent_task: asyncio.Task | None = None
-        sse_cancelled_flag: asyncio.Event | None = None
-
-        def _spawn_interrupted_save(_buf_ref=None):
-            """Schedule a detached background task that writes the partial
-            assistant reply + regenerated title using a FRESH DB session.
-            Used when the request's own `db` session becomes unusable (e.g.
-            client disconnected mid-commit → asyncpg connection closed)."""
-            interrupted_content = full_response.strip() or (
-                "回答在思考过程中被中断。已保存中间状态，您可以重新发送或追问以继续。"
-            )
-            _cap_reasoning = full_reasoning
-            _cap_tool_results = tool_results_json
-            _cap_conv_id = conversation_id
-            _cap_already_saved = response_saved
-            _cap_search_query = search_query
-            _cap_latest_user_query = latest_user_query
-            _cap_assistant = assistant
-            _cap_llm_service = llm_service
-
-            async def _job():
-                try:
-                    async with AsyncSessionLocal() as bg_db:
-                        conv_row = (await bg_db.execute(
-                            select(Conversation).where(Conversation.id == _cap_conv_id)
-                        )).scalar_one_or_none()
-                        if conv_row is None:
-                            if _buf_ref:
-                                try:
-                                    await _buf_ref.mark_complete(None)
-                                except Exception:
-                                    pass
-                            return
-                        if not _cap_already_saved:
-                            _loc_content, _loc_tr = await _localize_media_for_persist(
-                                interrupted_content, _cap_tool_results,
-                                _user_id_local, _username_local,
-                            )
-                            # 渐进落库：断连中断=非预期中断——streaming 在途行
-                            # 原地更新并标 interrupted（前端「已中断」徽标）。
-                            msg = await _save_assistant_terminal(
-                                bg_db,
-                                conversation_id=_cap_conv_id,
-                                content=_loc_content,
-                                reasoning=_cap_reasoning if _cap_reasoning else None,
-                                tool_results=_loc_tr,
-                                tool_calls=_cap_tool_calls,
-                                context_info=None,
-                                status="interrupted",
-                            )
-                            conv_row.updated_at = datetime.utcnow()
-                            await bg_db.commit()
-                            await bg_db.refresh(msg)
-                            if _buf_ref:
-                                try:
-                                    await _buf_ref.mark_complete(str(msg.id))
-                                except Exception:
-                                    pass
-                        if conv_row.title == "新对话":
-                            title_generator = TitleGeneratorService(
-                                **agent_service.title_generator_kwargs(_cap_assistant, _cap_llm_service),
-                                provider_type=wire_provider_type(_cap_llm_service, getattr(_cap_assistant, "provider_type", "deepseek") or "deepseek"),
-                            )
-                            _tq = _cap_search_query or _cap_latest_user_query or ""
-                            gt = None
-                            try:
-                                gt = await title_generator.generate_title(
-                                    user_query=_tq,
-                                    assistant_response=interrupted_content,
-                                )
-                            except Exception:
-                                import traceback as _tb
-                                _tb.print_exc()
-                            if not gt:
-                                gt = await title_generator.get_fallback_title(_tq)
-                            if not gt or gt == "新对话":
-                                _src = (_tq or interrupted_content or "").strip()
-                                gt = _src[:16] if _src else "未命名会话"
-                            conv_row.title = gt
-                            await bg_db.commit()
-                except Exception:
-                    import traceback as _tb
-                    _tb.print_exc()
-
-            try:
-                loop = asyncio.get_running_loop()
-                _bg = loop.create_task(_job())
-                _track_bg_task(_bg, _cap_conv_id, "interrupt_save")
-            except Exception:
-                import traceback as _tb
-                _tb.print_exc()
-
-
-        async def _run_tool_loop():
-            """Phase 1.2: New tool-calling agent loop — LLM decides which tools to call.
-
-            The agent loop runs in a detached asyncio.Task so it completes
-            even if the SSE connection is cancelled by sse-starlette.
-            Events are bridged via an asyncio.Queue.
-            """
-            nonlocal full_response, full_reasoning, tool_results_json, message_count, response_saved, client_disconnected
-
-            # 4.8: refresh the reservation at setup milestones so the
-            # provisional reaper never kills a legitimately-slow setup
-            # (deathmatch classify + coordinator pre-pass LLM calls).
-            if _reserved_agent_state is not None and _reserved_agent_state.provisional:
-                _reserved_agent_state.reserved_at = time.time()
-
-            import app.tools
-
-            from app.services.memory_service import build_shared_agent_context
-            from app.core.config import get_config as _gc
-            from app.db.database import AsyncSessionLocal as _AsyncSessionLocal
-            _cfg = _gc()
-
-            async def _memory_ctx() -> str | None:
-                """§5.2 工程要求 1：召回管线与 coordinator/准备工作并发（取 max 非 sum）。
-                独立 DB 会话（AsyncSession 不可并发共用）；失败回退 None 走旧方案。
-                2026-10-04：改 retrieve_with_meta 收本轮注入 id（P1-① 采纳回写输入）。"""
-                nonlocal _injected_mem_ids
-                from app.services.memory_runtime_state import memory_runtime_enabled as _mem_rt
-                if not (_mem_rt(_cfg) and _cfg.memory.get("retrieval_enabled")):
-                    return None
-                try:
-                    from app.services import memory_retrieval_service
-                    async with _AsyncSessionLocal() as mem_db:
-                        _ctx, _ids, _top = await memory_retrieval_service.retrieve_with_meta(
-                            mem_db, current_user.id, conversation_messages,
-                            conversation_id=conversation_id)
-                        _injected_mem_ids = list(_ids or [])
-                        return _ctx
-                except Exception:
-                    logger.exception("New memory retrieval failed, falling back")
-                    return None
-
-            # --- 与 sys_prompt 无关的准备工作前移（§5.2 工程要求 1：coordinator 与召回并发）---
-            messages_for_model = [{"role": "system", "content": ""}]  # placeholder，sys_prompt 就绪后回填
-            _config = get_config()
-            context_limit = _config.agent_conversation_context_limit
-            conv_msgs = conversation_messages
-            if len(conv_msgs) > context_limit:
-                conv_msgs = conv_msgs[-context_limit:]
-            # PHASE 2A + 2B: rebuild structured OpenAI history so multi-turn
-            # conversations show the model genuine assistant.tool_calls / tool
-            # message pairs instead of opaque content text. Without this the
-            # model loses the "I called tools and got results" pattern around
-            # turn 5-6 and stops invoking tools (same failure mode hermes-agent
-            # PR #3528 fixed).
-            from app.services.agent_service import _sanitize_history_content
-            from app.services.tool_history import (
-                build_history_message,
-                rebuild_structured_history,
-                sanitize_api_messages,
-            )
-            for msg in conv_msgs:
-                if msg.role == "assistant" and getattr(msg, "tool_calls", None):
-                    messages_for_model.extend(
-                        rebuild_structured_history(
-                            role="assistant",
-                            content=_sanitize_history_content(msg.content),
-                            tool_calls_json=msg.tool_calls,
-                            tool_results_json=getattr(msg, "tool_results", None),
-                            reasoning_content=getattr(msg, "reasoning_content", None),
-                        )
-                    )
-                else:
-                    # build_history_message applies the conv-a040c24e citation
-                    # neutralization for assistant rows only (users untouched);
-                    # reasoning_content round-trips via the same helper.
-                    messages_for_model.append(
-                        build_history_message(
-                            msg.role,
-                            _sanitize_history_content(msg.content),
-                            reasoning_content=getattr(msg, "reasoning_content", None),
-                        )
-                    )
-            messages_for_model = sanitize_api_messages(messages_for_model)
-
-            # W17-P1/P2（复审 IMPORTANT-1，2026-10-10）：轮次门控文本抽取必须在
-            # deathmatch 合成注入（build_context_messages 跨轮摘要 / 计划指令，
-            # 均为 user 角色）**之前**——否则合成文本混入近 3 条 ctx，非代码死磕
-            # 任务可被伪激活（dd3b2408 同类危害的新通道）。
-            from app.services.vibeweaver_turn_gate import extract_recent_user_text as _vw_extract
-            _vw_text, _vw_ctx = _vw_extract(messages_for_model)
-
-            # PHASE 3: build the iteration (sub-task) LLM. If the assistant
-            # has subtask_custom_* fields populated, spin up a separate
-            # cheaper client for tool-calling iterations; otherwise reuse
-            # the main llm_service. AgentLoop already forces iteration
-            # extra_body to disable thinking either way.
-            iteration_llm, iteration_provider_type = (
-                agent_service.create_iteration_llm_service(assistant, main_llm=llm_service)
-            )
-            if iteration_llm is not llm_service:
-                logger.info(
-                    "Phase 3: subtask LLM enabled (provider=%s)", iteration_provider_type
-                )
-
-            # DEATHMATCH: Wire up deathmatch manager if conversation is in deathmatch mode
-            _deathmatch_mgr: DeathmatchManager | None = None
-            _blocked_tools: set[str] = set()
-            if conversation.deathmatch_mode:
-                _deathmatch_mgr = DeathmatchManager(conversation)
-                # P0: judge/verifier inherit the assistant's model client.
-                _deathmatch_mgr.set_assistant_llm(llm_service)
-                # Block background_task during deathmatch — all work must
-                # stay inline in the same conversation stream. Background
-                # tasks create new conversations and scatter results.
-                _blocked_tools.add("background_task")
-                # Inject compressed context summary from previous rounds.
-                messages_for_model = _deathmatch_mgr.build_context_messages(messages_for_model)
-                # PEVR: Inject plan directive when goal loop is active so the
-                # agent knows the plan from the very first turn — not just
-                # from continuation prompts on turn 2+.
-                if _deathmatch_mgr.is_goal_active:
-                    plan_directive = _deathmatch_mgr.build_plan_directive()
-                    if plan_directive:
-                        # Insert as a user message right after the system prompt
-                        # so the agent sees it before any conversation history.
-                        messages_for_model.insert(1, {
-                            "role": "user",
-                            "content": plan_directive,
-                        })
-
-            identity_context = await _load_identity_memory_context(current_user.id)
-
-            async def _permission_request_callback(
-                conversation_id: str,
-                tool_name: str,
-                description: str,
-                details: dict,
-            ) -> bool:
-                from app.services.permission_manager import request_permission
-                request_id = f"perm_{conversation_id[:8]}_{tool_name}_{int(asyncio.get_event_loop().time() * 1000)}"
-                perm_data = {
-                    "request_id": request_id,
-                    "tool_name": tool_name,
-                    "description": description,
-                    "details": details,
-                }
-                perm_event = {"permission_request": perm_data}
-
-                state = await _agent_registry.get(conversation_id)
-                if state:
-                    try:
-                        await state.broadcast(perm_event)
-                    except Exception:
-                        logger.exception("Failed to broadcast permission request")
-
-                buf = await stream_buffer_manager.get_buffer_no_auth(conversation_id)
-                if buf:
-                    try:
-                        await buf.append(perm_event)
-                    except Exception:
-                        logger.exception("Failed to append permission request to stream buffer")
-
-                return await request_permission(
-                    conversation_id=conversation_id,
-                    tool_name=tool_name,
-                    description=description,
-                    details=details,
-                    timeout=120.0,
-                    request_id=request_id,
-                )
-
-            # 遵循词 canary: the marker is injected into the system prompt
-            # below (_build_system_prompt) AND handed to the loop so only this
-            # path ever checks for it (worker/scheduler/delegate never do).
-            from app.services.canary_marker import make_canary, strip_canary_streaming
-            _canary_marker = make_canary(str(conversation_id)) if _config.agent_canary_enabled else None
-
-            # Qwen3.8(Local): per-mode sampling param sets from the assistant
-            # (thinking vs non-thinking), NULL fields fall back to the
-            # model-card defaults（wave-7：预设单一事实源在 thinking profile；
-            # Qwen3.8-Next 已退役（2026-09-15）——池中仅剩 qwen3.8_vllm）。
-            from app.model_gateway.profiles import get_thinking_profile
-            _q38_profile = get_thinking_profile("qwen3.8_vllm")
-            QWEN38_VLLM_THINKING_DEFAULTS = _q38_profile.sampling_defaults(True)
-            QWEN38_VLLM_NON_THINKING_DEFAULTS = _q38_profile.sampling_defaults(False)
-            _thinking_sampling: dict = {}
-            _non_thinking_sampling: dict = {}
-            _preserve_thinking: bool | None = None
-            if _wire_provider_type == "qwen3.8_vllm":
-                _thinking_sampling = {
-                    k: getattr(assistant, f"thinking_{k}", None)
-                    for k in QWEN38_VLLM_THINKING_DEFAULTS
-                }
-                _thinking_sampling = {
-                    k: (v if v is not None else QWEN38_VLLM_THINKING_DEFAULTS[k])
-                    for k, v in _thinking_sampling.items()
-                }
-                _non_thinking_sampling = {
-                    k: getattr(assistant, k, None)
-                    for k in QWEN38_VLLM_NON_THINKING_DEFAULTS
-                }
-                _non_thinking_sampling = {
-                    k: (v if v is not None else QWEN38_VLLM_NON_THINKING_DEFAULTS[k])
-                    for k, v in _non_thinking_sampling.items()
-                }
-                # M1 (A4.9): NULL column must keep the "default ON" contract
-                _preserve_thinking = (
-                    getattr(assistant, "preserve_thinking", True)
-                    if getattr(assistant, "preserve_thinking", True) is not None
-                    else True
-                )
-
-            agent_loop = AgentLoop(
-                llm=llm_service,
-                tool_schemas=None,
-                max_iterations=_config.agent_tool_loop_max_iterations,
-                workspace_path="",  # gather 后回填（workspace 未就绪；run 前必被覆盖）
-                provider_type=_wire_provider_type,
-                enable_reasoning=request.enable_reasoning,
-                reasoning_effort=request.reasoning_effort,
-                thinking_budget=request.thinking_budget,
-                thinking_sampling=_thinking_sampling or None,
-                non_thinking_sampling=_non_thinking_sampling or None,
-                preserve_thinking=_preserve_thinking,
-                iteration_llm=iteration_llm,
-                iteration_provider_type=iteration_provider_type,
-                blocked_tools=_blocked_tools if _blocked_tools else None,
-                permission_callback=_permission_request_callback,
-                session_factory=AsyncSessionLocal,
-                identity_context=identity_context,
-                coordinator_llm=coordinator_llm,
-                # Must be passed here (not assigned post-init): the deathmatch
-                # iteration-budget override is evaluated inside __init__.
-                deathmatch_manager=_deathmatch_mgr,
-                enable_compression=_config.agent_compression_enabled,
-                canary_marker=_canary_marker,
-                # 二期工具集按需发送：浏览器交互子工具（navigate/click/type 等）
-                # 首轮不发送，模型调用 browser 入口后由 AgentLoop 自动追加
-                # （只增不减，会话内最多破坏一次前缀缓存；省 ~1.5k tokens/轮）。
-                lazy_tools=[
-                    n for n in registry.get_tool_names_for_toolset("web")
-                    if n not in ("browser", "pdf_export", "web_search")
-                ],
-            )
-
-            # 渐进落库（2026-10-06，conv ae9aa092）：审计打回时被拒草稿全文+
-            # 裁决元数据写入 message_attempts 台账（用户裁定：保留并标记）。
-            # 台账挂到本轮 streaming 在途行下；无在途行（死磕等路径）则跳过。
-            async def _on_draft_rejected(*, content, verdict, problem, source, attempt_no):
-                try:
-                    async with AsyncSessionLocal() as _att_db:
-                        _att_row = (await _att_db.execute(
-                            select(Message)
-                            .where(Message.conversation_id == conversation_id,
-                                   Message.delivery_status == "streaming")
-                            .order_by(Message.created_at.desc())
-                            .limit(1)
-                        )).scalars().first()
-                        if _att_row is None:
-                            return
-                        _att_db.add(MessageAttempt(
-                            message_id=_att_row.id,
-                            conversation_id=conversation_id,
-                            attempt_no=attempt_no,
-                            status="rejected",
-                            content=content or "",
-                            verdict_json=json.dumps({
-                                "verdict": verdict, "problem": problem, "source": source,
-                            }, ensure_ascii=False),
-                        ))
-                        await _att_db.commit()
-                except Exception:
-                    logger.warning("message_attempts write failed (fail-open)", exc_info=True)
-
-            agent_loop.on_draft_rejected = _on_draft_rejected
-
-            # §5.2 工程要求 1：coordinator 与召回管线/工作区准备/skills 组装真并发
-            # （合并等待取 max 非 sum）。coordinator 只读 user/assistant 消息，
-            # 不依赖 system prompt，可提前启动；失败回退 _ALO_UNSET 由 run 内串行重试。
-            from app.services.agent_loop import _UNSET as _ALO_UNSET
-
-            async def _coord_prepass():
-                try:
-                    return await agent_loop._coordinate(list(messages_for_model))
-                except Exception:
-                    logger.exception("coordinator pre-pass failed; in-loop retry")
-                    return _ALO_UNSET
-
-            # Setup heartbeat: this gather includes the coordinator LLM
-            # pre-pass and can legitimately exceed 30-60s. Before the buffer /
-            # registry / agent keepalive exist, total silence would trip the
-            # frontend's 30s stall watchdog and kill a healthy setup (and with
-            # it the whole run — the detached task does not exist yet). Emit
-            # raw SSE pings until the gather settles.
-            from app.services.sse_heartbeat import HEARTBEAT as _HB, aiter_with_heartbeat as _aiter_hb
-
-            async def _workspace_ctx():
-                """Request-independent workspace fetch.
-
-                A client disconnect during setup (tab switch / refresh /
-                network blip) must NOT kill the run — the SSE abort path
-                re-drives the tool loop in a detached task AFTER the request
-                session is closed, so setup can no longer depend on the
-                request-scoped ``db`` (conv b078987b, 2026-08-03: 20s-in
-                abort → dead-setup release → user message left unanswered).
-                """
-                async with _AsyncSessionLocal() as _ws_db:
-                    return await ensure_user_workspace(
-                        _ws_db, current_user.id, current_user.username,
-                    )
-
-            _setup_result = None
-            async for _hb_item in _aiter_hb(asyncio.gather(
-                _memory_ctx(),
-                _workspace_ctx(),
-                build_skills_system_prompt(current_user, include_force_inject=False),
-                _coord_prepass(),
-            ), interval=10.0):
-                if _hb_item is _HB:
-                    # Keep the provisional reservation alive: a live setup
-                    # (SSE pings flowing) must never be reaped by the 180s
-                    # provisional TTL — expiry would let a newer request
-                    # re-reserve the slot and fail THIS run with
-                    # conversation_superseded (user-visible "已被新的请求取代"
-                    # error on a healthy stream). Identity-checked: only
-                    # refresh while the slot is still ours.
-                    try:
-                        if (
-                            _reserved_agent_state is not None
-                            and _agent_registry.get_local(conversation_id) is _reserved_agent_state
-                            and _reserved_agent_state.provisional
-                        ):
-                            _reserved_agent_state.reserved_at = time.time()
-                    except Exception:
-                        pass
-                    yield {"event": "ping", "data": json.dumps({"ping": True})}
-                else:
-                    _setup_result = _hb_item
-            memory_context, workspace, skills_sys_prompt, coord_result = _setup_result
-            agent_loop.workspace_path = str(workspace.root_path)
-
-            # W17 vibeweaver 轮次门控：force-inject 全文与 gate/audit 执法仅对
-            # coding 任务或显式提及 vibeweaver 的轮次激活（生产 conv dd3b2408：
-            # 非代码任务被无条件注入拖入工程仪式直至空回答）。coordinator 缺位
-            # （死亡模式/显式技能调用/解析失败）→ coding_task None → 关键词兜底。
-            from app.services.vibeweaver_turn_gate import (
-                explicit_trigger_hit as _vw_explicit,
-                resolve_effective_active as _vw_resolve_eff,
-            )
-            # 门控文本/ctx 已于 messages_for_model 定稿后、deathmatch 合成注入前
-            # 抽取（见上方 IMPORTANT-1 注释）。coordinator 缺位（死亡模式/技能调用）
-            # 时启发式兜底吃近 3 条 ctx——「继续」类跟帖不丢工程上下文；
-            # explicit 仍只看末条（防历史提及对无关新话题过度激活）。
-            _vw_coding = coord_result.get("coding_task") if isinstance(coord_result, dict) else None
-            _vw_explicit_hit = _vw_explicit(_vw_text)
-            try:
-                _vw_gating = get_config().vibeweaver_task_gating_enabled
-                # D9/H15：mode=off = 不注入 + 不装钩子（单一 owner；kill-switch 全关，
-                # 含 force-inject 短路——round-6 三接缝之一）。
-                _vw_mode = get_config().vibeweaver_mode
-            except Exception:
-                _vw_gating, _vw_mode = True, "auto"
-            if _vw_mode == "off":
-                _vw_active = False
-            else:
-                _vw_active = _vw_resolve_eff(_vw_text, _vw_coding, _vw_gating, context_text=_vw_ctx)
-            agent_loop.vibeweaver_active = _vw_active
-            if _vw_active:
-                _vw_block = await build_force_injected_skills_prompt(current_user)
-                if _vw_block:
-                    skills_sys_prompt = (
-                        (skills_sys_prompt + "\n\n" + _vw_block) if skills_sys_prompt else _vw_block
-                    )
-            logger.info(
-                "vibeweaver turn gate active=%s explicit=%s coding=%s gating=%s mode=%s conv=%s",
-                _vw_active, _vw_explicit_hit, _vw_coding, _vw_gating, _vw_mode, conversation_id,
-            )
-
-            # D4 compactResume：压缩发生后的**下一轮** system 装配一次性注入恢复包
-            # （会话级 pending 标记；消费即清，绝不重复注入）。fail-open。
-            try:
-                if _vw_mode != "off":
-                    from app.services import vibeweaver_delivery_service as _vw_delivery
-                    from app.services.vibeweaver_gate_service import (
-                        find_project_root as _vw_find_root,
-                        resolve_session_root as _vw_resolve_root,
-                    )
-                    _vw_ws = str(workspace.root_path)
-                    _vw_root = _vw_resolve_root(_vw_ws, str(conversation_id))
-                    if _vw_root is None:
-                        _vw_root = _vw_find_root([_vw_ws], bound=_vw_ws)
-                    if _vw_root is not None:
-                        _vw_resume = _vw_delivery.consume_pending_resume(_vw_root, str(conversation_id))
-                        if _vw_resume:
-                            skills_sys_prompt = (
-                                (skills_sys_prompt + "\n\n" + _vw_resume) if skills_sys_prompt else _vw_resume
-                            )
-                            logger.info("vibeweaver compact-resume injected (conv=%s)", conversation_id)
-            except Exception:
-                logger.debug("vibeweaver compact-resume injection failed-open", exc_info=True)
-
-            from types import SimpleNamespace
-            if memory_context is not None and memory_context.strip():
-                shared_context = SimpleNamespace(
-                    agent_state=None,
-                    memory_summary=memory_context or '',
-                    dream_summary='',
-                    memory_entries=[],
-                )
-            else:
-                from app.services.memory_runtime_state import memory_runtime_enabled as _mem_rt2
-                if _mem_rt2(_config):
-                    # v2 运行时（2026-09-13 v1 退休，方案 A）：检索为空即无记忆
-                    # 注入——不再回落 v1 摘要（陈旧数据；v1 生成在 v2 下已停摆）。
-                    shared_context = SimpleNamespace(
-                        agent_state=None, memory_summary='', dream_summary='', memory_entries=[])
-                else:
-                    async with _AsyncSessionLocal() as _sctx_db:
-                        shared_context = await build_shared_agent_context(_sctx_db, current_user.id)
-
-            # 记忆优先级最高（2026-09-18 conv 3583d840，A4.9 I2 修复）：把本轮
-            # 注入写手上下文的**全部**记忆源（v2 检索摘要 / v1 dream / 条目层 /
-            # 身份记忆）带给审计证据域（[M] 权威来源），避免审计把记忆事实判成
-            # 「凭空编造」并指示写手拒答；v1 回落路径（[memory] 关闭）同样覆盖。
-            _mem_parts = [
-                str(getattr(shared_context, "memory_summary", "") or ""),
-                str(getattr(shared_context, "dream_summary", "") or ""),
-                "\n".join(
-                    str(getattr(_e, "content", "") or "")
-                    for _e in (getattr(shared_context, "memory_entries", None) or [])
-                ),
-                str(identity_context or ""),
-            ]
-            agent_loop.injected_memory_context = "\n\n".join(
-                _p for _p in _mem_parts if _p.strip())
-
-            sys_prompt = await agent_service._build_system_prompt(
-                assistant=assistant,
-                shared_context=shared_context,
-                workspace=workspace,
-                user=current_user,
-                user_skill_content=skill_content,
-                skills_system_prompt=skills_sys_prompt,
-                skill_files=skill_files,
-                identity_context=identity_context,
-                conversation_id=str(conversation_id),
-                deathmatch_mode=bool(conversation.deathmatch_mode),
-            )
-            messages_for_model[0] = {"role": "system", "content": sys_prompt}
-
-            # 上下文 token 用量：估算「系统提示词 + 历史 + 工具 schema」的完整
-            # 请求量，随流发给前端显示（头部徽章）。压缩事件携带 before/after
-            # 对比并在压缩后刷新本值。CJK 感知估算（与压缩决策同源）。
-            from app.services.agent_loop import _resolve_context_length
-            _ctx_window = _resolve_context_length(getattr(agent_loop, 'llm', None))
-            _ctx_tokens = 0
-            try:
-                from app.services.context_compressor import estimate_request_tokens_rough
-                _ctx_tokens = estimate_request_tokens_rough(
-                    messages_for_model, tools=agent_loop.tool_schemas
-                )
-            except Exception:
-                logger.exception("Failed to estimate context tokens")
-
-            _agent_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
-            _agent_done = object()
-            nonlocal sse_cancelled_flag
-            sse_cancelled_flag = asyncio.Event()
-            _sse_cancelled = sse_cancelled_flag
-
-            # 4.8 session lock handoff: adopt the slot reserved in the
-            # endpoint (identity-checked). If the registry no longer holds
-            # OUR state object, a newer request re-reserved the slot — this
-            # run is stale and must abort instead of spawning a second loop.
-            # Refresh first: a slow-but-alive setup must not abort itself.
-            if _reserved_agent_state is not None:
-                if _reserved_agent_state.provisional:
-                    _reserved_agent_state.reserved_at = time.time()
-                _agent_state = await _agent_registry.adopt_reservation(
-                    conversation_id, _reserved_agent_state
-                )
-                if _agent_state is None:
-                    yield {
-                        "event": "error",
-                        "data": json.dumps({
-                            "error": "该会话的回答已被新的请求取代，已取消重复请求。",
-                            "code": "conversation_superseded",
-                            # A newer request legitimately owns the conversation —
-                            # the frontend must end this stale stream SILENTLY
-                            # (no error bubble) and resync from the DB instead
-                            # of alarming the user.
-                            "silent": True,
-                        }, ensure_ascii=False),
-                    }
-                    return
-            else:
-                _agent_state = await _agent_registry.register(conversation_id)
-            # Cancel any previous detached agent task for this conversation to
-            # prevent stale tasks from emitting permission requests alongside the
-            # new one.
-            old_task = _DETACHED_AGENT_TASKS.pop(conversation_id, None)
-            if old_task and not old_task.done():
-                old_task.cancel()
-                logger.info("Cancelled stale detached agent task for conversation %s", conversation_id)
-            _agent_queue = await _agent_state.subscribe()
-
-            _TOOL_STEP_TITLES: dict[str, str] = {
-                "web_search": "联网检索结果",
-                "browser": "浏览网页结果",
-                "execute_code": "代码执行结果",
-                "memory": "记忆操作",
-                "delegate_task": "子任务执行结果",
-                "context7_resolve_library_id": "查找库文档ID",
-                "context7_query_docs": "查询库文档",
-            }
-
-            _cap_conversation_id = conversation_id
-            _cap_assistant = assistant
-            _cap_search_query = search_query
-            _cap_latest_user_query = latest_user_query
-            _cap_user_id = current_user.id
-            _cap_username = current_user.username
-            _cap_workspace_path = str(workspace.root_path)
-            _cap_llm_service = llm_service
-
-            async def _generate_title_bg(bg_db, conv_row, full_content: str) -> str | None:
-                """Run TitleGeneratorService for background save paths so that
-                conversations whose original SSE was interrupted still get a
-                proper LLM-generated title (instead of just slicing the query)."""
-                if not conv_row or conv_row.title != "新对话":
-                    return conv_row.title if conv_row else None
-                _tq = _cap_search_query or _cap_latest_user_query or ""
-                generated_title: str | None = None
-                try:
-                    tg = TitleGeneratorService(
-                        **agent_service.title_generator_kwargs(_cap_assistant, _cap_llm_service),
-                        provider_type=wire_provider_type(_cap_llm_service, getattr(_cap_assistant, "provider_type", "deepseek") or "deepseek"),
-                    )
-                    try:
-                        generated_title = await tg.generate_title(
-                            user_query=_tq,
-                            assistant_response=full_content or "",
-                        )
-                    except Exception:
-                        logger.exception("Background title LLM call failed; using fallback")
-                        generated_title = None
-                    if not generated_title:
-                        generated_title = await tg.get_fallback_title(_tq)
-                except Exception:
-                    logger.exception("Background TitleGeneratorService init failed")
-                if not generated_title or generated_title == "新对话":
-                    src = (_tq or full_content or "").strip()
-                    generated_title = src[:16] if src else "未命名会话"
-                conv_row.title = generated_title
-                await bg_db.commit()
-                return generated_title
-
-            # Deathmatch terminal-status flag shared with the nested
-            # _agent_loop_task (which sets it) and this function's finalize
-            # path (which reads it). Must live in THIS scope — defining it
-            # only inside _agent_loop_task caused a NameError at the final
-            # save whenever the loop ended with empty content (conv 51d74833).
-            _dm_terminal_status_saved = False
-
-            # Stream buffer for this conversation, shared between the agent
-            # task (creator) and the relay loop (post-disconnect save). Must
-            # live in _run_tool_loop scope, NOT inside _agent_loop_task: the
-            # relay's _bg_save / interrupted-save paths reference it after
-            # the agent task completes (conv b078987b recovery hit a
-            # NameError here when the post-disconnect relay path ran in the
-            # detached re-run).
-            _stream_buf = None
-
-            async def _agent_loop_impl():
-                # Shared with _run_tool_loop (enclosing scope): set when the
-                # deathmatch terminal status message (partial_complete/
-                # human_gate/paused) was persisted during per-turn handling —
-                # the outer finalize path then skips saving a redundant
-                # empty-content assistant bubble. Defined in _run_tool_loop
-                # before this def; bound here via nonlocal.
-                nonlocal _stream_buf, _dm_terminal_status_saved
-                _ttft_t0 = time.monotonic()
-                assistant_content = ""
-                assistant_reasoning = ""
-                # Pre-tool text gating: on tool-requiring turns (coordinator
-                # route=tool_loop + expects_tools=True) content produced BEFORE
-                # the first tool call is transient — it is dropped from the
-                # persisted answer, so streaming it makes the user see a
-                # "first answer" that later vanishes or duplicates the real
-                # one (conv 149ce886: the model claimed "我进行了真实检索"
-                # before the auto-invoked web_search). Gated text is discarded
-                # on the first tool_call, released at iteration boundaries and
-                # flushed at turn end otherwise. The hold is BOUNDED
-                # (HOLD_MAX_SECONDS) so a turn where the coordinator
-                # over-predicted tools but the model answered directly can
-                # never park the whole answer silently until `done` — the
-                # answer streams live instead of popping whole (2026-08-06).
-                _pre_tool_gate = PreToolGate()
-                # Set when the agent loop terminated via an error event. The
-                # completion block uses it to substitute a visible failure
-                # message instead of persisting an empty/invisible turn.
-                _loop_error: str | None = None
-                current_reasoning_segment = ""
-                # A4.9 R2 N1：hold-cap 释放给用户的预工具散文快照（压缩时保留）。
-                _released_prose = ""
-                # 遵循词 canary streaming strip: hold-back tails. LLM deltas are
-                # 1-3 chars, so [遵循词:xxxxxx] is routinely split across chunks
-                # and per-chunk regex strip misses it (conv 6227fb26 leak).
-                _canary_tail = ""
-                _reasoning_canary_tail = ""
-                # 显示层元引用清洗（2026-09-18 思考卫生波）：与 canary 同级的
-                # 确定性护栏——提示词禁止仍会概率性复发，思考对用户可见，
-                # 命中“系统提示词/coordinator note/identity rules”等内部脚手架
-                # 的短语由该尾缓冲清洗，跨分片拆词也不会泄漏。
-                _reasoning_meta_tail = ""
-                content_segments: list[str] = []
-                display_sequence: list[dict] = []
-                tool_results_accumulated: list[dict] = []
-                # PHASE 2B: collect raw tool_call events parallel to results.
-                # Used to populate Message.tool_calls so structured history
-                # can be replayed in future turns.
-                tool_call_events_accumulated: list[dict] = []
-                search_queries_used: list[str] = []
-                # Per-call web_search query map (conv a3cfb421 2026-08-09):
-                # call_id -> queries, so the persisted rounds display each
-                # round's OWN queries instead of the last call's for all.
-                search_queries_by_call: dict[str, list[str]] = {}
-                # Last accumulated download-card set streamed to the client
-                # (conv fbf5779b: emit the accumulated set on each tool_result
-                # so the live count equals the persisted one).
-                _last_streamed_attachments: list[dict] = []
-                # Deathmatch: deliverable file attachments collected when the
-                # goal completes. Injected into the final summary message's
-                # tool_results so download cards appear without relying on
-                # per-tool-call attachments.
-                _dm_final_attachments: list[dict] = []
-                # Deathmatch: attachments from the most recent per-turn save,
-                # used as fallback when _dm_final_attachments is empty (e.g.
-                # paused/human_gate paths where collect_final_deliverables was
-                # never called). Ensures the final summary message carries
-                # download cards for files generated in the last turn.
-                _dm_last_turn_attachments: list[dict] = []
-
-                # Create stream buffer for this conversation
-                try:
-                    _stream_buf = await stream_buffer_manager.create_buffer(
-                        _cap_conversation_id, _cap_user_id
-                    )
-                    await _stream_buf.set_sse_active(True)
-                except Exception:
-                    # Buffer creation failed before the main try below — no
-                    # `_failed` would ever be broadcast, so the relay loop
-                    # (drain mode in setup-recovery) would spin on 10s pings
-                    # forever with an adopted slot. Broadcast failure and
-                    # terminate; the task's finally releases the slot.
-                    logger.exception(
-                        "Stream buffer creation failed for conversation %s",
-                        _cap_conversation_id,
-                    )
-                    try:
-                        await _agent_state.broadcast({"_failed": "流缓冲创建失败"})
-                        await _agent_state.broadcast_done()
-                    except Exception:
-                        pass
-                    return
-
-                # 渐进落库（2026-10-06，conv ae9aa092）：run 开始即建
-                # delivery_status='streaming' 的 assistant 行 + 周期刷写器——
-                # 进程被杀死（部署/崩溃/OOM）时已流式正文存活于 DB，启动 sweep
-                # 翻 interrupted 后带徽标展示，不再整段蒸发。死磕按轮落库
-                # 不在此路径（其逐轮保存已有独立契约）。
-                _streaming_row_id: str | None = None
-                if _deathmatch_mgr is None:
-                    try:
-                        async with AsyncSessionLocal() as _pf_db:
-                            _pf_row = Message(
-                                conversation_id=_cap_conversation_id,
-                                role="assistant",
-                                content="",
-                                delivery_status="streaming",
-                            )
-                            _pf_db.add(_pf_row)
-                            await _pf_db.commit()
-                            await _pf_db.refresh(_pf_row)
-                            _streaming_row_id = str(_pf_row.id)
-                            # 行 id 挂到 buffer（A4.9 r1 M2）：detach/relay/消费端
-                            # 的空行清理按行 id 精确删除，不跨 run 误删下一 run 的新行。
-                            try:
-                                _stream_buf.streaming_message_id = _streaming_row_id
-                            except Exception:
-                                pass
-                    except Exception:
-                        logger.warning(
-                            "streaming row creation failed (fail-open)", exc_info=True)
-
-                async def _pf_write(text: str) -> None:
-                    if not _streaming_row_id:
-                        return
-                    try:
-                        async with AsyncSessionLocal() as _pf_db:
-                            # Core 级 UPDATE：不触发 ORM/sync 事件（streaming
-                            # 行本就不下发同步）；仅当行仍在途时刷写。
-                            await _pf_db.execute(
-                                sa_update(Message)
-                                .where(Message.id == _streaming_row_id,
-                                       Message.delivery_status == "streaming")
-                                .values(content=text)
-                            )
-                            await _pf_db.commit()
-                    except Exception:
-                        logger.debug("progressive flush failed (fail-open)", exc_info=True)
-
-                _pf = ProgressiveFlusher(_pf_write)
-
-                # F1-1: per-stream part translator. Legacy events keep flowing
-                # unchanged; each translated event additionally emits
-                # part_started/part_delta/part_updated so v2 clients can drive
-                # the timeline by stable part_id instead of positional heuristics.
-                part_translator = PartTranslator()
-
-                async def _put(event_dict):
-                    # F1-1: translate + broadcast part events FIRST. Ordering
-                    # matters: the frontend activates partMode on the first part
-                    # event; legacy events arriving afterwards only update
-                    # accumulators (content string, tool list), never the
-                    # displaySequence — preventing double-rendered items.
-                    #
-                    # Ordering between buffer and broadcast: the stream buffer
-                    # is the resume-replay authority — a client that
-                    # disconnects and resumes must be able to reconstruct
-                    # EVERYTHING it already displayed. Recording the buffer
-                    # BEFORE broadcasting guarantees the replay snapshot is
-                    # never behind the live stream; broadcasting first opened
-                    # a window where the client received an event that the
-                    # snapshot missed, so the resume replay regressed the
-                    # timeline and already-displayed content vanished
-                    # mid-answer (refresh restored it from the DB).
-                    part_events = part_translator.translate(event_dict)
-                    for _pe in part_events:
-                        try:
-                            await _stream_buf.append(_pe)
-                        except Exception:
-                            pass
-                        await _agent_state.broadcast(_pe)
-
-                    # Update registry state
-                    if "content" in event_dict:
-                        _agent_state.content += event_dict["content"]
-                    elif "content_segment" in event_dict:
-                        seg = event_dict["content_segment"]
-                        if seg.strip():
-                            _agent_state.content_segments.append(seg)
-                    elif "reasoning_content" in event_dict:
-                        _agent_state.reasoning += event_dict["reasoning_content"]
-                    elif "tool_call" in event_dict:
-                        _agent_state.tool_calls.append(event_dict["tool_call"])
-                    elif "tool_result" in event_dict:
-                        _agent_state.tool_results.append(event_dict["tool_result"])
-                    elif "attachments" in event_dict:
-                        _agent_state.file_attachments = list(event_dict["attachments"])
-                    elif "iteration" in event_dict:
-                        _agent_state.iteration = event_dict["iteration"]
-                    elif "agent_step" in event_dict:
-                        pass  # pass through to broadcast
-
-                    # Also write to persistent stream buffer (before the
-                    # broadcast — see ordering note above).
-                    try:
-                        await _stream_buf.append(event_dict)
-                    except Exception:
-                        pass
-
-                    # Broadcast to all subscribers (last: buffer already
-                    # recorded the event, so a disconnect right after the
-                    # broadcast can always be recovered via resume replay).
-                    await _agent_state.broadcast(event_dict)
-
-                async def _persist_final_answer(
-                    *,
-                    conv_id: str,
-                    content: str,
-                    reasoning: str | None,
-                    tr_json_str: str | None,
-                    tc_json: str | None,
-                    ctx_info: dict | None = None,
-                ) -> str | None:
-                    """conv 3b58af5b (R4, 2026-08-23): single-writer producer-
-                    side persistence for the final answer. Runs BEFORE the
-                    `_completed` broadcast so a client disconnect in the
-                    completion window can never lose a fully-generated answer.
-                    Returns the message id, or None on failure (callers fall
-                    back to the legacy consumer/self-save paths)."""
-                    try:
-                        async with AsyncSessionLocal() as db:
-                            conv_row = (await db.execute(
-                                select(Conversation).where(Conversation.id == conv_id)
-                            )).scalar_one_or_none()
-                            if conv_row is None:
-                                return None
-                            # 渐进落库（2026-10-06）：有 streaming 在途行则原地
-                            # 更新翻 final，不插入重复行。
-                            msg = await _save_assistant_terminal(
-                                db,
-                                conversation_id=conv_id,
-                                content=content,
-                                reasoning=reasoning or None,
-                                tool_results=tr_json_str,
-                                tool_calls=tc_json,
-                                context_info=(
-                                    json.dumps(ctx_info, ensure_ascii=False) if ctx_info else None
-                                ),
-                                status="final",
-                            )
-                            conv_row.updated_at = datetime.utcnow()
-                            await db.commit()
-                    except Exception:
-                        logger.exception(
-                            "Producer-side persistence failed for conversation %s", conv_id
-                        )
-                        return None
-                    # A4.9 fix (Important-1): commit succeeded — the row is
-                    # durable. Exceptions during refresh/close must NOT be
-                    # reported as "not persisted" (callers would fall back to
-                    # the legacy save path and insert a duplicate row).
-                    try:
-                        return str(msg.id)
-                    except Exception:
-                        logger.exception(
-                            "Persisted message id unavailable for conversation %s "
-                            "(row committed; falling back to legacy consumer save)",
-                            conv_id,
-                        )
-                        return None
-
-                # 每轮开始时推送上下文 token 用量（前端头部徽章）。
-                if _ctx_tokens > 0:
-                    await _put({"context_info": {
-                        "tokens": _ctx_tokens,
-                        "context_length": _ctx_window,
-                    }})
-
-                task_db = AsyncSessionLocal()
-                # A4.9 closure residual: optimistic sync snapshot — captured at
-                # bind time so the very first verdict sync already detects
-                # concurrent user actions (pause/stop/resume) instead of
-                # clobbering them (last-writer-wins).
-                _dm_sync_snapshot: dict = {}
-                _dm_sync_frozen = frozenset()
-                try:
-                    task_conversation = await task_db.get(Conversation, _cap_conversation_id)
-                    task_user = await task_db.get(User, _cap_user_id)
-                    # DEATHMATCH: Rebind deathmatch manager to task_db conversation
-                    if _deathmatch_mgr is not None and task_conversation is not None:
-                        _deathmatch_mgr._conv = task_conversation
-                        agent_loop.deathmatch_manager = _deathmatch_mgr
-                        from app.services.deathmatch_service import (
-                            DEATHMATCH_SYNC_FIELDS as _DM_SYNC_FIELDS,
-                        )
-                        import copy as _copy
-                        # Deep-copied seed: several fields are mutated in place
-                        # (events/reflections/plan), so aliasing the live row's
-                        # objects would hide changes (A4.9 r-residual F2).
-                        _dm_sync_snapshot = {
-                            _f: _copy.deepcopy(getattr(task_conversation, _f))
-                            for _f in _DM_SYNC_FIELDS
-                            if hasattr(task_conversation, _f)
-                        }
-                        # Emit initial deathmatch status for frontend
-                        await _put({"deathmatch_verdict": {
-                            "status": _deathmatch_mgr._conv.deathmatch_status,
-                            "verdict": None,
-                            "reason": None,
-                            "turns": _deathmatch_mgr._conv.deathmatch_turns,
-                            "max_turns": _deathmatch_mgr._conv.deathmatch_max_turns,
-                            "grilling_completed": _deathmatch_mgr._conv.deathmatch_grilling_completed or 0,
-                            "grilling_total": _deathmatch_mgr._conv.deathmatch_grilling_total or 0,
-                            "message": "",
-                        }})
-                except Exception:
-                    logger.warning("Agent task failed to load conversation/user from fresh DB session")
-                    await _agent_queue.put({"_failed": "DB session init failed"})
-                    try:
-                        await task_db.close()
-                    except Exception:
-                        pass
-                    return
-
-                # DEATHMATCH: Generate grilling questions during grilling phase
-                _grilling_generated = False
-                if _deathmatch_mgr and _deathmatch_mgr.is_grilling:
-                    # First, try to recover from a zombie grilling state
-                    # (all tasks completed but goal never synthesized).
-                    recovered = await _deathmatch_mgr.try_recover_stalled_grilling(task_db)
-                    if recovered:
-                        await task_db.commit()
-                        await _put({
-                            "deathmatch_verdict": {
-                                "status": "active",
-                                "verdict": "grilling_recovered",
-                                "reason": "盘问已完成，目标已合成，死磕模式已恢复",
-                                "turns": _deathmatch_mgr._conv.deathmatch_turns or 0,
-                                "max_turns": _deathmatch_mgr._conv.deathmatch_max_turns or 0,
-                                "grilling_completed": _deathmatch_mgr._conv.deathmatch_grilling_completed or 0,
-                                "grilling_total": _deathmatch_mgr._conv.deathmatch_grilling_total or 0,
-                                "message": "盘问阶段已完成，死磕目标执行已恢复",
-                            }
-                        })
-                        _grilling_generated = False
-                    else:
-                        try:
-                            grilling_questions = await _deathmatch_mgr.generate_grilling_questions(
-                                query=_cap_latest_user_query,
-                                db=task_db,
-                                user_id=_cap_user_id,
-                                assistant_id=_cap_assistant.id if _cap_assistant else None,
-                            )
-                            await task_db.commit()
-                            completed, total = _deathmatch_mgr.grilling_progress
-                            round_num = _deathmatch_mgr._conv.deathmatch_grilling_round or 1
-                            round_total = _deathmatch_mgr._conv.deathmatch_grilling_round_total or 3
-                            await _put({
-                                "deathmatch_verdict": {
-                                    "status": "grilling",
-                                    "verdict": "grilling_questions_generated",
-                                    "reason": f"已生成第{round_num}轮{total}个盘问问题",
-                                    "turns": 0,
-                                    "max_turns": 0,
-                                    "grilling_completed": completed,
-                                    "grilling_total": total,
-                                    "grilling_round": round_num,
-                                    "grilling_round_total": round_total,
-                                    "message": f"盘问阶段 第{round_num}/{round_total}轮 — 请回答{total}个问题以明确目标",
-                                    "grilling_questions": grilling_questions,
-                                }
-                            })
-                            _grilling_generated = True
-                        except Exception:
-                            logger.exception("Failed to generate grilling questions")
-                            await _put({
-                                "deathmatch_verdict": {
-                                    "status": "grilling",
-                                    "verdict": "grilling_generation_failed",
-                                    "reason": "盘问问题生成失败",
-                                    "turns": 0,
-                                    "max_turns": 0,
-                                    "grilling_completed": 0,
-                                    "grilling_total": 0,
-                                    "grilling_round": 0,
-                                    "grilling_round_total": 0,
-                                    "message": "盘问问题生成失败，请重试或关闭死磕模式",
-                                }
-                            })
-                            _grilling_generated = True
-
-                # Release the setup session before the (potentially long) agent loop.
-                try:
-                    await task_db.close()
-                except Exception:
-                    pass
-                task_db = None
-
-                try:
-                    # DEATHMATCH: If in grilling phase, skip the agent loop.
-                    # Grilling questions were already generated and emitted above.
-                    # The agent loop should only run during the active goal phase.
-                    if _deathmatch_mgr and _deathmatch_mgr.is_grilling and _grilling_generated:
-                        content_segments.append(f"盘问阶段：已生成 {_deathmatch_mgr._conv.deathmatch_grilling_total or 0} 个问题，等待回答")
-                        display_sequence.append({"type": "text", "content": "盘问阶段：请回答上方的问题以明确目标"})
-                        await _put({"done": True})
-                    else:
-                        _ttft_t1 = time.monotonic()
-                        _ttft_t2 = 0  # coordinator return
-                        _ttft_t3 = 0  # first content delta
-                        async for event in agent_loop.run(
-                            messages_for_model,
-                            user=task_user,
-                            conversation=task_conversation,
-                            assistant=_cap_assistant,
-                            precomputed_coord=coord_result,
-                            interjection_queue=_agent_state.interjection_queue,
-                        ):
-                            if "coord_done" in event:
-                                _ttft_t2 = time.monotonic()
-
-                            elif "coordinator" in event:
-                                _coord_route = (event["coordinator"] or {}).get("route")
-                                _coord_expects = (event["coordinator"] or {}).get("expects_tools")
-                                _pre_tool_gate.arm(_coord_route, _coord_expects)
-
-                            elif "reasoning_content" in event:
-                                if not _ttft_t3:
-                                    _ttft_t3 = time.monotonic()
-                                    logger.info(
-                                        "TTFT(reasoning) conv=%s setup=%dms coord=%dms prefill=%dms total=%dms",
-                                        conversation_id,
-                                        int((_ttft_t1 - _ttft_t0) * 1000),
-                                        int((_ttft_t2 - _ttft_t1) * 1000) if _ttft_t2 else -1,
-                                        int((_ttft_t3 - _ttft_t2) * 1000) if _ttft_t2 else -1,
-                                        int((_ttft_t3 - _ttft_t0) * 1000),
-                                    )
-                                # 遵循词 canary marker may appear in CoT when
-                                # the model restates the echo rule — strip it
-                                # here (single funnel for display + persist).
-                                # Streaming-aware: the marker can be split
-                                # across deltas, so a tail buffer is held back
-                                # (conv 6227fb26 leaked it into the thinking
-                                # panel otherwise).
-                                _reasoning_chunk, _reasoning_canary_tail = strip_canary_streaming(
-                                    event["reasoning_content"], _reasoning_canary_tail
-                                )
-                                # 元引用清洗（canary 之后，尾缓冲处理跨分片拆词）
-                                _reasoning_chunk, _reasoning_meta_tail = scrub_reasoning_streaming(
-                                    _reasoning_chunk, _reasoning_meta_tail
-                                )
-                                assistant_reasoning += _reasoning_chunk
-                                current_reasoning_segment += _reasoning_chunk
-                                await _put({"reasoning_content": _reasoning_chunk})
-
-                            elif "content" in event:
-                                if not _ttft_t3:
-                                    _ttft_t3 = time.monotonic()
-                                    logger.info(
-                                        "TTFT conv=%s setup=%dms coord=%dms prefill=%dms total=%dms",
-                                        conversation_id,
-                                        int((_ttft_t1 - _ttft_t0) * 1000),
-                                        int((_ttft_t2 - _ttft_t1) * 1000) if _ttft_t2 else -1,
-                                        int((_ttft_t3 - _ttft_t2) * 1000) if _ttft_t2 else -1,
-                                        int((_ttft_t3 - _ttft_t0) * 1000),
-                                    )
-                                _clean_content, _canary_tail = strip_canary_streaming(
-                                    event["content"], _canary_tail
-                                )
-                                _clean_content = _strip_dsml_all(_clean_content)
-                                assistant_content += _clean_content
-                                _pf.feed(assistant_content)
-                                if _clean_content:
-                                    _gate_stream = _pre_tool_gate.on_content(
-                                        _clean_content, time.monotonic()
-                                    )
-                                    if _gate_stream:
-                                        # Hold cap released (or gate not armed):
-                                        # the text must reach the client NOW.
-                                        await _put({"content": _gate_stream})
-
-                            elif "tool_call" in event:
-                                reason_seg = current_reasoning_segment.strip()
-                                if reason_seg:
-                                    _reason_item = {
-                                        "type": "reasoning_step",
-                                        "title": "💭 思考过程",
-                                        "content": reason_seg,
-                                    }
-                                    display_sequence.append(_reason_item)
-                                    await _put({"reasoning_segment": _reason_item})
-                                    current_reasoning_segment = ""
-                                # When the assistant emits tool calls, the content
-                                # produced so far is a transient pre-tool
-                                # utterance (often a duplicate or placeholder).
-                                # Only the part the client NEVER saw (still in
-                                # the gate hold) is dropped; anything already
-                                # streamed must persist — A4.9 I2 contract
-                                # generalized (conv 4e159a79, see helper doc).
-                                display_sequence.append({"type": "tool_placeholder"})
-                                assistant_content = _drop_unshown_pre_tool_prose(
-                                    assistant_content, _pre_tool_gate
-                                )
-                                if assistant_content:
-                                    # A4.9 R2 N1：快照已释放的预工具散文——压缩时
-                                    # 只保留它，其后（工具后）的草稿仍按契约丢弃，
-                                    # 否则「散文+旧稿+重答」三段拼接落库。
-                                    _released_prose = assistant_content
-                                # Held canary tails belong to the discarded
-                                # pre-tool draft — reset so no stale partial
-                                # marker is prepended to post-tool content.
-                                # Lossless for prose: the held tail is by
-                                # construction a pure `[遵循词…` marker-prefix
-                                # fragment (CANARY_PREFIX_RE; see
-                                # tests/test_canary_tail_invariant.py) — never
-                                # answer text, so dropping it on a KEPT draft
-                                # loses nothing (a flush would leak marker
-                                # fragments into the answer instead).
-                                _canary_tail = ""
-                                _reasoning_canary_tail = ""
-                                _reasoning_meta_tail = ""
-                                _pre_tool_gate.on_tool_call()
-                                tc = event["tool_call"]
-                                tool_call_events_accumulated.append(tc)
-                                if tc.get("name") == "web_search":
-                                    args = tc.get("arguments", {})
-                                    queries = args.get("queries", [])
-                                    if isinstance(queries, list):
-                                        search_queries_used = list(queries)
-                                        # Per-call queries for round-level display
-                                        # (conv a3cfb421 2026-08-09): keep each
-                                        # web_search call's own query list keyed
-                                        # by call id so the persisted rounds show
-                                        # real per-round queries instead of the
-                                        # last call's for every round. AgentLoop
-                                        # emits tool_call events with `call_id`
-                                        # (never `id` — A4.9 review finding).
-                                        search_queries_by_call[tc.get("call_id") or tc.get("id") or ""] = list(queries)
-                                await _put({"tool_call": tc})
-
-                            elif "tool_result" in event:
-                                tr = event["tool_result"]
-                                tool_results_accumulated.append(tr)
-                                await _put({"tool_result": tr})
-                                # Live download-card set: recompute the
-                                # ACCUMULATED set (same helper as the
-                                # persist-time transform) so the streamed card
-                                # count grows monotonically and never drops
-                                # files. The previous per-call events replaced
-                                # the whole set with only the current tool
-                                # call's files, so the live count jumped
-                                # 1→1→1→1→4 with docx cards vanishing
-                                # (conv fbf5779b, 2026-08-06).
-                                _live_atts = _collect_download_attachments(tool_results_accumulated)
-                                if _live_atts and _live_atts != _last_streamed_attachments:
-                                    _last_streamed_attachments = _live_atts
-                                    await _put({"attachments": _live_atts})
-
-                            elif "iteration" in event:
-                                await _put({"iteration": event["iteration"]})
-
-                            elif "interjection_committed" in event:
-                                # 插话 commit-echo（2026-08-29）：loop 在迭代边界
-                                # 把用户插话注入了消息列表 —— 此处落库为真实
-                                # role=user 消息并广播，前端据此确认乐观气泡。
-                                _ij_content = str((event["interjection_committed"] or {}).get("content") or "")
-                                _ij_msg_id = None
-                                _ij_created = None
-                                try:
-                                    async with AsyncSessionLocal() as _ij_db:
-                                        _ij_conv = (await _ij_db.execute(
-                                            select(Conversation).where(Conversation.id == conversation_id)
-                                        )).scalar_one_or_none()
-                                        if _ij_conv is not None:
-                                            _ij_msg = Message(
-                                                conversation_id=conversation_id,
-                                                role="user",
-                                                content=_ij_content,
-                                            )
-                                            _ij_db.add(_ij_msg)
-                                            _ij_conv.updated_at = datetime.utcnow()
-                                            await _ij_db.commit()
-                                            _ij_msg_id = str(_ij_msg.id)
-                                            _ij_created = (
-                                                _ij_msg.created_at.isoformat()
-                                                if _ij_msg.created_at else None
-                                            )
-                                except Exception:
-                                    logger.exception(
-                                        "Interjection persistence failed for conversation %s",
-                                        conversation_id,
-                                    )
-                                await _put({"interjection_committed": {
-                                    "id": _ij_msg_id,
-                                    "conversation_id": conversation_id,
-                                    "content": _ij_content,
-                                    "created_at": _ij_created,
-                                }})
-
-                            elif "context_info" in event:
-                                # 紧急压缩 recovery（LLM 错误/final-thinking）路径
-                                # 从 agent_loop 直接 yield context_info——转发给
-                                # 中继层刷新前端 token 徽章。
-                                await _put({"context_info": event["context_info"]})
-
-                            elif "iteration_done" in event:
-                                # Iteration boundary without a tool_call event:
-                                # the previous iteration ended. A no-tool
-                                # iteration means the held text IS the answer —
-                                # stream it now instead of parking it until
-                                # `done` (whole-answer pop, 2026-08-06). A
-                                # tool iteration means the held text is stale
-                                # pre-tool prose — drop it (also covers a
-                                # tool_call event lost to subscriber-queue
-                                # overflow). Same tool-boundary contract as
-                                # the tool_call branch: only the never-shown
-                                # hold is droppable (conv 4e159a79).
-                                _id_info = event["iteration_done"] or {}
-                                if bool(_id_info.get("tool_calls")):
-                                    assistant_content = _drop_unshown_pre_tool_prose(
-                                        assistant_content, _pre_tool_gate
-                                    )
-                                _gate_flush = _pre_tool_gate.on_iteration_done(
-                                    bool(_id_info.get("tool_calls")),
-                                    time.monotonic(),
-                                )
-                                if bool(_id_info.get("tool_calls")):
-                                    # Tool-call event lost to queue overflow:
-                                    # the tool_call branch (which resets the
-                                    # canary tails) never ran — reset here so
-                                    # stale partial-marker text cannot merge
-                                    # into post-tool content (A4.9 review).
-                                    _canary_tail = ""
-                                    _reasoning_canary_tail = ""
-                                    _reasoning_meta_tail = ""
-                                if _gate_flush.strip():
-                                    logger.info(
-                                        "Pre-tool gate released by iteration_done "
-                                        "(iteration=%s, tool_calls=%s): streaming held text (%d chars)",
-                                        _id_info.get("iteration"), _id_info.get("tool_calls"),
-                                        len(_gate_flush),
-                                    )
-                                    await _put({"content": _gate_flush})
-
-                            elif "ping" in event:
-                                await _put({"ping": True})
-
-                            elif "compression" in event:
-                                # 压缩 = 丢弃草稿文本、以压缩后上下文重答（A4.9 I2：
-                                # 持久化答案是重答稿，不是拼接稿）。
-                                # conv 038e837a（2026-09-22）修复两点：
-                                #   1. 工具证据三件套必须跨压缩存活——citation_ledger
-                                #      不随压缩重置，清空 tool_results_accumulated 会让
-                                #      落库 results[] 缩水（30→10），草稿合法 [N] 越界被
-                                #      sanitize_texts 误剥（角标/卡片全丢）。与 audit_reset
-                                #      （conv efaf8f9c）既定政策对齐：工具工作是本轮证据。
-                                #   2. 下发 audit_reset 做客户端时间轴清创（conv 827a6f78
-                                #      同族）——被丢弃的旧稿不再与重答同屏（重复生成）。
-                                logger.debug("Context compressed: %s", event["compression"])
-                                # A4.9 R2 N1 / R3：_released_prose 只在散文确被
-                                # hold-cap 释放时置位（空串=从未释放）——它是释放
-                                # 事实的快照，不依赖压缩时刻的 cap_released
-                                # （on_tool_call 已复位该标志）。
-                                _keep_prose = _released_prose
-                                _had_dropped_text = bool(
-                                    assistant_content and assistant_content != _keep_prose
-                                ) or bool(content_segments)
-                                assistant_content = _keep_prose
-                                # trailing 思考段不静默丢弃（audit_reset A4 parity）：
-                                # 落盘为 reasoning_step，思考与工具不随草稿丢弃。
-                                reason_seg = current_reasoning_segment.strip()
-                                if reason_seg:
-                                    display_sequence.append({
-                                        "type": "reasoning_step",
-                                        "title": "💭 思考过程",
-                                        "content": reason_seg,
-                                    })
-                                current_reasoning_segment = ""
-                                content_segments = []
-                                _seq_before = len(display_sequence)
-                                display_sequence = _display_sequence_keep_evidence(display_sequence)
-                                _had_dropped_text = _had_dropped_text or (
-                                    len(display_sequence) != _seq_before
-                                )
-                                _canary_tail = ""
-                                _reasoning_canary_tail = ""
-                                _reasoning_meta_tail = ""
-                                _pre_tool_gate.reset()
-                                # 客户端清创：仅当确有草稿文本被丢弃才下发——
-                                # 无文本可丢的前置压缩（token-threshold/deathmatch
-                                # forced）保持既有 no-op，不得误删上一轮已落库文本
-                                # （A4.9 R1 Important-4）。死磕多轮流（turn 边界
-                                # 不在事件里）暂不下发：dropDraftTextAfterLastTool
-                                # 非 turn 作用域，会连带删掉上一轮已落库答案文本
-                                # （A4.9 R2 N3，已知边界）。
-                                if _had_dropped_text and _deathmatch_mgr is None:
-                                    await _put({"audit_reset": True})
-                                # 压缩前后 token 对比（含工具 schema 口径）——
-                                # 前端在「上下文压缩」步骤块内展示 X → Y tokens 变化。
-                                _comp = event["compression"] or {}
-                                _c_before = int(_comp.get("before") or 0)
-                                _c_after = int(_comp.get("after") or 0)
-                                # A4 (2026-08-21): canary-triggered compressions
-                                # are silent — no timeline step, only logs +
-                                # token-badge refresh. Token-threshold
-                                # compressions (pre-turn maintenance) stay
-                                # visible as before.
-                                if not _comp.get("silent") or _had_dropped_text:
-                                    # A4 (2026-08-21)：canary 压缩静默（仅日志 +
-                                    # token 徽章）。但草稿被丢弃时用户会看见文本消失
-                                    # ——此时不再是「用户不可见」，必须补时间线步骤
-                                    # 说明（A4.9 R1 Minor-2）。
-                                    from app.services.context_compressor import format_compression_step_content
-                                    await _put({
-                                        "agent_step": {
-                                            "name": "context_compression",
-                                            "title": "上下文压缩",
-                                            "content": format_compression_step_content(_c_before, _c_after),
-                                            "step_type": "system",
-                                            "tokens_before": _c_before or None,
-                                            "tokens_after": _c_after or None,
-                                        }
-                                    })
-                                # 压缩后上下文已变小——刷新前端 token 徽章。
-                                if _c_after > 0:
-                                    await _put({"context_info": {
-                                        "tokens": _c_after,
-                                        "context_length": _ctx_window,
-                                        "compressed": True,
-                                    }})
-
-                            elif "audit_reset" in event:
-                                # A4 (2026-08-21): internal QC reset event.
-                                # A draft was streamed live and then failed the
-                                # internal quality audit (or the canary re-assert
-                                # path) — reset the accumulators so the rejected
-                                # draft never concatenates into the PERSISTED
-                                # answer; the regeneration that follows is the
-                                # only authoritative content. Nothing is
-                                # rendered to the client (silent QC).
-                                #
-                                # conv 3b58af5b (2026-08-23, R1/R2): ONLY the
-                                # rejected draft TEXT is discarded. The turn's
-                                # real work survives:
-                                #   - reasoning (assistant_reasoning +
-                                #     display_sequence reasoning_step items) —
-                                #     post-reject revisions run thinking-off
-                                #     (revision_thinking_off, user decision
-                                #     2026-08-21), so discarding pre-reject
-                                #     thinking erased the turn's ENTIRE
-                                #     thinking panel from the persisted answer;
-                                #   - tool_placeholder items — they pair 1:1
-                                #     with the preserved tool_results
-                                #     accumulated entries at completion;
-                                #     clearing them starved the pairing and
-                                #     appended every agent_step AFTER the final
-                                #     text (tools-at-bottom symptom).
-                                assistant_content = ""
-                                # A4.9 r1 M1：被拒草稿可能已被刷进在途行——
-                                # 撤回到本稿前基线（空），残稿永不含被拒文字。
-                                await _pf.revert_to("")
-                                reason_seg = current_reasoning_segment.strip()
-                                if reason_seg:
-                                    # Thinking accrued since the last tool
-                                    # boundary belongs to the rejected round —
-                                    # flush it as a preserved reasoning_step.
-                                    # Silent QC: NOT re-emitted live (the user
-                                    # already saw these deltas stream); this
-                                    # only fixes the persisted surfaces.
-                                    display_sequence.append({
-                                        "type": "reasoning_step",
-                                        "title": "💭 思考过程",
-                                        "content": reason_seg,
-                                    })
-                                    current_reasoning_segment = ""
-                                # conv efaf8f9c (2026-08-20): do NOT clear
-                                # tool_results_accumulated /
-                                # tool_call_events_accumulated /
-                                # search_queries_used / search_queries_by_call
-                                # here. What must be discarded is the rejected
-                                # DRAFT text/reasoning that was streamed live;
-                                # the tool work from earlier iterations is the
-                                # turn's evidence and must survive so the final
-                                # persisted tool_results keeps results[],
-                                # agent_steps[] and the citation mapping.
-                                _canary_tail = ""
-                                _reasoning_canary_tail = ""
-                                _reasoning_meta_tail = ""
-                                _pre_tool_gate.reset()
-                                # conv 827a6f78 turn-B (2026-09-03): sync the
-                                # CLIENT on the silent QC reset — without this
-                                # the frontend's s.content kept every rejected
-                                # draft and the done-time answer bubble
-                                # contained the whole mess (refresh restored
-                                # the clean DB row). The buffer resets its own
-                                # accumulator on this event (resume replay
-                                # parity); the SSE generator forwards it as a
-                                # frame for the client-side timeline surgery.
-                                await _put({"audit_reset": True})
-
-                            elif "agent_step" in event:
-                                await _put({"agent_step": event["agent_step"]})
-
-                            elif "error" in event:
-                                logger.error("Agent loop error: %s", event["error"])
-                                _loop_error = str(event["error"])
-                                await _agent_queue.put({"error": event["error"]})
-
-                            elif "deathmatch_verdict" in event:
-                                _dm_verdict = event["deathmatch_verdict"]
-                                await _put({"deathmatch_verdict": _dm_verdict})
-                                # Capture final deliverable attachments (set
-                                # when the goal is deemed complete) so they
-                                # can be attached to the final summary message.
-                                _new_att = _dm_verdict.get("final_attachments") or []
-                                if _new_att:
-                                    _dm_final_attachments = _new_att
-                                # _dm_last_turn_attachments is captured during
-                                # per-turn persistence above.
-                                try:
-                                    async with AsyncSessionLocal() as _dm_db:
-                                        _dm_conv = await _dm_db.get(Conversation, conversation_id)
-                                        if _dm_conv:
-                                            # A4.9: optimistic per-field merge
-                                            # (external user actions win; see
-                                            # merge_sync_deathmatch_state) —
-                                            # replaces the old blind copy.
-                                            from app.services.deathmatch_service import (
-                                                merge_sync_deathmatch_state,
-                                            )
-                                            _new_snapshot, _new_frozen = (
-                                                merge_sync_deathmatch_state(
-                                                    _dm_conv,
-                                                    task_conversation,
-                                                    _dm_sync_snapshot,
-                                                    _dm_sync_frozen,
-                                                )
-                                            )
-                                            await _dm_db.commit()
-                                            # Only advance the baseline AFTER a
-                                            # successful commit — otherwise a
-                                            # failed sync would look persisted
-                                            # and later syncs would skip it.
-                                            _dm_sync_snapshot = _new_snapshot
-                                            _dm_sync_frozen = _new_frozen
-                                except Exception:
-                                    logger.exception("Failed to commit deathmatch state")
-
-                                # ── Per-turn persistence: save each deathmatch turn's
-                                # content as a separate DB message so it survives page
-                                # refreshes. Without this, all intermediate turn content
-                                # lives only in memory and is lost on disconnect/refresh.
-                                _dm_should_continue = _dm_verdict.get("should_continue", False)
-                                _dm_continuation_prompt = _dm_verdict.get("continuation_prompt", "")
-                                _dm_status_val = _dm_verdict.get("status", "")
-                                _dm_message_val = _dm_verdict.get("message", "")
-                                _dm_turn_num = _dm_verdict.get("turns", 0)
-
-                                # Flush current assistant_content to content_segments
-                                # (A4.9 I1: per-turn deathmatch persistence is the
-                                # same final-answer surface — same single strip).
-                                _turn_content = _strip_leading_orphan_colon(_strip_leading_orphan_punct(_strip_dsml_all(assistant_content).strip()))
-                                if _turn_content:
-                                    content_segments.append(_turn_content)
-                                    display_sequence.append({"type": "text", "content": _turn_content})
-
-                                # Build joined content for this turn
-                                _turn_joined = "\n\n<!-- segment_split -->\n\n".join(content_segments) if content_segments else ""
-
-                                # Build tool results JSON for this turn
-                                _turn_tr_json = None
-                                if tool_results_accumulated:
-                                    try:
-                                        _turn_tr_json = _transform_tool_loop_results(
-                                            tool_results_accumulated,
-                                            search_queries_used=search_queries_used if search_queries_used else None,
-                                            queries_by_call=search_queries_by_call or None,
-                                        )
-                                    except Exception:
-                                        # A transform failure must never kill the
-                                        # detached goal loop (conv 6b0faf81: an
-                                        # unhandled raise here escaped to the
-                                        # task catch-all, leaving "active" with
-                                        # no terminal message — silent zombie).
-                                        logger.exception(
-                                            "Deathmatch turn transform failed (turn %d) — persisting raw tool results",
-                                            _dm_turn_num,
-                                        )
-                                        _turn_tr_json = json.dumps({
-                                            "content_segments": content_segments,
-                                            "display_sequence": display_sequence,
-                                        }, ensure_ascii=False)
-                                    if _turn_tr_json:
-                                        try:
-                                            _tr_obj = json.loads(_turn_tr_json)
-                                        except Exception:
-                                            _tr_obj = None
-                                        if _tr_obj:
-                                            _a_steps = _tr_obj.get("agent_steps", [])
-                                            _resolved_turn = []
-                                            _step_idx = 0
-                                            for _item in display_sequence:
-                                                if _item.get("type") == "text":
-                                                    _resolved_turn.append(_item)
-                                                elif _item.get("type") == "reasoning_step":
-                                                    _resolved_turn.append(_item)
-                                                elif _item.get("type") == "tool_placeholder" and _step_idx < len(_a_steps):
-                                                    _step = dict(_a_steps[_step_idx])
-                                                    _step["type"] = _step.get("step_type", "tool")
-                                                    _resolved_turn.append(_step)
-                                                    _step_idx += 1
-                                            while _step_idx < len(_a_steps):
-                                                _step = dict(_a_steps[_step_idx])
-                                                _step["type"] = _step.get("step_type", "tool")
-                                                _resolved_turn.append(_step)
-                                                _step_idx += 1
-                                            _tr_obj["display_sequence"] = _resolved_turn
-                                            _tr_obj["content_segments"] = content_segments
-                                            _turn_tr_json = json.dumps(_tr_obj, ensure_ascii=False)
-                                elif content_segments:
-                                    _turn_tr_json = json.dumps({
-                                        "content_segments": content_segments,
-                                        "display_sequence": display_sequence,
-                                    }, ensure_ascii=False)
-
-                                # Serialize tool_calls for this turn
-                                _turn_tc_json = None
-                                if tool_call_events_accumulated:
-                                    try:
-                                        from app.services.tool_history import build_persisted_tool_calls
-                                        _turn_tc_json = build_persisted_tool_calls(tool_call_events_accumulated)
-                                    except Exception:
-                                        pass
-
-                                # Save this turn's assistant message to DB
-                                if _turn_joined or _turn_tr_json:
-                                    try:
-                                        _turn_content = _build_content_fallback(_turn_joined, _turn_tr_json)
-                                        _turn_content, _turn_tr_json = await _localize_media_for_persist(
-                                            _turn_content, _turn_tr_json,
-                                            _user_id_local, _username_local,
-                                        )
-                                        async with AsyncSessionLocal() as _turn_db:
-                                            _turn_msg = Message(
-                                                conversation_id=conversation_id,
-                                                role="assistant",
-                                                content=_turn_content,
-                                                tool_results=_turn_tr_json,
-                                                tool_calls=_turn_tc_json,
-                                            )
-                                            _turn_db.add(_turn_msg)
-                                            await _turn_db.commit()
-                                            logger.info(
-                                                "Deathmatch turn %d persisted as message %s (%d chars)",
-                                                _dm_turn_num, _turn_msg.id, len(_turn_joined or ""),
-                                            )
-                                            # Capture attachments from the most
-                                            # recent per-turn tool_results so the
-                                            # final summary message can carry
-                                            # download cards even when the
-                                            # deathmatch ver dict has no
-                                            # final_attachments (paused/human_gate
-                                            # paths).
-                                            if _turn_tr_json:
-                                                try:
-                                                    _trp = json.loads(_turn_tr_json)
-                                                    _ta = _trp.get("attachments")
-                                                    if isinstance(_ta, list):
-                                                        _dm_last_turn_attachments = list(_ta)
-                                                except Exception:
-                                                    pass
-                                    except Exception:
-                                        logger.exception("Failed to save deathmatch turn message")
-
-                                # Save continuation prompt as user message
-                                if _dm_should_continue and _dm_continuation_prompt:
-                                    _clean_prompt = MARKER_RE.sub("", _dm_continuation_prompt).strip()
-                                    if _clean_prompt:
-                                        try:
-                                            async with AsyncSessionLocal() as _turn_db:
-                                                _turn_user_msg = Message(
-                                                    conversation_id=conversation_id,
-                                                    role="user",
-                                                    content=_clean_prompt,
-                                                )
-                                                _turn_db.add(_turn_user_msg)
-                                                await _turn_db.commit()
-                                        except Exception:
-                                            logger.exception("Failed to save deathmatch continuation prompt")
-                                elif not _dm_should_continue and (
-                                    _dm_status_val in ("human_gate", "paused", "partial_complete")
-                                    or _dm_verdict.get("verdict") == "wait"
-                                ) and _dm_message_val:
-                                    # Save status message for human_gate/paused/
-                                    # partial_complete. partial_complete carries
-                                    # the collected deliverables as attachments so
-                                    # the ending shows download cards next to the
-                                    # status text instead of an empty bubble.
-                                    _status_tr_json = None
-                                    if _dm_final_attachments:
-                                        try:
-                                            _status_tr_json = json.dumps(
-                                                {"attachments": _dm_final_attachments},
-                                                ensure_ascii=False,
-                                            )
-                                        except Exception:
-                                            _status_tr_json = None
-                                    try:
-                                        async with AsyncSessionLocal() as _turn_db:
-                                            _turn_status_msg = Message(
-                                                conversation_id=conversation_id,
-                                                role="assistant",
-                                                content=_dm_message_val,
-                                                tool_results=_status_tr_json,
-                                            )
-                                            _turn_db.add(_turn_status_msg)
-                                            await _turn_db.commit()
-                                        _dm_terminal_status_saved = True
-                                    except Exception:
-                                        logger.exception("Failed to save deathmatch status message")
-
-                                # Reset accumulators for next turn
-                                assistant_content = ""
-                                assistant_reasoning = ""
-                                current_reasoning_segment = ""
-                                content_segments = []
-                                display_sequence = []
-                                tool_results_accumulated = []
-                                tool_call_events_accumulated = []
-                                search_queries_used = []
-                                search_queries_by_call = {}
-                                _canary_tail = ""
-                                _reasoning_canary_tail = ""
-                                _reasoning_meta_tail = ""
-                                # Deathmatch per-turn persistence above writes
-                                # assistant_content (which INCLUDES gated text);
-                                # flush the gated text to the stream so the
-                                # live view matches what is persisted, then
-                                # reset the gate for the next turn.
-                                _gate_flush = _pre_tool_gate.flush()
-                                if _gate_flush.strip():
-                                    await _put({"content": _gate_flush})
-
-                            elif "done" in event:
-                                # Turn ended without a tool call: flush any
-                                # gated pre-tool text (it IS the final answer).
-                                _gate_flush = _pre_tool_gate.flush()
-                                if _gate_flush.strip():
-                                    await _put({"content": _gate_flush})
-                                # A4.9 R1 NEW-2：流结束时冲刷元引用尾缓冲
-                                # （canary 尾是残缺标记、按设计丢弃；元引用尾
-                                # 是正常思考文本，必须清洗后补发，否则尾部
-                                # 最多 63 字符静默丢失）。
-                                if _reasoning_meta_tail:
-                                    _meta_flush = scrub_reasoning_meta(_reasoning_meta_tail)
-                                    if _meta_flush:
-                                        assistant_reasoning += _meta_flush
-                                        current_reasoning_segment += _meta_flush
-                                        await _put({"reasoning_content": _meta_flush})
-                                    _reasoning_meta_tail = ""
-                                break
-
-                    # Strip a leading orphan colon HERE (not only at
-                    # _compose_terminal_content) because the frontend renders
-                    # the display_sequence / content_segments copies — a
-                    # content-only strip would leave the dangling '：' visible
-                    # in v2 rendering (same dual-surface lesson as conv 8629bdfe).
-                    full_response_local = _strip_leading_orphan_colon(_strip_leading_orphan_punct(_strip_dsml_all(assistant_content).strip()))
-                    if full_response_local:
-                        content_segments.append(full_response_local)
-                        display_sequence.append({"type": "text", "content": full_response_local})
-                    joined_content = "\n\n<!-- segment_split -->\n\n".join(content_segments)
-
-                    # Error-terminated OR content-empty-with-tool-work loop:
-                    # never emit an empty/partial `_completed`. Substitute a
-                    # visible failure message so every downstream path
-                    # (finalize save, detached self-save, buffer replay,
-                    # legacy resume save) persists something the user can
-                    # actually see — an empty bubble is filtered by the
-                    # frontend and renders as "query with nothing below"
-                    # (conv 149ce886 msg f9d168bd, conv 38ce8810 msg 63f0e6ee).
-                    _had_tool_activity = bool(tool_results_accumulated or tool_call_events_accumulated)
-                    _terminal_content, _terminal_substituted = _compose_terminal_content(
-                        joined_content, _loop_error, _had_tool_activity,
-                    )
-                    if _terminal_substituted:
-                        content_segments.append(_terminal_content)
-                        display_sequence.append({"type": "text", "content": _terminal_content})
-                        joined_content = _terminal_content
-
-                    # DEATHMATCH: grilling completion is now handled via
-                    # the subagent question/answer flow, not [GOAL_SUMMARY].
-                    full_reasoning_local = assistant_reasoning.strip()
-
-                    # Insert any remaining (post-last-tool_call) reasoning as a
-                    # final reasoning_step. Earlier per-turn reasoning chunks
-                    # were already flushed into display_sequence at each
-                    # tool_call boundary, so we only attach the trailing chunk
-                    # here. Fallback: if no per-turn chunks were captured but
-                    # we have full reasoning (e.g., no tool calls), attach it.
-                    trailing_reason = current_reasoning_segment.strip()
-                    has_inline_reasoning = any(
-                        it.get("type") == "reasoning_step" for it in display_sequence
-                    )
-                    if trailing_reason and display_sequence:
-                        _reasoning_item = {
-                            "type": "reasoning_step",
-                            "title": "💭 思考过程",
-                            "content": trailing_reason,
-                        }
-                        _last_text_idx = -1
-                        for _i in range(len(display_sequence) - 1, -1, -1):
-                            if display_sequence[_i].get("type") == "text":
-                                _last_text_idx = _i
-                                break
-                        if _last_text_idx >= 0:
-                            display_sequence.insert(_last_text_idx, _reasoning_item)
-                        else:
-                            display_sequence.append(_reasoning_item)
-                    elif not has_inline_reasoning and full_reasoning_local and display_sequence:
-                        # No per-turn reasoning chunks ever observed (and no
-                        # trailing leftover either): fall back to one global
-                        # reasoning block before the final answer.
-                        _reasoning_item = {
-                            "type": "reasoning_step",
-                            "title": "💭 思考过程",
-                            "content": full_reasoning_local,
-                        }
-                        _last_text_idx = -1
-                        for _i in range(len(display_sequence) - 1, -1, -1):
-                            if display_sequence[_i].get("type") == "text":
-                                _last_text_idx = _i
-                                break
-                        if _last_text_idx >= 0:
-                            display_sequence.insert(_last_text_idx, _reasoning_item)
-                        else:
-                            display_sequence.append(_reasoning_item)
-
-                    tr_json = None
-                    if tool_results_accumulated:
-                        logger.info(
-                            "DBG transform: search_queries_used=%s map=%s accum_calls=%s",
-                            search_queries_used,
-                            search_queries_by_call,
-                            [tr.get("call_id") for tr in tool_results_accumulated if tr.get("name") == "web_search"],
-                        )
-                        tr_json = _transform_tool_loop_results(
-                            tool_results_accumulated,
-                            search_queries_used=search_queries_used if search_queries_used else None,
-                            queries_by_call=search_queries_by_call or None,
-                        )
-                    if content_segments:
-                        if tr_json:
-                            tr_obj = json.loads(tr_json)
-                            a_steps = tr_obj.get("agent_steps", [])
-                            step_idx = 0
-                            resolved: list[dict] = []
-                            for item in display_sequence:
-                                if item.get("type") == "text":
-                                    resolved.append(item)
-                                elif item.get("type") == "reasoning_step":
-                                    resolved.append(item)
-                                elif item.get("type") == "tool_placeholder" and step_idx < len(a_steps):
-                                    step = dict(a_steps[step_idx])
-                                    step["type"] = step.get("step_type", "tool")
-                                    resolved.append(step)
-                                    step_idx += 1
-                            while step_idx < len(a_steps):
-                                step = dict(a_steps[step_idx])
-                                step["type"] = step.get("step_type", "tool")
-                                resolved.append(step)
-                                step_idx += 1
-                            tr_obj["display_sequence"] = resolved
-                            tr_obj["content_segments"] = content_segments
-                            tr_json = json.dumps(tr_obj, ensure_ascii=False)
-                        else:
-                            tr_json = json.dumps({
-                                "content_segments": content_segments,
-                                "display_sequence": display_sequence,
-                            }, ensure_ascii=False)
-
-                    # Deathmatch: attach final deliverable download cards to the
-                    # final summary message. Three sources, merged in priority:
-                    #   1. _dm_final_attachments — collected from ALL previous
-                    #      turns via collect_final_deliverables_from_messages
-                    #      (populated when verdict is "done" or "partial_complete")
-                    #   2. _dm_last_turn_attachments — extracted from the most
-                    #      recent per-turn save (captured above during per-turn
-                    #      persistence). Critical fallback for paused/human_gate
-                    #      paths where _dm_final_attachments is empty.
-                    _dm_all_atts: list[dict] = []
-                    if _dm_final_attachments:
-                        _dm_all_atts.extend(_dm_final_attachments)
-                    if _dm_last_turn_attachments:
-                        _dm_all_atts.extend(_dm_last_turn_attachments)
-                    if _dm_all_atts:
-                        if tr_json:
-                            _dm_tr_obj = json.loads(tr_json)
-                        else:
-                            _dm_tr_obj = {
-                                "content_segments": content_segments,
-                                "display_sequence": display_sequence,
-                            }
-                        existing_atts = _dm_tr_obj.get("attachments") or []
-                        # Deduplicate by name, keeping the largest size.
-                        _att_by_name: dict[str, dict] = {}
-                        for _a in list(existing_atts) + _dm_all_atts:
-                            _nm = _a.get("name") or _a.get("filename") or ""
-                            if not _nm:
-                                continue
-                            _cur = _att_by_name.get(_nm)
-                            if _cur is None or (_a.get("size") or 0) > (_cur.get("size") or 0):
-                                _att_by_name[_nm] = _a
-                        _dm_tr_obj["attachments"] = list(_att_by_name.values())
-                        tr_json = json.dumps(_dm_tr_obj, ensure_ascii=False)
-
-                    # PHASE 2B: serialize structured tool_calls for persistence.
-                    from app.services.tool_history import build_persisted_tool_calls
-                    tool_calls_json_local = build_persisted_tool_calls(
-                        tool_call_events_accumulated
-                    )
-
-                    # conv 3b58af5b (R4, 2026-08-23): sanitize + localize +
-                    # PERSIST here, in the producer, BEFORE any subscriber is
-                    # notified. The old order broadcast `_completed` first and
-                    # left the DB write to the SSE consumer (or the cancelled
-                    # self-save path); a client disconnect in that window killed
-                    # the consumer before it saved AND skipped the self-save
-                    # branch — a fully-generated, audit-passed answer vanished
-                    # without any log line. Persistence must not depend on any
-                    # subscriber staying alive.
-                    _cap_content = _build_content_fallback(joined_content, tr_json)
-                    _cap_content, tr_json = await _sanitize_cited_content(
-                        _cap_content, tr_json,
-                    )
-                    # M4：出货 citations 载荷（服务端样式化 reference + in_text）
-                    _cap_content, tr_json = await _render_answer_citations(
-                        _cap_content, tr_json,
-                        getattr(_cap_assistant, "citation_style", None),
-                    )
-                    if _cap_content:
-                        joined_content = _cap_content
-                    # Localize remote media BEFORE persisting/broadcasting so
-                    # the DB row, buffer done_data and every replay surface
-                    # carry identical content.
-                    _cap_content, tr_json = await _localize_media_for_persist(
-                        _cap_content, tr_json, _user_id_local, _username_local,
-                    )
-                    # Guard mirrors the consumer's _skip_empty_final: when the
-                    # deathmatch terminal status message was already persisted
-                    # with text + deliverables, an empty fallback bubble would
-                    # only duplicate its attachments.
-                    _dm_skip_empty = (
-                        not (_cap_content or "").strip() and _dm_terminal_status_saved
-                    )
-                    producer_message_id: str | None = None
-                    if (_cap_content or "").strip() or (tr_json and not _dm_skip_empty):
-                        producer_message_id = await _persist_final_answer(
-                            conv_id=_cap_conversation_id,
-                            content=_cap_content,
-                            reasoning=full_reasoning_local,
-                            tr_json_str=tr_json,
-                            tc_json=tool_calls_json_local,
-                            # P2 (2026-09-05): 落账本轮最新 token 快照
-                            # （buffer 持有 context_info 事件的最新值），
-                            # 跨设备加载会话时前端可播种徽章。
-                            ctx_info=getattr(_stream_buf, "context_info", None),
-                        )
-                        if producer_message_id:
-                            try:
-                                await _stream_buf.mark_complete(producer_message_id)
-                            except Exception:
-                                pass
-
-                    completed_payload = {
-                        "_completed": {
-                            "joined_content": joined_content,
-                            "full_reasoning": full_reasoning_local,
-                            "tool_results_json": tr_json,
-                            "tool_calls_json": tool_calls_json_local,
-                            # R4: consumers (SSE + legacy resume) skip their own
-                            # save when this is set — single-writer persistence.
-                            "message_id": producer_message_id,
-                        }
-                    }
-                    await _agent_state.broadcast(completed_payload)
-                    _agent_state.is_running = False
-                    _agent_state.completed_data = {
-                        "joined_content": joined_content,
-                        "full_reasoning": full_reasoning_local,
-                        "tool_results_json": tr_json,
-                    }
-                    await _agent_state.broadcast_done()
-
-                    # Pre-generate LLM title BEFORE notifying resume subscribers
-                    # via the buffer's `done` event, so the title is already
-                    # present in `done_data` when the resume `done` payload is
-                    # resolved (avoids a race where the frontend marks the
-                    # conversation finished while the sidebar title is still
-                    # "新对话").
-                    _pre_title: str | None = None
-                    if _sse_cancelled.is_set() and (joined_content or "").strip():
-                        try:
-                            async with AsyncSessionLocal() as _title_db:
-                                _conv_row_for_title = (await _title_db.execute(
-                                    select(Conversation).where(Conversation.id == _cap_conversation_id)
-                                )).scalar_one_or_none()
-                                if _conv_row_for_title is not None:
-                                    _pre_title = await _generate_title_bg(
-                                        _title_db, _conv_row_for_title, joined_content,
-                                    )
-                        except Exception:
-                            logger.exception("Pre-done title generation failed")
-                    if _pre_title:
-                        try:
-                            if _stream_buf.done_data is None:
-                                _stream_buf.done_data = {}
-                            _stream_buf.done_data["title"] = _pre_title
-                        except Exception:
-                            pass
-
-                    # (R4) citation sanitize + media localization already ran
-                    # above, before the broadcast — the buffer's done payload
-                    # feeds resume replay and must carry the SAME clean
-                    # content/tool_results as the DB row (conv 8629bdfe).
-
-                    # Mark stream buffer as done
-                    try:
-                        await _stream_buf.append({
-                            "done": True,
-                            "conversation_id": _cap_conversation_id,
-                            "joined_content": joined_content,
-                            "full_reasoning": full_reasoning_local,
-                            "tool_results_json": tr_json,
-                        })
-                    except Exception:
-                        pass
-
-                    if _sse_cancelled.is_set():
-                        if producer_message_id:
-                            # R4: already persisted pre-broadcast — nothing left
-                            # for the legacy self-save path to do.
-                            logger.info(
-                                "Agent loop completed after SSE cancellation; "
-                                "answer already persisted (msg %s)",
-                                producer_message_id,
-                            )
-                            return
-                        _cap_content = _build_content_fallback(joined_content, tr_json)
-                        _cap_content, tr_json = await _sanitize_cited_content(_cap_content, tr_json)
-                        _cap_content, tr_json = await _render_answer_citations(
-                            _cap_content, tr_json,
-                            getattr(_cap_assistant, "citation_style", None),
-                        )
-                        # Localize remote media (same as the finalize path —
-                        # the self-save path persists the FULL final answer
-                        # when SSE is cancelled after loop completion, so it
-                        # must not bypass localization; conv 97ff355d).
-                        _cap_content, tr_json = await _localize_media_for_persist(
-                            _cap_content, tr_json, _user_id_local, _username_local,
-                        )
-                        # Guard: never self-save a completely empty bubble
-                        # (no text, no tool results, no tool calls). The
-                        # normal finalize path skips such messages via
-                        # _skip_empty_final; the self-save path persisted one
-                        # unconditionally, producing an empty card as the last
-                        # message (conv 4d9a5289).
-                        if not _cap_content and not tr_json and not tool_calls_json_local:
-                            logger.info(
-                                "Agent loop completed after SSE cancellation with empty payload; "
-                                "skipping self-save (terminal status already persisted or nothing to save)"
-                            )
-                            try:
-                                # 空终态：清掉渐进落库的空 streaming 行
-                                try:
-                                    async with AsyncSessionLocal() as _clean_db:
-                                        _clean_q = sa_delete(Message).where(
-                                            Message.delivery_status == "streaming",
-                                            (Message.content == "") | (Message.content.is_(None)),
-                                        )
-                                        # A4.9 r1 M2：行 id 精确删除（buffer 携带），
-                                        # 避免跨 run 误删下一 run 的新建行。
-                                        # scoped 复审 Minor：本作用域无 _bg_buf（NameError
-                                        # 会被 except 吞成死代码）——只用 _stream_buf。
-                                        _clean_row_id = getattr(_stream_buf, "streaming_message_id", None)
-                                        if _clean_row_id:
-                                            _clean_q = _clean_q.where(Message.id == _clean_row_id)
-                                        else:
-                                            _clean_q = _clean_q.where(Message.conversation_id == _cap_conversation_id)
-                                        await _clean_db.execute(_clean_q)
-                                        await _clean_db.commit()
-                                except Exception:
-                                    logger.debug("empty streaming row cleanup failed", exc_info=True)
-                                await _stream_buf.mark_complete(None)
-                            except Exception:
-                                pass
-                            return
-                        logger.info("Agent loop completed after SSE cancellation, self-saving results")
-                        try:
-                            for attempt in range(3):
-                                try:
-                                    async with AsyncSessionLocal() as bg_db:
-                                        conv_row = (await bg_db.execute(
-                                            select(Conversation).where(Conversation.id == _cap_conversation_id)
-                                        )).scalar_one_or_none()
-                                        if conv_row is None:
-                                            break
-                                        # 渐进落库：streaming 在途行原地更新翻 final
-                                        msg = await _save_assistant_terminal(
-                                            bg_db,
-                                            conversation_id=_cap_conversation_id,
-                                            content=_cap_content,
-                                            reasoning=full_reasoning_local if full_reasoning_local else None,
-                                            tool_results=tr_json,
-                                            tool_calls=tool_calls_json_local,
-                                            context_info=None,
-                                            status="final",
-                                        )
-                                        conv_row.updated_at = datetime.utcnow()
-                                        await bg_db.commit()
-                                        await bg_db.refresh(msg)
-                                        try:
-                                            await _stream_buf.mark_complete(str(msg.id))
-                                        except Exception:
-                                            pass
-                                        try:
-                                            _final_title = await _generate_title_bg(bg_db, conv_row, _cap_content)
-                                            if _final_title:
-                                                try:
-                                                    if _stream_buf.done_data is None:
-                                                        _stream_buf.done_data = {}
-                                                    _stream_buf.done_data["title"] = _final_title
-                                                except Exception:
-                                                    pass
-                                        except Exception:
-                                            logger.exception("Background title generation failed (self-save path)")
-                                        logger.info("Agent self-save succeeded on attempt %d", attempt + 1)
-                                        break
-                                except Exception:
-                                    import traceback as _tb
-                                    _tb.print_exc()
-                                    await asyncio.sleep(2.0)
-                        except Exception:
-                            logger.exception("Agent self-save failed entirely")
-                except asyncio.CancelledError:
-                    # CancelledError (BaseException in 3.8+) bypasses
-                    # `except Exception` below — handle it explicitly so the
-                    # stream buffer is marked complete (is_running=False).
-                    # Otherwise the safety-net reconciliation in
-                    # GET /api/conversations/{id} sees is_running=True and
-                    # refuses to reset a zombie deathmatch_status="active".
-                    _agent_state.is_running = False
-                    await _agent_state.broadcast_done()
-                    logger.info(
-                        "Stop-cancel conv=%s content=%d reasoning=%d segments=%d tools=%d state_content=%d dm=%s",
-                        _cap_conversation_id, len(assistant_content), len(assistant_reasoning),
-                        len(content_segments), len(tool_results_accumulated),
-                        len(_agent_state.content), _deathmatch_mgr is not None,
-                    )
-                    # Deliberate stop (POST /stream/stop/{id}) or passive
-                    # disconnect cancels the task mid-reply: persist the
-                    # partial content accumulated so far, or the conversation
-                    # shows only the user message and the generated text is
-                    # lost (chat.spec "can stop a streaming response").
-                    # Mirror the self-save path: fresh session (the request's
-                    # `db` may be mid-cancellation) + empty-content guard.
-                    if _deathmatch_mgr is None:
-                        try:
-                            _stop_partial_text = _strip_dsml_all(assistant_content).strip()
-                            _stop_segments = [s for s in content_segments if s and s.strip()]
-                            if _stop_partial_text:
-                                _stop_segments.append(_stop_partial_text)
-                            _stop_content = "\n\n<!-- segment_split -->\n\n".join(_stop_segments)
-                            if not _stop_content.strip():
-                                # Response-audit wipe: the rejected draft was
-                                # streamed to the client then discarded from the
-                                # local accumulators (regeneration is the only
-                                # authoritative content). If the user stops
-                                # during regeneration, nothing else is left to
-                                # persist — fall back to what the client
-                                # actually received (_agent_state.content is
-                                # append-only and survives the audit reset).
-                                _stop_content = _agent_state.content or ""
-                            _stop_tool_results = (
-                                json.dumps(tool_results_accumulated, ensure_ascii=False)
-                                if tool_results_accumulated else None
-                            )
-                            _stop_reasoning = (assistant_reasoning or _agent_state.reasoning or "").strip() or None
-                            # A4.9 I2: stop-interrupted persistence is another
-                            # final-answer surface — the glitch lands on the
-                            # FIRST token, and a mid-reply stop would persist
-                            # it. Strip at the joined-content head (covers the
-                            # segment join AND the _agent_state fallback).
-                            _stop_content = _strip_leading_orphan_colon(_strip_leading_orphan_punct(_stop_content))
-                            if _stop_content.strip() or _stop_tool_results or _stop_reasoning:
-                                _stop_content, _stop_tool_results = await _localize_media_for_persist(
-                                    _stop_content, _stop_tool_results,
-                                    _user_id_local, _username_local,
-                                )
-                                async with AsyncSessionLocal() as _stop_db:
-                                    _stop_conv = (await _stop_db.execute(
-                                        select(Conversation).where(
-                                            Conversation.id == _cap_conversation_id
-                                        )
-                                    )).scalar_one_or_none()
-                                    if _stop_conv is not None:
-                                        # 渐进落库：streaming 在途行原地更新。
-                                        # 用户主动 stop = 刻意截断（用户知情且
-                                        # 见证），按既有语义落 'final'；进程
-                                        # 死亡类非预期中断才标 'interrupted'。
-                                        _stop_msg = await _save_assistant_terminal(
-                                            _stop_db,
-                                            conversation_id=_cap_conversation_id,
-                                            content=_stop_content,
-                                            reasoning=_stop_reasoning,
-                                            tool_results=_stop_tool_results,
-                                            tool_calls=None,
-                                            context_info=(
-                                                json.dumps(_stream_buf.context_info, ensure_ascii=False)
-                                                if getattr(_stream_buf, "context_info", None) else None
-                                            ),
-                                            status="final",
-                                        )
-                                        _stop_conv.updated_at = datetime.utcnow()
-                                        await _stop_db.commit()
-                                        await _stop_db.refresh(_stop_msg)
-                                        try:
-                                            await _stream_buf.mark_complete(str(_stop_msg.id))
-                                        except Exception:
-                                            pass
-                                        logger.info(
-                                            "Persisted partial reply after stop for conversation %s (%d chars)",
-                                            _cap_conversation_id, len(_stop_content),
-                                        )
-                        except Exception:
-                            logger.exception(
-                                "Failed to persist partial reply after stop for conversation %s",
-                                _cap_conversation_id,
-                            )
-                    try:
-                        await _stream_buf.mark_complete(None)
-                    except Exception:
-                        pass
-                    # DEATHMATCH (conv 6b0faf81): a cancelled/errored goal loop
-                    # must NEVER leave deathmatch_status="active" with no
-                    # terminal message — the user sees a silent stop. Persist
-                    # a paused terminal state + reason so the conversation is
-                    # visibly resumable instead of a zombie that only the
-                    # reconcile flips 18 minutes later.
-                    await _persist_deathmatch_failure(
-                        _cap_conversation_id, _deathmatch_mgr,
-                        "运行被取消",
-                        "死磕模式运行被取消。发送任意消息可继续推进目标。",
-                        expected_agent_state=_agent_state,
-                    )
-                    logger.info("Agent loop task cancelled for conversation %s", _cap_conversation_id)
-                    raise
-                except Exception as exc:
-                    logger.exception("Agent loop task failed: %s", exc)
-                    _agent_state.is_running = False
-                    _agent_state.error = str(exc)
-                    await _agent_state.broadcast({"_failed": str(exc)})
-                    await _agent_state.broadcast_done()
-                    try:
-                        await _stream_buf.mark_complete(None)
-                    except Exception:
-                        pass
-                    # DEATHMATCH (conv 6b0faf81): persist the failure as a
-                    # visible paused terminal state instead of a silent
-                    # active→paused zombie flip by the reconcile later. The
-                    # user must see WHY the goal loop stopped and that they
-                    # can resume.
-                    await _persist_deathmatch_failure(
-                        _cap_conversation_id, _deathmatch_mgr,
-                        f"运行异常中断: {type(exc).__name__}: {str(exc)[:300]}",
-                        (
-                            "死磕模式运行异常中断。可发送任意消息继续推进目标；"
-                            "若反复中断请检查模型服务或调整目标。"
-                        ),
-                        expected_agent_state=_agent_state,
-                    )
-                finally:
-                    try:
-                        if task_db is not None:
-                            await task_db.close()
-                    except Exception:
-                        pass
-                    # Identity-checked: a stale task (its slot re-reserved by
-                    # a newer request) must never pop the new run's state.
-                    await _agent_registry.unregister(_cap_conversation_id, expected=_agent_state)
-
-            async def _agent_loop_task():
-                """外层兜底（conv 5228db60）：task.cancel() 落在 impl 主
-                try/finally（unregister）之前时，CancelledError 清理链整段
-                逃逸 → adopted 槽永生。此包装把清理 finally 等价前移到协程
-                体首行；identity-checked，与内层重复调用为 no-op。"""
-                try:
-                    await _agent_loop_impl()
-                except asyncio.CancelledError:
-                    if getattr(_agent_state, "is_running", False):
-                        _agent_state.is_running = False
-                        try:
-                            await _agent_state.broadcast_done()
-                        except Exception:
-                            pass
-                        logger.info(
-                            "Stop-cancel escape-window conv=%s (pre-main-try cancel)",
-                            _cap_conversation_id,
-                        )
-                    raise
-                except Exception:
-                    if getattr(_agent_state, "is_running", False):
-                        _agent_state.is_running = False
-                        logger.exception(
-                            "Agent loop impl died before main-try for conv=%s",
-                            _cap_conversation_id,
-                        )
-                    raise
-                finally:
-                    try:
-                        await _agent_registry.unregister(
-                            _cap_conversation_id, expected=_agent_state
-                        )
-                    except Exception:
-                        pass
-
-            _agent_task = asyncio.create_task(_agent_loop_task(), name=f"agent-loop-{conversation_id[:8]}")
-            nonlocal detached_agent_task
-            detached_agent_task = _agent_task
-            # 兜底①绑定（conv 5228db60）：done-callback 据此 identity 释放孤儿槽。
-            try:
-                _agent_state.task_handle = _agent_task
-            except Exception:
-                pass
-            _track_detached_task(_agent_task, _cap_conversation_id)
-
-            try:
-                while True:
-                    try:
-                        # 10s server-side keepalive — must stay well under the
-                        # frontend's 30s stall watchdog. Agent phases that emit
-                        # no events on their own (e.g. the tool-digest batch,
-                        # up to 300s) must never look like a dead connection.
-                        event = await asyncio.wait_for(_agent_queue.get(), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        yield {"event": "ping", "data": json.dumps({"ping": True})}
-                        if client_disconnected:
-                            continue
-                        # In deathmatch mode, be more tolerant of slow agent
-                        # iterations — the agent is detached and should keep
-                        # running in the background regardless of the SSE
-                        # viewer connection.
-                        _dm_active = bool(_deathmatch_mgr and _deathmatch_mgr.is_active)
-                        if _dm_active:
-                            continue
-                        try:
-                            if await req.is_disconnected():
-                                client_disconnected = True
-                                logger.warning("Client disconnected during tool loop, agent continues in background")
-                        except Exception:
-                            pass
-                        continue
-
-                    if isinstance(event, object) and not isinstance(event, dict):
-                        break
-
-                    if "_completed" in event:
-                        completed = event["_completed"]
-                        # conv 3b58af5b (R4): the producer already sanitized,
-                        # localized and persisted the answer BEFORE broadcasting.
-                        # Single-writer: skip every consumer-side save path and
-                        # go straight to the done emission — whether or not this
-                        # client is still connected.
-                        if completed.get("message_id"):
-                            full_response = _build_content_fallback(
-                                completed["joined_content"], completed.get("tool_results_json")
-                            )
-                            full_reasoning = completed["full_reasoning"]
-                            tool_results_json = completed.get("tool_results_json")
-                            tool_calls_json = completed.get("tool_calls_json")
-                            assistant_message_id = completed["message_id"]
-                            response_saved = True
-                            # A4.9 fix (Important-2): keep chat_sessions
-                            # bookkeeping on the now-default producer-persist
-                            # path (legacy save path maintained this counter).
-                            try:
-                                message_count += 1
-                                if chat_session is not None:
-                                    chat_session.message_count = message_count
-                                    await db.commit()
-                            except Exception:
-                                logger.exception(
-                                    "chat_session message_count update failed after producer persist"
-                                )
-                            logger.info(
-                                "Final answer already persisted by producer (msg %s) — skipping consumer save",
-                                assistant_message_id,
-                            )
-                            try:
-                                async for done_event in _finalize_and_emit_done(
-                                    assistant_message_id=assistant_message_id,
-                                    final_content=full_response,
-                                    final_tool_results_json=tool_results_json,
-                                    fallback=False,
-                                ):
-                                    yield done_event
-                            except Exception as done_exc:
-                                logger.exception("Failed to emit done event: %s", done_exc)
-                                yield {
-                                    "event": "done",
-                                    "data": json.dumps({
-                                        "conversation_id": conversation_id,
-                                        "message_id": assistant_message_id,
-                                        "title": conversation.title if conversation else None,
-                                        "tool_results": None,
-                                        "done": True,
-                                        "fallback": False,
-                                    }),
-                                }
-                            return
-                        _cap_content = _build_content_fallback(completed["joined_content"], completed.get("tool_results_json"))
-                        # Citation ledger verify step: strip [N] markers that
-                        # reference no real fetched source before persistence
-                        # (grounded-citations port — frontend cannot catch
-                        # out-of-range [N] when any search ran). Sanitizes the
-                        # content AND the tool_results content_segments /
-                        # display_sequence text surfaces in one judgment.
-                        _cap_content, _cap_tool_results = await _sanitize_cited_content(
-                            _cap_content, completed.get("tool_results_json"),
-                        )
-                        _cap_content, _cap_tool_results = await _render_answer_citations(
-                            _cap_content, _cap_tool_results,
-                            getattr(_cap_assistant, "citation_style", None),
-                        )
-                        _cap_reasoning = completed["full_reasoning"]
-                        _cap_tool_calls = completed.get("tool_calls_json")
-
-                        # Localize remote media the agent decided to display
-                        # (content-addressed into the user's workspace).
-                        _cap_content, _cap_tool_results = await _localize_media_for_persist(
-                            _cap_content, _cap_tool_results, _user_id_local, _username_local,
-                        )
-
-                        full_response = _cap_content
-                        full_reasoning = _cap_reasoning
-                        tool_results_json = _cap_tool_results
-                        tool_calls_json = _cap_tool_calls
-
-                        if client_disconnected:
-                            logger.info("Agent loop completed after disconnect, saving results via background task")
-                            _bg_buf = _stream_buf
-                            async def _bg_save():
-                                # Guard: never persist a completely empty bubble
-                                # (mirrors the self-save guard above).
-                                if not (_cap_content or "").strip() and not _cap_tool_results and not _cap_tool_calls:
-                                    logger.info("Post-disconnect save skipped: empty payload")
-                                    # 空终态：清掉渐进落库的空 streaming 行
-                                    # （A4.9 r1 M2：行 id 精确删除，不跨 run 误删）
-                                    try:
-                                        async with AsyncSessionLocal() as _clean_db:
-                                            _clean_q = sa_delete(Message).where(
-                                                Message.delivery_status == "streaming",
-                                                (Message.content == "") | (Message.content.is_(None)),
-                                            )
-                                            _clean_row_id = getattr(_bg_buf, "streaming_message_id", None)
-                                            if _clean_row_id:
-                                                _clean_q = _clean_q.where(Message.id == _clean_row_id)
-                                            else:
-                                                _clean_q = _clean_q.where(Message.conversation_id == _cap_conversation_id)
-                                            await _clean_db.execute(_clean_q)
-                                            await _clean_db.commit()
-                                    except Exception:
-                                        logger.debug("empty streaming row cleanup failed", exc_info=True)
-                                    try:
-                                        await _bg_buf.mark_complete(None)
-                                    except Exception:
-                                        pass
-                                    return
-                                for attempt in range(3):
-                                    try:
-                                        async with AsyncSessionLocal() as bg_db:
-                                            conv_row = (await bg_db.execute(
-                                                select(Conversation).where(Conversation.id == _cap_conversation_id)
-                                            )).scalar_one_or_none()
-                                            if conv_row is None:
-                                                return
-                                            # 渐进落库：streaming 在途行原地更新翻 final
-                                            msg = await _save_assistant_terminal(
-                                                bg_db,
-                                                conversation_id=_cap_conversation_id,
-                                                content=_cap_content,
-                                                reasoning=_cap_reasoning if _cap_reasoning else None,
-                                                tool_results=_cap_tool_results,
-                                                tool_calls=_cap_tool_calls,
-                                                context_info=None,
-                                                status="final",
-                                            )
-                                            conv_row.updated_at = datetime.utcnow()
-                                            await bg_db.commit()
-                                            await bg_db.refresh(msg)
-                                            try:
-                                                await _bg_buf.mark_complete(str(msg.id))
-                                            except Exception:
-                                                pass
-                                            try:
-                                                _final_title = await _generate_title_bg(bg_db, conv_row, _cap_content)
-                                                if _final_title:
-                                                    try:
-                                                        if _bg_buf.done_data is None:
-                                                            _bg_buf.done_data = {}
-                                                        _bg_buf.done_data["title"] = _final_title
-                                                    except Exception:
-                                                        pass
-                                            except Exception:
-                                                logger.exception("Background title generation failed (post-disconnect path)")
-                                            logger.info("Background save succeeded on attempt %d (post-disconnect)", attempt + 1)
-                                            return
-                                    except Exception:
-                                        import traceback as _tb
-                                        _tb.print_exc()
-                                        await asyncio.sleep(2.0)
-                                logger.error("Background save failed after 3 attempts")
-                            try:
-                                _bg = asyncio.get_running_loop().create_task(_bg_save())
-                                _track_bg_task(_bg, _cap_conversation_id, "post_disconnect_save")
-                            except Exception:
-                                pass
-                            response_saved = True
-                            return
-
-                        # Resolve the final assistant message id. The variable
-                        # must be BOUND (None) BEFORE the save attempt: a save
-                        # failure (e.g. FK violation when the conversation was
-                        # deleted mid-stream) falls through to
-                        # _finalize_and_emit_done below, and an unbound
-                        # reference would crash the whole SSE generator
-                        # without a done/error event — the client loses the
-                        # stream (and with the old broadcast-before-append
-                        # ordering, part of the displayed answer with it)
-                        # while the backend keeps the answer in the buffer.
-                        assistant_message_id: str | None = None
-                        try:
-                            sanitized_content = _cap_content if _cap_content else _build_content_fallback("", _cap_tool_results)
-                            # When the deathmatch terminal status message
-                            # (partial_complete/human_gate/paused) was already
-                            # persisted with text + deliverables, an empty
-                            # fallback bubble would only duplicate its
-                            # attachments — skip it (conv aadb26a3 ending).
-                            _skip_empty_final = (
-                                not sanitized_content
-                                and _dm_terminal_status_saved
-                            )
-                            if sanitized_content or (_cap_tool_results and not _skip_empty_final):
-                                # 渐进落库（2026-10-06）：streaming 在途行原地更新
-                                # 翻 final，不插入重复行。
-                                assistant_message = await _save_assistant_terminal(
-                                    db,
-                                    conversation_id=conversation_id,
-                                    content=sanitized_content,
-                                    reasoning=_cap_reasoning or None,
-                                    tool_results=_cap_tool_results,
-                                    tool_calls=_cap_tool_calls,
-                                    context_info=None,
-                                    status="final",
-                                )
-                                conversation.updated_at = datetime.utcnow()
-                                await db.commit()
-                                await db.refresh(assistant_message)
-                                response_saved = True
-                                message_count += 1
-                                assistant_message_id = assistant_message.id
-
-                                chat_session.message_count = message_count
-                                await db.commit()
-
-                                try:
-                                    await _stream_buf.mark_complete(str(assistant_message_id))
-                                except Exception:
-                                    pass
-                            else:
-                                # 空终态不落库——但渐进落库的 streaming 空行
-                                # 必须清掉，否则启动 sweep 会把它翻成
-                                # interrupted 空 bubble（2026-10-06）。
-                                try:
-                                    _clean_q = sa_delete(Message).where(
-                                        Message.delivery_status == "streaming",
-                                        (Message.content == "") | (Message.content.is_(None)),
-                                    )
-                                    _clean_row_id = getattr(_stream_buf, "streaming_message_id", None)
-                                    if _clean_row_id:
-                                        _clean_q = _clean_q.where(Message.id == _clean_row_id)
-                                    else:
-                                        _clean_q = _clean_q.where(Message.conversation_id == conversation_id)
-                                    await db.execute(_clean_q)
-                                    await db.commit()
-                                except Exception:
-                                    logger.debug("empty streaming row cleanup failed", exc_info=True)
-                                try:
-                                    await _stream_buf.mark_complete(None)
-                                except Exception:
-                                    pass
-                                async for done_event in _finalize_and_emit_done(
-                                    assistant_message_id=None,
-                                    final_content="",
-                                    final_tool_results_json=None,
-                                    fallback=True,
-                                ):
-                                    yield done_event
-                                return
-                        except Exception as save_exc:
-                            logger.exception("Failed to save tool-loop assistant message: %s", save_exc)
-                            _spawn_interrupted_save(_stream_buf)
-
-                        try:
-                            async for done_event in _finalize_and_emit_done(
-                                assistant_message_id=assistant_message_id,
-                                final_content=full_response,
-                                final_tool_results_json=tool_results_json,
-                                fallback=assistant_message_id is None,
-                            ):
-                                yield done_event
-                        except Exception as done_exc:
-                            logger.exception("Failed to emit done event: %s", done_exc)
-                            yield {
-                                "event": "done",
-                                "data": json.dumps({
-                                    "conversation_id": conversation_id,
-                                    "message_id": assistant_message_id,
-                                    "title": conversation.title if conversation else None,
-                                    "tool_results": None,
-                                    "done": True,
-                                    "fallback": assistant_message_id is None,
-                                }),
-                            }
-                        return
-
-                    if "_failed" in event:
-                        if not client_disconnected:
-                            yield {"event": "error", "data": json.dumps({"error": f"Agent管线故障: {event['_failed']}"})}
-                        return
-
-                    if client_disconnected:
-                        continue
-
-                    if "part_started" in event:
-                        # F1-1: push new timeline part (v2 clients). Payload is
-                        # wrapped in the type key — the frontend parser sniffs
-                        # data payload keys and ignores the `event:` line.
-                        yield {"event": "part_started", "data": json.dumps({"part_started": event["part_started"]}, ensure_ascii=False)}
-
-                    elif "part_delta" in event:
-                        # F1-1: incremental append to an existing part (v2 clients)
-                        yield {"event": "part_delta", "data": json.dumps({"part_delta": event["part_delta"]}, ensure_ascii=False)}
-
-                    elif "part_updated" in event:
-                        # F1-1: structured state transition for an existing part
-                        yield {"event": "part_updated", "data": json.dumps({"part_updated": event["part_updated"]}, ensure_ascii=False)}
-
-                    elif "reasoning_content" in event:
-                        # PHASE 5: forward the phase marker ("final" for
-                        # _final_thinking / grace-call output) so the
-                        # frontend can route iteration vs final reasoning.
-                        _payload = {"reasoning_content": scrub_reasoning_meta(
-                            event["reasoning_content"])}
-                        if event.get("phase"):
-                            _payload["phase"] = event["phase"]
-                        yield {"event": "reasoning_content", "data": json.dumps(_payload)}
-
-                    elif "content" in event:
-                        yield {"event": "content", "data": json.dumps({"content": event["content"]})}
-
-                    elif "content_segment" in event:
-                        yield {"event": "content_segment", "data": json.dumps({"segment_content": event["content_segment"]})}
-
-                    elif "tool_call" in event:
-                        tc = event["tool_call"]
-                        yield {
-                            "event": "message",
-                            "data": json.dumps({
-                                "agent_step": {
-                                    "name": tc.get("name", "unknown"),
-                                    "title": _TOOL_STEP_TITLES.get(tc.get("name", ""), f"工具调用: {tc.get('name', '')}"),
-                                    "content": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
-                                    "step_type": "tool_call",
-                                },
-                                "done": False,
-                            }),
-                        }
-                        yield {"event": "tool_call", "data": json.dumps(tc)}
-                        message_count += 1
-
-                    elif "tool_result" in event:
-                        tr = event["tool_result"]
-                        yield {"event": "tool_result", "data": json.dumps(tr)}
-
-                    elif "attachments" in event:
-                        # Accumulated download-card set (conv fbf5779b: the
-                        # per-call subsets previously emitted here replaced
-                        # the whole set on the client, so the live count was
-                        # wrong — the tool loop now streams the accumulated
-                        # set instead).
-                        yield {
-                            "event": "message",
-                            "data": json.dumps({"attachments": event["attachments"], "done": False}),
-                        }
-
-                    elif "iteration" in event:
-                        yield {"event": "iteration", "data": json.dumps(event["iteration"])}
-
-                    elif "ping" in event:
-                        yield {"event": "ping", "data": json.dumps({"ping": True})}
-
-                    elif "audit_reset" in event:
-                        # Silent-QC reset sync (conv 827a6f78 turn-B): not a
-                        # rendered item — the client uses it to drop the
-                        # rejected draft text from its timeline/accumulators.
-                        yield {"event": "audit_reset", "data": json.dumps({"audit_reset": True})}
-
-                    elif "agent_step" in event:
-                        yield {"event": "message", "data": json.dumps({"agent_step": event["agent_step"], "done": False})}
-
-                    elif "context_info" in event:
-                        yield {"event": "message", "data": json.dumps({"context_info": event["context_info"], "done": False})}
-
-                    elif "interjection_committed" in event:
-                        # 插话 commit-echo：loop 迭代边界注入用户插话后由
-                        # producer 落库并转发至此 —— 前端据此确认乐观气泡。
-                        yield {
-                            "event": "message",
-                            "data": json.dumps({
-                                "interjection_committed": event["interjection_committed"],
-                                "done": False,
-                            }),
-                        }
-
-                    elif "error" in event:
-                        yield {"event": "error", "data": json.dumps({"error": event["error"]})}
-
-                    elif "deathmatch_verdict" in event:
-                        _dm = event["deathmatch_verdict"]
-                        yield {
-                            "event": "message",
-                            "data": json.dumps({
-                                "deathmatch_verdict": _dm,
-                                "done": False,
-                            }),
-                        }
-
-                    elif "permission_request" in event:
-                        yield {
-                            "event": "message",
-                            "data": json.dumps({
-                                "permission_request": event["permission_request"],
-                                "done": False,
-                            }),
-                        }
-
-                    try:
-                        if not client_disconnected and await req.is_disconnected():
-                            client_disconnected = True
-                            try:
-                                await _stream_buf.set_sse_active(False)
-                            except Exception:
-                                pass
-                            logger.warning("Client disconnected during tool loop, agent continues in background")
-                    except Exception:
-                        pass
-
-            except asyncio.CancelledError:
-                if not _agent_task.done():
-                    _sse_cancelled.set()
-                    try:
-                        await _stream_buf.set_sse_active(False)
-                    except Exception:
-                        pass
-                    logger.warning("SSE cancelled but agent loop still running — it will complete and self-save results")
-                raise
-
-        # ---- Tool-calling loop path (AgentLoop is the only pipeline) ---
-        _config = get_config()
-
-        async def _release_setup_slot():
-            """Free the 4.8 session-lock slot + stream buffer for a run that
-            died before its detached agent task was spawned. The slot is
-            claimed by reserve() at request start; if the SSE is cancelled
-            (or setup throws) before task creation, nothing else ever
-            unregisters it — the next /stream for this conversation is then
-            rejected with conversation_busy (the stop → edit → resend → no
-            answer bug). Running agents own both and clean up in their own
-            CancelledError handler / finally, so this must only fire when no
-            agent task was created."""
-            if _reserved_agent_state is not None:
-                try:
-                    await _agent_registry.release_dead_setup(conversation_id, _reserved_agent_state)
-                except Exception:
-                    pass
-            try:
-                _dead_buf = await stream_buffer_manager.get_buffer(conversation_id, current_user.id)
-                if _dead_buf is not None and _dead_buf.is_running:
-                    await _dead_buf.mark_complete(None)
-            except Exception:
-                pass
-
-        async def _release_setup_slot_safely():
-            # A second cancellation during the cleanup awaits would re-raise
-            # CancelledError out of the handler and re-leak the slot; the
-            # shield lets the cleanup run to completion.
-            try:
-                await asyncio.shield(_release_setup_slot())
-            except asyncio.CancelledError:
-                pass
-
-        async def _recover_tool_loop():
-            """Re-drive the tool loop after a setup-phase SSE abort.
-
-            When the SSE is cancelled during setup, the detached agent task
-            does not exist yet — the run would otherwise die permanently and
-            the already-saved user message would never get an answer (conv
-            b078987b, 2026-08-03: 20s-in visibilitychange abort → dead-setup
-            release → no answer ever produced). Re-invoking ``_run_tool_loop``
-            in a background task: setup re-runs with fresh sessions, the
-            (still-ours) reservation is adopted, the agent loop runs, and on
-            completion the relay's post-disconnect path self-saves with a
-            fresh session. If the stop endpoint already released the slot
-            (deliberate stop), ``adopt_reservation`` returns None and the
-            recovery dies with conversation_superseded — correct stop
-            semantics preserved.
-            """
-            try:
-                async for _ev in _run_tool_loop():
-                    pass  # drain — no SSE client; agent self-saves on completion
-            except asyncio.CancelledError:
-                # The recovery task itself was cancelled (e.g. app shutdown).
-                # Release the adopted slot so the conversation is never
-                # wedged behind a dead running-claim (the cleanup loop only
-                # reaps PROVISIONAL entries; an adopted one would leak
-                # conversation_busy forever). Identity-checked: never pops a
-                # slot re-reserved by a newer request.
-                await _release_setup_slot_safely()
-            except Exception:
-                logger.exception(
-                    "Setup-recovery tool loop failed for conversation %s",
-                    conversation_id,
-                )
-                await _release_setup_slot_safely()
-
-        _recovery_task: asyncio.Task | None = None
-
-        try:
-            async for event in _run_tool_loop():
-                yield event
-        except asyncio.CancelledError:
-            # Stop/abort during setup: CancelledError (BaseException in 3.8+)
-            # bypasses `except Exception` below. The loop-phase handler inside
-            # _run_tool_loop already deals with the agent-running case; here
-            # the run died pre-handoff. Releasing the slot AND killing the run
-            # leaves the saved user message permanently unanswered — instead
-            # re-drive the tool loop detached so the answer is produced and
-            # self-saved. The slot is NOT released here: the recovery run
-            # adopts it (identity-checked); a deliberate stop released it
-            # already, so the recovery aborts cleanly via supersession.
-            if detached_agent_task is None and _recovery_task is None:
-                _slot_still_ours = False
-                try:
-                    _slot_still_ours = (
-                        _reserved_agent_state is not None
-                        and _agent_registry.get_local(conversation_id) is _reserved_agent_state
-                    )
-                except Exception:
-                    _slot_still_ours = False
-                if _slot_still_ours:
-                    _recovery_task = asyncio.create_task(_recover_tool_loop())
-                    _track_bg_task(_recovery_task, conversation_id, "setup_recovery")
-                else:
-                    # Stop endpoint already released the slot (deliberate
-                    # stop) — no recovery; keep the dead-setup release so the
-                    # conversation is not wedged.
-                    await _release_setup_slot_safely()
-            raise
-        except Exception:
-            # 4.8 session lock: setup died before the reservation handoff —
-            # release the slot (identity-checked, adopted-or-provisional), so
-            # the conversation is never wedged behind a dead running-claim.
-            if detached_agent_task is None:
-                await _release_setup_slot_safely()
-            raise
-        try:
-            from app.services.proactive_learning_service import ProactiveLearningService
-            _pls = ProactiveLearningService()
-            await _pls.update_user_model(db, current_user.id)
-        except Exception:
-            pass
-
-    await db.commit()
-    try:
-        db.expunge(conversation)
-    except Exception:
-        pass
-    await db.close()
-
-    return EventSourceResponse(event_generator())
+    return await stream_chat_response(request, req, db, current_user)
 
 
 @router.post("/stream/resume")
@@ -4891,6 +1125,16 @@ async def resume_stream(
             return {
                 "event": "message",
                 "data": json.dumps({"db_message_id_update": delta["data"], "done": False}),
+            }
+        elif delta["type"] == "interjection_committed":
+            # W26（B2）：插话 commit-echo 的实时增量转发。断连期间 commit 的
+            # 那一条由 replay 的 interjections_committed 补齐（buffer 权威）。
+            return {
+                "event": "message",
+                "data": json.dumps({
+                    "interjection_committed": delta["data"],
+                    "done": False,
+                }),
             }
         elif delta["type"] == "reasoning_segment":
             # Mid-stream "thinking" block flushed between answer text and a
@@ -5231,7 +1475,10 @@ async def resume_stream(
 
                     # Guard: never persist a completely empty bubble from the
                     # legacy resume path either (mirrors the main-flow guards).
-                    if not (_cap_content or "").strip() and not (_cap_reasoning or "").strip() and not _cap_tr_json:
+                    # P1（2026-10-31 UPSTREAM_TODO_20261031）：reasoning 不参与落库
+                    # 判定——「无正文且无工具结果」即跳过，reasoning-only 不再落
+                    # final（conv d7ea65b8 空气泡第二落库面，与 stop 分支同裁定）。
+                    if not (_cap_content or "").strip() and not _cap_tr_json:
                         logger.info("Legacy resume _completed with empty payload; skipping save")
                         yield {
                             "event": "done",
@@ -5255,6 +1502,11 @@ async def resume_stream(
                             if conv_row:
                                 # 渐进落库：resume 完成的 run 若在别的请求里建过
                                 # streaming 行，按 (conv, streaming) 反查原地更新。
+                                buf_fallback = None
+                                try:
+                                    buf_fallback = await stream_buffer_manager.get_buffer_no_auth(_cap_conv_id)
+                                except Exception:
+                                    pass
                                 msg = await _save_assistant_terminal(
                                     bg_db,
                                     conversation_id=_cap_conv_id,
@@ -5264,6 +1516,12 @@ async def resume_stream(
                                     tool_calls=None,
                                     context_info=None,
                                     status="final",
+                                    # 2026-11-02（C6）：绑定本 run 的 streaming 行。
+                                    # 缺此参数会回退「本会话最新 streaming 行」反查，
+                                    # 可能错翻别的 run 的僵尸行（W5 引入 row_id 正是
+                                    # 为修这个 bug）。
+                                    row_id=getattr(buf_fallback, "streaming_message_id", None),
+                                    interjection_items=interjection_items_from_buffer(buf_fallback),
                                 )
                                 conv_row.updated_at = datetime.utcnow()
                                 await bg_db.commit()
@@ -5271,7 +1529,6 @@ async def resume_stream(
                                 msg_id = str(msg.id)
                                 title = conv_row.title
                                 try:
-                                    buf_fallback = await stream_buffer_manager.get_buffer_no_auth(_cap_conv_id)
                                     if buf_fallback:
                                         await buf_fallback.mark_complete(msg_id)
                                 except Exception:
@@ -5333,6 +1590,16 @@ async def resume_stream(
                     }
                 elif "iteration" in event:
                     yield {"event": "iteration", "data": json.dumps(event["iteration"])}
+                elif "interjection_committed" in event:
+                    # W26（B2）：legacy resume 路径同样转发插话 echo（主路径
+                    # 的 replay 已携带 interjections_committed）。
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "interjection_committed": event["interjection_committed"],
+                            "done": False,
+                        }),
+                    }
                 elif "ping" in event:
                     yield {"event": "ping", "data": json.dumps({"ping": True})}
                 elif "agent_step" in event:
@@ -5459,6 +1726,31 @@ def _interject_target_alive(state) -> bool:
     return bool(state.provisional)
 
 
+_MAX_INTERJECT_CLIENT_MESSAGE_ID = 128
+
+
+def _normalize_interject_request(request_data: dict | None) -> tuple[str, str | None]:
+    """Normalize the interject POST body (W26 §B3).
+
+    ``client_message_id`` is client-generated and echoed back in
+    ``interjection_committed`` so the frontend can pair echoes by id (same
+    conversation, identical text) instead of by content. Legacy clients omit
+    it — the queue item then carries ``None`` and the client falls back to
+    content pairing.
+
+    Non-string values are treated as absent (never coerced via ``str()``:
+    ``str({"a": 1})`` would smuggle a Python repr into the model context).
+    Length validation belongs to the endpoint so it can return HTTP 400
+    instead of silently truncating an id the client can never match again.
+    """
+    data = request_data or {}
+    raw_content = data.get("content")
+    content = raw_content.strip() if isinstance(raw_content, str) else ""
+    raw_id = data.get("client_message_id")
+    client_message_id = raw_id.strip() if isinstance(raw_id, str) else ""
+    return content, (client_message_id or None)
+
+
 @router.post("/stream/interject/{conversation_id}")
 async def interject_agent_stream(
     conversation_id: str,
@@ -5481,6 +1773,11 @@ async def interject_agent_stream(
     ``not_running`` (no live run — the client should fall back to a normal
     send) · ``unsupported_mode`` (deathmatch conversations have their own
     human-gate interaction semantics).
+
+    Request body: ``{"content": str, "client_message_id"?: str}``.
+    ``client_message_id`` (≤128 chars, optional — legacy clients omit it) is
+    echoed back unchanged in the ``interjection_committed`` payload so the
+    client can pair echoes by id instead of by content (W26 §B3).
     """
     # 归属校验先于内容校验（第四波 ④）：非属主探测一律 404，不泄漏端点
     # 内容规则（authz-first）。
@@ -5490,9 +1787,16 @@ async def interject_agent_stream(
     conversation = result.scalar_one_or_none()
     if conversation is None or conversation.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="会话不存在")
-    content = str((request_data or {}).get("content") or "").strip()
+    content, client_message_id = _normalize_interject_request(request_data)
     if not content:
         raise HTTPException(status_code=400, detail="插话内容不能为空")
+    if client_message_id and len(client_message_id) > _MAX_INTERJECT_CLIENT_MESSAGE_ID:
+        # echo 必须与客户端保存的 id 逐字相同才能配对：截断会静默降级为
+        # 内容配对（B3 要根治的错配面），故直接 400。
+        raise HTTPException(
+            status_code=400,
+            detail=f"client_message_id 过长（上限 {_MAX_INTERJECT_CLIENT_MESSAGE_ID} 字符）",
+        )
     if len(content) > 8000:
         raise HTTPException(status_code=400, detail="插话内容过长（上限 8000 字符）")
     if (conversation.deathmatch_status or "") in ("grilling", "active", "paused"):
@@ -5507,7 +1811,10 @@ async def interject_agent_stream(
         # 无上限是上下文/成本放大面。客户端收到 429 将文本回填输入框稍后
         # 重发（rate_limited，绝不回退普通发送——那会杀掉在途 run）。
         raise HTTPException(status_code=429, detail="插话队列已满，请等待当前插话被接收")
-    state.interjection_queue.put_nowait(content)
+    state.interjection_queue.put_nowait({
+        "content": content,
+        "client_message_id": client_message_id,
+    })
     logger.info(
         "Interjection queued for conversation %s (%d chars, user=%s)",
         conversation_id, len(content), current_user.id,
@@ -5521,11 +1828,18 @@ async def permission_respond(
     current_user: User = Depends(get_current_user),
 ):
     """Respond to a pending permission request from the agent loop."""
-    from app.services.permission_manager import respond_to_request
+    from app.services.permission_manager import get_pending_request, respond_to_request
     request_id = request_data.get("request_id", "")
     approved = bool(request_data.get("approved", False))
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id is required")
+    pending = get_pending_request(request_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="Permission request not found or expired")
+    # P1b: only the conversation owner may answer an act-gate/permission
+    # prompt; an unbound request fails closed.
+    if not pending.user_id or str(pending.user_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Permission request belongs to another user")
     success = respond_to_request(request_id, approved)
     if not success:
         raise HTTPException(status_code=404, detail="Permission request not found or expired")

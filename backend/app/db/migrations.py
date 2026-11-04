@@ -234,6 +234,23 @@ $$"""),
     )"""),
     # Rename the legacy voice assistant (酬) to 语音助理 for existing installs
     ("assistants_rename_voice_assistant", "UPDATE assistants SET name = '语音助理' WHERE name = '酬'"),
+    # Voice background-task completion notices survive disconnect/restart. The
+    # task id is unique so repeated worker completion hooks stay idempotent.
+    ("create_voice_notification_outbox", """CREATE TABLE IF NOT EXISTS voice_notification_outbox (
+        id VARCHAR(36) PRIMARY KEY,
+        task_id VARCHAR(36) REFERENCES agent_tasks(id) ON DELETE CASCADE NOT NULL UNIQUE,
+        user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+        conversation_id VARCHAR(36) REFERENCES conversations(id) ON DELETE CASCADE NOT NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'pending',
+        task_status VARCHAR(16) NOT NULL,
+        payload TEXT NOT NULL DEFAULT '{}',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TIMESTAMP,
+        delivered_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("idx_voice_notification_outbox_pending", "CREATE INDEX IF NOT EXISTS idx_voice_notification_outbox_pending ON voice_notification_outbox(user_id, conversation_id, status, created_at)"),
     # ---- Memory & Dreaming v2: 纯列 ALTER（不依赖 pgvector，pgvector 缺失时也应执行）----
     # ALTER user_agent_states: new columns for concept extraction watermarks + management
     ("uas_last_note_processed_at", "ALTER TABLE user_agent_states ADD COLUMN IF NOT EXISTS last_note_processed_at TIMESTAMP"),
@@ -471,6 +488,10 @@ $$"""),
     ("conversations_deathmatch_no_progress_replans", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_no_progress_replans INTEGER DEFAULT 0"),
     # AEWM 借鉴波（2026-09-25）：证伪台账（anti task-state contamination）
     ("conversations_deathmatch_retracted_claims", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_retracted_claims JSONB"),
+    # W2 证据视图 v1（2026-10-14 ACG 2609.32754）：证据单元列。A3 勘正——
+    # derived state 不同步客户端（不入 DEATHMATCH_SYNC_FIELDS）；非 memory 迁移，
+    # 置于 pgvector_extension 之前（后缀纯度守卫）。
+    ("conversations_deathmatch_evidence_units", "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deathmatch_evidence_units JSONB DEFAULT '[]'::jsonb"),
     # conv-open 性能治理 P1-1（2026-10-03）：超限 tool_results/reasoning_content/
     # tool_calls 全文外置（DESIGN_conv_open_performance.md），行内留显式 stub。
     ("message_payloads_v1", (
@@ -658,6 +679,399 @@ $$"""),
         "SELECT device_id, user_id FROM purged "
         "ON CONFLICT (device_id) DO NOTHING"
     )),
+    # 2026-10-18 C1（context continuity）：跨轮滚动摘要 / artifact index /
+    # resume snapshot。非 memory v2 表，必须置于 pgvector_extension 之前。
+    ("create_conversation_rolling_summaries", """CREATE TABLE IF NOT EXISTS conversation_rolling_summaries (
+        conversation_id VARCHAR(36) PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+        summary TEXT NOT NULL DEFAULT '',
+        covered_count INTEGER NOT NULL DEFAULT 0,
+        covered_until_message_id VARCHAR(36),
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("create_conversation_artifacts", """CREATE TABLE IF NOT EXISTS conversation_artifacts (
+        id VARCHAR(36) PRIMARY KEY,
+        conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        path_hash VARCHAR(64) NOT NULL,
+        kind VARCHAR(20) NOT NULL DEFAULT 'file',
+        source VARCHAR(50) NOT NULL DEFAULT '',
+        mtime_ns BIGINT,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(conversation_id, path_hash)
+    )"""),
+    ("create_conversation_resume_snapshots", """CREATE TABLE IF NOT EXISTS conversation_resume_snapshots (
+        conversation_id VARCHAR(36) PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+        pack TEXT NOT NULL DEFAULT '',
+        delivery_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("create_tool_reliability_stats", """CREATE TABLE IF NOT EXISTS tool_reliability_stats (
+        tool_name VARCHAR(120) NOT NULL,
+        provider VARCHAR(80) NOT NULL DEFAULT '',
+        n INTEGER NOT NULL DEFAULT 0,
+        successes INTEGER NOT NULL DEFAULT 0,
+        failures INTEGER NOT NULL DEFAULT 0,
+        total_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+        last_error_class VARCHAR(60),
+        last_failure_at TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (tool_name, provider)
+    )"""),
+    ("create_decision_calibration", """CREATE TABLE IF NOT EXISTS decision_calibration (
+        id BIGSERIAL PRIMARY KEY,
+        task VARCHAR(60) NOT NULL DEFAULT '',
+        probs_json TEXT NOT NULL DEFAULT '{}',
+        outcome VARCHAR(40),
+        brier DOUBLE PRECISION,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    # TMA-NM P1a: runtime taint + verdict chain. Non-memory tables, so they
+    # must stay before the pgvector skip window.
+    ("create_taint_states", """CREATE TABLE IF NOT EXISTS taint_states (
+        conversation_id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL DEFAULT '',
+        max_taint VARCHAR(20) NOT NULL DEFAULT 'trusted',
+        sources_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("create_memory_verdicts", """CREATE TABLE IF NOT EXISTS memory_verdicts (
+        id VARCHAR(36) PRIMARY KEY,
+        tenant_id VARCHAR(64) NOT NULL DEFAULT '',
+        seq INTEGER NOT NULL DEFAULT 0,
+        user_id VARCHAR(36) NOT NULL DEFAULT '',
+        conversation_id VARCHAR(36) NOT NULL DEFAULT '',
+        action_fingerprint VARCHAR(64) NOT NULL DEFAULT '',
+        tool_name VARCHAR(80) NOT NULL DEFAULT '',
+        decision VARCHAR(20) NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        taint VARCHAR(20) NOT NULL DEFAULT 'untrusted',
+        corroborators JSONB NOT NULL DEFAULT '[]'::jsonb,
+        mode VARCHAR(20) NOT NULL DEFAULT 'shadow',
+        blocked BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at_epoch BIGINT NOT NULL DEFAULT 0,
+        prev_hash VARCHAR(64) NOT NULL DEFAULT '',
+        entry_hash VARCHAR(64) NOT NULL UNIQUE,
+        sig VARCHAR(64) NOT NULL DEFAULT '',
+        key_id VARCHAR(20) NOT NULL DEFAULT 'v1',
+        created_at TIMESTAMP DEFAULT NOW(),
+        CONSTRAINT uq_memory_verdict_tenant_seq UNIQUE (tenant_id, seq)
+    )"""),
+    # Upgrade path for DBs that already ran the round-1 CREATE TABLE.
+    ("memory_verdicts_tma_mode", "ALTER TABLE memory_verdicts ADD COLUMN IF NOT EXISTS mode VARCHAR(20) NOT NULL DEFAULT 'shadow'"),
+    ("memory_verdicts_tma_blocked", "ALTER TABLE memory_verdicts ADD COLUMN IF NOT EXISTS blocked BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("memory_verdicts_tma_epoch", "ALTER TABLE memory_verdicts ADD COLUMN IF NOT EXISTS created_at_epoch BIGINT NOT NULL DEFAULT 0"),
+    # P2: legacy rows got created_at_epoch=0 from the ALTER above; backfill
+    # from the real timestamp so retention never treats them as ancient.
+    ("memory_verdicts_tma_epoch_backfill", "UPDATE memory_verdicts SET created_at_epoch = COALESCE(CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT), 0) WHERE created_at_epoch = 0 AND created_at IS NOT NULL"),
+    ("create_memory_verdicts_idx", "CREATE INDEX IF NOT EXISTS idx_memory_verdicts_conv ON memory_verdicts(conversation_id, created_at DESC)"),
+    ("ix_taint_states_user_id", "CREATE INDEX IF NOT EXISTS ix_taint_states_user_id ON taint_states(user_id)"),
+    ("ix_memory_verdicts_user_id", "CREATE INDEX IF NOT EXISTS ix_memory_verdicts_user_id ON memory_verdicts(user_id)"),
+    ("ix_memory_verdicts_action_fingerprint", "CREATE INDEX IF NOT EXISTS ix_memory_verdicts_action_fingerprint ON memory_verdicts(action_fingerprint)"),
+    ("ix_memory_verdicts_created_at", "CREATE INDEX IF NOT EXISTS ix_memory_verdicts_created_at ON memory_verdicts(created_at)"),
+    ("create_memory_verdict_heads", """CREATE TABLE IF NOT EXISTS memory_verdict_heads (
+        tenant_id VARCHAR(64) PRIMARY KEY,
+        last_hash VARCHAR(64) NOT NULL DEFAULT '',
+        last_seq INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("create_artifact_taint", """CREATE TABLE IF NOT EXISTS artifact_taint (
+        user_id VARCHAR(36) NOT NULL,
+        artifact_type VARCHAR(32) NOT NULL,
+        artifact_id VARCHAR(64) NOT NULL,
+        tenant_id VARCHAR(64) NOT NULL DEFAULT '',
+        taint VARCHAR(20) NOT NULL DEFAULT 'untrusted',
+        origin VARCHAR(40) NOT NULL DEFAULT 'legacy_untrusted',
+        parent_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (user_id, artifact_type, artifact_id)
+    )"""),
+    ("artifact_taint_parent_ids_jsonb", "ALTER TABLE artifact_taint ALTER COLUMN parent_ids TYPE jsonb USING parent_ids::jsonb"),
+    ("ix_artifact_taint_updated_at", "CREATE INDEX IF NOT EXISTS ix_artifact_taint_updated_at ON artifact_taint(updated_at)"),
+    ("ix_memory_action_tokens_user", "CREATE INDEX IF NOT EXISTS ix_memory_action_tokens_user ON memory_action_tokens(user_id)"),
+    ("ix_memory_action_tokens_fp", "CREATE INDEX IF NOT EXISTS ix_memory_action_tokens_fp ON memory_action_tokens(action_fingerprint)"),
+    ("create_memory_action_tokens", """CREATE TABLE IF NOT EXISTS memory_action_tokens (
+        token_id VARCHAR(36) PRIMARY KEY,
+        tenant_id VARCHAR(64) NOT NULL DEFAULT '',
+        user_id VARCHAR(36) NOT NULL DEFAULT '',
+        conversation_id VARCHAR(36) NOT NULL DEFAULT '',
+        action_fingerprint VARCHAR(64) NOT NULL DEFAULT '',
+        tool_name VARCHAR(80) NOT NULL DEFAULT '',
+        nonce VARCHAR(64) NOT NULL UNIQUE,
+        issued_at_epoch BIGINT NOT NULL DEFAULT 0,
+        expires_at_epoch BIGINT NOT NULL DEFAULT 0,
+        used_at_epoch BIGINT NOT NULL DEFAULT 0,
+        sig VARCHAR(64) NOT NULL DEFAULT ''
+    )"""),
+    ("create_memory_verdict_checkpoints", """CREATE TABLE IF NOT EXISTS memory_verdict_checkpoints (
+        tenant_id VARCHAR(64) NOT NULL,
+        seq INTEGER NOT NULL,
+        merkle_root VARCHAR(64) NOT NULL DEFAULT '',
+        last_hash VARCHAR(64) NOT NULL DEFAULT '',
+        sig VARCHAR(64) NOT NULL DEFAULT '',
+        key_id VARCHAR(20) NOT NULL DEFAULT 'v1',
+        witness_required BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at_epoch BIGINT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (tenant_id, seq)
+    )"""),
+    ("memory_verdict_checkpoints_epoch", "ALTER TABLE memory_verdict_checkpoints ADD COLUMN IF NOT EXISTS created_at_epoch BIGINT NOT NULL DEFAULT 0"),
+    ("memory_verdict_checkpoints_witness", "ALTER TABLE memory_verdict_checkpoints ADD COLUMN IF NOT EXISTS witness_required BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("ix_memory_verdict_checkpoints_created_at", "CREATE INDEX IF NOT EXISTS ix_memory_verdict_checkpoints_created_at ON memory_verdict_checkpoints(created_at)"),
+    # TMA-NM P2: hash-only retention tombstones + signed prefix boundary.
+    ("create_memory_verdict_redacted", """CREATE TABLE IF NOT EXISTS memory_verdict_redacted (
+        tenant_id VARCHAR(64) NOT NULL DEFAULT '',
+        seq INTEGER NOT NULL,
+        prev_hash VARCHAR(64) NOT NULL DEFAULT '',
+        entry_hash VARCHAR(64) NOT NULL DEFAULT '',
+        key_id VARCHAR(20) NOT NULL DEFAULT 'v1',
+        PRIMARY KEY (tenant_id, seq)
+    )"""),
+    ("create_memory_verdict_retention", """CREATE TABLE IF NOT EXISTS memory_verdict_retention (
+        tenant_id VARCHAR(64) PRIMARY KEY,
+        pruned_through_seq INTEGER NOT NULL DEFAULT 0,
+        boundary_hash VARCHAR(64) NOT NULL DEFAULT '',
+        boundary_prev_hash VARCHAR(64) NOT NULL DEFAULT '',
+        sig VARCHAR(64) NOT NULL DEFAULT '',
+        key_id VARCHAR(20) NOT NULL DEFAULT 'v1',
+        updated_at_epoch BIGINT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    # TMA-NM P3: hash-only detector quarantine telemetry.
+    ("create_injection_quarantine", """CREATE TABLE IF NOT EXISTS injection_quarantine (
+        id VARCHAR(36) PRIMARY KEY,
+        tenant_id VARCHAR(64) NOT NULL DEFAULT '',
+        user_id VARCHAR(36) NOT NULL DEFAULT '',
+        conversation_id VARCHAR(36) NOT NULL DEFAULT '',
+        channel VARCHAR(40) NOT NULL DEFAULT '',
+        tool_name VARCHAR(80) NOT NULL DEFAULT '',
+        origin VARCHAR(40) NOT NULL DEFAULT '',
+        content_hash VARCHAR(64) NOT NULL DEFAULT '',
+        detector VARCHAR(80) NOT NULL DEFAULT '',
+        score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT '',
+        mode VARCHAR(20) NOT NULL DEFAULT 'shadow',
+        created_at_epoch BIGINT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("ix_injection_quarantine_content_hash", "CREATE INDEX IF NOT EXISTS ix_injection_quarantine_content_hash ON injection_quarantine(content_hash)"),
+    ("ix_injection_quarantine_created_at", "CREATE INDEX IF NOT EXISTS ix_injection_quarantine_created_at ON injection_quarantine(created_at)"),
+    ("ix_injection_quarantine_tenant_id", "CREATE INDEX IF NOT EXISTS ix_injection_quarantine_tenant_id ON injection_quarantine(tenant_id)"),
+    # ---- 记忆/长程 v2（2026-10-23）：用户权利/基础设施表，必须置于
+    # pgvector_extension 之前——pgvector 缺失时后缀整体跳过，遗忘/撤销面
+    # （D1 memory-only 擦除、约束 revoke）不得随之消失。
+    ("cpc_create", """CREATE TABLE IF NOT EXISTS conversation_pinned_constraints (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        source_message_id VARCHAR(36),
+        source_role VARCHAR(20) NOT NULL DEFAULT 'user',
+        provenance VARCHAR(20) NOT NULL DEFAULT 'trusted',
+        scope VARCHAR(20) NOT NULL DEFAULT 'conversation',
+        pinned_by VARCHAR(20) NOT NULL DEFAULT 'user',
+        created_at TIMESTAMP DEFAULT NOW(),
+        revoked_at TIMESTAMP,
+        revoked_by VARCHAR(20)
+    )"""),
+    ("cpc_idx_conv_revoked", "CREATE INDEX IF NOT EXISTS idx_pinned_conv_revoked ON conversation_pinned_constraints(conversation_id, revoked_at)"),
+    ("dm_create", """CREATE TABLE IF NOT EXISTS deletion_manifests (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        request_id VARCHAR(64) NOT NULL,
+        scope_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        residual_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP DEFAULT NOW(),
+        completed_at TIMESTAMP
+    )"""),
+    ("drr_create", """CREATE TABLE IF NOT EXISTS dream_repair_reports (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        run_date VARCHAR(10) NOT NULL,
+        probe_count INTEGER NOT NULL DEFAULT 0,
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        miss_count INTEGER NOT NULL DEFAULT 0,
+        repairs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+        hit_at_k_before DOUBLE PRECISION,
+        hit_at_k_after DOUBLE PRECISION,
+        cost_tokens INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("sc_create", """CREATE TABLE IF NOT EXISTS step_checkpoints (
+        id VARCHAR(36) PRIMARY KEY,
+        deathmatch_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        step_id VARCHAR(64) NOT NULL,
+        context_cursor INTEGER NOT NULL DEFAULT 0,
+        snapshot_id VARCHAR(64),
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("sc_idx_dm_step", "CREATE INDEX IF NOT EXISTS idx_sc_dm_step ON step_checkpoints(deathmatch_id, step_id)"),
+    ("mer_create", """CREATE TABLE IF NOT EXISTS memory_eval_runs (
+        id VARCHAR(36) PRIMARY KEY,
+        run_id VARCHAR(64) NOT NULL,
+        suite VARCHAR(64) NOT NULL,
+        arm VARCHAR(64) NOT NULL,
+        metrics_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("conv_artifacts_deleted_at", "ALTER TABLE conversation_artifacts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ"),
+    # ---- 2026-11-01：插话内联定位 + 用户级 MCP（非 memory，置于 pgvector
+    # 后缀哨兵之前；pgvector 缺失时也必须执行）。
+    ("messages_interjection_items", "ALTER TABLE messages ADD COLUMN IF NOT EXISTS interjection_items TEXT"),
+    ("messages_embedded_in_message_id", "ALTER TABLE messages ADD COLUMN IF NOT EXISTS embedded_in_message_id VARCHAR(36)"),
+    ("ix_messages_embedded_in_message_id", "CREATE INDEX IF NOT EXISTS ix_messages_embedded_in_message_id ON messages(embedded_in_message_id)"),
+    ("drop_legacy_idx_messages_embedded_in_message_id", "DROP INDEX IF EXISTS idx_messages_embedded_in_message_id"),
+    ("create_user_mcp_servers", """CREATE TABLE IF NOT EXISTS user_mcp_servers (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name VARCHAR(64) NOT NULL,
+        transport VARCHAR(10) NOT NULL DEFAULT 'http',
+        url VARCHAR(1000),
+        api_key VARCHAR(1000),
+        command VARCHAR(1000),
+        args_json TEXT,
+        env_json TEXT,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("uq_user_mcp_servers_user_name", "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_mcp_servers_user_name ON user_mcp_servers(user_id, name)"),
+    # ---- 2026-11-04：语音主 Agent 异步委派 separate_v1（非 memory，置于
+    # pgvector 后缀哨兵之前；pgvector 缺失时也必须执行）。
+    # All new AgentTask columns are nullable so legacy rows keep execution_mode
+    # NULL and existing behavior is byte-for-byte unchanged.
+    ("agent_tasks_source_conversation_id",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS source_conversation_id VARCHAR(36) REFERENCES conversations(id) ON DELETE SET NULL"),
+    ("agent_tasks_source_message_id",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS source_message_id VARCHAR(36) REFERENCES messages(id) ON DELETE SET NULL"),
+    ("agent_tasks_execution_conversation_id",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS execution_conversation_id VARCHAR(36) REFERENCES conversations(id) ON DELETE SET NULL"),
+    ("agent_tasks_goal_message_id",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS goal_message_id VARCHAR(36) REFERENCES messages(id) ON DELETE SET NULL"),
+    ("agent_tasks_execution_mode",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS execution_mode VARCHAR(20)"),
+    ("agent_tasks_origin_kind",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS origin_kind VARCHAR(20)"),
+    ("agent_tasks_execution_config",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS execution_config TEXT"),
+    ("agent_tasks_idempotency_key",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128)"),
+    ("agent_tasks_request_fingerprint",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64)"),
+    ("agent_tasks_attempt_id",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS attempt_id VARCHAR(36)"),
+    ("agent_tasks_lease_until",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_until TIMESTAMP"),
+    ("agent_tasks_heartbeat_at",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP"),
+    ("agent_tasks_cancel_requested_at",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMP"),
+    ("agent_tasks_status_version",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS status_version INTEGER DEFAULT 0"),
+    ("agent_tasks_output_message_id",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS output_message_id VARCHAR(36)"),
+    ("agent_tasks_reasoning_status",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS reasoning_status VARCHAR(20)"),
+    ("agent_tasks_runtime_meta",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS runtime_meta TEXT"),
+    ("agent_tasks_usage_meta",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS usage_meta TEXT"),
+    ("uq_agent_tasks_user_idempotency",
+     "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_tasks_user_idempotency ON agent_tasks(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL"),
+    ("uq_agent_tasks_execution_conversation",
+     "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_tasks_execution_conversation ON agent_tasks(execution_conversation_id) WHERE execution_conversation_id IS NOT NULL"),
+    ("idx_agent_tasks_mode_status",
+     "CREATE INDEX IF NOT EXISTS idx_agent_tasks_mode_status ON agent_tasks(execution_mode, status)"),
+    ("idx_agent_tasks_source_conversation",
+     "CREATE INDEX IF NOT EXISTS idx_agent_tasks_source_conversation ON agent_tasks(source_conversation_id)"),
+    # Outbox v2: task reference must survive the 7-day AgentTask cleanup.
+    ("voice_notification_outbox_task_fk",
+     "ALTER TABLE voice_notification_outbox DROP CONSTRAINT IF EXISTS voice_notification_outbox_task_id_fkey"),
+    ("voice_notification_outbox_task_fk_set_null",
+     """ALTER TABLE voice_notification_outbox
+        ADD CONSTRAINT voice_notification_outbox_task_id_fkey
+        FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL"""),
+    ("voice_notification_outbox_task_nullable",
+     "ALTER TABLE voice_notification_outbox ALTER COLUMN task_id DROP NOT NULL"),
+    ("voice_notification_outbox_conversation_nullable",
+     "ALTER TABLE voice_notification_outbox ALTER COLUMN conversation_id DROP NOT NULL"),
+    ("voice_notification_outbox_logical_task_id",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS logical_task_id VARCHAR(36)"),
+    ("voice_notification_outbox_recipient",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS recipient_user_id VARCHAR(36)"),
+    ("voice_notification_outbox_origin_conversation",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS origin_conversation_id VARCHAR(36)"),
+    ("voice_notification_outbox_execution_conversation",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS execution_conversation_id VARCHAR(36)"),
+    ("voice_notification_outbox_output_message",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS output_message_id VARCHAR(36)"),
+    ("voice_notification_outbox_event_type",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS event_type VARCHAR(32) DEFAULT 'terminal'"),
+    ("voice_notification_outbox_status_version",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS status_version INTEGER DEFAULT 0"),
+    ("voice_notification_outbox_delivery_attempt",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS delivery_attempt_id VARCHAR(36)"),
+    ("voice_notification_outbox_delivery_lease_owner",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS delivery_lease_owner VARCHAR(64)"),
+    ("voice_notification_outbox_delivery_lease_expires",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS delivery_lease_expires_at TIMESTAMP"),
+    ("voice_notification_outbox_dismissed_at",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS dismissed_at TIMESTAMP"),
+    ("voice_notification_outbox_delivery_channel",
+     "ALTER TABLE voice_notification_outbox ADD COLUMN IF NOT EXISTS delivery_channel VARCHAR(16) DEFAULT 'voice'"),
+    ("voice_notification_outbox_backfill_recipient",
+     "UPDATE voice_notification_outbox SET recipient_user_id = user_id WHERE recipient_user_id IS NULL"),
+    ("voice_notification_outbox_backfill_logical_task",
+     "UPDATE voice_notification_outbox SET logical_task_id = task_id WHERE logical_task_id IS NULL"),
+    ("uq_voice_notification_outbox_event",
+     "CREATE UNIQUE INDEX IF NOT EXISTS uq_voice_notification_outbox_event ON voice_notification_outbox(recipient_user_id, logical_task_id, status_version, event_type) WHERE logical_task_id IS NOT NULL"),
+    ("idx_voice_notification_outbox_logical_task",
+     "CREATE INDEX IF NOT EXISTS idx_voice_notification_outbox_logical_task ON voice_notification_outbox(logical_task_id)"),
+    ("ix_voice_notification_outbox_recipient_user_id",
+     "CREATE INDEX IF NOT EXISTS ix_voice_notification_outbox_recipient_user_id ON voice_notification_outbox(recipient_user_id)"),
+    # Wave 2: the composite unique event index already prefixes
+    # recipient_user_id; keep only one index for the same access path.
+    ("drop_voice_outbox_recipient_prefix",
+     "DROP INDEX ix_voice_notification_outbox_recipient_user_id"),
+    ("idx_voice_notification_outbox_user_pending",
+     "CREATE INDEX IF NOT EXISTS idx_voice_notification_outbox_user_pending ON voice_notification_outbox(user_id, status, created_at)"),
+    # ── Wave 2 (2026-11-04): waiting states / permits / summaries ─────────
+    ("agent_tasks_waiting_reason",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS waiting_reason TEXT"),
+    ("agent_tasks_workspace_mode",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS workspace_mode VARCHAR(20)"),
+    ("agent_tasks_workspace_meta",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS workspace_meta TEXT"),
+    ("agent_tasks_merge_status",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS merge_status VARCHAR(20)"),
+    ("agent_tasks_last_attempt_started_at",
+     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS last_attempt_started_at TIMESTAMP"),
+    # One task can now emit input_required/auth_required/budget_required plus
+    # terminal events; the old per-task unique constraint must go.
+    ("voice_notification_outbox_drop_task_unique",
+     "ALTER TABLE voice_notification_outbox DROP CONSTRAINT IF EXISTS voice_notification_outbox_task_id_key"),
+    ("create_agent_task_permits", """CREATE TABLE IF NOT EXISTS agent_task_permits (
+        id VARCHAR(36) PRIMARY KEY,
+        task_id VARCHAR(36) NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tool_name VARCHAR(120) NOT NULL,
+        action_fingerprint VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        consumed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("idx_agent_task_permits_task",
+     "CREATE INDEX IF NOT EXISTS ix_agent_task_permits_task ON agent_task_permits(task_id, consumed_at)"),
+    ("create_agent_task_summaries", """CREATE TABLE IF NOT EXISTS agent_task_summaries (
+        id VARCHAR(36) PRIMARY KEY,
+        logical_task_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        result_hash VARCHAR(64) NOT NULL,
+        part_index INTEGER NOT NULL DEFAULT 0,
+        summary TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW(),
+        CONSTRAINT uq_agent_task_summary_hash UNIQUE (logical_task_id, result_hash, part_index)
+    )"""),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (
@@ -847,11 +1261,24 @@ $$"""),
         created_at TIMESTAMP DEFAULT NOW()
     )"""),
     ("mrl_idx_user_created", "CREATE INDEX IF NOT EXISTS idx_mrl_user_created ON memory_recall_log(user_id, created_at DESC)"),
+    # M2b（论文 2609.37559 APM-Bench）：零命中遥测字段
+    ("mrl_miss", "ALTER TABLE memory_recall_log ADD COLUMN IF NOT EXISTS miss BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("mrl_providers_queried", "ALTER TABLE memory_recall_log ADD COLUMN IF NOT EXISTS providers_queried TEXT"),
     # D1（2026-09-14）：RippleMem P/L/T 线索列（可空；存量行保持 NULL，不回填）
     ("me_participants", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS participants VARCHAR(1000)"),
     ("me_locations", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS locations VARCHAR(1000)"),
     # D1/DC5（2026-09-14）：边来源列（存量行默认 llm 语义；读侧白名单门控）
     ("cr_edge_source", "ALTER TABLE concept_relations ADD COLUMN IF NOT EXISTS edge_source VARCHAR(20) DEFAULT 'llm'"),
+    # ---- 记忆/长程 v2（2026-10-23）：memory_v2 列变更（后缀——pgvector 缺失时
+    # memory v2 整体停用，列随之跳过无害）。回填：scripts/backfill_retention_score.py
+    # （默认 dry-run；WHERE ... IS NULL 幂等）；fidelity_state 默认 full 不回溯降级。
+    ("mc_retention_score", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS retention_score DOUBLE PRECISION DEFAULT 0"),
+    ("mc_fidelity_state", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS fidelity_state VARCHAR(16) DEFAULT 'full'"),
+    ("idx_concepts_user_retention", "CREATE INDEX IF NOT EXISTS idx_concepts_user_retention ON memory_concepts(user_id, retention_score DESC)"),
+    ("ad_provenance_taint", "ALTER TABLE agent_dreams ADD COLUMN IF NOT EXISTS provenance_taint VARCHAR(16)"),
+    ("ad_scanned", "ALTER TABLE agent_dreams ADD COLUMN IF NOT EXISTS scanned BOOLEAN DEFAULT FALSE"),
+    # W2-3（2026-10-23）：读时门槛拒绝面 shadow 落档（误杀审计）
+    ("mrl_rejects_json", "ALTER TABLE memory_recall_log ADD COLUMN IF NOT EXISTS rejects_json TEXT"),
 ]
 
 

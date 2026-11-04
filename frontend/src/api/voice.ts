@@ -31,6 +31,17 @@ export interface VoiceEvent {
   task_id?: string
   title?: string
   status?: string
+  speech_kind?: 'answer' | 'aux' | 'notice'
+  notification_id?: string
+  notice_burst_seq?: number
+  execution_conversation_id?: string | null
+  logical_task_id?: string | null
+  assistant_name?: string
+  reasoning_policy?: string
+  requested_reasoning_effort?: string | null
+  deduplicated?: boolean
+  count?: number
+  items?: Array<Record<string, unknown>>
 }
 
 export interface VoiceSession {

@@ -19,6 +19,7 @@ async function globalSetup() {
     path.join(projectRoot, 'tests', 'memory_ui_seed.py'),
     path.join(projectRoot, 'tests', 'citation_ui_seed.py'),
     path.join(projectRoot, 'tests', 'seed_workspace_preview_fixtures.py'),
+    path.join(projectRoot, 'tests', 'voice_delegation_ui_seed.py'),
   ];
   for (const seed of seeds) {
     if (!fs.existsSync(seed) || !fs.existsSync(python)) {

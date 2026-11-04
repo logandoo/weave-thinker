@@ -147,13 +147,22 @@ _UNIT_CANON = {"毫升": "ml", "立方毫米": "mm³", "立方厘米": "cm³", "
                "毫克": "mg", "克": "g", "千克": "kg", "吨": "t", "人民币": "元"}
 _UNIT_ALT = "|".join(sorted({re.escape(k) for k in _UNIT_TABLE}, key=len, reverse=True))
 # unit'd candidate: Chinese numeral OR arabic number (+万/亿) + unit.
-# IGNORECASE (GB/gb) + right letter-boundary guard (「12 long」≠ 12 liters).
+# IGNORECASE (GB/gb) + right letter-boundary guard (「12 long」≠ 12 liters)。
+# 后瞻同排 ASCII 字母（评审 A-M2 2026-10-18，与 _BARE_RE 同口径）：标识符紧贴
+# 单位词（D2281 次列车/班次 G385 次）不是数量——否则标识符在 unit'd 通道
+# 重新进入候选且同样不可接地。
 _UNITED_RE = re.compile(
-    r"(?<![\d.])((?:" + _CN_NUM_BODY + r")|(-?\d[\d,]*(?:\.\d+)?))(万|亿)?\s*("
+    r"(?<![\d.A-Za-z])((?:" + _CN_NUM_BODY + r")|(-?\d[\d,]*(?:\.\d+)?))(万|亿)?\s*("
     + _UNIT_ALT + r")(?![A-Za-z])",
     re.IGNORECASE,
 )
-_BARE_RE = re.compile(r"(?<![\d.])(-?\d[\d,]*(?:\.\d+)?)(万|亿)?")
+# 后瞻同排 ASCII 字母（2026-10-17，conv 6871cf68 生产误伤）：字母紧邻的数字是
+# 标识符而非数量（车次 D2281/G385/T31、航班、型号），照录工具结果即「接地事实」，
+# 但其经校核脚本输出进推导闭包变得可 flag、B1a/B1b 回执又永不接地 → 不可满足
+# 打回循环。标识符数字在候选侧与证据/回执/用户锚点侧（四处抽取同一口径）
+# 一致豁免。已接受风险（评审 M3 记录）：伪造的类标识符形态（X40000）可逃逸
+# NPG——由 LLM 审计员语义判定兜底，确定性软闸门不追此对抗面。
+_BARE_RE = re.compile(r"(?<![\d.A-Za-z])(-?\d[\d,]*(?:\.\d+)?)(万|亿)?")
 
 
 def _unit_info(unit: str) -> Optional[Tuple[str, float]]:
@@ -356,7 +365,7 @@ def _latex_next_class(text: str, pos: int) -> str:
 def _classify_candidate(cleaned: str, start: int, end: int,
                         math_spans: Sequence[Tuple[int, int]]) -> str:
     """'exempt'（知识/区间/单位定义/数学块中间量）| 'math_result'（数学块内
-    结果位——数学式天然是计算上下文，无视标记/闭包面强制 gated）| 'normal'."""
+    结果位——数学式天然是计算上下文，无视闭包面强制 gated）| 'normal'."""
     # (0) unit-definition statement: 「1 cm³ = 1000 mm³」 right-hand number
     for m in _UNIT_DEF_RE.finditer(cleaned):
         if abs(m.end() - start) <= 1:
@@ -410,15 +419,11 @@ def _risk_gate(value: float, family: str, has_unit: bool) -> bool:
     return (not dec and abs(value) >= 100) or (dec and digits >= 3)
 
 
-# 计算标记（friction-1 深修）：标记窗口内的数值才默认需要回执——纯知识点值
-# （168 mL 对比规格/10%/35℃/128 孔）交还 LLM 审计的知识规则（模板明许可凭
-# 知识作答）。数学块结果位天然含 ≈/= 标记。
-_COMPUTATION_MARKERS = (
-    "≈", "＝", "=", "计算得", "计算结果", "结果为", "代入", "换算", "折算",
-    "经计算", "容积", "体积", "面积", "容量", "占比", "总数", "总量", "合计",
-    "平均", "差值", "比值", "单价", "总价", "利率",
-)
-_MARKER_WINDOW = 20
+# 触发面（2026-10-18 用户裁定「收紧」，红线=禁止关键词枚举做语义判断）：
+# 候选只在「算术可归因」时触发——① 数学块结果位（$…$ 结果位=结构性计算
+# 声明，非关键词）；② 推导闭包命中（值可由用户输入∪回执值两步算术导出）。
+# 历史上的 _COMPUTATION_MARKERS 关键词表（≈/计算得/容积/合计…）已删除——
+# 「是不是计算」是语义判断，归 LLM 审计员（模板知识规则），NPG 不再枚举。
 
 
 def _extract_gated_candidates(draft: str):
@@ -582,12 +587,42 @@ def _receipt_grounds(value: float, unit: str, family: str,
 
 # ── public API ───────────────────────────────────────────────────────────────
 
+
+def _trusted_receipt_values(tool_calls: Sequence[dict],
+                            anchors: Sequence[float], tol: float) -> List[float]:
+    """闭包输入白名单（4a 根治 2026-10-18，调研后方案）：只吞通过 B1 溯源的
+    回执输出裸值——代码含 ≥1 溯源锚点（用户消息∪证据台账数字）、非裸字面量
+    表达式、且该值本身不是代码里的字面量（B1a per-value）。
+
+    校核脚本（代码无锚点）打印的照录值不进闭包：照录工具结果=事实，它既不
+    触发也不接地——「照录事实被不可满足打回」（conv 6871cf68，D2281/818）
+    从结构上消失；同时不冲破 B1a 反硬编码（print(40000) 洗白通道不开）。
+    """
+    vals: List[float] = []
+    for tc in tool_calls or []:
+        code = str(tc.get("code") or "")
+        out = str(tc.get("output") or "")
+        if not out or not code:
+            continue
+        if _BARE_EXPR_RE.match(code):
+            continue
+        if not any(_num_in_code(b, code) for b in anchors):
+            continue
+        for cv, cu, _cf in _extract_corpus_tuples(out):
+            if cu:
+                continue
+            if _value_literal_in_code(code, cv, "", "", tol):
+                continue
+            vals.append(cv)
+    return vals
+
 def _derivation_closure(user_nums: Sequence[float], receipt_values: Sequence[float]) -> set:
     """Depth-2 arithmetic closure of user-input numbers ∪ receipt values —
     the set of values a model could plausibly have derived IN ITS HEAD from
     given data (the 40ml incident: 40 = 65-25). Anything outside the closure
-    that carries no computation marker is a knowledge claim, not a
-    computation (168 mL comparable-tray spec, 10%, 128 孔)."""
+    and outside math-block result positions is a knowledge claim, not a
+    computation (168 mL comparable-tray spec, 10%, 128 孔) — 语义判断归
+    LLM 审计员（2026-10-18 收紧，关键词标记表已删）。"""
     s0 = [float(x) for x in list(user_nums)[:16] + list(receipt_values)[:16]]
     vals = set(s0)
     for a in s0:
@@ -605,11 +640,6 @@ def _in_closure(value: float, closure: set, tol: float = 5e-3) -> bool:
     return any(_close(value, v, tol) for v in closure)
 
 
-def _has_computation_marker(cleaned: str, start: int, end: int) -> bool:
-    window = cleaned[max(0, start - _MARKER_WINDOW):min(len(cleaned), end + _MARKER_WINDOW)]
-    return any(m in window for m in _COMPUTATION_MARKERS)
-
-
 def evaluate_numeric_provenance(
     draft: str,
     evidence_text: str,
@@ -621,14 +651,13 @@ def evaluate_numeric_provenance(
     neither quoted (ledger/user messages) nor receipt-backed (current-turn
     execute_code/calculate/terminal outputs with B1 param provenance).
 
-    Gate trigger面 (2026-09-02 晚, conv 43dd9841 death-loop fix): a candidate
-    is flagged ONLY when it carries a computation marker (≈/=/计算得/换算/
-    容积…) OR is derivable from user inputs (family-exportable AND inside
-    the arithmetic closure) OR is a bare number inside the closure. Knowledge
-    point values (168 mL specs, 10%, 35℃, 128 孔) are NOT flaggable — they
-    are not computations and the model cannot ground them with calculate;
-    blocking them created an unsatisfiable loop that burned the audit budget
-    into the deterministic fallback."""
+    Gate trigger面 (2026-10-18 用户裁定收紧；旧版 2026-09-02 晚 conv 43dd9841
+    death-loop fix): a candidate is flagged ONLY when it sits in a math-block
+    result position (structural computation claim) OR is arithmetic-derivable
+    from user inputs ∪ receipt values (closure hit, unit'd 还需同族可导出).
+    Knowledge point values (168 mL specs, 10%, 35℃, 128 孔) are NOT flaggable.
+    关键词标记表已按用户红线删除——「是不是计算」的语义判断归 LLM 审计员，
+    本闸门只管「算术上可不可能凭空来」。"""
     report = NumericProvenanceReport()
     if not draft or not draft.strip():
         return report
@@ -642,19 +671,19 @@ def evaluate_numeric_provenance(
             quoted.append((v, u, f))
             if u and f:
                 user_families.add(f.split(":")[0])
-        for m in re.finditer(r"(?<![\d.])\d[\d,]*(?:\.\d+)?", um_clean):
+        for m in re.finditer(r"(?<![\d.A-Za-z])\d[\d,]*(?:\.\d+)?", um_clean):
             # 单数字也作锚点（A4.9 R2 finding-1：半径9cm 场景）
+            # 后瞻与 _BARE_RE 同源排字母（评审 I1 2026-10-18）：用户消息里的
+            # 标识符数字（D2281）不进锚点/闭包——否则 _BARE_RE 豁免后 quoted
+            # 语料丢失同值，草稿裸重述会被不可满足打回（回归形态）。
             user_nums.append(float(m.group(0).replace(",", "")))
     # B1b 溯源锚点（conv 5abef2bf, 2026-09-11）：回执表达式的输入可以来自
     # 证据台账（工具输出），不限于用户消息——非数值问题 + 工具实测量的推导
     # （175+50+30+27=282KB）否则不可接地：3 连打回 → salvage/selection 全被拒
     # → 警示兜底，用户看到 4 轮完整重生成。
     provenance_nums: List[float] = list(user_nums) + [v for v, _u, _f in evidence_tuples]
-    receipt_values: List[float] = []
-    for tc in current_tool_calls or []:
-        for cv, cu, cf in _extract_corpus_tuples(str(tc.get("output") or "")):
-            if not cu:
-                receipt_values.append(cv)
+    receipt_values: List[float] = _trusted_receipt_values(
+        current_tool_calls, provenance_nums, tolerance)
     closure = _derivation_closure(user_nums, receipt_values)
     cands, cleaned = _extract_gated_candidates(draft)
     for value, unit, family, raw, start, end, math_result in cands:
@@ -668,18 +697,17 @@ def evaluate_numeric_provenance(
             un / 2, un * 10, un / 10, un * 100, un / 100, un * 1000, un / 1000,
         )):
             continue
-        # Gate trigger面收缩：数学块结果位强制 gated（数学式=计算上下文）；
-        # 否则需计算标记或可导出闭包——纯知识点值交还审计员知识规则
+        # Gate trigger面（2026-10-18 收紧）：数学块结果位（结构性计算声明）
+        # 或算术可归因闭包命中才 flag；语义判断归 LLM 审计员。
         base_family = family.split(":")[0]
         derivable = (
             base_family in ("volume", "area") and "length" in user_families
         ) or (family in user_families and base_family not in ("length", "time", "temp", "currency", "percent", "count"))
-        marker = math_result or _has_computation_marker(cleaned, start, end)
         if unit:
-            if not marker and not (derivable and _in_closure(value, closure)):
+            if not math_result and not (derivable and _in_closure(value, closure)):
                 continue
         else:
-            if not marker and not _in_closure(value, closure):
+            if not math_result and not _in_closure(value, closure):
                 continue
         report.flags.append(NumericFlag(raw=raw, value=value, unit=unit, family=family))
     return report

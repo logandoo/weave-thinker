@@ -260,6 +260,27 @@ async def verify_device_token(db: AsyncSession, token: str) -> Optional[ClientEx
     return result.scalar_one_or_none()
 
 
+async def rename_device(db: AsyncSession, row: ClientExecutorDevice, name: str) -> ClientExecutorDevice:
+    """设备自改显示名（handoff ③ 形状；token/device_id 不动）。
+
+    端点层已拒 >255（不静默截断——截断=云端与本地显示名静默分歧）。
+    竞态（评审 R1-I1 + 复审 New-Important）：verify 通过后行被 revoke（删）——
+    双会话形态 commit flush UPDATE 0 行命中抛 StaleDataError（SA 2.0 起非
+    InvalidRequestError 子类），同会话 detached 形态 refresh 抛 InvalidRequestError；
+    两类均转 LookupError（端点 404），不外漏 500。"""
+    from sqlalchemy.exc import InvalidRequestError
+    from sqlalchemy.orm.exc import StaleDataError
+
+    row.name = name
+    try:
+        await db.commit()
+        await db.refresh(row)
+    except (InvalidRequestError, StaleDataError):
+        await db.rollback()
+        raise LookupError("设备不存在或已解绑")
+    return row
+
+
 async def list_devices(db: AsyncSession, user_id: str) -> list:
     result = await db.execute(
         select(ClientExecutorDevice)

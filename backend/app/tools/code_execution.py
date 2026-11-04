@@ -33,134 +33,18 @@ _EXT_TYPE_MAP = {
 }
 
 
+from app.prompts.tools import (
+    _CODE_GENERATION_PROMPT,
+    _CODE_GENERATION_PROMPT_PTC,
+)
+
 def _detect_file_type_label(ext: str) -> str:
     """Map a file extension to a display type label for attachments."""
     if not ext:
         return "file"
     return _EXT_TYPE_MAP.get(ext, "file")
 
-_CODE_GENERATION_PROMPT = """\
-你是一个精确的 Python 代码生成器。根据用户需求生成可直接运行的 Python 代码。
 
-要求：
-1. 只输出一个 JSON 对象，包含 "code" 字段
-2. code 字段值是一段完整的、可以直接用 `python -c` 执行的 Python 代码
-3. 如果是计算/数据处理类任务：用 print() 输出结果
-4. 如果是文件生成类任务（PPT/Excel/Word/CSV/图片/PDF 等）：
-   - 使用相对文件名将产物保存到**当前工作目录**（cwd 是本次调用专用的 scratch/task_XXXX 子目录，直接 `open("xxx.pptx","wb")` 即可）
-   - **重要：每次工具调用都会新建独立的 scratch/task_XXXX 子目录，上一次调用 cwd 里的文件不会出现在本次 cwd 下**；需要跨多次调用读取/续写同一文件时，必须使用用户工作区根目录的绝对路径，例如 `open(r"{workspace_root}/xxx.md", "a")`
-   - 生成后用 print() 打印所生成的文件名
-   - 生成文件时，文件名中的时间戳必须使用本地时间（datetime.now()），禁止使用 utcnow()
-5. 读取用户上传文件：上传文件保存在用户工作区的 `uploads/` 目录下。你可以通过相对路径（如 `uploads/xxx_sample.xlsx`）或工作区内的绝对路径访问它们。如果当前 cwd 是 scratch 子目录，可使用 `../uploads/xxx_sample.xlsx`。
-6. 常用库已预装：python-pptx、openpyxl、reportlab、matplotlib、numpy、pandas、Pillow。
-   如果需要其他第三方库，先用 try/except ImportError 检测，失败时在代码中 print("NEED_PIP: 包名")，让上层 agent 通过 terminal 工具执行 pip install 后再重试
-7. 禁止使用 subprocess、os.system、eval、exec、__import__、ctypes、socket、requests、urllib、httpx、aiohttp
-7. 禁止使用 os.makedirs、os.remove、os.rmdir、shutil 等写操作；但 os.listdir、os.path.exists、os.path.join 等只读操作可以安全使用
-8. 禁止访问 /etc、/proc、/sys、/dev 等系统路径（字体查找不受此限制）
-9. 不要尝试联网下载资源；所有内容均从用户需求中推导
-10. 代码应简洁、健壮，处理可能的异常；不要使用交互式输入
-11. 代码应简洁高效，避免不必要的冗余。如果任务需要生成大量内容（如长文本、多章小说等），可根据需要分多次调用工具，每次生成一部分内容。
-12. 生成中文字符的 PDF/图片时，必须正确处理中文字体，防止出现方块或乱码：
-    - 使用以下辅助函数自动查找可用中文字体：
-      ```python
-      import os
-      def _find_cn_font():
-          candidates = [
-              '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
-              '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
-              '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
-          ]
-          for root_dir in ['/usr/share/fonts', '/usr/local/share/fonts', os.path.expanduser('~/.fonts')]:
-              if os.path.isdir(root_dir):
-                  for dirpath, dirnames, filenames in os.walk(root_dir):
-                      for fn in filenames:
-                          if any(kw in fn.lower() for kw in ['cjk', 'noto', 'wqy', 'simhei', 'simsun', 'microsoft', 'yahei', 'fang']):
-                              fp = os.path.join(dirpath, fn)
-                              if fp not in candidates:
-                                  candidates.append(fp)
-          for p in candidates:
-              if os.path.exists(p):
-                  return p
-          return None
-      _cn_font_path = _find_cn_font()
-      ```
-    - 对于 matplotlib: `matplotlib.font_manager.FontProperties(fname=_cn_font_path)` 或 `plt.rcParams['font.sans-serif'] = [_cn_font_path]`
-    - 对于 reportlab: `pdfmetrics.registerFont(TTFont('CNFont', _cn_font_path))` 然后 `canvas.setFont('CNFont', 12)`
-    - 对于 PIL/Pillow: `ImageFont.truetype(_cn_font_path, size)`
-    - 如果 `_cn_font_path` 为 None，则输出 "NEED_FONT: 系统缺少中文字体" 并优雅降级（使用英文标注或无文字）
-13. 文件交付规范：写出到**用户工作区根目录**的文件不会自动成为下载卡片——需要把文件提供给用户下载时，必须显式调用 provide_file（file_path=绝对路径）。cwd（scratch/task_XXXX 临时目录）用于中间草稿、调试统计、日志、临时数据；**最终需要交付的文件**写到工作区根目录（绝对路径）后再调用 provide_file，避免把无关文件混入交付。
-
-用户工作目录: {workspace_path}
-"""
-
-_CODE_GENERATION_PROMPT_PTC = """\
-你是一个精确的 Python 代码生成器。根据用户需求生成可直接运行的 Python 代码。
-
-你可以在代码中调用工具来获取外部数据。使用方法：
-  from _ptc_bridge import tools
-  result = tools.工具名(参数=值)
-
-可用工具：
-{tools_doc}
-
-要求：
-1. 只输出一个 JSON 对象，包含 "code" 字段
-2. code 字段值是一段完整的、可以直接用 `python -c` 执行的 Python 代码
-3. 如果是计算/数据处理类任务：用 print() 输出结果
-4. 如果是文件生成类任务（PPT/Excel/Word/CSV/图片/PDF 等）：
-   - 使用相对文件名将产物保存到**当前工作目录**（cwd 是本次调用专用的 scratch/task_XXXX 子目录，直接 `open("xxx.pptx","wb")` 即可）
-   - **重要：每次工具调用都会新建独立的 scratch/task_XXXX 子目录，上一次调用 cwd 里的文件不会出现在本次 cwd 下**；需要跨多次调用读取/续写同一文件时，必须使用用户工作区根目录的绝对路径，例如 `open(r"{workspace_root}/xxx.md", "a")`
-   - 生成后用 print() 打印所生成的文件名
-   - 生成文件时，文件名中的时间戳必须使用本地时间（datetime.now()），禁止使用 utcnow()
-5. 读取用户上传文件：上传文件保存在用户工作区的 `uploads/` 目录下。你可以通过相对路径（如 `uploads/xxx_sample.xlsx`）或工作区内的绝对路径访问它们。如果当前 cwd 是 scratch 子目录，可使用 `../uploads/xxx_sample.xlsx`。
-6. 常用库已预装：python-pptx、openpyxl、reportlab、matplotlib、numpy、pandas、Pillow。
-   如果需要其他第三方库，先用 try/except ImportError 检测，失败时在代码中 print("NEED_PIP: 包名")，让上层 agent 通过 terminal 工具执行 pip install 后再重试
-7. 禁止使用 subprocess、os.system、eval、exec、__import__、ctypes、socket、requests、urllib、httpx、aiohttp
-7. 禁止使用 os.makedirs、os.remove、os.rmdir、shutil 等写操作；但 os.listdir、os.path.exists、os.path.join 等只读操作可以安全使用
-8. 禁止访问 /etc、/proc、/sys、/dev 等系统路径（字体查找不受此限制）
-9. 不要尝试联网下载资源；使用 tools 工具获取数据代替直接联网
-10. 代码应简洁、健壮，处理可能的异常；不要使用交互式输入
-11. tools 工具调用可能失败，请用 try/except 处理错误
-12. 生成中文字符的 PDF/图片时，必须正确处理中文字体，防止出现方块或乱码：
-    - 使用以下辅助函数自动查找可用中文字体：
-      ```python
-      import os
-      def _find_cn_font():
-          candidates = [
-              '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
-              '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
-              '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
-              '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
-          ]
-          for root_dir in ['/usr/share/fonts', '/usr/local/share/fonts', os.path.expanduser('~/.fonts')]:
-              if os.path.isdir(root_dir):
-                  for dirpath, dirnames, filenames in os.walk(root_dir):
-                      for fn in filenames:
-                          if any(kw in fn.lower() for kw in ['cjk', 'noto', 'wqy', 'simhei', 'simsun', 'microsoft', 'yahei', 'fang']):
-                              fp = os.path.join(dirpath, fn)
-                              if fp not in candidates:
-                                  candidates.append(fp)
-          for p in candidates:
-              if os.path.exists(p):
-                  return p
-          return None
-      _cn_font_path = _find_cn_font()
-      ```
-    - 对于 matplotlib: `matplotlib.font_manager.FontProperties(fname=_cn_font_path)`
-    - 对于 reportlab: `pdfmetrics.registerFont(TTFont('CNFont', _cn_font_path))` 然后 `canvas.setFont('CNFont', 12)`
-    - 对于 PIL/Pillow: `ImageFont.truetype(_cn_font_path, size)`
-    - 如果 `_cn_font_path` 为 None，则输出 "NEED_FONT: 系统缺少中文字体" 并优雅降级
-13. 文件交付规范：写出到**用户工作区根目录**的文件不会自动成为下载卡片——需要把文件提供给用户下载时，必须显式调用 provide_file（file_path=绝对路径）。cwd（scratch/task_XXXX 临时目录）用于中间草稿、调试统计、日志、临时数据；**最终需要交付的文件**写到工作区根目录（绝对路径）后再调用 provide_file，避免把无关文件混入交付。
-
-用户工作目录: {workspace_path}
-"""
 
 
 def check_code_execution_requirements() -> bool:
@@ -472,18 +356,24 @@ async def generate_and_execute_code(args: dict, **kwargs) -> str:
     # guidance so the agent can self-correct instead of blindly retrying
     # the same long script (conv 01d08b67 spin loop). The partial stdout
     # (captured before the kill) is already in result.stdout.
+    #
+    # 2026-11-01 审计 F3：旧文案无条件断言「已产生上述部分 stdout 输出」——
+    # 而 Python 子进程默认块缓冲被 SIGKILL 后缓冲丢失（conv a4d54ec7 即空输出），
+    # 且逃生口错指研究型 background_task。现按实际有无输出分叉，并与 terminal 共用
+    # `app/tools/timeout_guidance.py`。
     if getattr(result, "timed_out", False):
+        from app.tools.timeout_guidance import build_timeout_guidance
+        _has_output = bool((result.stdout or "").strip() or (result.stderr or "").strip())
         output["timed_out"] = True
-        output["guidance"] = (
-            "代码执行超过超时限制被终止。脚本在被终止前已产生上述部分 stdout 输出——"
-            "请先查看部分输出判断进度，然后调整方案："
-            "(1) 减少单次处理的数据量（如只处理部分样本）；"
-            "(2) 分批执行，每批保存中间结果到文件，下一批从文件读取继续；"
-            "(3) 将长任务拆分为多个小步骤，每步单独调用 execute_code；"
-            "(4) 检查是否存在死循环或性能瓶颈。"
-            "对于确实需要长时间运行的任务（如大规模评测、模型训练），"
-            "使用 background_task 工具提交到后台执行（后台任务超时限制为 5 小时），"
-            "不要用相同代码重复调用——会再次超时。"
+        # F5：-1 只表示"未正常结束"，补可判读信号与生效超时
+        output["killed_by"] = getattr(result, "killed_by", "") or "SIGTERM+SIGKILL"
+        _te = getattr(result, "timeout_effective", None) or config.code_execution_timeout
+        output["timeout_effective"] = _te
+        output["guidance"] = build_timeout_guidance(
+            float(_te),
+            _has_output,
+            tool_name="execute_code",
+            durable_hint="用**同一个** execute_code 工具的 durable=true 提交持久作业",
         )
     if ptc_bridge:
         output["ptc_calls"] = ptc_bridge.call_count

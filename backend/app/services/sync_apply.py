@@ -83,6 +83,35 @@ def sanitize_payload(entity_type: str, model, payload: dict) -> dict:
     return data
 
 
+async def _execution_target_change_allowed(
+    db: AsyncSession, user: User, row, data: dict,
+) -> bool:
+    """Apply the same device/empty-conversation contract to inbound sync."""
+    if "execution_target" not in data:
+        return True
+    from app.services import client_device_service as cds
+
+    try:
+        target = cds.normalize_execution_target(data["execution_target"])
+    except ValueError:
+        return False
+    data["execution_target"] = target
+    if row is not None and row.execution_target == target:
+        return True  # no-op: do not revalidate or discard unrelated field edits
+    if target is not None:
+        try:
+            await cds.assert_device_usable(db, user.id, target)
+        except LookupError:
+            return False
+    if row is not None and row.execution_target != target:
+        has_messages = (await db.execute(
+            select(Message.id).where(Message.conversation_id == row.id).limit(1)
+        )).first() is not None
+        if has_messages:
+            return False
+    return True
+
+
 async def owns(db: AsyncSession, user: User, entity_type: str, row) -> bool:
     if entity_type == "user_profile":
         return getattr(row, "id", None) == user.id
@@ -237,7 +266,12 @@ async def apply_change(
         model = MEMORY_SYNC_ENTITIES[entity_type]
     if model is None:
         return SKIPPED
-    row = await db.get(model, entity_id)
+    if entity_type == "conversations" and payload and "execution_target" in payload:
+        row = (await db.execute(
+            select(Conversation).where(Conversation.id == entity_id).with_for_update()
+        )).scalar_one_or_none()
+    else:
+        row = await db.get(model, entity_id)
 
     if op == "delete":
         if row is None and entity_type == "user_model_providers" and payload:
@@ -319,6 +353,10 @@ async def apply_change(
     if row is None:
         if op not in ("create", "update"):
             return SKIPPED
+        if entity_type == "conversations" and not await _execution_target_change_allowed(
+            db, user, None, data,
+        ):
+            return SKIPPED
         data["id"] = entity_id
         if entity_type in DIRECT_USER_TYPES:
             data["user_id"] = user.id
@@ -333,6 +371,10 @@ async def apply_change(
     if current_ts is not None and new_ts <= current_ts:
         return STALE
     if not await owns(db, user, entity_type, row):
+        return SKIPPED
+    if entity_type == "conversations" and not await _execution_target_change_allowed(
+        db, user, row, data,
+    ):
         return SKIPPED
     for key, value in data.items():
         if key != "updated_at":

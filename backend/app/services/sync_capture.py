@@ -7,10 +7,19 @@
 （after_insert/after_update/after_delete）+ 同事务 connection.execute 写
 sync_events（delete 时附带 sync_tombstones）。事件在 flush 内逐对象触发，
 与本仓全 ORM 写路径同覆盖；bulk DML（update()/delete() 语句）不触发 mapper
-事件——实测同步域（conversations/messages/notes/notebooks/assistants）无 bulk
-写路径（唯一 bulk 点 asr.py UserAsrHotword 已随全量保真波入同步域
+事件。
+
+⚠ 2026-10-31 教训（UPSTREAM_TODO_20261031）：本节曾断言「实测同步域无 bulk
+写路径，故 mapper 覆盖面无缺口」——该断言被证伪。`_delete_message_slice`
+（编辑重发/重新生成）长期走 messages 的 Core 批量 DELETE，after_delete 零触发
+→ 零 delete 事件、零墓碑，客户端只收到过被删消息的 create，delta 收不到删除、
+resync 不做差集删除 → 所有设备永久残留（conv d7ea65b8 空回答事故；存量经
+scripts/backfill_message_tombstones.py 补发）。已修复为按 id 重查 ORM 行逐行
+db.delete（chat_persistence.py）。**规则：对 SYNC_ENTITIES 的 Core bulk DML =
+同步泄漏**，评审视同缺陷；确需 bulk 必须在同事务手工补事件+墓碑并配契约测试。
+（唯一 bulk 点 asr.py UserAsrHotword 已随全量保真波入同步域
 SYNC_ENTITIES（user_asr_hotwords）且其写路径为逐行 ORM + delete+create，
-无 bulk update 缺口），故 mapper 覆盖面无缺口。
+无 bulk update 缺口。）
 ⚠ 已知捕获缺口（后续项，非 mapper 面）：memory 域**后台维护批处理**仍走
 Core-SQL/text() 写同步列（scheduler 驱动的 weight_decay/consolidation/dreaming/
 backfill/migration/embedding 刷新，~30 点清单见 sync 收口波记录）——零事件零

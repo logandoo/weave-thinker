@@ -294,36 +294,6 @@ export const useNotesStore = defineStore('notes', () => {
     }
   }
 
-  async function createQuickNote(transcription: string, notebookId?: string) {
-    isLoading.value = true
-    error.value = null
-    try {
-      const note = await notesApi.createQuickNote(transcription, notebookId)
-      if (!notes.value[note.notebook_id]) {
-        notes.value[note.notebook_id] = []
-      }
-      notes.value[note.notebook_id].unshift({
-        id: note.id,
-        notebook_id: note.notebook_id,
-        title: note.title,
-        content_preview: buildContentPreview(note.content),
-        created_at: note.created_at,
-        updated_at: note.updated_at
-      })
-      const nb = notebooks.value.find(n => n.id === note.notebook_id)
-      if (nb) {
-        nb.note_count++
-      }
-      return note
-    } catch (e: any) {
-      error.value = e.message || '创建快速笔记失败'
-      console.error('Failed to create quick note:', e)
-      throw e
-    } finally {
-      isLoading.value = false
-    }
-  }
-
   async function loadDefaultNotebook() {
     try {
       defaultNotebook.value = await notesApi.getDefaultNotebook()
@@ -543,7 +513,6 @@ export const useNotesStore = defineStore('notes', () => {
     updateNote,
     deleteNote,
     bulkDeleteNotes,
-    createQuickNote,
     loadDefaultNotebook,
     moveNote,
     bulkMoveNotes,

@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import api from './client'
-import type { AgentTaskInfo } from '@/types'
+import type {
+  AgentTaskActiveInfo,
+  AgentTaskInfo,
+  AgentTaskNotification,
+  AgentTaskSummaryResponse,
+} from '@/types'
 
 export const agentTaskApi = {
   async listTasks(status?: string, includeCompleted?: boolean): Promise<AgentTaskInfo[]> {
@@ -18,6 +23,28 @@ export const agentTaskApi = {
     return data
   },
 
+  async getTaskResult(taskId: string): Promise<{
+    task_id: string | null
+    logical_task_id: string
+    status: string
+    assistant_name: string
+    assistant_id: string | null
+    execution_conversation_id: string | null
+    output_message_id: string | null
+    result_missing: boolean
+    conversation_deleted: boolean
+  }> {
+    const { data } = await api.get(`/agent-tasks/${taskId}/result`)
+    return data
+  },
+
+  async getActiveTask(conversationId: string): Promise<AgentTaskActiveInfo | null> {
+    const { data } = await api.get('/agent-tasks/active', {
+      params: { conversation_id: conversationId },
+    })
+    return data
+  },
+
   async createTask(goal: string, title?: string, assistantId?: string): Promise<AgentTaskInfo> {
     const { data } = await api.post('/agent-tasks', {
       goal,
@@ -29,6 +56,49 @@ export const agentTaskApi = {
 
   async cancelTask(taskId: string): Promise<{ ok: boolean; task_id: string; status: string }> {
     const { data } = await api.post(`/agent-tasks/${taskId}/cancel`)
+    return data
+  },
+
+  async steerTask(
+    taskId: string,
+    content: string,
+  ): Promise<{ ok: boolean; message_id: string; queued: number; status: string }> {
+    const { data } = await api.post(`/agent-tasks/${taskId}/messages`, { content })
+    return data
+  },
+
+  async summarizeTask(taskId: string, part = 0): Promise<AgentTaskSummaryResponse> {
+    const { data } = await api.post(`/agent-tasks/${taskId}/summary`, { part })
+    return data
+  },
+
+  async listNotifications(includeResolved = false): Promise<AgentTaskNotification[]> {
+    const { data } = await api.get('/agent-tasks/notifications', {
+      params: { include_resolved: includeResolved },
+    })
+    return data
+  },
+
+  async dismissNotification(eventId: string): Promise<void> {
+    await api.post(`/agent-tasks/notifications/${eventId}/dismiss`)
+  },
+
+  async grantPermit(
+    taskId: string,
+    toolName: string,
+    actionFingerprint: string,
+    ttlSeconds = 300,
+  ): Promise<{ permit_id: string; status: string }> {
+    const { data } = await api.post(`/agent-tasks/${taskId}/permit`, {
+      tool_name: toolName,
+      action_fingerprint: actionFingerprint,
+      ttl_seconds: ttlSeconds,
+    })
+    return data
+  },
+
+  async mergeTask(taskId: string): Promise<{ merged: boolean; commit: string }> {
+    const { data } = await api.post(`/agent-tasks/${taskId}/merge`)
     return data
   },
 

@@ -14,30 +14,7 @@ from app.services.provider_router import build_thinking_extra_body
 logger = logging.getLogger(__name__)
 config = get_config()
 
-_TITLE_SYSTEM_PROMPT = """你是一个对话标题生成器。
 
-请根据用户最新问题和助手最终回答，生成一个简洁准确的中文标题。
-你的回复必须严格满足 JSON schema，只输出一个 JSON 对象：{"title": "..."}。
-
-要求：
-1. `title` 必须是简洁标题，只保留标题文字本身
-2. 不要输出任何 reasoning、解释、用户原始问句、Markdown、代码块、XML 标签或额外字段
-3. 不要照抄完整用户 query，不要输出疑问句，不要包含“什么/如何/为什么/请问/？”等问句成分
-4. 标题尽量控制在 6 到 16 个字之内
-5. 标题应该是名词短语或主题短语，而不是用户提问原文
-6. title 不能是“...”“……”这类省略号、纯标点或空泛占位词
-
-错误示例：{"title": "Python 是什么编程语言？"}
-正确示例：{"title": "Python 语言简介"}"""
-
-_TITLE_REPAIR_PROMPT = """你上一条标题回复未通过系统校验，原因是：{error}
-
-请基于同一个任务重新回答，并严格遵守以下要求：
-1. 只输出一个合法 JSON 对象
-2. JSON 对象必须只有一个字段：title
-3. 不要输出 markdown 代码块、解释、分析、标签或额外文字
-4. title 必须是最终标题文字，不能包含用户原始问句或 reasoning 内容
-5. title 不能是“...”“……”这类省略号、纯标点或占位词"""
 
 _TITLE_RESPONSE_FORMAT = {
     "type": "json_schema",
@@ -71,6 +48,12 @@ _RESPONSE_FORMAT_ERROR_HINTS = (
 _FALLBACK_DEFAULT_TITLE = "新对话"
 
 
+from app.prompts.tools import (
+    _TITLE_SYSTEM_PROMPT,
+    _TITLE_REPAIR_PROMPT,
+    _FALLBACK_TITLE_PROMPT,
+)
+
 def _normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", title).strip()
 
@@ -95,20 +78,22 @@ def _truncate_query(source: str) -> str:
     return snippet or src[:16]
 
 
-_FALLBACK_TITLE_PROMPT = (
-    "你是对话标题生成器。根据用户的提问，生成一个简洁准确的中文标题。\n"
-    "要求：\n"
-    "1. 标题是名词短语或主题短语（如「Python 语言简介」），不是提问原文，"
-    "不是疑问句，不含「什么/如何/为什么/请问/？」等问句成分\n"
-    "2. 6 到 16 个字之间，只保留标题文字本身\n"
-    "3. 不能是省略号、纯标点或空泛占位词\n"
-    '只输出JSON：{"title": "..."}'
-)
 
 
 def _validate_title_payload(parsed: dict) -> str:
-    """Structural validation of a title payload (no semantic judgment)."""
-    raw_title = parsed.get("title")
+    """Structural validation of a title payload (no semantic judgment).
+
+    P1.4: the JSON shape is the versioned contract ``title.generation``;
+    schema failures are reported with the contract's failure kind.
+    """
+    import json as _json
+    from app.prompts.contracts import TitleResult, parse_contract
+
+    contract, failure = parse_contract(
+        TitleResult, _json.dumps(parsed, ensure_ascii=False))
+    if failure is not None or contract is None:
+        raise ValueError(f"title contract failed: {failure.kind if failure else 'schema'}")
+    raw_title = contract.title
     if not isinstance(raw_title, str):
         raise ValueError("title must be a string")
 

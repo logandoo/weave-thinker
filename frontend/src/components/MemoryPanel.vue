@@ -227,6 +227,94 @@
         <div v-else class="ledger-end">已加载全部 {{ recallTotal }} 条</div>
       </template>
     </div>
+
+    <!-- 约束（W1-2：固定约束可见可撤销，P5） -->
+    <div v-else-if="activeSubTab === 'constraints'" class="memory-section">
+      <div class="memory-note">
+        固定约束由你在对话中的明确指令经信任门固定（仅本人消息、每会上限 20 条），压缩后原样重放。此处可撤销（立即不再重放）。
+      </div>
+      <div v-if="loading.constraints" class="memory-loading">加载中…</div>
+      <div v-else-if="constraints.length === 0" class="memory-empty">暂无固定约束</div>
+      <template v-else>
+        <div v-for="c in constraints" :key="c.id" class="ledger-item">
+          <div class="ledger-row">
+            <span class="constraint-text">{{ c.text }}</span>
+            <span class="ledger-badges">
+              <span v-if="c.revoked_at" class="tag truncated">已撤销</span>
+              <span v-else class="tag cache">生效中</span>
+            </span>
+          </div>
+          <div class="ledger-row ledger-meta">
+            <span>{{ formatDateTime(c.created_at) }}</span>
+            <span>{{ c.conversation_id ? c.conversation_id.slice(0, 8) : '' }}</span>
+            <button
+              v-if="!c.revoked_at"
+              class="memory-delete-btn"
+              :disabled="revokingId === c.id"
+              @click="handleRevokeConstraint(c.id)"
+            >{{ revokingId === c.id ? '撤销中…' : '撤销' }}</button>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- 保留/淘汰（W5-3：容量淘汰预览，shadow 只记录，可撤销） -->
+    <div v-else-if="activeSubTab === 'retention'" class="memory-section">
+      <div class="memory-note">
+        保留/淘汰按容量计算（retention_score：权重 + 新近度 + 复现）。默认 shadow——只预览不删除；淘汰=归档降级（fidelity_state），可一键恢复。
+      </div>
+      <div v-if="loading.retention" class="memory-loading">加载中…</div>
+      <div v-else-if="retentionPreview.candidates.length === 0" class="memory-empty">
+        活跃概念 {{ retentionPreview.active }} / 容量 {{ retentionPreview.capacity }}——未超容量，无淘汰候选
+      </div>
+      <template v-else>
+        <div class="ledger-row ledger-meta">
+          <span>活跃 {{ retentionPreview.active }} / 容量 {{ retentionPreview.capacity }}</span>
+          <span>mode: {{ retentionPreview.mode }}</span>
+        </div>
+        <div v-for="c in retentionPreview.candidates" :key="c.id" class="ledger-item">
+          <div class="ledger-row">
+            <span class="constraint-text">{{ c.canonical_name }}</span>
+            <span class="ledger-badges">
+              <span class="tag truncated">{{ c.fidelity_state }}</span>
+              <span class="tag cache">分 {{ (c.retention_score ?? 0).toFixed(3) }}</span>
+            </span>
+          </div>
+          <div class="ledger-row ledger-meta">
+            <span>候选动作：{{ c.action }}</span>
+            <button
+              class="memory-delete-btn"
+              :disabled="undoingId === c.id"
+              @click="handleUndoRetention(c.id)"
+            >{{ undoingId === c.id ? '恢复中…' : (c.fidelity_state === 'archived' ? '恢复 full' : '预览淘汰（未执行）') }}</button>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- Dream 修复报告（W3-3：probe→hit/miss→只修 miss，默认关） -->
+    <div v-else-if="activeSubTab === 'repairs'" class="memory-section">
+      <div class="memory-note">
+        梦境主动探测/修复报告（MemDream 式）：探测查询 hit/miss → 只修 miss → hit@k 前后对比。默认关（[memory.dream_repair]），14 天无正收益自动停。
+      </div>
+      <div v-if="loading.repairs" class="memory-loading">加载中…</div>
+      <div v-else-if="dreamRepairs.length === 0" class="memory-empty">暂无修复报告（机制默认关）</div>
+      <template v-else>
+        <div v-for="r in dreamRepairs" :key="r.id" class="ledger-item">
+          <div class="ledger-row">
+            <span class="ledger-time">{{ r.run_date }}</span>
+            <span class="ledger-badges">
+              <span class="tag cache">hit@k {{ (r.hit_at_k_before ?? 0).toFixed(2) }} → {{ (r.hit_at_k_after ?? 0).toFixed(2) }}</span>
+              <span class="tag truncated">{{ r.cost_tokens }} tokens</span>
+            </span>
+          </div>
+          <div class="ledger-row ledger-meta">
+            <span>探测 {{ r.probe_count }} · 命中 {{ r.hit_count }} · 缺口 {{ r.miss_count }}</span>
+            <span>修复 {{ (r.repairs || []).join('、') || '无' }}</span>
+          </div>
+        </div>
+      </template>
+    </div>
   </div>
 </template>
 
@@ -248,6 +336,9 @@ const subTabs = [
   { key: 'concepts', label: '概念' },
   { key: 'dreams', label: 'Dream' },
   { key: 'clarifications', label: '澄清' },
+  { key: 'constraints', label: '约束' },
+  { key: 'retention', label: '保留/淘汰' },
+  { key: 'repairs', label: 'Dream修复' },
   { key: 'status', label: '状态' },
   { key: 'ledger', label: '台账' },
 ]
@@ -293,14 +384,49 @@ function toggleDream(id: string): void {
   expandedDreams.value = next
 }
 
-const loading = ref({ concepts: false, dreams: false, clarifications: false, status: false, ledger: false })
+const loading = ref({ concepts: false, dreams: false, clarifications: false, status: false, ledger: false, constraints: false, retention: false, repairs: false })
 const errorMsg = ref('')
 const deletingId = ref('')
 const forgettingId = ref('')
 const revertingId = ref('')
+const revokingId = ref('')
+const undoingId = ref('')
 const confirmErase = ref(false)
 const eraseText = ref('')
 const erasing = ref(false)
+
+// W1-2/W5-3/W3-3（记忆/长程 v2）：约束 / 保留淘汰预览 / dream 修复报告
+interface PinnedConstraint {
+  id: string
+  conversation_id: string
+  text: string
+  source_role: string
+  provenance: string
+  created_at: string | null
+  revoked_at: string | null
+}
+interface RetentionCandidate {
+  id: string
+  canonical_name: string
+  retention_score: number | null
+  fidelity_state: string
+  action: string
+}
+interface DreamRepairRow {
+  id: string
+  run_date: string
+  probe_count: number
+  hit_count: number
+  miss_count: number
+  repairs: string[]
+  hit_at_k_before: number | null
+  hit_at_k_after: number | null
+  cost_tokens: number
+}
+const constraints = ref<PinnedConstraint[]>([])
+const retentionPreview = ref<{ capacity: number; active: number; mode: string; loaded: boolean; candidates: RetentionCandidate[] }>(
+  { capacity: 0, active: 0, mode: 'shadow', loaded: false, candidates: [] })
+const dreamRepairs = ref<DreamRepairRow[]>([])
 
 function trustLabel(t: string): string {
   return { user_stated: '用户陈述', user_authored: '用户笔记', agent_inferred: '助手推断', external: '外部内容' }[t] || t
@@ -494,6 +620,69 @@ async function handleEraseAll() {
   }
 }
 
+async function loadConstraints(): Promise<void> {
+  loading.value.constraints = true
+  errorMsg.value = ''
+  try {
+    constraints.value = await memoryApi.getConstraints()
+  } catch (e: any) {
+    errorMsg.value = '加载约束失败：' + (e?.message || '未知错误')
+  } finally {
+    loading.value.constraints = false
+  }
+}
+
+async function handleRevokeConstraint(id: string): Promise<void> {
+  revokingId.value = id
+  errorMsg.value = ''
+  try {
+    await memoryApi.revokeConstraint(id)
+    await loadConstraints()
+  } catch (e: any) {
+    errorMsg.value = '撤销失败：' + (e?.message || '未知错误')
+  } finally {
+    revokingId.value = ''
+  }
+}
+
+async function loadRetention(): Promise<void> {
+  loading.value.retention = true
+  errorMsg.value = ''
+  try {
+    const data = await memoryApi.getRetentionPreview()
+    retentionPreview.value = { ...data, loaded: true }
+  } catch (e: any) {
+    errorMsg.value = '加载保留预览失败：' + (e?.message || '未知错误')
+  } finally {
+    loading.value.retention = false
+  }
+}
+
+async function handleUndoRetention(id: string): Promise<void> {
+  undoingId.value = id
+  errorMsg.value = ''
+  try {
+    await memoryApi.undoRetention([id])
+    await loadRetention()
+  } catch (e: any) {
+    errorMsg.value = '恢复失败：' + (e?.message || '未知错误')
+  } finally {
+    undoingId.value = ''
+  }
+}
+
+async function loadDreamRepairs(): Promise<void> {
+  loading.value.repairs = true
+  errorMsg.value = ''
+  try {
+    dreamRepairs.value = await memoryApi.getDreamRepairReports()
+  } catch (e: any) {
+    errorMsg.value = '加载修复报告失败：' + (e?.message || '未知错误')
+  } finally {
+    loading.value.repairs = false
+  }
+}
+
 watch(activeSubTab, (tab) => {
   errorMsg.value = ''
   if (tab === 'concepts' && !concepts.value.length) loadConcepts()
@@ -501,6 +690,9 @@ watch(activeSubTab, (tab) => {
   else if (tab === 'clarifications' && !clarifications.value.length) loadClarifications()
   else if (tab === 'status' && !costStatus.value) loadStatus()
   else if (tab === 'ledger' && !recallLog.value.length) loadRecallLog()
+  else if (tab === 'constraints' && !constraints.value.length) loadConstraints()
+  else if (tab === 'retention' && !retentionPreview.value.candidates.length && !retentionPreview.value.loaded) loadRetention()
+  else if (tab === 'repairs' && !dreamRepairs.value.length) loadDreamRepairs()
 })
 
 onMounted(loadConcepts)
@@ -909,5 +1101,25 @@ onMounted(loadConcepts)
   border-radius: 8px;
   background: var(--surface-panel-strong);
   color: var(--color-text);
+}
+
+/* W1-2/W5-3/W3-3（记忆/长程 v2）：约束 / 保留淘汰 / dream 修复面板 */
+.memory-note {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text);
+  opacity: 0.75;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  background: var(--surface-panel-subtle);
+}
+
+.constraint-text {
+  flex: 1;
+  font-size: 13px;
+  color: var(--color-text);
+  word-break: break-word;
 }
 </style>

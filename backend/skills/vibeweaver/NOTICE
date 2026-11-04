@@ -1,0 +1,23 @@
+# NOTICE
+
+vibeweaver — opencode engineering-workflow skill
+Copyright (c) 2026 logandoo. Licensed under the MIT License (see `LICENSE`).
+
+## Third-party code
+
+The release payload (SKILL.md + companion docs, gate/audit plugins, helper
+scripts) embeds **no third-party source code**. `scripts/license_check.py`
+verifies this against known license-header signatures on every build
+(fail-closed: an embedded third-party header is a hard FAIL).
+
+> Embedded Weave Thinker note: this product subset does not ship
+> `scripts/license_check.py` (a source-release asset); see `UPSTREAM.md`.
+> The statement above is not a claim that license checking ran here.
+
+## Related software
+
+- Designed for **opencode** (https://opencode.ai). opencode is separate
+  software under its own license, in its own repository; nothing from it is
+  vendored here.
+- The `release/` manifest (per-file sha256) and optional Sigstore
+  attestation of each `w*` tag are integrity metadata, not copied content.

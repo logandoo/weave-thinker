@@ -106,8 +106,20 @@ async function loadPdf() {
   destroyDoc()
   const generation = docGeneration
   try {
-    const pdfjs = await import('pdfjs-dist')
-    const workerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default
+    // TC39 upsert（Map/WeakMap.getOrInsert(Computed)）是 Baseline 2026-02 的新 API，
+    // 旧 Android WebView（Chromium <~134）缺失会在 pdfjs 内部炸
+    // `n(...).getOrInsertComputed is not a function`。legacy 构建自带 core-js
+    // polyfill（主+worker 成对），探测缺失才走 legacy，现代浏览器保持小体积现代构建。
+    const upsertMissing = typeof (Map.prototype as { getOrInsertComputed?: unknown }).getOrInsertComputed !== 'function'
+      || typeof (WeakMap.prototype as { getOrInsertComputed?: unknown }).getOrInsertComputed !== 'function'
+    const pdfjs = upsertMissing
+      ? await import('pdfjs-dist/legacy/build/pdf.mjs')
+      : await import('pdfjs-dist')
+    const workerUrl = (
+      upsertMissing
+        ? await import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url')
+        : await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
+    ).default
     pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
     const loaded = await pdfjs.getDocument({ data: props.bytes.slice(0) }).promise
     if (generation !== docGeneration) {

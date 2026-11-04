@@ -17,6 +17,7 @@ registry.dispatch 在执行前调用 try_remote_dispatch：
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -129,6 +130,12 @@ def is_server_owned(tool_name: str) -> bool:
 def strip_internal_args(args: Dict[str, Any]) -> Dict[str, Any]:
     """剥离所有 `_`-前缀内部键（A4.9 M1：对齐 agent_loop 前缀语义）。"""
     return {k: v for k, v in args.items() if not str(k).startswith("_")}
+
+
+class RemoteToolResult(str):
+    """Cloud-created provenance marker; device JSON cannot forge this type."""
+
+    _remote_execution = True
 
 
 def resolve_execution_target(kwargs: Dict[str, Any]) -> Optional[str]:
@@ -426,6 +433,13 @@ async def _try_remote_dispatch_inner(
             "workspace_ctx": ws_ctx,
             "timeout_seconds": timeout,
         }
+        grant = kwargs.get("_device_grant")
+        if grant is not None:
+            params["grant"] = grant
+        if tool_name == "skill_run_script" and grant is not None:
+            # Script/script_ext are execution-relevant but outside the v1 grant
+            # formula. Never execute a partially covered approval.
+            return tool_error("设备授权通道暂不支持技能脚本调用（签名未覆盖脚本内容）")
         if tool_name == "skill_run_script":
             content, ext, err = await _resolve_skill_script(tool_name, args, kwargs)
             if err is not None:
@@ -473,8 +487,19 @@ async def _try_remote_dispatch_inner(
             friendly = _friendly_call_error(_err, code=result.get("error_code"))
             return friendly if friendly is not None else tool_error(_err)
         if isinstance(result, dict) and isinstance(result.get("content"), str):
-            await record_exec_audit(kwargs, device_id, tool_name, True, None, _ms())
-            return result["content"]
+            content = result["content"]
+            try:
+                parsed = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("_permission_needed"):
+                # A permission challenge is not a successful execution.
+                await record_exec_audit(
+                    kwargs, device_id, tool_name, False, "permission-needed", _ms()
+                )
+            else:
+                await record_exec_audit(kwargs, device_id, tool_name, True, None, _ms())
+            return RemoteToolResult(content)
         await record_exec_audit(kwargs, device_id, tool_name, False, "unparseable", _ms())
         return tool_error("设备返回了无法解析的执行结果")
 

@@ -11,7 +11,10 @@ import {
   type VoiceState,
 } from '@/api/voice'
 import { useNotesStore } from '@/stores/notes'
+import { openTaskResult } from '@/utils/openTaskResult'
 import { RNNoiseNode, rnnoise_loadAssets } from 'simple-rnnoise-wasm'
+import { spillChunk, drainSpilledChunks, clearSpilledChunks, getSpilledCount } from './voiceAudioSpill'
+import { TOKEN_KEY } from '@/api/client'
 
 export interface VoiceMessage {
   id: number
@@ -99,6 +102,52 @@ export function useVoiceDuplex() {
   const interjectionText = ref('')
 
   let socket: WebSocket | null = null
+  // ---- weak-network resilience (2026-11-03) ----
+  // Mirrors useAsrStreaming's proven semantics: abnormal close of an
+  // ESTABLISHED session auto-reconnects the same conversation with
+  // exponential backoff; mic frames produced during the gap go into a
+  // drop-oldest ring buffer and are replayed after the new session is
+  // ready — recorded speech is never silently dropped.
+  const RECONNECT_MAX_ATTEMPTS = 10
+  const RECONNECT_BASE_DELAY_MS = 500
+  const RECONNECT_MAX_DELAY_MS = 5000
+  // e2e hook: shrink the in-memory ring so the IndexedDB spill path is
+  // reachable without generating ~100s of real audio (voice_duplex_reconnect
+  // S7). DEV-only + floor of 32 chunks so a production page (or an extension)
+  // cannot shrink the ring and force every frame through IndexedDB (M5).
+  const rawTestCap = (import.meta as any).env?.DEV && typeof window !== 'undefined'
+    ? (window as any).__VOICE_TEST_BUFFER_CAP
+    : undefined
+  const MAX_PENDING_CHUNKS = typeof rawTestCap === 'number' && Number.isFinite(rawTestCap)
+    ? Math.max(8, Math.floor(rawTestCap))
+    : 1200
+  const BACKPRESSURE_THRESHOLD = 256 * 1024
+  const FLUSH_INTERVAL_MS = 100
+  const MAX_PENDING_CLIENT_EVENTS = 20
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let flushTimer: ReturnType<typeof setTimeout> | null = null
+  let reconnectAttempt = 0
+  let reconnecting = false
+  // Generation counter: start()/disconnect() bump it; a reconnect whose
+  // epoch went stale belongs to a dead generation and must not touch state.
+  let sessionEpoch = 0
+  let userClosed = false      // disconnect() → suppress auto-reconnect
+  let sawErrorEvent = false   // backend `error` on this connection → terminal (no retry storm
+                              // on fatal config errors); cleared by later session activity
+  let terminalClose = false   // 1008 POLICY_VIOLATION (auth) → retrying cannot help
+  let micIntentionallyOff = false // user turned the mic off → a late 'ready' must not reopen it
+  let pendingChunks: ArrayBuffer[] = []
+  let pendingClientEvents: Array<string> = []
+  // Spill replay state (see voiceAudioSpill.ts): loaded once per reconnect,
+  // drained oldest-first before the in-memory ring.
+  let spillLoaded: ArrayBuffer[] | null = null
+  let spillDrainStarted = false
+  let flushInFlight = false
+  // Generation token for the spill store: bumped by clearSpillState() so a
+  // drain that was in flight across a teardown can never inject the previous
+  // session's audio into the next one (B2).
+  let spillEpoch = 0
+  let lastConversationId: string | null = null
   // capture graph
   let mediaStream: MediaStream | null = null
   let captureCtx: AudioContext | null = null
@@ -123,6 +172,11 @@ export function useVoiceDuplex() {
   let burstStartTime = 0 // ctx time the current audible burst started playing
   let burstEndTime = 0 // scheduled end (nextStartTime) of the current burst
   let drainedSent = false
+  let activeNotificationId: string | null = null
+  let activeNoticeBurstSeq = 0
+  // A notice→answer transition starts a new burst without cancelling the old
+  // audible tail. Keep independent drain clocks until each notice has ACKed.
+  let pendingNoticeDrains = new Map<string, { seq: number; endTime: number }>()
   let progressTimer: ReturnType<typeof setInterval> | null = null
   const playbackProgress = ref(0) // 0..1 — drives the orb progress ring
 
@@ -169,12 +223,42 @@ export function useVoiceDuplex() {
     }
   }
 
+  function retainActiveNoticeDrain(nextNotificationId: string | null) {
+    if (
+      activeNotificationId
+      && activeNotificationId !== nextNotificationId
+      && !drainedSent
+      && burstEndTime > burstStartTime
+    ) {
+      pendingNoticeDrains.set(activeNotificationId, {
+        seq: activeNoticeBurstSeq,
+        endTime: burstEndTime,
+      })
+    }
+  }
+
+  function drainFinishedNotices() {
+    if (!playCtx) return
+    for (const [notificationId, pending] of pendingNoticeDrains) {
+      if (playCtx.currentTime < pending.endTime - 0.05) continue
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          event: 'playback_drained',
+          notification_id: notificationId,
+          notice_burst_seq: pending.seq,
+        }))
+        pendingNoticeDrains.delete(notificationId)
+      }
+    }
+  }
+
   // Periodically report the real playback position to the backend and detect
   // when the burst fully drains. WebAudio's clock advances even in headless /
   // silent output, so this works regardless of actual sound rendering.
   function startProgressTimer() {
     stopProgressTimer()
     progressTimer = setInterval(() => {
+      drainFinishedNotices()
       if (!playCtx || burstEndTime <= burstStartTime) return
       const total = burstEndTime - burstStartTime
       const played = Math.max(0, Math.min(playCtx.currentTime - burstStartTime, total))
@@ -186,7 +270,11 @@ export function useVoiceDuplex() {
         drainedSent = true
         playbackProgress.value = 1
         if (socket && socket.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ event: 'playback_drained' }))
+          socket.send(JSON.stringify({
+            event: 'playback_drained',
+            notification_id: activeNotificationId,
+            notice_burst_seq: activeNoticeBurstSeq,
+          }))
         }
         stopProgressTimer()
       }
@@ -223,6 +311,7 @@ export function useVoiceDuplex() {
       try { s.stop() } catch { /* ignore */ }
     }
     activeSources = []
+    pendingNoticeDrains.clear()
     if (playCtx) {
       nextStartTime = playCtx.currentTime + 0.02
     } else {
@@ -230,6 +319,8 @@ export function useVoiceDuplex() {
     }
     stopProgressTimer()
     resetBurstTiming()
+    activeNotificationId = null
+    activeNoticeBurstSeq = 0
   }
 
   // ---- mic capture ----
@@ -341,59 +432,73 @@ export function useVoiceDuplex() {
     muteNode = captureCtx.createGain()
     muteNode.gain.value = 0
     processorNode.onaudioprocess = (e) => {
-      if (!socket || socket.readyState !== WebSocket.OPEN || !micOn.value) {
+      if (!micOn.value) {
         micLevel.value = 0
         return
       }
+      const live = !!socket && socket.readyState === WebSocket.OPEN
       const mono = downmixToMono(e.inputBuffer)
       // Compute RMS amplitude to drive the listening-halo pulse animation
       // so the user can visually tell whether their voice is being captured.
+      // Kept running while the socket is down: the capture graph and the
+      // adaptive noise floor stay warm, so the first frames after a reconnect
+      // are judged against a live baseline instead of a cold one.
       let sumSq = 0
       for (let i = 0; i < mono.length; i += 1) sumSq += mono[i] * mono[i]
       const rms = Math.sqrt(sumSq / Math.max(1, mono.length))
       // Normalize: typical speech RMS ~0.05-0.3; map to 0-1 with soft curve
       const level = Math.min(1, rms * 3.5)
       micLevel.value = level
-      // Near-field classification: adaptive noise floor vs current RMS.
-      // A far-field background voice is a few dB below close-mic speech, so
-      // a loud-close-vs-quiet-far threshold separates "the user talking into
-      // the phone" from "TV/room speech picked up at a distance".
-      _proxFrameCount += 1
-      if (rms < _proxFloor) {
-        _proxFloor = Math.max(0.0005, rms * 0.9 + _proxFloor * 0.1)
-      } else {
-        _proxFloor = Math.min(PROX_FLOOR_MAX, _proxFloor + _proxFloor * 0.002 + 1e-5)
-      }
-      if (_proxFrameCount >= PROX_WARMUP_FRAMES) {
-        const nearThr = Math.max(_proxFloor * PROX_NEAR_RATIO, PROX_NEAR_MIN)
-        if (rms >= nearThr) {
-          _proxNearFrames += 1
-          _proxFarFrames = 0
+      if (live) {
+        // Near-field classification: adaptive noise floor vs current RMS.
+        // A far-field background voice is a few dB below close-mic speech, so
+        // a loud-close-vs-quiet-far threshold separates "the user talking into
+        // the phone" from "TV/room speech picked up at a distance".
+        _proxFrameCount += 1
+        if (rms < _proxFloor) {
+          _proxFloor = Math.max(0.0005, rms * 0.9 + _proxFloor * 0.1)
         } else {
-          _proxNearFrames = 0
-          _proxFarFrames += 1
+          _proxFloor = Math.min(PROX_FLOOR_MAX, _proxFloor + _proxFloor * 0.002 + 1e-5)
         }
-        const wantNear = _proxNearFrames >= PROX_NEAR_FRAMES
-        const wantFar = _proxFarFrames >= PROX_FAR_FRAMES
-        if (!_proxReported) {
-          _proxReported = true
-          sendProximity(wantNear)
-        } else if (wantNear && !_proxNear) {
-          sendProximity(true)
-        } else if (wantFar && _proxNear) {
-          sendProximity(false)
-        } else if (wantNear && _proxNear && performance.now() - _proxLastSentAt >= PROX_HEARTBEAT_MS) {
-          // Heartbeat while near persists: the backend's freshness window is
-          // 1.0s and it classifies at EoT flush (1-3s after the last partial),
-          // so a single near report would expire before the verdict matters.
-          sendProximity(true)
+        if (_proxFrameCount >= PROX_WARMUP_FRAMES) {
+          const nearThr = Math.max(_proxFloor * PROX_NEAR_RATIO, PROX_NEAR_MIN)
+          if (rms >= nearThr) {
+            _proxNearFrames += 1
+            _proxFarFrames = 0
+          } else {
+            _proxNearFrames = 0
+            _proxFarFrames += 1
+          }
+          const wantNear = _proxNearFrames >= PROX_NEAR_FRAMES
+          const wantFar = _proxFarFrames >= PROX_FAR_FRAMES
+          if (!_proxReported) {
+            _proxReported = true
+            sendProximity(wantNear)
+          } else if (wantNear && !_proxNear) {
+            sendProximity(true)
+          } else if (wantFar && _proxNear) {
+            sendProximity(false)
+          } else if (wantNear && _proxNear && performance.now() - _proxLastSentAt >= PROX_HEARTBEAT_MS) {
+            // Heartbeat while near persists: the backend's freshness window is
+            // 1.0s and it classifies at EoT flush (1-3s after the last partial),
+            // so a single near report would expire before the verdict matters.
+            sendProximity(true)
+          }
         }
       }
       const resampled = resample(mono, e.inputBuffer.sampleRate, 16000)
       if (resampled.length === 0) return
-      if (socket.bufferedAmount < 256 * 1024) {
-        socket.send(float32ToLEBuffer(resampled))
+      const chunk = float32ToLEBuffer(resampled)
+      if (live && socket!.bufferedAmount < BACKPRESSURE_THRESHOLD && pendingChunks.length === 0) {
+        socket!.send(chunk)
+      } else if (live || reconnecting || reconnectTimer !== null) {
+        // Backpressured, or the socket died with an auto-reconnect in flight:
+        // buffer so speech in the gap is replayed after reconnect instead of
+        // being silently dropped. Ring-bound drop-oldest (≤~100s) keeps memory
+        // bounded on a long outage.
+        bufferChunk(chunk)
       }
+      // Socket down with NO reconnect pending (idle/stopped session) → drop.
     }
     // Audio graph: mic → RNNoise(denoise) → ScriptProcessor(capture) → mute → destination
     if (rnnoiseNode) {
@@ -438,21 +543,322 @@ export function useVoiceDuplex() {
   }
 
   // ---- websocket ----
+  function stopFlushTimer() {
+    if (flushTimer !== null) { clearTimeout(flushTimer); flushTimer = null }
+  }
+
+  function stopReconnectTimer() {
+    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  }
+
+  async function flushPendingChunks(): Promise<void> {
+    if (flushInFlight) return
+    flushInFlight = true
+    const epoch = spillEpoch
+    try {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        // Socket dead (reconnect pending): KEEP the buffered audio — it will be
+        // flushed once the new session is ready. Never silently drop speech.
+        stopFlushTimer()
+        return
+      }
+      // Oldest first: spilled (IndexedDB, ~10 min bound) then the in-memory ring.
+      if (spillLoaded === null && !spillDrainStarted) {
+        spillDrainStarted = true
+        const drained = await drainSpilledChunks()
+        // B1: the socket may have died (or the whole generation been replaced)
+        // while we awaited the cursor walk. On a dead socket `send()` is
+        // silently DROPPED by the browser, and the rows are already deleted
+        // from IndexedDB — so re-spill the remainder instead of flushing it
+        // into the void.
+        if (epoch !== spillEpoch) {
+          // A newer generation owns the spill store now; these rows belong to
+          // a dead session and must never leak into it (B2).
+          spillLoaded = null
+          spillDrainStarted = false
+          return
+        }
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          for (const chunk of drained) void spillChunk(chunk)
+          spillLoaded = null
+          spillDrainStarted = false
+          stopFlushTimer()
+          return
+        }
+        spillLoaded = drained
+      }
+      while (
+        spillLoaded && spillLoaded.length > 0
+        && socket && socket.readyState === WebSocket.OPEN
+        && socket.bufferedAmount < BACKPRESSURE_THRESHOLD
+      ) {
+        socket.send(spillLoaded.shift()!)
+      }
+      while (
+        pendingChunks.length > 0
+        && socket && socket.readyState === WebSocket.OPEN
+        && socket.bufferedAmount < BACKPRESSURE_THRESHOLD
+      ) {
+        socket.send(pendingChunks.shift()!)
+      }
+      if ((spillLoaded && spillLoaded.length > 0) || pendingChunks.length > 0) {
+        flushTimer = setTimeout(() => { void flushPendingChunks() }, FLUSH_INTERVAL_MS)
+      } else {
+        stopFlushTimer()
+      }
+    } finally {
+      flushInFlight = false
+    }
+  }
+
+  function bufferChunk(chunk: ArrayBuffer) {
+    pendingChunks.push(chunk)
+    // Ring bound: move the oldest overflow to IndexedDB (~10 min) instead of
+    // dropping recorded speech; if spill is unavailable, fall back to the old
+    // drop-oldest behavior so memory stays bounded either way.
+    while (pendingChunks.length > MAX_PENDING_CHUNKS) {
+      const oldest = pendingChunks.shift()!
+      if (spillLoaded !== null) {
+        // A replay is in flight: spilling now would give these chunks HIGHER
+        // auto-increment keys than the re-spilled remainder and reorder the
+        // stream (M1). The replay window is short — keep them in memory.
+        pendingChunks.push(oldest)
+        break
+      }
+      void spillChunk(oldest).then((stored) => {
+        if (!stored) console.warn('[voice] pending audio buffer full, dropping oldest chunk')
+      })
+    }
+    if (flushTimer === null && !flushInFlight) {
+      flushTimer = setTimeout(() => { void flushPendingChunks() }, FLUSH_INTERVAL_MS)
+    }
+  }
+
+  // Re-spill the undelivered remainder of a drain when the socket dies again
+  // mid-replay — keeps order (auto-increment keys append after nothing else
+  // exists in the store at that point) and loses no audio.
+  function respillRemainder() {
+    if (spillLoaded && spillLoaded.length > 0) {
+      for (const chunk of spillLoaded) void spillChunk(chunk)
+    }
+    spillLoaded = null
+    spillDrainStarted = false
+  }
+
+  function clearSpillState() {
+    // Bump the generation FIRST: an in-flight drain that resumes after this
+    // point must discard its result instead of injecting the previous
+    // session's audio into the new one (B2). `flushInFlight` is intentionally
+    // NOT reset here — the old flush still owns that flag until it returns.
+    spillEpoch += 1
+    spillLoaded = null
+    spillDrainStarted = false
+    void clearSpilledChunks()
+  }
+
+  function queueClientEvent(payload: { event: string; text?: string }) {
+    if (pendingClientEvents.length >= MAX_PENDING_CLIENT_EVENTS) {
+      // A text message is a semantic unit — dropping the OLDEST silently loses
+      // speech the user already typed. Reject the newest and keep the queue
+      // stable (M4); the caller keeps its local UI copy.
+      console.warn('[voice] pending client-event queue full, dropping newest event')
+      return
+    }
+    pendingClientEvents.push(JSON.stringify(payload))
+  }
+
+  function flushClientEvents() {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return
+    while (pendingClientEvents.length > 0) {
+      socket.send(pendingClientEvents.shift()!)
+    }
+  }
+
+  function finalizeStreamingMessages() {
+    // The turn in flight died with the socket — clear streaming flags so no
+    // message spins forever, but KEEP the text (completed turns are already
+    // persisted server-side; the transcript stays visible).
+    for (const m of messages.value) {
+      if (m.streaming) m.streaming = false
+    }
+  }
+
+  function scheduleReconnect() {
+    stopReconnectTimer()
+    if (reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
+      errorMsg.value = '语音连接已断开，自动重连失败'
+      state.value = 'error'
+      // Drop every buffered medium of the dead session — it must never be
+      // replayed into a later session as ghost speech.
+      pendingChunks = []
+      pendingClientEvents = []
+      stopFlushTimer()
+      clearSpillState()
+      return
+    }
+    state.value = 'connecting'
+    const epoch = sessionEpoch
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY_MS * (2 ** reconnectAttempt),
+      RECONNECT_MAX_DELAY_MS,
+    )
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      if (epoch !== sessionEpoch) return
+      void doReconnect(epoch)
+    }, delay)
+  }
+
+  function handleSocketClose(closeEvent: CloseEvent) {
+    const epoch = sessionEpoch
+    connected.value = false
+    finalizeStreamingMessages()
+    // Playback/turn cursors belong to the dead connection — reset them. The
+    // audible-notification ACK state is server-owned and replayed on the next
+    // session (voice_notification_service), so local teardown is safe here.
+    clearPlayback()
+    speaking.value = false
+    partialText.value = ''
+    pendingUserMsgId = null
+    currentAssistantId = null
+    respillRemainder()
+    if (userClosed) return
+    if (closeEvent.code === 1008) {
+      // Auth failure delivered AFTER accept (api/voice.py:116-120 when the
+      // session survives the handshake): a retry would fail identically until
+      // the user signs in again — terminal, and end the generation's buffers.
+      terminalClose = true
+      pendingChunks = []
+      pendingClientEvents = []
+      stopFlushTimer()
+      clearSpillState()
+      errorMsg.value = closeEvent.reason || '语音服务鉴权失败，请重新登录'
+      state.value = 'error'
+      return
+    }
+    if (closeEvent.code === 1006 || closeEvent.code === 1005) {
+      // A token rejected BEFORE accept surfaces as an opaque 1006/1005 (the
+      // browser discards the backend's pre-accept 1008 → HTTP 403). One cheap
+      // authenticated probe tells "network down" (retry) apart from
+      // "credentials gone" (terminal), so an expired session cannot spin the
+      // full backoff ladder (I1).
+      void probeAuthLost().then((lost) => {
+        if (!lost || userClosed || epoch !== sessionEpoch) return
+        terminalClose = true
+        stopReconnectTimer()
+        pendingChunks = []
+        pendingClientEvents = []
+        stopFlushTimer()
+        clearSpillState()
+        errorMsg.value = '语音服务鉴权失败，请重新登录'
+        state.value = 'error'
+      })
+    }
+    if (sawErrorEvent) {
+      // Backend reported an error on this connection and it closed — treat as
+      // terminal (the error state is already shown; the manual retry button
+      // stays available). Prevents retry storms on permanent failures.
+      if (state.value !== 'error') {
+        errorMsg.value = errorMsg.value || closeEvent.reason || '语音服务连接已断开'
+        state.value = 'error'
+      }
+      return
+    }
+    // Initial connect failures, abnormal closes AND clean server-side closes
+    // (restart/drain) all auto-reconnect with backoff — a weak network must
+    // never strand the user on a "tap retry" screen.
+    scheduleReconnect()
+  }
+
+  async function probeAuthLost(): Promise<boolean> {
+    try {
+      // Deliberately NOT the axios instance: a 401 there triggers the global
+      // logout redirect (client.ts:30-36), which would unmount the voice page
+      // before its terminal message can render. A bare fetch keeps the probe
+      // side-effect free; every normal API call still runs the usual flow.
+      const token = localStorage.getItem(TOKEN_KEY)
+      const resp = await fetch('/api/voice/sessions', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      return resp.status === 401 || resp.status === 403
+    } catch {
+      return false // network-level failure → keep retrying
+    }
+  }
+
+  function shouldReconnect(): boolean {
+    return !userClosed && !sawErrorEvent && !terminalClose
+  }
+
+  async function doReconnect(epoch: number) {
+    if (reconnecting) return
+    reconnecting = true
+    reconnectAttempt += 1
+    try {
+      await connect(lastConversationId, true)
+      if (epoch !== sessionEpoch) return // superseded generation: its handlers belong to the new one
+      // Success bookkeeping happens on 'ready' (reconnecting=false, attempt reset).
+    } catch {
+      if (epoch !== sessionEpoch) return
+      if (reconnecting) {
+        reconnecting = false
+        // The attempt socket's close event normally schedules the next try via
+        // handleSocketClose; this covers non-close failures (connect timeout).
+        // must NOT resurrect a terminal decision made there (I-3).
+        if (reconnectTimer === null && shouldReconnect()) scheduleReconnect()
+      }
+    }
+  }
+
   function handleEvent(ev: VoiceEvent) {
+    if (ev.event !== 'error') {
+      // Any successfully parsed backend event counts as "the connection lived
+      // on after the last error": the terminal guard only applies when an
+      // `error` was the LAST thing this connection produced (I-2). A per-turn
+      // error (voice_generation.py:410) followed by normal traffic must not
+      // permanently disarm auto-reconnect; nor may its stale text be reused
+      // as a later disconnect's message (M-3).
+      sawErrorEvent = false
+      errorMsg.value = null
+    }
     switch (ev.event) {
       case 'ready':
         connected.value = true
         ttsAvailable.value = ev.tts !== false
         state.value = 'listen'
+        // Reconnect completed: the new session is live — drain the audio
+        // buffered during the gap into it (backend queues it until its own
+        // ASR upstream connects, so nothing is lost).
+        if (reconnecting) {
+          reconnecting = false
+          reconnectAttempt = 0
+          // Fresh acoustic baseline for the new backend session (M-4): the
+          // noise floor may not match the room the reconnect lands in, and a
+          // stale `_proxReported` would suppress the first near/far verdict.
+          _proxFrameCount = 0
+          _proxNearFrames = 0
+          _proxFarFrames = 0
+          _proxReported = false
+          _proxNear = false
+        }
+        void flushPendingChunks()
+        // Text typed / interrupt tapped during the outage: deliver in order.
+        flushClientEvents()
         // Late-ready recovery: if capture isn't running (e.g. the 12s connect
         // timeout fired while the backend waited on a slow ASR upstream), start
         // the mic now so the session isn't left "listening" with the mic off.
-        if (!micOn.value) {
+        // NEVER reopen a mic the user explicitly turned off (2026-11-03:
+        // reconnect 'ready' would otherwise resurrect capture against an
+        // intentional mute).
+        if (!micOn.value && !micIntentionallyOff) {
           void ensureCapture().catch(surfaceCaptureError)
         }
         break
       case 'session':
-        if (ev.session_id) currentSessionId.value = ev.session_id
+        if (ev.session_id) {
+          currentSessionId.value = ev.session_id
+          lastConversationId = ev.session_id
+        }
         if (ev.assistant_id) voiceAssistantId.value = ev.assistant_id
         break
       case 'state':
@@ -488,15 +894,23 @@ export function useVoiceDuplex() {
         }
         break
       }
-      case 'speaking_start':
+      case 'speaking_start': {
         droppingAudio = false
         speaking.value = true
+        const nextNotificationId = ev.notification_id || null
+        retainActiveNoticeDrain(nextNotificationId)
+        activeNotificationId = nextNotificationId
+        activeNoticeBurstSeq = typeof ev.notice_burst_seq === 'number' && Number.isInteger(ev.notice_burst_seq) ? ev.notice_burst_seq : 0
         resetBurstTiming()
         startProgressTimer()
         break
+      }
       case 'speaking_end':
         speaking.value = false
-        stopProgressTimer()
+        activeNotificationId = null
+        activeNoticeBurstSeq = 0
+        drainFinishedNotices()
+        if (pendingNoticeDrains.size === 0) stopProgressTimer()
         playbackProgress.value = 0
         break
       case 'tool_notice':
@@ -551,13 +965,19 @@ export function useVoiceDuplex() {
         clearPlayback()
         speaking.value = false
         break
+      case 'notification_ack_pending':
+        // A drain arrived before the full notice was ready. Rearm instead of
+        // leaving the client unable to ACK the final segment of the same notice.
+        if (activeNotificationId === ev.notification_id) {
+          drainedSent = false
+          if (speaking.value) startProgressTimer()
+        }
+        break
       case 'playback_resumed':
-        // Answer playback continues from the breakpoint (backchannel/defer).
-        // The resumed audio is a NEW burst: restart the playback clock so
-        // played_sec stays relative to the resume point. The backend anchors
-        // its pause-breakpoint math to this (burst_base_chars + played_sec);
-        // without the reset, played_sec would keep counting from the
-        // pre-pause burst and the backend would double-count (and truncate).
+        // The backend emits this before any resumed PCM. Restore both parts of
+        // the notice ACK identity so a pre-pause drain cannot settle this burst.
+        activeNotificationId = ev.notification_id || null
+        activeNoticeBurstSeq = typeof ev.notice_burst_seq === 'number' && Number.isInteger(ev.notice_burst_seq) ? ev.notice_burst_seq : 0
         resetBurstTiming()
         startProgressTimer()
         break
@@ -578,15 +998,54 @@ export function useVoiceDuplex() {
         speaking.value = false
         pushMessage({ role: 'system', text: '任务已取消', kind: 'notice' })
         break
-      case 'bg_task_notice': {
-        // A background task submitted from voice reached a terminal state —
-        // the assistant is about to announce it aloud and offer follow-ups.
-        const done = ev.status === 'completed'
+      case 'delegation_submitted': {
         pushMessage({
           role: 'system',
-          text: done
-            ? `后台任务《${ev.title || '未命名任务'}》已完成`
-            : `后台任务《${ev.title || '未命名任务'}》执行失败`,
+          text: ev.deduplicated
+            ? `该任务已经提交过（${ev.assistant_name || '执行助手'}），无需重复创建`
+            : `已交给 ${ev.assistant_name || '执行助手'}，独立执行会话已创建（${ev.status || 'pending'}）`,
+          kind: 'notice',
+        })
+        break
+      }
+      case 'open_task_result': {
+        const target = String(ev.task_id || ev.execution_conversation_id || '')
+        if (target) void openTaskResult(target)
+        break
+      }
+      case 'bg_task_notice_batch': {
+        const items = Array.isArray(ev.items) ? ev.items : []
+        for (const raw of items) {
+          const item = raw as Record<string, unknown>
+          const status = String(item.status || '')
+          pushMessage({
+            role: 'system',
+            text: `委派任务《${String(item.title || '未命名任务')}》${status === 'completed' ? '已完成' : status === 'cancelled' ? '已取消' : status === 'timed_out' ? '已超时' : status.startsWith('waiting_') ? '需要你确认' : '执行失败'}`,
+            kind: 'notice',
+          })
+        }
+        break
+      }
+      case 'bg_task_notice': {
+        // A background task submitted from voice reached a terminal/waiting
+        // state — the assistant announces it aloud and offers follow-ups.
+        const status = String(ev.status || '')
+        const stateText = status === 'completed'
+          ? '已完成'
+          : status === 'cancelled'
+            ? '已取消'
+            : status === 'timed_out'
+              ? '已超时'
+              : status === 'waiting_input'
+                ? '需要你补充信息'
+                : status === 'waiting_auth'
+                  ? '需要你授权'
+                  : status === 'waiting_budget'
+                    ? '需要你确认是否继续'
+                    : '执行失败'
+        pushMessage({
+          role: 'system',
+          text: `后台任务《${ev.title || '未命名任务'}》${stateText}`,
           kind: 'notice',
         })
         break
@@ -594,6 +1053,11 @@ export function useVoiceDuplex() {
       case 'error':
         errorMsg.value = ev.error || '语音服务出错'
         state.value = 'error'
+        // Terminal guard: a backend `error` followed by a close on the SAME
+        // connection must not spin the reconnect loop (permanent failures —
+        // ASR 未配置 / server draining — would otherwise burn ~35s of retries).
+        // Cleared by any later session activity (see 'state'/'ready').
+        sawErrorEvent = true
         break
     }
   }
@@ -608,44 +1072,105 @@ export function useVoiceDuplex() {
     }
   }
 
-  async function connect(conversationId?: string | null) {
-    errorMsg.value = null
-    state.value = 'connecting'
+  async function connect(conversationId?: string | null, isReconnect = false): Promise<void> {
+    if (!isReconnect) {
+      errorMsg.value = null
+      state.value = 'connecting'
+    }
+    // Tear down any previous live socket BEFORE adopting the new one, so two
+    // live sockets can never coexist and a dying socket's handlers can never
+    // touch the new session's state (I-4).
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      const dead = socket
+      socket = null
+      dead.onopen = null
+      dead.onmessage = null
+      dead.onerror = null
+      dead.onclose = null
+      try { dead.close() } catch { /* ignore */ }
+    }
+    const epoch = sessionEpoch
     return new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(getVoiceWebSocketUrl(undefined, conversationId))
       ws.binaryType = 'arraybuffer'
       socket = ws
+      let settled = false
       const timer = setTimeout(() => {
-        if (!connected.value) {
-          errorMsg.value = '连接语音服务超时'
-          state.value = 'error'
+        // Per-promise `settled` (not the shared `connected` ref): if another
+        // socket flipped `connected` meanwhile, this stale attempt must still
+        // time out instead of hanging forever with reconnecting stuck true (M-1).
+        if (!settled) {
+          settled = true
+          if (!isReconnect) {
+            errorMsg.value = '连接语音服务超时'
+            state.value = 'error'
+          }
           reject(new Error('连接超时'))
+          // A handshake that never completes produces no close event; close it
+          // ourselves so the retry chain takes over (initial connects included —
+          // the old "late-ready rescue" is superseded by auto-retry).
+          try { ws.close() } catch { /* ignore */ }
         }
       }, 12000)
       ws.onopen = () => {
+        if (epoch !== sessionEpoch) return
         if (playCtx && playCtx.state === 'suspended') void playCtx.resume()
       }
       ws.onmessage = (e) => {
+        if (epoch !== sessionEpoch) {
+          // Orphan of a superseded generation: close it out without touching state.
+          try { ws.close() } catch { /* ignore */ }
+          return
+        }
         handleMessage(e)
-        if (connected.value) {
+        if (connected.value && !settled) {
+          settled = true
           clearTimeout(timer)
           resolve()
         }
       }
       ws.onerror = () => {
-        clearTimeout(timer)
-        errorMsg.value = '语音服务连接失败'
-        state.value = 'error'
-        reject(new Error('连接失败'))
+        if (epoch !== sessionEpoch) return
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+          reject(new Error('连接失败'))
+        }
+        // State bookkeeping only for the initial connect; a reconnect's error
+        // is followed by onclose, which drives the retry schedule.
+        if (!isReconnect && !connected.value) {
+          errorMsg.value = '语音服务连接失败'
+          state.value = 'error'
+        }
       }
-      ws.onclose = () => {
-        clearTimeout(timer)
-        connected.value = false
+      ws.onclose = (ev) => {
+        if (epoch !== sessionEpoch) return // superseded generation owns the state now
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+          reject(new Error('连接已关闭'))
+        }
+        handleSocketClose(ev)
       }
     })
   }
 
   async function start(conversationId?: string | null) {
+    // Fresh generation: invalidate any in-flight reconnect of the previous one.
+    sessionEpoch += 1
+    stopReconnectTimer()
+    stopFlushTimer()
+    reconnecting = false
+    reconnectAttempt = 0
+    userClosed = false
+    sawErrorEvent = false
+    terminalClose = false
+    micIntentionallyOff = false
+    // A fresh session never carries audio/text buffered by a previous one.
+    pendingChunks = []
+    pendingClientEvents = []
+    clearSpillState()
+    lastConversationId = conversationId ?? null
     await connect(conversationId)
     try {
       await ensureCapture()
@@ -659,23 +1184,45 @@ export function useVoiceDuplex() {
   }
 
   function sendText(text: string) {
-    if (!socket || socket.readyState !== WebSocket.OPEN || !text.trim()) return
-    socket.send(JSON.stringify({ event: 'text', text: text.trim() }))
+    const trimmed = text.trim()
+    if (!trimmed) return
+    // `connected` (ready received) — not merely OPEN — is the send gate: the
+    // handshake-to-ready window would otherwise let a fresh message overtake
+    // text queued during the outage (M3).
+    if (socket && socket.readyState === WebSocket.OPEN && connected.value) {
+      socket.send(JSON.stringify({ event: 'text', text: trimmed }))
+      return
+    }
+    if (socket || reconnecting || reconnectTimer !== null) {
+      // Weak-network window: queue instead of silently dropping the message —
+      // delivered (in order) as soon as the new session is ready.
+      queueClientEvent({ event: 'text', text: trimmed })
+    }
   }
 
   function interrupt() {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return
-    socket.send(JSON.stringify({ event: 'interrupt' }))
+    // Local teardown is unconditional: the user's tap must stop audio/UI even
+    // while the socket is down (previously a silent no-op in that window).
     droppingAudio = true
     clearPlayback()
     speaking.value = false
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ event: 'interrupt' }))
+      return
+    }
+    if (reconnecting || reconnectTimer !== null) {
+      // The fresh session may start replaying a queued notice — carry the tap over.
+      queueClientEvent({ event: 'interrupt' })
+    }
   }
 
   function toggleMic() {
     if (micOn.value) {
+      micIntentionallyOff = true
       stopCapture()
       return
     }
+    micIntentionallyOff = false
     void ensureCapture()
       .then(() => {
         if (state.value === 'error') {
@@ -687,6 +1234,20 @@ export function useVoiceDuplex() {
   }
 
   function disconnect() {
+    // User-initiated teardown: kill the reconnect machine (epoch bump
+    // invalidates any in-flight attempt), its timer, and every buffer of this
+    // generation (memory + spilled audio + queued text events).
+    userClosed = true
+    sessionEpoch += 1
+    stopReconnectTimer()
+    stopFlushTimer()
+    reconnecting = false
+    reconnectAttempt = 0
+    sawErrorEvent = false
+    terminalClose = false
+    pendingChunks = []
+    pendingClientEvents = []
+    clearSpillState()
     if (socket) {
       try {
         if (socket.readyState === WebSocket.OPEN) {
@@ -750,10 +1311,25 @@ export function useVoiceDuplex() {
     } catch { /* error surfaced via state */ }
   }
 
-  // Test hook: expose sendText on window for Playwright WS-level testing.
-  // Non-invasive: only active when the page sets window.__VOICE_TEST_MODE.
+  // Test hooks: exposed unconditionally on window (same convention as the
+  // pre-existing __voiceTestSend used by voice_mode_changes.spec.ts, which
+  // feature-detects them). Read-only probe + text-send shim for WS-level e2e
+  // (voice_duplex_reconnect.spec.ts); neither alters runtime behavior.
   if (typeof window !== 'undefined') {
     ;(window as any).__voiceTestSend = (text: string) => sendText(text)
+    // Read-only resilience probe for e2e (voice_duplex_reconnect.spec.ts):
+    // connection/mic/buffer state without touching behavior.
+    ;(window as any).__voiceTestState = () => ({
+      state: state.value,
+      connected: connected.value,
+      micOn: micOn.value,
+      messages: messages.value.map(m => ({ role: m.role, text: m.text, streaming: !!m.streaming })),
+      buffered: pendingChunks.length,
+      queuedEvents: pendingClientEvents.length,
+      spillCount: getSpilledCount(),
+      reconnectAttempt,
+      sessionId: currentSessionId.value,
+    })
   }
 
   return {

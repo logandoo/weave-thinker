@@ -248,6 +248,10 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
         # 任一步骤失败即不在部分回滚状态上跑主动 Dreaming（§9.3 隔离原则）
         await _try_active_dreaming(db, user_id)
         await _clear_consolidation_failure(db, user_id)
+        # W3 续波 A3（2026-10-24，判据 #54-#56）：dream probe/repair 运行时
+        # 触发——只在 clean-pass 尾部跑（savepoint 隔离，fail-open，
+        # 不影响水位推进；默认关 [memory] dream_repair_enabled=false）。
+        await _try_dream_probe_repair(db, user_id)
     else:
         failures = await _bump_consolidation_failure(db, user_id)
         if _consolidation_failure_action(failures) == "hold":
@@ -269,6 +273,35 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
     )
     await db.commit()
     return result
+
+
+async def _try_dream_probe_repair(db: AsyncSession, user_id: str):
+    """W3 续波 A3（2026-10-24，判据 #54-#57）：dream probe/repair 运行时触发。
+
+    只在 consolidation clean-pass 尾部调用（部分回滚状态不跑附加写入——
+    §9.3 隔离原则同 _try_active_dreaming）。默认关（[memory]
+    dream_repair_enabled=false，P3）；probe→只修 miss→dream_repair_reports
+    落库后跑 check_stop_rule（14 天无正收益落 stop 标记=回退方案 B 决策记录，
+    此后 _stopped 短路、面板只展示不注入）。整体 savepoint 隔离
+    （_isolated_merge_item 同款）：异常不毒化 consolidation 事务、不影响
+    run_consolidation 返回值与水位推进。接线经 Config 属性（单一真源）。"""
+    if not config.memory_dream_repair_enabled:
+        return None
+    from app.services import memory_dream_repair_service as drs
+
+    # 评审修批（A#1/A#4）：① check_stop_rule 只在本轮真产出报告后跑——
+    # probe 短路/无探测词时不拿陈旧报告重复重判（防 stop 行重复 + 恢复陷阱
+    # 加剧）；② probe 与 stop 规则各自独立 savepoint——stop 侧失败不丢弃
+    # 已成功的修复写入。
+    report = await _isolated_merge_item(
+        db, "dream_probe_repair",
+        lambda: drs.run_probe_repair(db, user_id, enabled=True))
+    if not report:
+        return bool(report)
+    await _isolated_merge_item(
+        db, "dream_repair_stop_rule",
+        lambda: drs.check_stop_rule(db, user_id, min_reports=3))
+    return True
 
 
 async def _get_agent_state(db: AsyncSession, user_id: str) -> dict | None:
@@ -737,6 +770,26 @@ async def _update_cluster_weights(db: AsyncSession, user_id: str, result: dict |
     )
 
 
+def dream_write_verdict(narrative: str, source_trusts=()):
+    """W3-2/W1-3（记忆/长程 v2，2026-10-23）：dream 写入判定（纯函数）。
+
+    返回 (clean, provenance_taint, scanned, stripped)：
+    - sanitize_untrusted_text 剥离注入/自我传播句（B2 投毒放大器写入边界）；
+    - taint 继承来源最严（B3）：stripped 或来源含非 {user_stated, agent_inferred}
+      → untrusted；否则 agent（dream 叙事是 agent 推测，永非 trusted）；
+    - scanned=True 表示已过扫描（读取侧只注入 scanned 且非 untrusted 的行）。
+    """
+    from app.services.memory_security import sanitize_untrusted_text
+
+    clean, filtered = sanitize_untrusted_text(str(narrative or ""))
+    stripped = bool(filtered)
+    strict_sources = {"user_stated", "agent_inferred"}
+    src_untrusted = any(
+        str(s or "").strip() not in strict_sources for s in (source_trusts or ()))
+    taint = "untrusted" if (stripped or src_untrusted) else "agent"
+    return clean, taint, True, stripped
+
+
 async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     """§5.5 Step 5：结构化 dream（今日新增/合并/澄清/权重分布 → JSON + narrative）。"""
     from app.services.memory_llm_factory import _memory_llm
@@ -897,13 +950,33 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
         result["dream_generated"] = False
         return
 
+    # W3-2/W1-3（记忆/长程 v2，2026-10-23）：入库前扫描 + 派生 taint + scanned
+    # 标记（B2 dream 是投毒放大器——写入边界必须扫描；读取侧只注入 scanned
+    # 且非 untrusted 的行）。
+    trust_r = await db.execute(
+        text("SELECT DISTINCT source_trust FROM memory_concepts WHERE user_id = :uid AND valid_to IS NULL"),
+        {"uid": user_id},
+    )
+    source_trusts = [r[0] for r in trust_r.fetchall()]
+    narrative, dream_taint, _scanned, stripped = dream_write_verdict(
+        narrative, source_trusts)
+    if stripped:
+        logger.warning("dream narrative sanitized (poisoning stripped): taint=untrusted")
+
     dream_id = str(uuid.uuid4())
     await db.execute(
-        text("INSERT INTO agent_dreams (id, agent_state_id, generated_for_date, summary, source_note_count, source_message_count, source_concept_count, source_cluster_count, metadata_json, created_at, dream_type) VALUES (:id, :sid, :dt, :sum, 0, 0, :cc, :clc, :meta, :created, 'consolidation')"),
+        text("INSERT INTO agent_dreams (id, agent_state_id, generated_for_date, summary, source_note_count, source_message_count, source_concept_count, source_cluster_count, metadata_json, created_at, dream_type, provenance_taint, scanned) VALUES (:id, :sid, :dt, :sum, 0, 0, :cc, :clc, :meta, :created, 'consolidation', :taint, TRUE)"),
         {"id": dream_id, "sid": state_row[0], "dt": today, "sum": (narrative or "")[:4000],
          "cc": concept_count, "clc": cluster_count, "created": datetime.utcnow(),
-         "meta": json.dumps(metadata, ensure_ascii=False)},
+         "meta": json.dumps(metadata, ensure_ascii=False), "taint": dream_taint},
     )
+    try:
+        from app.services.taint_service import record_artifact_taint
+        await record_artifact_taint(
+            db, user_id, "dream", dream_id, dream_taint,
+            origin="untrusted_external" if dream_taint == "untrusted" else "agent")
+    except Exception:
+        logger.debug("dream artifact taint record failed (fail-open)", exc_info=True)
     await db.execute(
         text("UPDATE user_agent_states SET latest_dream_id = :did WHERE id = :sid"),
         {"did": dream_id, "sid": state_row[0]},

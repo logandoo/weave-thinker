@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -35,6 +36,60 @@ LOOP_GUARD_PATTERN_CAP = 80
 STOP_DEBT_CAP = 5
 
 _lock = threading.Lock()
+
+_SECRET_RULES = (
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "aws-access-key-id"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"), "github-token"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), "slack-token"),
+    (re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}"), "api-token"),
+    (re.compile(r"AIza[0-9A-Za-z_-]{35}"), "google-api-key"),
+    (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), "jwt"),
+    (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY[\s\S]*?-----END (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"), "private-key-block"),
+)
+_GENERIC_SECRET_RE = re.compile(
+    r"(?P<prefix>(?:api[_-]?key|apikey|secret|password|passwd|pwd|token|credential|private[_-]?key|access[_-]?key)"
+    r"\s*[=:]\s*[\"']?)(?P<value>[A-Za-z0-9+/_.-]{12,})",
+    re.IGNORECASE,
+)
+_SECRET_ALLOW_RE = re.compile(r"example|placeholder|dummy|sample|redacted|changeme|your[_-]|xxxx|test[_-]?key|fake", re.I)
+_SSHPASS_RE = re.compile(r"(sshpass\s+-p\s+)(\S+)")
+_BEARER_RE = re.compile(r"(authorization:\s*bearer\s+)(\S{12,})", re.I)
+_UNTERMINATED_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----[\s\S]{0,8192}"
+    r"(?:-----END (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----|$)"
+)
+
+
+def _redact_string(value: str) -> str:
+    out = value
+    for pattern, kind in _SECRET_RULES:
+        out = pattern.sub(lambda m: f"[REDACTED:{kind}:{len(m.group(0))}]", out)
+
+    def _generic(match: re.Match) -> str:
+        whole = match.group(0)
+        secret = match.group("value")
+        if _SECRET_ALLOW_RE.search(whole) or secret.startswith("[REDACTED:"):
+            return whole
+        return match.group("prefix") + f"[REDACTED:generic-credential:{len(secret)}]"
+
+    out = _GENERIC_SECRET_RE.sub(_generic, out)
+    out = _SSHPASS_RE.sub(lambda m: m.group(1) + f"[REDACTED:sshpass:{len(m.group(2))}]", out)
+    out = _BEARER_RE.sub(lambda m: m.group(1) + f"[REDACTED:bearer:{len(m.group(2))}]", out)
+    out = _UNTERMINATED_PRIVATE_KEY_RE.sub("[REDACTED:private-key-block]", out)
+    return out
+
+
+def redact_state(value: Any, depth: int = 0) -> Any:
+    """递归脱敏；保留未知字段/容器形状，深度与数组长度有界。"""
+    if isinstance(value, str):
+        return _redact_string(value)
+    if value is None or not isinstance(value, (dict, list, tuple)):
+        return value
+    if depth > 64:
+        return "[TRUNCATED:depth]"
+    if isinstance(value, (list, tuple)):
+        return [redact_state(item, depth + 1) for item in value]
+    return {key: redact_state(item, depth + 1) for key, item in value.items()}
 
 
 def state_path(root: Path) -> Path:
@@ -61,7 +116,7 @@ def save_state(root: Path, st: Dict[str, Any]) -> None:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(redact_state(st), ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
     except OSError as exc:
         logger.debug("vibeweaver state save failed-open: %s", exc)

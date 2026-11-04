@@ -188,7 +188,7 @@ checkout -- <files>`) before applying the next hypothesis. Forward-patching
 on top of a failed attempt leaves dead scaffolding that contaminates the next
 iteration and hides which change fixed what.
 
-- Lane L: take a cheap snapshot each iteration (`git add -A && git commit -m
+- Lane L: take a cheap snapshot each iteration (`git add -u && git commit --allow-empty -m
   "wip-iter-N"` or equivalent) so revert is one command and the attempt trail
   is auditable. Never squash away the trail before FCV.
 - Regression tests complete the revert-and-fail cycle (already binding in
@@ -211,10 +211,11 @@ iteration and hides which change fixed what.
 ## §V8 A/B Evaluation Runbook ★
 
 How to measure whether a SKILL.md revision actually changes agent behavior.
-Harnesses: `scripts/ab/run.mjs` (compliance/convention checks) and
-`scripts/ab/obj_eval.mjs` (objective grading). Method follows established eval
-practice: fresh isolated context per cell · paired old/new arms · deterministic
-assertions (no LLM judge) · honest small-sample reporting.
+Harnesses (upstream source repo only; **not bundled**): `scripts/ab/run.mjs`
+(compliance/convention checks) and `scripts/ab/obj_eval.mjs` (objective
+grading). Method follows established eval practice: fresh isolated context per
+cell · paired old/new arms · deterministic assertions (no LLM judge) · honest
+small-sample reporting.
 
 **Objective metrics hierarchy (use these as the verdict axes).** Compliance
 tokens (gate line, `[Coverage]`, `Lane:`) measure whether the skill's own
@@ -314,6 +315,8 @@ remaining budget still afford minimal code + one test run + the gate line?"
   that lands nothing.
 - The budget signal is the wall clock, the turn/conversation cap, a user
   deadline, or a visibly shrinking allowance — pick what is real, state it.
+  A budget stop is legal ONLY as this consolidation or a PAUSED packet —
+  the four legal stops + mechanical enforcement: §V12.
 
 **Narration discipline:** narration is a running index (one line per action
 + verdict), not an essay. Full prose lives in artifacts. Restating
@@ -494,7 +497,7 @@ ONLY when the gate line declares `Class: DOC|CONFIG`.
   LAST task block wins — older blocks are history). Class-NA groups print
   `class: <X> — group N/A …` as gate evidence (DOC structurally N/A's memory
   + service lifecycle groups; a profile never weakens an applicable group;
-  groups 12-16 — diagnosis+claim lint · secret scan · test-change · risk-tier —
+  groups 12-16 — claim lint · secret scan · test-change · risk-tier —
   NEVER skip).
 - audit Group B accepts the lite table header ONLY when the gate line
   declares `Class: DOC|CONFIG` (the field must be a filled single value —
@@ -648,6 +651,74 @@ class-asset check + C18). C18 verdicts: non-prose non-asset write = class
 misreport BAD · asset without render evidence = `NO RENDER, NO DONE` BAD ·
 asset with bound evidence = OK. Prose-class misreport rules (V11.7) are
 unchanged.
+
+---
+
+## §V12 Stop-Guard — false-stop resistance ★
+
+**Legal stops (binding):** a turn ends in exactly four states — ① ALL-PASS ·
+② cap/stall with the ❌ memory record (COV-7) · ③ a PAUSED packet (§3.4) ·
+④ a `[Coverage]`-honest partial completion (§V9). "Context exhausted" is NOT
+a fifth: an exhaustion claim is a BUDGET claim and stands only with its §V9
+basis (wall clock · turn cap · measured allowance). Genuinely near the
+limit? Consolidate ship-order ①–③, name the rest in `[Coverage] unchecked`,
+or write the PAUSED packet — never abandon silently.
+
+**Stop-guard (mechanical, vibeweaver-audit plugin):** at session idle, when
+ALL of these hold, the plugin posts ONE corrective prompt (idle-only — a
+session is never aborted after a completed turn):
+- vibeweaver-active root + skill loaded + task incomplete on disk
+  (`tests/acceptance.md` exists, tool calls occurred, current block has no
+  TRUSTED `- final-run` — bound to `assert_artifacts.py: all N
+  checks pass` or a turn-fresh artifact — not `Class: DOC`/read-only);
+- the LAST assistant message matches a stop-euphemism (zh/en, syntax level
+  only — no semantic intent detection; conservative bias: misses acceptable,
+  false positives not; quoted spans are stripped, ≥2 pattern hits = meta-
+  discussion not a declaration, a single hit must carry cessation intent or
+  end the message), OR that message ended with `finish: "length"`
+  (output-limit truncation ≠ completion — host bug class opencode#40146),
+  OR the **positive on-disk predicate**: `acceptance.md` exists, the current
+  block has no trusted `final-run`, the turn-scoped assistant text has no
+  `[Verification Gate]` emitted after the last task write, a write/edit to a NON-evidence task file occurred
+  after the last user message, and no whitelist holds. No euphemism needed —
+  this is the silent-stop leg. Absence of final-run alone is NOT proof of
+  abandonment (COV-11): DOC/read-only/awaiting-user are exempt. Error/abort
+  fences until a later write; a Q&A turn after the write does not fire;
+- NO terminal-state whitelist entry, history cannot immunize the
+  present: paused_state written this session · Class-E in decisions.md this
+  session · `[Verification Gate]` after the last user message and last task write · explicit user stop (directive-shaped, negation-excluded,
+  plugin prompts stripped first). The read-only/DOC and awaiting-user
+  exemptions apply ONLY to the positive (no-euphemism) leg: an explicit
+  "context exhausted" claim or a truncated turn still prompts.
+- telemetry (v1 `message.updated` info — spike W0): with audit.json
+  `contextLimitTokens` set, the corrective quotes the measured fill
+  (`fill ≈ (input + cache.read) / limit`, one-turn-stale, stated as such;
+  fill ≥ 90% softens to "consolidate NOW" — the prompt never accuses a claim
+  the measurement supports); unset → the prompt restates the legal stops
+  WITHOUT a fill claim — the trigger never depends on telemetry;
+- budget 2/session (audit.json `stopGuardMaxInterventions`), exhausted =
+  log-only (never thrash); episodes are keyed on the assistant message id
+  (or a tail snapshot when message telemetry is absent) — a NEW message is a
+  new episode, the same message never re-fires; `VIBEWEAVER_STOPGUARD=off`
+  escapes; counters Number.isFinite-guarded and flushed before the prompt
+  lands; a host without a prompt channel journals debt instead of burning
+  budget (no phantom interventions);
+- v2 hosts (no message telemetry): explicit euphemism/truncation prompts when session.prompt exists; positive silent-stop stays debt-only.
+
+**Abandonment debt (advisory, never blocking):** a trigger not followed by a
+corrective (v2 mode · budget exhausted · no prompt channel) is journaled to
+`.vibeweaver/audit-state.json` (cap 5, same-episode deduped) and replayed
+into the `## Stop-debt` section of every later `tests/gate_audit.md` — it
+surfaces at the next audit/final and in Tier-2 human review. Silent
+abandonment with an active `acceptance.md` + ≥1 write/edit is covered by the
+positive predicate; a session with no acceptance/tool call remains
+indistinguishable from a user walking away and stays a known gap (Tier-2).
+
+**Corrective prompt contract:** names the contradiction, lists the four legal
+stops, and gives an explicit already-complete exit ("run assert, append
+`- assert-run:` + `- final-run:`, then emit the `[Verification Gate]` line;
+do NOT fabricate") plus the awaiting-user exit (request-cued question or PAUSED). It points at `working_note.md`, never fabricates
+a fill number, never auto-continues a whitelisted stop.
 
 ---
 End of VERIFICATION_UPGRADES.md. Adding rules here: keep SKILL.md lines

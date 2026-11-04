@@ -7,21 +7,42 @@
   </div>
 </template>
 
-<script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import Sortable from 'sortablejs'
-
-// Global store for dragged items (shared between all SortableList instances)
+<script lang="ts">
+// W26 拖拽全局态必须是**模块级**单例 —— <script setup> 顶层=每实例一份，
+// 跨实例 destroy 守卫全失效（目标列表被毁时查的是它自己的 false 标志），且
+// failsafe 无从复位。模块级才与 SortableJS 的模块级 _nulling 全局态对齐。
 // itemById provides a robust fallback: even if `item` ref is lost during Vue
 // re-renders (e.g. group expansion during drag), the Map persists.
 // isDragging flag prevents reactive array mutations during drag — the parent
 // (Sidebar) reconciles DOM state after drag ends via reconcileDragState().
-const draggedItemStore: { item: any | null; sourceKey: string | null; itemById: Map<string, any>; isDragging: boolean } = {
+const draggedItemStore: { item: any | null; sourceKey: string | null; itemById: Map<string, any>; isDragging: boolean; dragToken: number; sourceInstance: any | null } = {
   item: null,
   sourceKey: null,
   itemById: new Map(),
   isDragging: false,
+  // W26（评审 B-M1）：拖拽世代令牌 —— onEnd 的 100ms 延迟清理不得清掉
+  // 100ms 内新开始的拖拽状态（旧计时器闭包对活值点火）。
+  dragToken: 0,
+  // W26（评审 B-I2）：源实例身份 —— 源列表在拖拽中卸载（drawer v-if 关闭 /
+  // 路由切换）时 end 永不派发，必须由卸载路径复位模块级全局态。
+  sourceInstance: null,
 }
+
+/** W26 failsafe 复位出口：SortableJS 的 end 事件未到达时（destroy-during-drag
+ *  等）onEnd 的清理也不会跑 —— Sidebar 的 forceEndDrag 经此复位全局态，
+ *  否则 isDragging 永真会永久锁死全部实例的 re-init 与变更持久化。 */
+export function resetGlobalDragState() {
+  draggedItemStore.isDragging = false
+  draggedItemStore.item = null
+  draggedItemStore.sourceKey = null
+  draggedItemStore.itemById.clear()
+  draggedItemStore.sourceInstance = null
+}
+</script>
+
+<script setup lang="ts">
+import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import Sortable from 'sortablejs'
 
 const props = defineProps<{
   modelValue?: any[]
@@ -71,6 +92,14 @@ function findItemByKey(key: string): any | null {
 
 function initSortable() {
   if (!containerRef.value) return
+
+  // W26 拖拽卡死根治（扼流守卫）：拖拽进行中禁止重建已有实例 ——
+  // SortableJS 1.14.0 destroy() → _onDrop(undefined) → _nulling() 清空
+  // **模块级全局**拖拽态（dragEl/tapEvt/Sortable.active），onEnd 永不派发，
+  // isDragging 永真（上游 Vue.Draggable#1199 同源）。destroy 的唯一合法
+  // 时机 = 非拖拽期（此处守卫之后）与组件卸载。尚无实例的懒初始化列表
+  // （折叠组首次展开）允许纯创建 —— 无 destroy 即无 _nulling。
+  if (draggedItemStore.isDragging && sortableInstance) return
 
   // If element is hidden (display:none), defer initialization until visible
   // This is critical for SortableJS to properly register drop zones
@@ -134,6 +163,8 @@ function initSortable() {
     removeCloneOnHide: true,
     onStart(evt: any) {
       draggedItemStore.isDragging = true
+      draggedItemStore.dragToken += 1
+      draggedItemStore.sourceInstance = sortableInstance
       document.body.style.userSelect = 'none'
       document.body.style.cursor = 'grabbing'
       const key = evt.item.getAttribute('data-key')
@@ -150,11 +181,16 @@ function initSortable() {
     onEnd(evt: any) {
       document.body.style.userSelect = ''
       document.body.style.cursor = ''
+      // W26（评审 B-M1）：世代令牌守卫 —— 延迟清理只对「自己这一代」拖拽生效，
+      // 否则 100ms 内开始的下一次拖拽会被旧计时器清掉状态。
+      const token = draggedItemStore.dragToken
       setTimeout(() => {
+        if (draggedItemStore.dragToken !== token) return
         draggedItemStore.isDragging = false
         draggedItemStore.item = null
         draggedItemStore.sourceKey = null
         draggedItemStore.itemById.clear()
+        draggedItemStore.sourceInstance = null
       }, 100)
       emit('end', evt)
     },
@@ -269,6 +305,12 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  // W26（评审 B-I2）：源列表在拖拽中卸载 → end 永不派发。只有源实例的卸载
+  // 才允许复位模块级拖拽态（目标列表卸载不影响在途拖拽），否则全局守卫
+  // 永真会永久锁死所有列表的 mutation 与重建。
+  if (draggedItemStore.isDragging && draggedItemStore.sourceInstance === sortableInstance) {
+    resetGlobalDragState()
+  }
   if (sortableInstance) {
     sortableInstance.destroy()
     sortableInstance = null
@@ -294,15 +336,9 @@ watch(() => props.group, () => {
 })
 
 // Force re-initialization when prop changes (e.g. parent expands collapsed groups during drag).
-// IMPORTANT: Skip reinitialization for the source list to avoid destroying the active drag.
+// W26：destroy 收敛进 initSortable 扼流守卫（拖拽中禁 destroy 任何实例，
+// 不止源列表 —— _nulling() 清的是全局态，毁目标列表同样杀死在途拖拽）。
 watch(() => props.forceReinit, () => {
-  if (draggedItemStore.isDragging && draggedItemStore.sourceKey === props.sortKey) {
-    return
-  }
-  if (sortableInstance) {
-    sortableInstance.destroy()
-    sortableInstance = null
-  }
   if (lazyObserver) {
     lazyObserver.disconnect()
     lazyObserver = null

@@ -11,7 +11,23 @@ port = 8158
 
 [security]
 jwt_secret_key = "<YOUR-SECRET>"
-super_admin_bypass = true
+super_admin_bypass = false
+user_mcp_stdio_enabled = true
+user_mcp_allow_private_hosts = true
+memory_provenance_strict = false
+memory_hmac_key = ""
+multi_tenant_experimental = false
+tma_mode = "shadow"
+tma_verdict_key = ""
+tma_verdict_key_id = "v1"
+tma_checkpoint_interval = 64
+tma_witness_dir = ""
+tma_action_token_ttl = 120
+verdict_reason_redaction = true
+injection_detector_mode = "shadow"
+injection_detector_target_fpr = 0.01
+injection_detector_threshold = 0.0
+injection_detector_external_url = ""
 
 [database]
 host = "127.0.0.1"
@@ -22,14 +38,25 @@ name = "<YOUR-DB-NAME>"
 
 [agent]
 name = "共享智能体"
+prompt_compact_ratio = 0.05
 background_task_memory_injection_enabled = false
 background_task_memory_budget_chars = 600
 memory_max_items = 12
 note_context_limit = 12
 conversation_context_limit = 40
+context_continuity_enabled = true
+context_window_mode = "2d"
+conversation_context_max_tokens = 0
+conversation_context_budget_ratio = 0.45
+conversation_context_budget_cap_tokens = 300000
+conversation_context_min_messages = 0
+history_tool_result_max_tokens = 2000
+tools_catalog_discovery_enabled = true
+tools_reliability_ranking_enabled = true
 memory_refresh_note_limit = 20
 memory_refresh_message_limit = 60
 cross_turn_citation_note_enabled = true
+tool_result_spotlight = true
 scheduled_task_system_prompt = """你是一个智能助手，正在执行用户设定的定时任务。请根据任务要求完成操作并给出结果。你可以使用 web_search 联网搜索最新信息，使用 browser 浏览网页深入获取内容，使用 execute_code 执行代码。当你不确定某个事实或需要最新信息时，必须主动搜索而不是猜测。
 
 Markdown格式要求（严格遵守，否则渲染会出错）：
@@ -46,6 +73,10 @@ Markdown格式要求（严格遵守，否则渲染会出错）：
 - 表格每行之间必须换行，表头分隔行 |---| 必须独占一行
 - 禁止标题后紧跟粗体文本，粗体内容应另起一行
 - 禁止两个粗体块之间没有换行分隔"""
+[agent.vision]
+max_history_image_frames = 2
+max_current_turn_image_frames = 4
+
 [agent.tools]
 mcp_progressive_enabled = true
 
@@ -61,7 +92,7 @@ max_read_chars = 20000
 
 [agent.tool_loop]
 max_iterations = 50
-max_consecutive_iterations = 999
+max_consecutive_iterations = 60
 memory_read_dedup = true
 max_empty_answer_retries = 2
 max_force_stage_rounds = 50
@@ -74,7 +105,7 @@ vision_interpret = 3600
 
 [agent.tool_loop.tool_call_stall_timeout_overrides]
 vision_interpret = 600
-code_execution = 300
+execute_code = 300
 
 tool_call_progress_check_interval_seconds = 10
 subtask_iteration_timeout_seconds = 1800
@@ -82,6 +113,19 @@ inactivity_timeout_seconds = 3600
 judge_timeout_seconds = 300
 grace_timeout_seconds = 120
 live_thinking = true
+
+[agent.loop_governor]
+mode = "shadow"
+turn_interventions = 2
+session_interventions = 8
+turn_wall_time_seconds = 0
+refund_max_per_turn = 10
+max_total_iterations = 150
+cycle_period_max = 128
+cycle_min_copies = 3
+semantic_enabled = false
+polling_tools = []
+exempt_tools = []
 
 [agent.background_tasks]
 enabled = true
@@ -182,15 +226,18 @@ user_modeling_enabled = true
 
 [agent.compression]
 enabled = true
-threshold_percent = 0.65
+threshold_percent = 0.8
 protect_first_n = 3
-protect_last_tokens = 20000
-min_summary_tokens = 800
+protect_last_tokens = 60000
+min_summary_tokens = 1200
 summary_ratio = 0.15
-summary_tokens_ceiling = 6000
+summary_tokens_ceiling = 24000
 failure_cooldown_seconds = 300
 context_length = 262144
 spike_guard_ratio = 0.75
+verified_context = true
+fact_recall_floor = 0.8
+max_verbatim_facts = 20
 
 [agent.moa]
 enabled = false
@@ -231,21 +278,29 @@ temperature = 0.7
 stream_include_usage = true
 
 [mcp]
+hot_reload_enabled = true
+hot_reload_interval_seconds = 5
 [mcp.servers]
-[mcp.servers.rempilot]
-url = "https://your-endpoint.example/v1"
-oauth_state_file = "<YOUR-HOME>/Library/Application Support/WeaveThinker/rempilot_oauth.json"
+[mcp.servers.weave-connector]
+command = "<YOUR-HOME>/Documents/DEV/weave-connector/.venv/bin/python"
+args = ["-m", "weave_connector.server"]
+[mcp.servers.weave-connector.env]
+WEAVE_CONNECTOR_CONFIG = "<YOUR-HOME>/Documents/DEV/weave-connector/config.toml"
+
 
 
 
 [web_search]
 enabled = true
-provider = "exa"
-fallback_providers = ["bocha", "firecrawl", "tavily"]
+provider = "deepseek"
+fallback_providers = ["exa", "tavily", "bing"]
 api_url = ""
 api_key = "<YOUR-SECRET>"
 exa_api_key = "<YOUR-SECRET>"
-bocha_api_key = "<YOUR-SECRET>"
+deepseek_api_key = "<YOUR-SECRET>"
+deepseek_api_url = ""
+bing_api_url = ""
+bing_api_key = "<YOUR-SECRET>"
 firecrawl_api_key = "<YOUR-SECRET>"
 max_results = 10
 timeout_seconds = 8.0
@@ -303,6 +358,8 @@ ignore_https_errors = true
 enabled = true
 session_timeout_seconds = 18000
 max_concurrent_sessions = 5
+close_on_turn_end = true
+max_lifetime_seconds = 1800
 
 
 [terminal]
@@ -421,6 +478,9 @@ tts_enabled = true
 
 [deathmatch]
 enabled = true
+typed_judge_enabled = true
+typed_judge_max_loops = 3
+execution_state_enabled = true
 memory_injection_enabled = false
 memory_injection_budget_chars = 600
 max_consecutive_failures = 5
@@ -564,6 +624,11 @@ recovery_ratio = 1.0
 degrade_steps = ["rerank_off", "profile_sync_off", "stage0_off", "dreaming_step6_off", "subconscious_off"]
 per_user_independent = true
 
+[memory.constraints]
+mode = "enforce"
+max_pins = 20
+llm_fallback_enabled = false
+
 [memory.retrieval]
 bootstrap_threshold = 10
 embedding_sim_threshold = 0.3
@@ -599,6 +664,12 @@ boost_min_relevance_episodic = 0.4
 overview_max_concepts = 12
 overview_max_episodes = 5
 overview_max_chars = 800
+overview_include_concepts = false
+overview_include_episodes = false
+overview_exclude_recent_minutes = 120
+injection_boundary_enabled = true
+self_reference_guard_enabled = true
+self_reference_recent_minutes = 30
 fusion_concept_relevance = 0.5
 fusion_concept_recency = 0.2
 fusion_concept_weight = 0.3
@@ -639,9 +710,29 @@ concept_link_expansion_units = 5
 concept_link_expansion_score = 0.45
 
 
+[voice_delegation]
+enabled = true
+reasoning_policy = "strict_highest"
+max_running_per_user = 1
+max_pending_per_user = 3
+iterations_max_cap = 60
+wall_time_seconds = 0
+lease_seconds = 180
+heartbeat_seconds = 30
+notification_replay_seconds = 15
+summary_enabled = true
+summary_max_chars = 1200
+summary_part_chars = 6000
+budget_pause_enabled = true
+budget_resume_seconds = 1800
+max_daily_wall_time_seconds_per_user = 0
+notification_batch_max = 5
+worktree_enabled = true
+
 [secrets]
 tavily_api_key = "<YOUR-SECRET>"
 exa_api_key = "<YOUR-SECRET>"
-bocha_api_key = "<YOUR-SECRET>"
+deepseek_api_key = "<YOUR-SECRET>"
+bing_api_key = "<YOUR-SECRET>"
 firecrawl_api_key = "<YOUR-SECRET>"
 context7_api_key = "<YOUR-SECRET>"

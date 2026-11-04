@@ -21,6 +21,7 @@ class PermissionRequest:
     tool_name: str
     description: str
     details: dict = field(default_factory=dict)
+    user_id: str = ""
     _event: asyncio.Event = field(default_factory=asyncio.Event)
     _response: Optional[bool] = None
 
@@ -46,6 +47,7 @@ async def request_permission(
     details: Optional[dict] = None,
     timeout: float = 120.0,
     request_id: Optional[str] = None,
+    user_id: str = "",
 ) -> bool:
     req_id = request_id or uuid.uuid4().hex[:12]
     req = PermissionRequest(
@@ -54,6 +56,7 @@ async def request_permission(
         tool_name=tool_name,
         description=description,
         details=details or {},
+        user_id=str(user_id or (details or {}).get("user_id") or ""),
     )
     _permission_requests[req_id] = req
     try:

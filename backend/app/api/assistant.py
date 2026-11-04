@@ -141,6 +141,24 @@ async def delete_assistant(
     if not assistant:
         raise HTTPException(status_code=404, detail="Assistant not found")
 
+    # §12: deleting a target assistant with active delegated tasks would strand
+    # resumable work and silently change the execution target.
+    from app.db.database import AgentTask
+    from app.services.agent_task_status import ACTIVE_STATUSES
+
+    active_task = (await db.execute(
+        select(AgentTask.id).where(
+            AgentTask.assistant_id == assistant_id,
+            AgentTask.execution_mode == "separate_v1",
+            AgentTask.status.in_(ACTIVE_STATUSES),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if active_task:
+        raise HTTPException(
+            status_code=409,
+            detail="Assistant is the target of an active delegated task; cancel it first",
+        )
+
     await db.delete(assistant)
     await db.commit()
     return {"status": "ok"}

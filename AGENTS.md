@@ -60,6 +60,7 @@ but not bound to any npm script; there is no Python lint config. Do not invent
   `backend/config.toml.example`, `backend/config_model.toml.example`.
   All options documented in `backend/app/core/config.py`.
   Only `[server]`, `[database]` and `[security]` are required to start.
+- **MCP**: global `[mcp.servers.*]` is hot-reloaded by a per-worker watcher (`[mcp].hot_reload_enabled` default true, 5s) with probe-then-swap and stdio process reaping; no restart. Per-user servers live in `user_mcp_servers` (CRUD `/api/mcp/servers`, settings → MCP, agent tool `manage_mcp_server`), are owner-scoped (`ToolEntry.owner_user_id`, `mcp_u<uid8>_<server>_<tool>`, toolset `mcp-<server>`), and fail closed for non-owners. User stdio (server-side process execution) and private/loopback HTTP (SSRF) are opt-in via `[security].user_mcp_stdio_enabled` / `user_mcp_allow_private_hosts` (both default false).
 - **Dependencies**: `backend/requirements.txt` — no `pyproject.toml`
 - **API docs**: `docs/API.md` — detailed reference (machine-generated field
   tables from the running backend's OpenAPI schema + curated behavior sections:
@@ -80,6 +81,7 @@ but not bound to any npm script; there is no Python lint config. Do not invent
   `canary_marker.py`, send-audit with reject budgets, `citation_ledger.py`
   (`[N]` citation ledger with frontend badges), `pre_tool_gate.py`,
   `error_classifier.py`; markdown sanitization in `markdown_sanitizer.py`
+- **OpenCode boundary**: Weave Thinker consumes the upstream vibeweaver skill payload but does not install or synchronize local OpenCode. Local OpenCode is managed only by the upstream vibeweaver repo's own `install.sh`; never copy the host-adapted skill/plugin back into `~/.config/opencode`.
 - **Web search**: `search_service.py` — provider chain with fallbacks
   (`[web_search]` in config); results persisted to `web_search_results`
 - **Skins**: `app/api/skins.py` — built-in catalog (`GET /api/skins`, public) +

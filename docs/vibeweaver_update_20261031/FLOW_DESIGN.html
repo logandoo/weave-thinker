@@ -1,0 +1,40 @@
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>vibeweaver 双运行时上下文适配设计</title>
+<style>body{font:16px/1.65 system-ui,sans-serif;max-width:1040px;margin:40px auto;padding:0 24px;color:#18231d}code,pre{font-family:ui-monospace,monospace}pre{white-space:pre-wrap;background:#f3f6f4;padding:16px;border-radius:8px}.rule{border-left:4px solid #2d6a4f;padding-left:14px}.boundary{color:#714b13}</style></head><body>
+<h1>vibeweaver 上游刷新与双运行时深度适配</h1>
+<p><strong>SUPERSEDED（2026-10-31 范围纠正）：OpenCode 不在本仓运行时/安装范围内；本图仅保留为历史设计，当前边界见 docs/VIBEAWEAVER.md §10。</strong></p>
+<p>上游锚：<code>3568be61a55a7c2b228a6313024a0e80950b8ba6</code>。本设计覆盖后端与非 UI OpenCode harness；无页面、数据库或 API 变更。</p>
+<h2>1. 权威与所有权</h2>
+<div class="rule"><b>Python 唯一权威：</b>产品 gate/audit/security/taint/approval/deathmatch。<br><b>OpenCode 适配器：</b>开发 harness 的 tool/context/compaction hooks。<br><b>每个会话：</b>一个 compactor、一个 pendingResume writer、一个 continuation scheduler。恢复上下文绝不回滚工作区，也不提升信任或授权。</div>
+<h2>2. OpenCode v1/v2 数据流</h2>
+<pre>tests/working_note.md → memory-snapshot.json → compactStateBundle(root)
+v1: experimental.session.compacting → output.context
+v2: ctx.session.hook("compaction") → event.system[{type:"text",text}]
+       ↓ actual compactor input（不是仅消息存储）
+compaction succeeds
+v1: session.compacted
+v2: session.compaction.ended
+       ↓ mark delivery-state.json pendingResume[exact sessionID]
+next primary request
+v1: experimental.chat.system.transform
+v2: ctx.session.hook("context")
+       ↓ one logical restore; re-arm only on a later compaction</pre>
+<p>独立 `opencode run` 进程验证恢复不依赖内存。恢复前不得禁用宿主 continuation；没有第二自动续跑调度器。v2 `event.result` 不由本插件设置，避免成为第二 compactor。</p>
+<h2>3. Python 产品数据流</h2>
+<pre>ContextCompressor pre-summary → prepare/attach delivery bundle
+  → summary + synthetic resume + persistent pendingResume
+  → chat_stream_transport 下轮精确 conversation 消费
+DeathmatchPlanCoreMixin → 同一 delivery_root / delivery_conv_id / delivery_active</pre>
+<p>现有 DB rolling summary/artifact/resume snapshot 保持权威；working note 是任务态，不与 DB 记忆合并成第二套账。最新用户消息逐字、证据三件套、provenance/taint 和 deathmatch 生命周期不被 prose summary 替代。</p>
+<h2>4. Checker 与状态安全</h2>
+<ul><li>bundled checker 与 pin 同步；已有自定义 checker 不覆盖，hash 不匹配时执行 bundled canonical fallback。</li><li>assert 使用 JSON severity；输出畸形/超时/缺失不能变绿。</li><li>cue 有长度、星号和时间预算；观测命令有界；状态写前脱敏且保留未知字段。</li><li>silent-stop 只在非证据写入、任务活跃、无 final-run、无白名单时触发。</li></ul>
+<h2>5. 同步与回滚</h2>
+<p><code>scripts/sync_opencode_vibeweaver.sh</code> 默认只检查；<code>--apply</code> 先在用户配置目录创建时间戳备份，再同步插件和技能，最后逐文件 hash 校验。回滚即恢复备份；不改全局其他插件，不移除项目外功能。</p>
+<h2>6. 非运行时装载项</h2>
+<p>上游 installer/release/eval lab 不进入产品 runtime；它们在上游自检中使用。core profile 随包但不自动激活，D9 与 full force-inject 不变。风险/破坏命令审批继续由 act_gate/permission/git 白名单单一承载。</p>
+<h2 class="boundary">7. 边界与验证</h2>
+<p>真实 v2 以本地 fake provider 捕获 compactor 与 primary 请求，跨三个进程证明 pendingResume；mock 只用于形状负例。另跑上游 selftests、Python 定向回归、完整 CI parity、script build、双对抗评审和 fresh-context verify。任何不能真实验证的项目列入 Coverage unchecked，不伪装完成。</p>
+</body></html>

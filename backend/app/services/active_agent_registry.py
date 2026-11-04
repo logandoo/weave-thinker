@@ -22,6 +22,70 @@ from app.services.shared_state import shared_state
 
 logger = logging.getLogger(__name__)
 
+# 契约事件（W26 §B1）：客户端无法从增量流重建的确认信号 —— 插话 commit-echo、
+# run 终态（producer 实际广播形态 `_completed`）、失败（`_failed`）、错误与
+# 权限请求（丢了会永久卡住 run）。订阅队列溢出时只允许淘汰 delta backlog，
+# 绝不允许以「保最新」之名丢掉它们（慢客户端恰在 commit 瞬间丢 echo = 唯一
+# 确认信号永久丢失）。
+_CONTRACT_EVENT_KEYS = (
+    "interjection_committed",
+    "_completed",
+    "_failed",
+    "done",
+    "error",
+    "permission_request",
+)
+
+
+def _is_contract_event(event: Any) -> bool:
+    return isinstance(event, dict) and any(key in event for key in _CONTRACT_EVENT_KEYS)
+
+
+def _enqueue_with_contract_priority(q: asyncio.Queue, event: Any) -> bool:
+    """Enqueue ``event``, evicting at most one OLDEST non-contract item.
+
+    Returns False when the subscriber must be dropped (the queue still has no
+    room after eviction — only possible for a pathological maxsize).
+    Order is preserved for every surviving item and the new event is appended
+    last; the queue is never drained wholesale (that lost every intermediate
+    delta, 2026-08-06).
+    """
+    try:
+        q.put_nowait(event)
+        return True
+    except asyncio.QueueFull:
+        pass
+    pending: List[Any] = []
+    while True:
+        try:
+            pending.append(q.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    drop_idx = next(
+        (i for i, item in enumerate(pending) if not _is_contract_event(item)),
+        None,
+    )
+    if drop_idx is None:
+        # Degenerate: a backlog made ONLY of contract events. Keep memory
+        # bounded by the queue and preserve the NEWEST signal; the client can
+        # resume and get the full echo list from the replay (B2).
+        drop_idx = 0
+        logger.warning(
+            "Subscriber backlog is all contract events; evicting oldest (size=%d)",
+            len(pending),
+        )
+    pending.pop(drop_idx)
+    for item in pending:
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            return False
+    try:
+        q.put_nowait(event)
+    except asyncio.QueueFull:
+        return False
+    return True
+
 
 @dataclass
 class ActiveAgentState:
@@ -104,24 +168,8 @@ class ActiveAgentState:
         async with self._lock:
             dead = []
             for q in self._subscribers:
-                try:
-                    q.put_nowait(event)
-                except asyncio.QueueFull:
-                    # Overflow with a slow client: drop the OLDEST backlog
-                    # item and keep the newest event. Draining the whole
-                    # queue (the previous behavior) lost EVERY intermediate
-                    # event — reasoning/text deltas vanished mid-stream and a
-                    # dropped tool_call could keep the SSE relay's pre-tool
-                    # gate armed for the entire turn (2026-08-06 user report:
-                    # thinking streams, long silence, whole answer pops).
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    try:
-                        q.put_nowait(event)
-                    except asyncio.QueueFull:
-                        dead.append(q)
+                if not _enqueue_with_contract_priority(q, event):
+                    dead.append(q)
             for q in dead:
                 self._subscribers.remove(q)
 
@@ -129,17 +177,9 @@ class ActiveAgentState:
         sentinel = object()
         async with self._lock:
             for q in self._subscribers:
-                try:
-                    q.put_nowait(sentinel)
-                except asyncio.QueueFull:
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    try:
-                        q.put_nowait(sentinel)
-                    except asyncio.QueueFull:
-                        pass
+                # The sentinel is not a contract event: it evicts the oldest
+                # delta, never an unconfirmed echo.
+                _enqueue_with_contract_priority(q, sentinel)
 
 
 _TTL_SECONDS = 300
@@ -601,6 +641,7 @@ class ActiveAgentRegistry:
                         """UPDATE agent_tasks SET status = 'failed',
                            error = 'Worker instance no longer alive (auto-recovery on startup)'
                            WHERE status = 'running'
+                           AND execution_mode IS NULL
                            AND worker_id IS NOT NULL
                            AND worker_id != :current_worker
                            AND started_at < NOW() - INTERVAL '5 minutes'"""

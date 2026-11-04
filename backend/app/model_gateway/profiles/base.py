@@ -51,3 +51,11 @@ class ThinkingProfile:
 
     def sampling_defaults(self, thinking: bool) -> dict:
         return dict(self.SAMPLING_THINKING if thinking else self.SAMPLING_NON_THINKING)
+
+    def sanitize_request(self, body: dict, thinking: bool) -> dict:
+        """Vendor wire hygiene applied to the final request body (no-op base).
+
+        Profiles override when a vendor documents params as unsupported or
+        silently clamped, so we do not send misleading values.
+        """
+        return body

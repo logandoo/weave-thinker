@@ -82,15 +82,17 @@
           <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="11" y1="14" x2="14" y2="11"/>
         </svg>
         <svg v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'active'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M15 12l-8.5 8.5c-.83.83-2.17.83-3 0 0 0 0 0 0 0a2.12 2.12 0 0 1 0-3L12 9"/>
-          <path d="M17.64 15L22 10.64"/>
+          <path d="m15 12-9.373 9.373a1 1 0 0 1-3.001-3L12 9"/>
+          <path d="m18 15 4-4"/>
+          <path d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172v-.344a2 2 0 0 0-.586-1.414l-1.657-1.657A6 6 0 0 0 12.516 3H9l1.243 1.243A6 6 0 0 1 12 8.485V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5"/>
         </svg>
         <svg v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'done'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
         </svg>
         <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M15 12l-8.5 8.5c-.83.83-2.17.83-3 0 0 0 0 0 0 0a2.12 2.12 0 0 1 0-3L12 9"/>
-          <path d="M17.64 15L22 10.64"/>
+          <path d="m15 12-9.373 9.373a1 1 0 0 1-3.001-3L12 9"/>
+          <path d="m18 15 4-4"/>
+          <path d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172v-.344a2 2 0 0 0-.586-1.414l-1.657-1.657A6 6 0 0 0 12.516 3H9l1.243 1.243A6 6 0 0 1 12 8.485V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5"/>
         </svg>
       </div>
       <div class="dm-status-text">
@@ -103,15 +105,30 @@
             · 计划 {{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.filter(s => s.status === 'done').length }}/{{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.length }}
           </span>
         </span>
-        <span v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'paused'">死磕模式 · 已暂停</span>
+        <span v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'paused'">
+          死磕模式 · 已暂停
+          <span v-if="chatStore.currentStreamingDeathmatchVerdict?.plan_steps?.length" class="dm-plan-progress">
+            · 计划 {{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.filter(s => s.status === 'done').length }}/{{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.length }}
+          </span>
+        </span>
         <span v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'partial_complete'">
           死磕模式 · 目标未完全达成
           <span v-if="chatStore.currentStreamingDeathmatchVerdict?.plan_steps?.length" class="dm-plan-progress">
             · 计划 {{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.filter(s => s.status === 'done').length }}/{{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.length }}
           </span>
         </span>
-        <span v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'human_gate'">死磕模式 · 需人工介入</span>
-        <span v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'done'">死磕模式 · 目标已完成</span>
+        <span v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'human_gate'">
+          死磕模式 · 需人工介入
+          <span v-if="chatStore.currentStreamingDeathmatchVerdict?.plan_steps?.length" class="dm-plan-progress">
+            · 计划 {{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.filter(s => s.status === 'done').length }}/{{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.length }}
+          </span>
+        </span>
+        <span v-else-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'done'">
+          死磕模式 · 目标已完成
+          <span v-if="chatStore.currentStreamingDeathmatchVerdict?.plan_steps?.length" class="dm-plan-progress">
+            · 计划 {{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.filter(s => s.status === 'done').length }}/{{ chatStore.currentStreamingDeathmatchVerdict.plan_steps.length }}
+          </span>
+        </span>
         <span v-else>死磕模式 · 已激活</span>
       </div>
       <div v-if="chatStore.currentStreamingDeathmatchVerdict?.message" class="dm-status-message">
@@ -120,14 +137,15 @@
       <div v-if="chatStore.currentStreamingDeathmatchVerdict?.status === 'human_gate' && chatStore.currentStreamingDeathmatchVerdict?.human_gate" class="dm-human-gate-report">
         <pre>{{ chatStore.currentStreamingDeathmatchVerdict.human_gate }}</pre>
       </div>
-      <div v-else-if="chatStore.currentStreamingDeathmatchVerdict?.plan_steps?.length && chatStore.currentStreamingDeathmatchVerdict?.status === 'active'" class="dm-plan-list">
-        <div v-for="step in chatStore.currentStreamingDeathmatchVerdict.plan_steps" :key="step.id" class="dm-plan-step" :class="{ done: step.status === 'done' }">
-          <span class="dm-step-mark">{{ step.status === 'done' ? '✓' : '○' }}</span>
+      <div v-if="chatStore.currentStreamingDeathmatchVerdict?.plan_steps?.length" class="dm-plan-list">
+        <div v-for="step in chatStore.currentStreamingDeathmatchVerdict.plan_steps" :key="step.id" class="dm-plan-step" :class="{ done: step.status === 'done', stuck: step.status !== 'done' && step.stuck }">
+          <span class="dm-step-mark">{{ step.status === 'done' ? '✓' : (step.stuck ? '⚠' : '○') }}</span>
           <span class="dm-step-id">{{ step.id }}</span>
           <span class="dm-step-desc">{{ step.description }}</span>
+          <span v-if="step.status !== 'done' && step.stuck" class="dm-step-stuck-tag">卡住</span>
         </div>
       </div>
-      <div v-if="chatStore.currentStreamingDeathmatchVerdict?.verdict === 'continue' && chatStore.currentStreamingDeathmatchVerdict?.status !== 'partial_complete'" class="dm-continue-indicator">
+      <div v-if="chatStore.currentStreamingDeathmatchVerdict?.verdict === 'continue' && chatStore.currentStreamingDeathmatchVerdict?.status !== 'partial_complete' && chatStore.currentStreamingDeathmatchVerdict?.status !== 'paused' && chatStore.currentStreamingDeathmatchVerdict?.status !== 'human_gate'" class="dm-continue-indicator">
         <span class="dm-pulse"></span> 继续推进...
       </div>
     </div>
@@ -150,7 +168,7 @@
         <div v-if="chatStore.hasMoreMessages[chatStore.currentConversationId || '']" ref="olderSentinelRef" class="older-sentinel">加载更早消息…</div>
         <MessageBubble
           v-if="!useVirtualMessageList"
-          v-for="msg in chatStore.currentMessages"
+          v-for="msg in visibleMessages"
           :key="msg.id"
           :message="msg"
           :save-mode="saveMode"
@@ -170,7 +188,7 @@
             :key="virtualRow.key"
             :ref="messageVirtualizer.measureElement"
             :data-index="virtualRow.index"
-            :data-message-id="chatStore.currentMessages[virtualRow.index]?.id"
+            :data-message-id="visibleMessages[virtualRow.index]?.id"
             :style="{
               position: 'absolute',
               top: 0,
@@ -180,11 +198,11 @@
             }"
           >
             <MessageBubble
-              :message="chatStore.currentMessages[virtualRow.index]"
+              :message="visibleMessages[virtualRow.index]"
               :save-mode="saveMode"
-              :selected="selectedMessageIds.has(chatStore.currentMessages[virtualRow.index].id)"
-              :can-regenerate="canRegenerateMessage(chatStore.currentMessages[virtualRow.index].id)"
-              @toggle-select="toggleMessageSelect(chatStore.currentMessages[virtualRow.index].id)"
+              :selected="selectedMessageIds.has(visibleMessages[virtualRow.index].id)"
+              :can-regenerate="canRegenerateMessage(visibleMessages[virtualRow.index].id)"
+              @toggle-select="toggleMessageSelect(visibleMessages[virtualRow.index].id)"
               @regenerate="handleRegenerate"
               @edit="handleEdit"
             />
@@ -259,6 +277,19 @@
                        </div>
                      </details>
                    </div>
+                  <!-- 2026-11-01: interjection committed into the live run —
+                       render it exactly where it entered the timeline. -->
+                  <div
+                    v-else-if="item.type === 'interjection'"
+                    class="timeline-interjection"
+                    :data-message-id="(item as any).message_id || undefined"
+                  >
+                    <div class="timeline-interjection-head">
+                      <span class="timeline-interjection-label">插话</span>
+                      <span v-if="item.created_at" class="timeline-interjection-time">{{ (item.created_at as string).slice(11, 16) }}</span>
+                    </div>
+                    <StreamMarkdown :content="item.content || ''" />
+                  </div>
                   <!-- Tool call: self-contained state card (F1-2) -->
                   <ToolPartCard v-else-if="item.type === 'tool_call'" :item="item" />
                   <!-- Context tool group: folded consecutive read-only tools (F0-2) -->
@@ -283,7 +314,14 @@
                       </div>
                     </details>
                   </div>
-                  <!-- Text: regular markdown stream -->
+                  <!-- Text: regular markdown stream.
+                       P0 R2: parked pre-tool prose is a draft/process unit. -->
+                  <details v-else-if="item.type === 'text' && item.superseded" class="timeline-superseded">
+                    <summary class="timeline-superseded-summary">草稿（已被终稿取代，点击展开）</summary>
+                    <div class="timeline-text">
+                      <StreamMarkdown :content="item.content" :hasSearchResults="streamingSearchResults.length > 0" />
+                    </div>
+                  </details>
                   <div v-else-if="item.type === 'text'" class="timeline-text">
                     <StreamMarkdown :content="item.content" :hasSearchResults="streamingSearchResults.length > 0" /><span v-if="chatStore.isStreamingCurrentConversation && idx === timelineItems.length - 1" class="cursor"></span>
                   </div>
@@ -440,6 +478,16 @@
       />
     </Teleport>
 
+    <div v-if="chatStore.activeSteerTask" class="steer-composer-hint">
+      <span class="steer-dot"></span>
+      {{ chatStore.activeSteerTask.status === 'waiting_input'
+        ? '任务在等待你的补充信息；发送即继续执行'
+        : chatStore.activeSteerTask.status === 'waiting_auth'
+          ? '任务在等待授权；发送补充要求不会代替授权'
+          : chatStore.activeSteerTask.status === 'waiting_budget'
+            ? '任务已暂停（预算）；发送“继续”可恢复执行'
+            : '该会话正由后台委派任务占用；发送即补充要求（steer）' }}
+    </div>
     <ChatInput v-if="!saveMode" ref="chatInputRef" @sent="onUserMessageSent" />
   </div>
 </template>
@@ -449,9 +497,11 @@ import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { endnoteExportQuery } from '@/api/notes'
 import { useVirtualizer } from '@tanstack/vue-virtual'
 import { useChatStore } from '@/stores/chat'
+import { filterEmbeddedInterjections } from '@/stores/interjectionDisplay'
 import { useNotesStore } from '@/stores/notes'
 import { useUploadStore } from '@/stores/upload'
 import { parseFileRefBlocks, restoreEditChips } from '@/utils/fileRefs'
+import { parseNoteRefBlocks, stripNoteRefBlocks } from '@/utils/noteRefs'
 import { useAssistantStore } from '@/stores/assistant'
 import { liveReasoningTail } from '@/stores/streamReducer'
 import { useToast } from '@/composables/useToast'
@@ -821,15 +871,21 @@ const pendingInterjections = computed(() => {
 // Markdown/KaTeX/Mermaid payloads can render hundreds of DOM nodes; the
 // virtualizer keeps only the visible messages mounted.
 const MESSAGE_VIRTUAL_SCROLL_THRESHOLD = 30
+// 2026-11-01：内联插话的用户行不再是顶层消息（由 assistant 时间线渲染）；
+// 仅隐藏其父 assistant 仍在当前列表中的行，分页/旧数据不丢消息。
+const visibleMessages = computed(() => filterEmbeddedInterjections(
+  chatStore.currentMessages,
+  chatStore.currentStreamingRowId,
+))
 const useVirtualMessageList = computed(() =>
-  chatStore.currentMessages.length > MESSAGE_VIRTUAL_SCROLL_THRESHOLD &&
+  visibleMessages.value.length > MESSAGE_VIRTUAL_SCROLL_THRESHOLD &&
   !chatStore.searchHighlightNonce &&
   !saveMode.value
 )
 
 const messageVirtualizer = useVirtualizer(
   computed(() => ({
-    count: chatStore.currentMessages.length,
+    count: visibleMessages.value.length,
     getScrollElement: () => messageListRef.value,
     estimateSize: () => 120,
     measureElement: (el) => {
@@ -837,7 +893,7 @@ const messageVirtualizer = useVirtualizer(
       return h > 0 ? h : 120
     },
     overscan: 5,
-    getItemKey: (index) => chatStore.currentMessages[index]?.id ?? index,
+    getItemKey: (index) => visibleMessages.value[index]?.id ?? index,
   }))
 )
 
@@ -904,6 +960,12 @@ async function submitGrillingAnswer(taskId: string) {
   }
   try {
     const data = await chatStore.answerGrillingQuestion(taskId, answer)
+    if (!data) {
+      // Failed submissions keep the typed answer and restore the custom-input
+      // state so the user can retry instead of staring at a disabled button.
+      grillingOtherMap.value[taskId] = true
+      return
+    }
     grillingInputMap.value[taskId] = ''
     grillingOtherMap.value[taskId] = false
     if (data?.result?.status === 'next_round') {
@@ -1227,12 +1289,16 @@ function handleEdit(messageId: string, content: string) {
   // when this message carries no file-refs), keeps genuine pending uploads;
   // a later normal send drops restored-tagged chips (ChatInput.handleSend).
   uploadStore.setFiles(restoreEditChips(uploadStore.files, restoredChips))
+  // Same loss class for [note-ref] blocks (2026-11-04): parse them back as
+  // note chips BEFORE stripping — otherwise the resend silently loses the
+  // note reference and its inlined body (the note-ref strip below removed
+  // them from the editable text and nothing restored them).
+  const restoredNotes = parseNoteRefBlocks(content)
   // Strip note-ref and file-ref markers from the content for editing
-  const strippedContent = stripDsmlTags(content)
-    .replace(/\[note-ref:[^\]]*\]\n[\s\S]*?\n\[\/note-ref\]\n*/g, '')
+  const strippedContent = stripDsmlTags(stripNoteRefBlocks(content))
     .replace(/\[file-ref:[^\]]*\]\n[\s\S]*?\n\[\/file-ref\]\n*/g, '')
     .trim()
-  chatInputRef.value?.setEditContent(strippedContent, messageId)
+  chatInputRef.value?.setEditContent(strippedContent, messageId, restoredNotes)
 }
 
 const userHasScrolledUp = ref(false)
@@ -1304,12 +1370,21 @@ function scrollToBottom() {
 }
 
 function scrollToMessageById(messageId: string) {
-  const idx = chatStore.currentMessages.findIndex(m => m.id === messageId)
-  if (idx === -1) return
+  // Embedded interjections are not top-level rows; navigate to their parent
+  // assistant bubble instead. The virtualizer indexes visibleMessages, not the
+  // raw list (hidden rows would shift every index above them).
+  const raw = chatStore.currentMessages.find(m => m.id === messageId)
+  const targetId = raw?.embedded_in_message_id || messageId
+  const idx = visibleMessages.value.findIndex(m => m.id === targetId)
+  if (idx === -1) {
+    const el = messageListRef.value?.querySelector(`[data-message-id="${targetId}"]`)
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    return
+  }
   if (useVirtualMessageList.value) {
     messageVirtualizer.value.scrollToIndex(idx, { align: 'center', behavior: 'auto' })
   } else {
-    const el = messageListRef.value?.querySelector(`[data-message-id="${messageId}"]`)
+    const el = messageListRef.value?.querySelector(`[data-message-id="${targetId}"]`)
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 }
@@ -2025,6 +2100,18 @@ watch(
   text-decoration-color: color-mix(in srgb, var(--color-success) 40%, transparent);
 }
 
+.dm-plan-step.stuck {
+  color: var(--color-warning, #b45309);
+}
+
+.dm-step-stuck-tag {
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: var(--color-warning-bg, rgba(180, 83, 9, 0.12));
+  color: var(--color-warning, #b45309);
+}
+
 .dm-step-mark {
   font-weight: 700;
   width: 14px;
@@ -2637,6 +2724,20 @@ watch(
   padding-left: 1.5em;
 }
 
+/* P0 R2: superseded pre-tool draft — process area, collapsed by default. */
+.timeline-superseded {
+  margin-bottom: 6px;
+  padding: 6px 12px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-md);
+}
+.timeline-superseded-summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color-text-light);
+  user-select: none;
+}
+
 /* Text segment in timeline */
 .timeline-text {
   margin-bottom: 6px;
@@ -2646,6 +2747,36 @@ watch(
   border-bottom-left-radius: 4px;
   box-shadow: var(--panel-shadow);
   line-height: 1.6;
+}
+
+/* 2026-11-01 插话内联（实时流）：右对齐用户气泡，位于 commit 时的真实位置。 */
+.timeline-interjection {
+  margin: 8px 0 10px auto;
+  max-width: 82%;
+  padding: 10px 14px;
+  color: var(--msg-user-text);
+  background: var(--msg-user-bg);
+  border: var(--msg-bubble-border);
+  border-radius: var(--msg-bubble-radius);
+  border-bottom-right-radius: 4px;
+  box-shadow: var(--msg-bubble-shadow);
+  overflow-wrap: anywhere;
+}
+.timeline-interjection-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.timeline-interjection-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-primary);
+}
+.timeline-interjection-time {
+  font-size: 11px;
+  color: var(--msg-user-text);
+  opacity: .72;
 }
 
 /* Tool call card: status-driven, inline in timeline */
@@ -2818,5 +2949,28 @@ watch(
   .empty-lead {
     display: none;
   }
+}
+</style>
+
+<style scoped>
+.steer-composer-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 20px 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-secondary);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.steer-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--color-primary);
 }
 </style>

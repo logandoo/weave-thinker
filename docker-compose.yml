@@ -68,6 +68,7 @@ services:
       - memories_data:/app/backend/agent_memories
       - audio_data:/app/backend/audio_files
       - output_data:/app/backend/output_files
+      - checkpoints_data:/app/backend/tma_checkpoints
       - skins_data:/app/backend/skins_custom
 
 volumes:
@@ -76,4 +77,5 @@ volumes:
   memories_data:
   audio_data:
   output_data:
+  checkpoints_data:
   skins_data:

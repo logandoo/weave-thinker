@@ -16,6 +16,10 @@
           </div>
           <div class="perm-body">
             <p class="perm-description">{{ chatStore.pendingPermissionRequest.description }}</p>
+            <div v-if="chatStore.pendingPermissionRequest.details?.act_gate" class="perm-act-gate">
+              <span class="perm-act-badge">不可信来源</span>
+              <span class="perm-act-reason">{{ chatStore.pendingPermissionRequest.details?.reason }}</span>
+            </div>
             <div v-if="chatStore.pendingPermissionRequest.details?.command" class="perm-detail">
               <span class="perm-detail-label">命令</span>
               <code class="perm-detail-value">{{ chatStore.pendingPermissionRequest.details.command }}</code>
@@ -79,8 +83,11 @@ function handleDeny() {
   box-shadow: var(--frame-shadow), 0 20px 40px rgba(0, 0, 0, 0.15);
   border-radius: 24px;
   padding: 28px;
-  max-width: 420px;
+  max-width: 520px;
   width: 100%;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
 }
 
 .perm-header {
@@ -111,6 +118,32 @@ function handleDeny() {
 
 .perm-body {
   margin-bottom: 20px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.perm-act-gate {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-warning, #b45309) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-warning, #b45309) 35%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.perm-act-badge {
+  flex-shrink: 0;
+  font-weight: 700;
+  color: var(--color-warning, #b45309);
+}
+
+.perm-act-reason {
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
 }
 
 .perm-description {
@@ -123,7 +156,7 @@ function handleDeny() {
 .perm-detail {
   display: flex;
   gap: 8px;
-  align-items: baseline;
+  align-items: flex-start;
   padding: 6px 10px;
   background: var(--color-bg);
   border-radius: 8px;
@@ -139,11 +172,17 @@ function handleDeny() {
 
 .perm-detail-value {
   color: var(--color-text);
-  word-break: break-all;
   font-family: var(--font-mono);
   font-size: 12px;
   background: none;
   padding: 0;
+  flex: 1;
+  min-width: 0;
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 42vh;
+  overflow-y: auto;
 }
 
 .perm-actions {

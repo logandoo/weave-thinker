@@ -16,6 +16,11 @@ from app.services.memory_llm_factory import _memory_llm
 
 config = get_config()
 logger = logging.getLogger(__name__)
+from app.prompts.memory import (
+    MEMORY_DREAM_SYSTEM_PROMPT,
+    MEMORY_SUMMARY_SYSTEM_PROMPT,
+)
+
 
 _memory_gen_in_flight: set[str] = set()
 
@@ -135,6 +140,25 @@ async def _generate_summary(prompt_messages: list, fallback: str) -> str:
     return cleaned or fallback
 
 
+def _sanitize_generated_memory(text: str) -> str:
+    """Facts survive; self-propagating/injection instructions are removed.
+
+    2026-10-18 (Mind Viruses): the daily summary/dream is injected into the
+    system prompt, so it is a cross-session propagation surface. Scan at the
+    write boundary, not only when the user later reads it.
+    """
+    try:
+        from app.services.memory_security import sanitize_untrusted_text
+        cleaned, reasons = sanitize_untrusted_text(text)
+        if reasons:
+            logger.warning("memory summary sanitized: %s", "; ".join(sorted(set(reasons))[:4]))
+            return cleaned.strip() or "[已隔离指令]"
+        return cleaned
+    except Exception:
+        logger.debug("memory summary sanitize failed (fail-open)", exc_info=True)
+        return text
+
+
 async def generate_user_agent_memory(db: AsyncSession, user_id: str, *, force: bool = False) -> UserAgentState:
     state = await ensure_user_agent_state(db, user_id)
     today = date.today()
@@ -161,10 +185,7 @@ async def generate_user_agent_memory(db: AsyncSession, user_id: str, *, force: b
         [
             {
                 "role": "system",
-                "content": (
-                    "你在整理一个用户级共享 agent 的长期记忆。"
-                    "请用简洁中文输出 5-10 条要点，提炼用户长期关注的主题、偏好、正在推进的任务和上下文。"
-                ),
+                "content": MEMORY_SUMMARY_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
@@ -181,10 +202,7 @@ async def generate_user_agent_memory(db: AsyncSession, user_id: str, *, force: b
         [
             {
                 "role": "system",
-                "content": (
-                    "你在为共享 agent 生成 nightly dream。"
-                    "请输出一段简短抽象总结，说明最近主题之间的关联、下一步可能延续的问题，以及需要持续关注的方向。"
-                ),
+                "content": MEMORY_DREAM_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
@@ -201,8 +219,14 @@ async def generate_user_agent_memory(db: AsyncSession, user_id: str, *, force: b
     now = datetime.utcnow()
     today_key = today.isoformat()
 
-    state.memory_summary = _trim_text(memory_summary, int(config.agent_memory.get("summary_storage_limit", 4000)))
-    state.dream_summary = _trim_text(dream_summary, int(config.agent_memory.get("dream_storage_limit", 4000)))
+    state.memory_summary = _trim_text(
+        _sanitize_generated_memory(memory_summary),
+        int(config.agent_memory.get("summary_storage_limit", 4000)),
+    )
+    state.dream_summary = _trim_text(
+        _sanitize_generated_memory(dream_summary),
+        int(config.agent_memory.get("dream_storage_limit", 4000)),
+    )
     state.last_memory_generated_at = now
     state.last_dream_generated_at = now
 
@@ -274,6 +298,17 @@ async def generate_user_agent_memory(db: AsyncSession, user_id: str, *, force: b
 
 
 async def build_shared_agent_context(db: AsyncSession, user_id: str) -> AgentSharedContext:
+    # W3-1（记忆/长程 v2，2026-10-23）双轨收敛：v2 运行时下 v1 共享上下文直接
+    # 返回空、不再触发 v1 后台生成——只留 consolidation 轨（读取统一走
+    # memory_retrieval_service；v1 nightly 行已在生成侧停写）。
+    from app.services.memory_runtime_state import memory_runtime_enabled
+    if memory_runtime_enabled(config):
+        return AgentSharedContext(
+            agent_state=None,
+            memory_summary="",
+            dream_summary="",
+            memory_entries=[],
+        )
     state = await ensure_user_agent_state(db, user_id)
     if not state.memory_summary or not state.dream_summary:
         if user_id not in _memory_gen_in_flight:

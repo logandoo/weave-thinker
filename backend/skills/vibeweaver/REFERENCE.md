@@ -45,8 +45,12 @@ Before making ANY changes, read:
 ### Step M1: Git Baseline + Verify Clean Baseline
 ```bash
 git status
-git add -A && git commit -m "backup: before changes"
+git add -u && git commit --allow-empty -m "backup: before changes"
 ```
+Tracked-only staging: NEVER `git add -A` (it sweeps untracked USER files like
+`.env` into the repo). New paths your task creates are staged explicitly at
+milestone commits. The empty-commit flag keeps the wave anchor commit present
+even on a clean tree (assert_artifacts wave-scope greps this message).
 Then run the existing tests/build once. **Per change-wave** (the previous task's baseline in the same session does NOT count — every change-wave gets its own run), then record the verdict as the first log entry: `- Baseline verified GREEN` (or `- COV-9 skipped — reason: …`) — assert_artifacts.py group 9 machine-checks this FILE. Baseline green → proceed. Baseline already failing → report the pre-existing failures to the user and ask whether to proceed; record them in `tests/verification_log.md` so they aren't mistaken for regressions later. See Part C below → C2 Step 5.
 
 ### Step M2: Determine Design Document Needs
@@ -89,7 +93,7 @@ python tests/api_test.py
 
 ### Step M7: Acceptance & Git
 - Acceptance checklist
-- `git add -A && git commit -m "feat: description"`
+- `git add -u && git add <explicit new paths> && git commit -m "feat: description"`
 
 ### Step M8: Log Modification to Project Memory
 - Create or update a fix topic file in `memory/` with `status: ⏳` if tests passed, `status: ❌` if tests failed (never directly to ✅)
@@ -107,12 +111,17 @@ python tests/api_test.py
 Decompose user query, ask clarifying questions for ambiguities.
 **Also: Create `memory/MEMORY.md` index** (see [MEMORY_TEMPLATES.md](MEMORY_TEMPLATES.md) for template).
 
-### Step 1: Initialize Git Repository
+### Step 1: Initialize Git Repository + .gitignore
 ```bash
 git init
-git add .
-git commit -m "Initial project setup"
+# BEFORE installing dependencies: write .gitignore from APPENDIX §A12
+git add .gitignore && git commit -m "chore: repo hygiene baseline"
+git add -u && git add <explicit new paths> && git commit -m "Initial project setup"
 ```
+NEVER `git add -A` in a mixed workspace — it sweeps untracked user files
+(`.env`) and dependency caches (`.pnpm-store`, `node_modules`) into history.
+Untracked user files must never enter the repo; there is no fresh-scaffold
+exception.
 
 ### Step 2: Generate Design Documents
 - **FLOW_DESIGN.html** — Mermaid flowcharts & sequence diagrams
@@ -172,7 +181,7 @@ project/
 - Mount path: `/static`
 - If frontend uses **History routing**, configure a **fallback route** in FastAPI to serve `index.html`.
 
-See [APPENDIX.md §A3](APPENDIX.md#a3-fastapi-fallback-route-for-history-routing) for code.
+See [APPENDIX.md §A4.7.2](APPENDIX.md) for code.
 
 #### Virtual Environment
 - Use the project directory's `.venv` as the virtual environment.
@@ -196,7 +205,7 @@ script/
 ```
 
 - `project_build` must: build the frontend, then automatically mount the output to the backend's static directory.
-- Script templates in [APPENDIX.md §A6](APPENDIX.md#a6-script-templates).
+- Script templates in [APPENDIX.md §A2](APPENDIX.md).
 
 ### Step 8: Testing
 
@@ -379,10 +388,10 @@ Part B stack choices onto an existing project. Detailed standards:
 
 ### B1. Default New Project Stack: FastAPI + React + Vite + PostgreSQL
 - **Backend:** Python + FastAPI · OAuth2 auth on all endpoints · frontend
-  mounted at `/static` · History routing fallback → [APPENDIX.md §A3](APPENDIX.md).
+  mounted at `/static` · History routing fallback → [APPENDIX.md §A4.7.2](APPENDIX.md).
 - **Frontend:** React + Vite · responsive (desktop / tablet / mobile).
-- **Directory Structure** and **Script Templates** → [APPENDIX.md §A5](APPENDIX.md),
-  [APPENDIX.md §A6](APPENDIX.md).
+- **Directory Structure** and **Script Templates** → [APPENDIX.md §A3](APPENDIX.md),
+  [APPENDIX.md §A2](APPENDIX.md).
 
 ### B2. Adapting to Other Stacks
 When the project uses a different stack (Vue / MySQL / MongoDB / Go backend…):
@@ -472,9 +481,17 @@ design). Everything else stays fully autonomous.
 
 #### Step 5: Git — Commit Before and After + Verify Clean Baseline
 ```bash
-git add -A && git commit -m "backup: before changes"   # baseline
+# Preflight (A10.1 / assert group 21): .gitignore exists, no tracked vendor,
+# untracked ≤ 2k, .git ≤ 1 GiB. RED → fix .gitignore + `git rm -r --cached --ignore-unmatch`
+# FIRST; history rewrite (filter-repo) is Class-E, user-approved only.
+python3 tests/assert_artifacts.py --existing --json   # copy canonical script if missing
+# R2: archive the PREVIOUS session's uncommitted work FIRST (descriptive
+# commit), then the literal backup anchor — a bare backup commit swallows it
+# into the baseline and destroys attribution:
+git add -u && git add <explicit new paths> && git commit -m "chore: carry-over <previous wave> work"
+git add -u && git commit --allow-empty -m "backup: before changes"   # baseline (tracked-only — never `git add -A`)
 # ... make changes ...
-git add -A && git commit -m "feat: description of change"
+git add -u && git add <explicit new paths> && git commit -m "feat: description of change"
 ```
 **After the baseline commit, verify the baseline is GREEN before changing
 anything.** Run the project's existing tests / build once (via `script/` where
@@ -515,7 +532,7 @@ won't know whether you broke it or it was already broken.
   existing verification suite AFTER the change: steering config deserves the
   same regression testing as code (the org-scale form: a scheduled eval
   suite re-run on every config change, each production incident becoming a
-  permanent case — see APPENDIX §A9).
+  permanent case — see APPENDIX C6).
 - Act → Capture → Verify → Fix → Log to `tests/verification_log.md` →
   Repeat until ALL acceptance criteria pass or cap=5/stall=3× stops you.
 - ★ Convergence summary line + 8-column completion table (§A4.4) — final
@@ -544,7 +561,8 @@ At session end, before the completion table, you MUST (operational rules in
 8. Check consolidation need (>15 topic files or index >150 lines / 20KB — see
    [MEMORY_RULES.md §A7.13](MEMORY_RULES.md)).
 9. Pass Final Memory Gate (A7.10) and output the `[Memory Gate] Passed: …`
-   (or `na (reason)` per §V11.3) line immediately before the completion table.
+   (or `na (reason)` per §V11.3) line in its slot of the authoritative output
+   order (COMPLETION_GATE §A4.4).
 
 ### C3. Large-Task Implementation Plan (Conditional)
 **Trigger:** work touching ≥3 files, or multi-step inter-dependencies (new
@@ -600,5 +618,5 @@ in the plan.
    definitions exactly (`clearLayers()` in Task 3 but `clearFullLayers()` in
    Task 7 is a bug).
 
-Template: [APPENDIX.md §A7](APPENDIX.md). The plan's verification commands
+Template: [APPENDIX.md](APPENDIX.md) — the C3 Plan Template section. The plan's verification commands
 feed the §A4.1 / §A4.7 / §A4.8 loops.

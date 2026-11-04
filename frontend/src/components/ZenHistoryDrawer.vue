@@ -131,7 +131,7 @@
             <div v-show="!groupsDirectoryCollapsed" class="groups-directory-content">
               <SortableList
                 v-model="groupStore.groups"
-                :group="{ name: 'zen-groups', pull: false, put: false }"
+                :group="zenGroupsDragGroup"
                 item-key="id"
                 handle=".group-header"
                 :delay="100"
@@ -997,6 +997,10 @@ const ungroupedTimeCategories = computed(() => {
 
 const convDragGroup = { name: 'zen-conversations', pull: true, put: true }
 
+// W26：groups 目录拖拽组引用必须稳定（内联对象字面量每渲染都是新引用，
+// 触发 SortableList props.group watcher 在拖拽中重建实例 → 拖拽卡死）。
+const zenGroupsDragGroup = { name: 'zen-groups', pull: false, put: false }
+
 function syncDragLists() {
   if (isDragging.value) return
   emptyUngroupedList.value = []
@@ -1081,9 +1085,16 @@ async function handleNewChat() {
     return (!msgs || msgs.length === 0) && c.title === '新对话'
   })
   if (emptyConv) {
+    // Match Sidebar: the click is the clean boundary; a newer ON during the
+    // async selection must not be cleared when that selection completes.
+    chatStore.deathmatchMode = false
+    chatStore.deathmatchAction = null
     await chatStore.selectConversation(emptyConv.id)
-    emit('close')
-    return
+    if (!chatStore.messages[emptyConv.id]?.length) {
+      if (!(await chatStore.applyDefaultExecutionTargetToConversation(emptyConv.id))) return
+      emit('close')
+      return
+    }
   }
   await chatStore.createConversation(undefined, assistantStore.currentAssistantId)
   emit('close')

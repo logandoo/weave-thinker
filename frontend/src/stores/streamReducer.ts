@@ -104,6 +104,27 @@ export function liveReasoningTail(
   return `…（思考已生成 ${c.length} 字，实时显示尾部，完成后展开全文）\n\n` + c.slice(-cap)
 }
 
+/** P0 R2: a new tool card turns every already-streamed text part before it
+ *  into a pre-tool draft.  The backend parks those units in display_sequence;
+ *  live SSE has no superseded event, so the client mirrors the same rule.
+ *  Idempotent; returns the number of items newly marked. */
+export function markPreToolDrafts(items: TimelineItem[] | null | undefined): number {
+  const seq = Array.isArray(items) ? items : []
+  let changed = 0
+  for (let i = 0; i < seq.length; i++) {
+    const t = seq[i]?.type
+    if (t !== 'tool_call' && t !== 'tool' && t !== 'tool_placeholder') continue
+    for (let j = 0; j < i; j++) {
+      const it = seq[j]
+      if (it && it.type === 'text' && !it.superseded) {
+        it.superseded = true
+        changed++
+      }
+    }
+  }
+  return changed
+}
+
 /** audit_reset client-side timeline surgery (conv 827a6f78 turn-B, 2026-09-03).
  *
  *  The backend's silent QC rejects the streamed draft and resets ITS
@@ -123,9 +144,12 @@ export function dropDraftTextAfterLastTool(seq: Array<{ type?: string }> | null 
   for (let i = items.length - 1; i >= 0; i--) {
     if (items[i] && items[i].type === 'tool_call') { lastTool = i; break }
   }
+  // P0 R2: superseded pre-tool drafts are already-shown evidence; keep them
+  // even when they sit after the last tool card (only the non-superseded
+  // rejected draft text is droppable).
   const kept = lastTool >= 0
-    ? items.filter((it, i) => i <= lastTool || it?.type !== 'text')
-    : items.filter(it => it?.type !== 'text')
+    ? items.filter((it, i) => i <= lastTool || it?.type !== 'text' || (it as { superseded?: boolean })?.superseded === true)
+    : items.filter(it => it?.type !== 'text' || (it as { superseded?: boolean })?.superseded === true)
   return { kept, changed: kept.length !== items.length }
 }
 
@@ -184,7 +208,7 @@ export function mergeReplayIntoSequence(
             if (sv !== undefined && sv !== null) liveItem[key] = sv
           }
         }
-        for (const key of ['status', 'title', 'error']) {
+        for (const key of ['status', 'title', 'error', 'superseded']) {
           if (liveItem[key] === undefined || liveItem[key] === null) {
             if (rp[key] !== undefined && rp[key] !== null) liveItem[key] = rp[key]
           }
@@ -196,8 +220,21 @@ export function mergeReplayIntoSequence(
     } else {
       // Legacy (no part_id) items cannot be keyed. Dedup by identity
       // anywhere in the result (tail-only dedup double-renders [A,B]+[A,B]).
-      const dup = out.some(it => !it.part_id && it.type === rp.type && it.content === rp.content)
-      if (dup) continue
+      // A persisted parked item has no part_id while the live item may have
+      // one (partMode); matching by (type, content) prevents the reconnect
+      // from rendering the same draft twice (review R2 Minor-5).
+      const dup = out.find(it => it.type === rp.type && (
+        rp.type === 'interjection'
+          ? (it as Record<string, unknown>).message_id === (rp as Record<string, unknown>).message_id
+          : it.content === rp.content
+      ))
+      if (dup) {
+        // The live item is created from SSE without the persisted flag; the
+        // replay snapshot carries it.  Merge instead of suppressing the
+        // snapshot item (review R1 Important-4).
+        if (rp.superseded === true && dup.superseded !== true) dup.superseded = true
+        continue
+      }
       out.push({ ...rp })
     }
   }

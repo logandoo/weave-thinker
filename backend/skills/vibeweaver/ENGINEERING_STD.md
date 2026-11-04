@@ -64,11 +64,11 @@ The following standards apply when building a project from scratch. When modifyi
 **Publishing Requirements:**
 1. Mount the frontend as static files in the backend. The FastAPI mount path is `/static`.
 2. Use the project's `.venv` as the virtual environment. Use `fastapi` CLI for running the server.
-3. Generate start, stop, restart, and project_build scripts in the `script/` directory. `project_build` must automatically mount the built frontend into the backend. Provide separate scripts for Linux/macOS (`script/linux/`) and Windows (`script/windows/`). See [APPENDIX.md §A6](APPENDIX.md#a6-script-templates-default-fastapi--react--vite--adapt-for-other-stacks) for templates.
-4. If the frontend uses History routing, configure a fallback route in FastAPI. See [APPENDIX.md §A3](APPENDIX.md#a3-fastapi-fallback-route--history-routing-fastapi-only).
+3. Generate start, stop, restart, and project_build scripts in the `script/` directory. `project_build` must automatically mount the built frontend into the backend. Provide separate scripts for Linux/macOS (`script/linux/`) and Windows (`script/windows/`). See [APPENDIX.md §A2](APPENDIX.md) for templates.
+4. If the frontend uses History routing, configure a fallback route in FastAPI. See [APPENDIX.md §A4.7.2](APPENDIX.md).
 
 **Configuration File Requirements:**
-1. All configuration should be stored in `config.toml`. See [APPENDIX.md §A5](APPENDIX.md#a5-configtoml-full-template-example--adapt-to-your-project) for a template.
+1. All configuration should be stored in `config.toml`. See [APPENDIX.md §A3](APPENDIX.md) for a template.
 2. Unless otherwise specified, use PostgreSQL.
 
 **Closing Work (New Projects Only):**
@@ -95,7 +95,7 @@ Every new dependency is permanent code you do not control.
 - Do not silently add transitive dependencies or convenience wrappers.
 - Prefer well-maintained, widely-used libraries with active community support.
 
-## §A7. Communication
+## §A8. Communication
 
 Describe what you did and why — do not just drop code.
 - Be precise about uncertainty: "I am not certain this endpoint supports
@@ -123,7 +123,7 @@ Describe what you did and why — do not just drop code.
 - If you pushed back and were wrong: state the correction factually ("I
   checked X — it does Y. Fixing.") and move on. No long apologies.
 
-## §A8. Common Failure Modes — Stop and Reassess
+## §A9. Common Failure Modes — Stop and Reassess
 
 Watch for these predictable mistakes. If you notice yourself doing any of
 them, STOP and reassess before continuing.
@@ -135,7 +135,7 @@ them, STOP and reassess before continuing.
 | **Optimistic Path**    | Only handling the happy path; ignoring bad input, network failure, missing data | Add explicit error handling and test the failure cases |
 | **Runaway Refactor**   | One change cascades into touching many unrelated files   | Pause, restore baseline, make the smallest surgical change that works |
 
-## §A9. Git Version Control
+## §A10. Git Version Control
 
 - Every major change gets a descriptive commit
 - Commit before starting work (baseline) and after each significant milestone
@@ -143,3 +143,99 @@ them, STOP and reassess before continuing.
 - Production deploys are human-confirmed: the agent prepares (build,
   changelog, rollback path); the user authorizes the production action —
   no autonomous deploy to production targets
+
+### §A10.1 Repository hygiene / VCS budget (COV-9 preflight · assert group 21)
+
+**Why this exists (2026-10-17/18 incident).** An old `git add -A` backup
+commit swept a pnpm store, Playwright browser cache, SQL dumps and a zip into
+history (~1.3 GiB). `.gitignore` was added afterwards and `git rm --cached`
+untracked the files, but the `.git` pack stayed **1.9 GiB / 85,302 objects**;
+`git log --all -- .pnpm-store` still reached ~45k paths. The gate then walked
+and scanned that tree on every write until it was disabled. **Untrack is not
+history cleanup; `.gitignore` is prevention, not a cure.**
+
+Run the preflight BEFORE the baseline commit (C2 Step 5) and before installing
+dependencies (C1 Step 1). `assert_artifacts.py` group 21 is the machine check;
+it runs in every class/profile and cannot be skipped.
+
+| Check | Warn | Hard fail |
+|---|---:|---:|
+| `.gitignore` present | — | missing |
+| tracked dependency/cache path (`node_modules`, `.pnpm-store`, `.venv`, `site-packages`, `__pycache__`, `.next`, `.nuxt`, `coverage`, Playwright caches) | — | any |
+| `.gitignore` covers the detected stack (`node_modules/`; `.pnpm-store/` when pnpm; `.venv/`/`venv/` when Python) | — | missing pattern when the manifest exists |
+| untracked, non-ignored files | > 500 | > 2,000 (fail; partial scans refused) |
+| `.git` size (`git count-objects -v`) | > 200 MiB | > 1 GiB |
+| largest reachable blob (preflight + `--final`, one boundary — G3 ratchet) | > 10 MiB (`held at baseline` WARN when committed-recorded) | > 40 MiB (ceiling on unrecorded debt) |
+| change-wave live paths (net deletions excluded — R3) | — | > 2,000 (split the wave) |
+
+**Existing debt does not block new work — the ratchet does (G3, W18).**
+`tests/debt_baseline.json` (written ONLY by `python3 tests/assert_artifacts.py
+--record-debt`) records today's measurements ONCE; afterwards the same check
+reports `held at baseline (reason)` as WARN while the number holds or shrinks,
+and FAILS the moment it GROWS (joeira/openchrome semantics: *debt may shrink
+or hold, never grow*). Unrecorded debt above the hard limit still fails —
+record it once, then only growth is a violation. `--record-debt` refuses NEW
+keys (that would launder new debt); the preflight and `--final` share ONE
+WARN/FAIL boundary (fail at entry, not at exit).
+
+**Remediation (index only — safe):**
+
+```bash
+# 1) write/extend .gitignore first (APPENDIX §A12), then:
+git rm -r --cached --ignore-unmatch node_modules .pnpm-store .venv dist build
+git add .gitignore && git commit -m "chore: untrack dependency/build caches"
+# 2) verify the index is clean:
+git ls-files | rg '(^|/)(node_modules|\.pnpm-store|\.venv|site-packages)/' || echo clean
+git count-objects -vH
+```
+
+**History rewrite (destructive — Class-E, user approval required).**
+W12 runbook gap that lost real data: an uncommitted `verification_log.md`
+edit was wiped by the tree reset, and every `memory/**/commit:` /
+review-package reference went stale when all hashes changed. The order below
+is mandatory — steps 1, 2 and 5 are the incident fixes.
+
+```bash
+# 0) USER APPROVAL first (Class-E). Record the decision in tests/decisions.md.
+# 1) CLEAN TREE — forced capture (a rewrite resets tracked files and drops
+#    every uncommitted change; this is the step that lost the W12 log edits).
+#    STOP until `git status --porcelain` is empty — untracked work counts:
+git status --porcelain
+git add -u                        # tracked modifications
+git add <explicit new paths>      # untracked work you keep — NAME them
+#   (or `git stash push -u` to keep the work out of the wave entirely;
+#    `git add -A` stays forbidden in a mixed workspace — the staging rule)
+git commit -m "chore: carry-over <previous wave> work before history rewrite"
+test -z "$(git status --porcelain)" || { echo "STOP: tree still dirty"; exit 1; }
+# 2) MIRROR BACKUP (keep it; log the path AND commit that log line — step 1's
+#    clean-tree rule applies to the log edit itself):
+git clone --mirror . ../<repo>-backup-$(date +%Y%m%d-%H%M).git
+#    capture the BEFORE measurements NOW (step 4 compares them AFTER):
+git count-objects -vH ; git cat-file --batch-all-objects --batch-check | sort -k3 -n | tail -3 ; git rev-list --count --all
+# 3) REWRITE — typical offender path set (add the wave's own offenders):
+git filter-repo --invert-paths --path .pnpm-store --path node_modules \
+  --path .venv --path playwright-cache --path '*.zip' --path '*.sql.gz' \
+  --path workspace/<vendor>/opencode.db
+# 4) VERIFY the surgery (对照 step 2 的 BEFORE 值记录 all three AFTER):
+git count-objects -vH                                   # .git size
+git cat-file --batch-all-objects --batch-check \
+  | sort -k3 -n | tail -3                               # largest blobs
+git rev-list --count --all                              # commit count
+# 5) HASH REMAP — every commit id changed; references are rewritten FROM
+#    .git/filter-repo/commit-map (copy, never retype a hash by hand; the
+#    file is space-separated "old new" pairs under an "old new" header):
+#      memory/**/commit:  ·  tests/verification_log.md  ·  review packages
+awk 'NR>1{print substr($1,1,12) " -> " substr($2,1,12)}' .git/filter-repo/commit-map
+# 6) POST-CLEANUP (git filter-branch checklist legacy):
+git for-each-ref --format='%(refname)' | grep refs/original && echo "LEFTOVER" || echo clean
+git reflog expire --expire=now --all && git gc --prune=now --aggressive
+# coordinate with every collaborator before force-pushing; keep the mirror.
+```
+
+Do not run this automatically. A history rewrite changes every commit hash;
+the user owns that decision. Record it in `tests/decisions.md` (Class-E) and
+verify `git rev-list --objects --all | rg '\.pnpm-store/'` is empty afterward.
+
+**Staging rule:** `git add -u && git add <explicit new paths>` only. Never
+`git add -A` / `git add .` in a mixed workspace. A pre-commit hook is useful
+but bypassable with `--no-verify`; the authoritative gate is group 21.

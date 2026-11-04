@@ -151,6 +151,17 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
 
     try:
         workspace_root = await _get_workspace_root(db, user)
+        override = str(kwargs.get("workspace_path") or "").strip()
+        if override:
+            candidate = Path(override).resolve()
+            try:
+                candidate.relative_to(Path(workspace_root).resolve())
+                workspace_root = str(candidate)
+            except ValueError:
+                return json.dumps(
+                    {"error": "任务工作区路径超出用户工作区，禁止导出"},
+                    ensure_ascii=False,
+                )
         export_dir = await _ensure_export_dir(workspace_root)
 
         if action == "export_note":

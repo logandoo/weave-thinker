@@ -97,6 +97,42 @@ _USER_STOP_NEG_RE = re.compile(
 # 插件自产提示必须剥离（守卫不得给自己发白名单）
 _PLUGIN_PROMPT_STRIP_RE = re.compile(r"^\[(stop-guard|loop-guard)\][^\n]*", re.MULTILINE)
 
+# Positive silent-stop exemptions (upstream stopAwaitingUser / read-only scope).
+_AWAITING_RE = re.compile(
+    r"(please\s+(confirm|choose|decide|let me know)|waiting\s+(on|for)\s+your|"
+    r"awaiting\s+your|should\s+i\s+(proceed|continue)|would\s+you\s+like|"
+    r"请(你)?确认|等你(确认|决定)|需要你(确认|决定)|是否继续|要我继续吗|待你确认)",
+    re.IGNORECASE,
+)
+_READONLY_RE = re.compile(
+    r"(仅(做|是|需|要)?(评估|审计|评审|分析|检查)|只读|不要修改|请勿修改|别改代码|"
+    r"read[- ]?only|\bonly\s+(evaluate|review|audit|analy[sz]e|inspect)\b|"
+    r"\b(review|audit|evaluation|analysis)\s+only\b|"
+    r"(do not|don'?t)\s+(modify|change|edit)\s+(any\s+|the\s+)?(code|implementation|source|files?))",
+    re.IGNORECASE,
+)
+_PROSE_WRITE_RE = re.compile(
+    r"\.(md|txt|rst|log|png|jpe?g|webm|wav|mp4|mp3|docx?|xlsx?|pptx?|pdf|odt|ods|odp|rtf|odg|epub|mht|csv|tsv|ya?ml)$",
+    re.IGNORECASE,
+)
+_PROSE_NAME_RE = re.compile(r"(^|/)(LICENSE|NOTICE|COPYING|README|CHANGELOG|AUTHORS)(\.[A-Za-z0-9]+)?$", re.IGNORECASE)
+_REPORT_PATH_RE = re.compile(
+    r"(^|/)(reports?|output|outputs|artifacts?|findings?|results?|summaries|summary|docs?)(/|$)",
+    re.IGNORECASE,
+)
+_CODE_WRITE_RE = re.compile(
+    r"\.(py|js|mjs|ts|tsx|jsx|go|rs|java|c|cc|cpp|h|hpp|rb|php|cs|kt|swift|m|scala|pl|sh|bash|ps1|vue|svelte|sql)$",
+    re.IGNORECASE,
+)
+_FINAL_RUN_PASS_RE = re.compile(
+    r"-[ \t]*final-run:[^\n]*--final[^\n]*pass=[1-9]\d*[ \t]*/[ \t]*fail=0(?![\d.])",
+    re.IGNORECASE,
+)
+_ASSERT_RUN_RE = re.compile(
+    r"-[ \t]*assert-run:[ \t]*assert_artifacts\.py:[ \t]*(?:all\s+[1-9]\d*\s+checks\s+pass|pass=[1-9]\d*/fail=0)",
+    re.IGNORECASE,
+)
+
 def _strip_quoted_spans(s: str) -> str:
     for re_ in _QUOTED_RES:
         s = re_.sub(" ", s)
@@ -175,6 +211,8 @@ def stop_guard_prompt(kind: str = "euphemism") -> str:
             'Your last turn ended with finish:"length" (output-limit truncation) — '
             "a truncated turn is NOT a completed task."
         )
+    elif kind == "silent-stop":
+        what = "This is a silent stop after a non-evidence task write without a trusted final verification run."
     else:
         what = "Your last message declared context exhaustion and stopped mid-task."
     return (
@@ -206,6 +244,7 @@ def _session_state(conv_id: str) -> Dict[str, Any]:
             "armed": True,
             "disarmed_key": "",
             "first_seen": time.time(),  # 会话作用域白名单锚（本进程首见时刻）
+            "writes": [],  # 本 run 的非证据写入（positive silent-stop 腿）
         }
         _SESSIONS[conv_id] = st
     return st
@@ -221,7 +260,27 @@ def touch_session(conv_id: str) -> None:
     在**本会话任何写入之前**建立——否则本回合写入的 paused_state/Class-E 会因
     mtime < first_seen 而被排除，恰是白名单存在的场景（评审 B-C1）。"""
     if conv_id:
-        _session_state(conv_id)
+        st = _session_state(conv_id)
+        st["writes"] = []  # run 边界：上一 run 的非证据写入不得触发本 run silent-stop
+
+
+def note_task_write(conv_id: str, rel_path: str) -> None:
+    """记录本 run 的非证据、非 prose/report 写入；tests/test/memory 只算修复路径。"""
+    normalized = str(rel_path or "").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.lstrip("/")
+    if not normalized or normalized.split("/", 1)[0].lower() in ("tests", "test", "memory"):
+        return
+    if _PROSE_WRITE_RE.search(normalized) or _PROSE_NAME_RE.search(normalized):
+        return
+    if _REPORT_PATH_RE.search(normalized) and not _CODE_WRITE_RE.search(normalized):
+        return
+    st = _session_state(conv_id or "unknown")
+    writes = st.setdefault("writes", [])
+    if normalized not in writes:
+        writes.append(normalized)
+        del writes[:-50]
 
 
 def _mtime(path: Path) -> float:
@@ -239,10 +298,16 @@ def _read(path: Path) -> str:
 
 
 def current_log_block(log_text: str) -> str:
-    """当前任务块（最后 `## ` 块；与 B12 同一分割）。"""
+    """Current task block, not merely the last heading (see audit service)."""
     if not log_text or not isinstance(log_text, str):
         return ""
-    parts = re.split(r"^(?=## )", log_text, flags=re.MULTILINE)
+    parts = [p for p in re.split(r"^(?=## )", log_text, flags=re.MULTILINE) if p.strip()]
+    marker = re.compile(
+        r"(?m)^- (?:iter \d+ (?:PASS|FAIL)|final-run:|assert-run:)|\[Verification Gate\]"
+    )
+    for part in reversed(parts):
+        if marker.search(part):
+            return part
     return parts[-1] if parts else log_text
 
 
@@ -282,8 +347,6 @@ async def _stop_guard_hook(ctx: hook_service.StopContext) -> Optional[hook_servi
             return None
         a_tail = (ctx.assistant_content or "")[-_TAIL_SCAN:]
         trigger = stop_euphemism(a_tail)
-        if trigger is None:
-            return None  # 无 finish 遥测 → truncation 腿不可得（宿主差异，文档化）
         st = _session_state(key or "unknown")
         arm_key = hashlib.sha1(a_tail[-256:].encode("utf-8", "replace")).hexdigest()[:16]
         if st["disarmed_key"] and arm_key != st["disarmed_key"]:
@@ -297,18 +360,28 @@ async def _stop_guard_hook(ctx: hook_service.StopContext) -> Optional[hook_servi
             and "class-e" in _read(decisions_path).lower()
         )
         gate_marker = "[Verification Gate]" in a_tail
-        tail_question = bool(re.search(r"[?？]\s*$", a_tail.strip()))
+        awaiting_user = bool(_AWAITING_RE.search(a_tail))
+        tail_question = awaiting_user or bool(re.search(r"[?？]\s*$", a_tail.strip()))
         user_text = _PLUGIN_PROMPT_STRIP_RE.sub("", ctx.last_user_text or "")
+        readonly_scope = bool(_READONLY_RE.search(user_text))
         user_stop = bool(_USER_STOP_RE.search(user_text)) and not bool(
             _USER_STOP_NEG_RE.search(user_text)
         )
         block = current_log_block(_read(root / "tests" / "verification_log.md"))
-        wave_complete = bool(re.search(r"-[ \t]*final-run:[ \t]*--final\b", block, re.IGNORECASE))
+        gate_marker = gate_marker or "[Verification Gate]" in block
+        wave_complete = bool(_FINAL_RUN_PASS_RE.search(block)) and bool(_ASSERT_RUN_RE.search(block))
         task_active = (
             (root / "tests" / "acceptance.md").exists()
             and bool(ctx.had_tool_calls)
             and not wave_complete
         )
+        if trigger is None and task_active and not gate_marker and not readonly_scope and not awaiting_user:
+            is_doc = bool(re.search(r"-[ \t]*class:[ \t]*DOC\b", block, re.IGNORECASE))
+            forged_doc_code = is_doc and any(_CODE_WRITE_RE.search(w) for w in (st.get("writes") or []))
+            if st.get("writes") and (not is_doc or forged_doc_code):
+                trigger = {"kind": "silent-stop", "match": "non-evidence code write without trusted final-run"}
+        if trigger is None:
+            return None  # 无 finish 遥测 → truncation 腿不可得（宿主差异，文档化）
         decision = stop_guard_decision(
             trigger=trigger,
             task_active=task_active,
@@ -359,6 +432,32 @@ async def _stop_guard_hook(ctx: hook_service.StopContext) -> Optional[hook_servi
         return None  # fail-open：守卫绝不掀翻收尾
 
 
+async def _stop_guard_tool_after(ctx: hook_service.ToolHookContext) -> Optional[hook_service.HookDecision]:
+    """只观察成功的 write/edit，供 positive silent-stop 判定；不改变工具结果。"""
+    if not ctx.vibeweaver_active or ctx.is_error or ctx.tool_name not in ("workspace_write", "workspace_edit"):
+        return None
+    from app.services.vibeweaver_gate_service import resolve_session_root
+
+    key = ctx.conversation_id or ctx.session_id or ""
+    file_path = (ctx.args or {}).get("file_path") or (ctx.args or {}).get("path")
+    root = resolve_session_root(
+        ctx.workspace_path, key, starts=[file_path], prefer_hints=True
+    )
+    if root is None:
+        return None
+    if not file_path:
+        return None
+    try:
+        candidate = Path(file_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        rel = candidate.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, ValueError):
+        return None
+    note_task_write(key, rel)
+    return None
+
+
 def install_hooks() -> Dict[str, Any]:
     """注册 stop-guard stop 钩子（gate/audit 之后 = when-would-allow 语义）。"""
     summary = {"stop_guard_hooks": 0}
@@ -372,6 +471,8 @@ def install_hooks() -> Dict[str, Any]:
     except Exception:
         return summary
     hook_service.register_stop_hook(_stop_guard_hook, name="vibeweaver_stop_guard")
+    hook_service.register_tool_hook("after", _stop_guard_tool_after, name="vibeweaver_stop_guard_writes")
     summary["stop_guard_hooks"] = 1
+    summary["stop_guard_tool_hooks"] = 1
     logger.info("vibeweaver stop-guard hook installed")
     return summary

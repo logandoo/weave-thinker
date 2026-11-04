@@ -34,6 +34,7 @@ _CLASSIFIER_TASKS = {
     "error_classify", "triviality", "interest_extract", "skill_assess",
     "identity_facts", "citation_disambiguate", "schedule_parse",
     "creative_goal", "completion_reconcile", "title_fallback",
+    "memory_semantic_guard",
 }
 
 _TASK_PURPOSE = {

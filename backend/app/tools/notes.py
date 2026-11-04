@@ -17,6 +17,60 @@ config = get_config()
 _NOTE_CITE_RE = re.compile(r"\[\d{1,3}\]")
 
 
+async def _record_note_taint(db, user, note_id: str, kwargs: dict) -> None:
+    """Record the note's derivation taint at write time (P1d)."""
+    try:
+        from app.services import taint_service
+        if not taint_service.provenance_enabled():
+            return
+        cid = str(getattr(kwargs.get("conversation"), "id", "") or "")
+        ledger = await taint_service.load_ledger(db, cid, str(user.id)) if cid else None
+        if not ledger or not getattr(ledger, "loaded", False):
+            # Unknown/unreadable conversation taint must not produce an
+            # agent-level carrier.
+            note_taint = taint_service.TAINT_UNTRUSTED
+            origin = "untrusted_external"
+        else:
+            note_taint = taint_service.max_taint(
+                ledger.max_taint, taint_service.TAINT_AGENT,
+            )
+            origin = (
+                "untrusted_external"
+                if note_taint == taint_service.TAINT_UNTRUSTED else "agent"
+            )
+        from app.services.tenant_service import tenant_segment
+        await taint_service.record_artifact_taint(
+            db, str(user.id), "note", str(note_id), note_taint,
+            origin=origin, parent_ids=[cid] if cid else [],
+            tenant_id=tenant_segment(),
+        )
+    except Exception:
+        logger.warning("note provenance record failed", exc_info=True)
+
+
+async def _annotate_notes(db, user, notes: list[dict]) -> list[dict]:
+    from app.services import taint_service
+    if not taint_service.provenance_enabled():
+        return notes
+    try:
+        taints = await taint_service.get_artifact_taints(
+            db, str(user.id), "note", [str(n.get("id")) for n in notes],
+        )
+    except Exception:
+        logger.warning("note provenance read failed", exc_info=True)
+        taints = {}
+    for note in notes:
+        meta = taints.get(str(note.get("id"))) or {
+            "taint": taint_service.TAINT_UNTRUSTED,
+            "origin": "legacy_untrusted",
+            "parent_ids": [],
+        }
+        note["taint"] = meta["taint"]
+        note["origin"] = meta["origin"]
+        note["parent_ids"] = meta["parent_ids"]
+    return notes
+
+
 def _maybe_render_note_citations(content: str, kwargs: dict) -> str:
     """agent 写入笔记前内建引用渲染（已知限制 #1 修复，2026-09-27 用户裁定）。
 
@@ -257,6 +311,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
                     return _notebook_not_found_payload(notebook_id, notebooks)
                 notebook_id = nb["id"]
             notes = await _get_notebook_notes(db, notebook_id, user.id)
+            notes = await _annotate_notes(db, user, notes)
             return json.dumps({"notes": notes, "count": len(notes), "notebook_id": notebook_id}, ensure_ascii=False)
 
         if action == "get_note":
@@ -266,6 +321,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
             note = await _get_note_by_id(db, note_id, user.id)
             if not note:
                 return json.dumps({"error": f"Note '{note_id}' not found"}, ensure_ascii=False)
+            await _annotate_notes(db, user, [note])
             return json.dumps(note, ensure_ascii=False)
 
         if action == "create_notebook":
@@ -341,6 +397,12 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
                 return _notebook_not_found_payload(notebook_id, notebooks)
             name = nb_obj.name
             await db.delete(nb_obj)
+            from sqlalchemy import text as _text
+            await db.execute(_text(
+                "DELETE FROM artifact_taint WHERE user_id = :uid "
+                "AND artifact_type = 'note' AND artifact_id IN "
+                "(SELECT id FROM notes WHERE notebook_id = :nid)"
+            ), {"uid": user.id, "nid": nb["id"]})
             await db.commit()
             return json.dumps(
                 {
@@ -372,6 +434,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
             db.add(note)
             await db.commit()
             await db.refresh(note)
+            await _record_note_taint(db, user, note.id, kwargs)
             return json.dumps(
                 {
                     "success": True,
@@ -409,6 +472,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
                 note.updated_at = datetime.utcnow()
             await db.commit()
             await db.refresh(note)
+            await _record_note_taint(db, user, note.id, kwargs)
             return json.dumps(
                 {
                     "success": True,
@@ -438,6 +502,7 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
             note.content = _append_note_content(note.content, addition)
             await db.commit()
             await db.refresh(note)
+            await _record_note_taint(db, user, note.id, kwargs)
             return json.dumps(
                 {
                     "success": True,
@@ -464,6 +529,11 @@ async def notes_tool(args: Dict[str, Any], **kwargs) -> str:
                 return json.dumps({"error": f"Note '{note_id}' not found"}, ensure_ascii=False)
             title = note.title or "无标题"
             await db.delete(note)
+            from sqlalchemy import text as _text
+            await db.execute(_text(
+                "DELETE FROM artifact_taint WHERE user_id = :uid "
+                "AND artifact_type = 'note' AND artifact_id = :aid"
+            ), {"uid": user.id, "aid": note_id})
             await db.commit()
             return json.dumps(
                 {"success": True, "id": note_id, "message": f"已删除笔记《{title}》"},

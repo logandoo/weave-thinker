@@ -308,16 +308,27 @@
 }
 
 /* Collapsed groups during drag: show as droppable targets with min-height */
+/* W26：折叠组保持 0fr 折叠，仅呈现固定高度放置条；悬停 300ms 的目标组由
+   dragExpandedGroupId 机制单独展开（Sidebar.vue 移除该组的折叠类）。
+   旧规则 grid-template-rows:1fr 会把每个折叠组的全部 session 渲染出来：
+   列表爆炸、目标组被挤出可视区，且经 ResizeObserver 触发重建风暴。 */
 .sidebar-dragging .group-convs-collapsed {
-  grid-template-rows: 1fr !important;
   opacity: 1 !important;
   overflow: hidden !important;
   padding: 0 !important;
-  min-height: 40px !important;
+  min-height: 44px !important;
   border: 2px dashed var(--color-primary) !important;
   border-radius: var(--radius-sm) !important;
   margin: 4px 0 !important;
   background-color: color-mix(in srgb, var(--color-primary) 5%, transparent) !important;
+}
+
+/* 内层拖拽列表须有真实可视高度（grid 0fr 行钳制下靠 min-height 撑出
+   44px 命中区），超出的 session 行由容器 overflow:hidden 裁剪。
+   注意选择器优先级：必须 > .sidebar-dragging .group-conv-drag-list（24px
+   旧规，同权重且位置靠后会覆盖），故用子代组合器加一级 class。 */
+.sidebar-dragging .group-convs-collapsed > .sortable-list {
+  min-height: 44px !important;
 }
 
 .sidebar-dragging .group-conv-drag-list {

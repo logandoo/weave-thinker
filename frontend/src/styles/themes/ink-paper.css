@@ -1963,3 +1963,76 @@ html[data-skin="ink-paper"][data-theme="dark"] .np-swipe-action.delete { backgro
   html[data-skin="ink-paper"] .export-confirm-btn { border-radius: 3px; }
 }
 
+
+/* 笔记工具栏按钮尺寸统一（判据 #1，2026-10-25 笔记波）：与组件 scoped 基线同值
+   36×36 方盒（border-box + 内容居中）。本波前各按钮按内容撑尺寸（实测同栏
+   44x35 / 36x30 / 43x30 三档）；皮肤只保留各自的边框/圆角/配色。
+   作用域限定 .editor-toolbar / .zen-note-toolbar，聊天输入栏 .toolbar-btn 不受影响。 */
+html[data-skin="ink-paper"] .editor-toolbar .toolbar-btn,
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-btn {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  border: 1px solid var(--skin-line-soft);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text);
+  transition: background-color .16s ease, border-color .16s ease, color .16s ease;
+}
+html[data-skin="ink-paper"] .editor-toolbar .toolbar-primary-btn,
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-primary-btn {
+  width: 60px;
+  min-width: 60px;
+  padding: 0;
+  gap: 5px;
+  justify-content: center;
+}
+html[data-skin="ink-paper"] .editor-toolbar .toolbar-primary-label,
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-primary-label {
+  font-size: 12px;
+  font-weight: 500;
+}
+html[data-skin="ink-paper"] .editor-toolbar .toolbar-btn:hover,
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-btn:hover {
+  background: var(--color-hover);
+  border-color: var(--skin-line);
+  color: var(--color-text);
+}
+html[data-skin="ink-paper"] .editor-toolbar .toolbar-btn.active,
+html[data-skin="ink-paper"] .zen-note-toolbar .toolbar-btn.active {
+  background: rgba(178, 59, 46, .08);
+  border-color: rgba(178, 59, 46, .45);
+  color: var(--color-primary);
+}
+/* 二级面板：纸面、4px 直角、细墨线 */
+html[data-skin="ink-paper"] .note-toolbar-panel {
+  border: 1px solid var(--skin-line);
+  border-radius: 6px;
+  background: var(--surface-panel-strong);
+  box-shadow: 0 14px 30px rgba(42, 37, 33, .12);
+}
+html[data-skin="ink-paper"] .note-toolbar-panel-head {
+  background: var(--surface-panel-subtle);
+  border-bottom-color: var(--skin-line-soft);
+}
+html[data-skin="ink-paper"] .note-toolbar-menu-item { border-radius: 3px; }
+html[data-skin="ink-paper"] .note-toolbar-menu-item:hover { background: var(--color-hover); }
+html[data-skin="ink-paper"] .note-toolbar-menu-item.active { background: var(--color-hover); color: var(--color-text); font-weight: 600; }
+html[data-skin="ink-paper"] .note-toolbar-menu-item:focus-visible { outline-color: var(--color-primary); }
+html[data-skin="ink-paper"] .note-toolbar-table-cell { border-radius: 2px; }
+html[data-skin="ink-paper"] .note-toolbar-table-cell.active { background: var(--color-primary); border-color: var(--color-primary); }
+html[data-skin="ink-paper"] .note-toolbar-group-label { color: var(--color-text-light); }
+
+html[data-skin="ink-paper"] .toc-panel { border-radius: 6px; }
+html[data-skin="ink-paper"] .toc-header { background: var(--surface-panel-subtle); }
+html[data-skin="ink-paper"] .toc-item { border-radius: 3px; }
+
+/* 深色纸面：浅色的 0.12 阴影不可见，改用深投影 */
+html[data-skin="ink-paper"][data-theme="dark"] .note-toolbar-panel {
+  box-shadow: 0 16px 34px rgba(0, 0, 0, .55);
+}

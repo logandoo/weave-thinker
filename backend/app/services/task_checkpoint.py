@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Tuple
 
 from app.services.durable_types import CHECKPOINT_VERSION
 
-_KEEP_MSG_FIELDS = ("role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content")
+_KEEP_MSG_FIELDS = ("role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content", "_interjection")
 
 
 def _slim_message(m: Dict[str, Any]) -> Dict[str, Any]:

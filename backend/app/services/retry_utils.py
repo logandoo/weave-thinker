@@ -232,6 +232,42 @@ def decide_tool_dispatch(
     return args, error
 
 
+def _batch_dedup_signature(tool_name: str, args: Optional[dict]) -> Optional[tuple]:
+    """Canonical signature for same-round duplicate detection.
+
+    Scope is deliberately narrow (P0): duplicate ``web_search`` calls with the
+    same query SET + time_sensitive flag, and duplicate ``memory(read)``
+    targets.  Write actions and every other tool are untouched.  This is a
+    structural comparison, not semantic dedup (D-13/D-936).
+    """
+    if not isinstance(args, dict):
+        return None
+    name = str(tool_name or "")
+    if name == "web_search":
+        raw = args.get("queries")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return None
+        queries = tuple(sorted({
+            str(q).strip().casefold() for q in raw if str(q).strip()
+        }))
+        if not queries:
+            return None
+        return ("web_search", queries, bool(args.get("time_sensitive", False)))
+    if name == "memory" and str(args.get("action") or "read").lower() == "read":
+        # Respect the per-turn dedup kill switch.  Import lazily: retry_utils
+        # is also imported by offline scripts without a loaded config.
+        try:
+            from app.core.config import get_config
+            if not get_config().agent_tool_loop_memory_read_dedup:
+                return None
+        except Exception:
+            pass
+        return ("memory", "read", str(args.get("target") or "agent").lower())
+    return None
+
+
 def plan_tool_calls_for_round(
     tool_calls: List[dict],
 ) -> Tuple[Dict[str, Tuple[Optional[dict], Optional[str]]], List[dict]]:
@@ -254,11 +290,30 @@ def plan_tool_calls_for_round(
     """
     plan: Dict[str, Tuple[Optional[dict], Optional[str]]] = {}
     safe_calls: List[dict] = []
+    seen_dedup: set[tuple] = set()
     for tc in tool_calls:
         fn = tc.get("function", {}) if isinstance(tc, dict) else {}
         raw = fn.get("arguments") if isinstance(fn, dict) else None
         args, error = plan_tool_call_for_dispatch(tc)
-        plan[tc.get("id", "") if isinstance(tc, dict) else ""] = (args, error)
+        call_id = tc.get("id", "") if isinstance(tc, dict) else ""
+        duplicate_note: Optional[str] = None
+        if error is None and isinstance(args, dict):
+            sig = _batch_dedup_signature(fn.get("name", ""), args)
+            if sig is not None:
+                if sig in seen_dedup:
+                    duplicate_note = json.dumps({
+                        "duplicate_call": True,
+                        "note": (
+                            "同一轮已计划过一次相同调用（web_search 查询集合 / "
+                            "memory read 目标相同），本次不重复执行；请使用已有结果继续。"
+                        ),
+                    }, ensure_ascii=False)
+                else:
+                    seen_dedup.add(sig)
+        if duplicate_note is not None:
+            plan[call_id] = (None, duplicate_note)
+        else:
+            plan[call_id] = (args, error)
         if error is not None or not isinstance(raw, str):
             safe_args = "{}"
         else:

@@ -1,0 +1,13 @@
+# Copyright (c) 2026 Weave Thinker Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Optional developer/CI dependencies (C-14, 2026-10-18).
+#
+# Production deliberately does NOT require these: token estimates fall back to
+# the deterministic CJK-aware estimator, and the authoritative token count is
+# always the provider's `usage.prompt_tokens`.
+#
+# Reproducible exact-token path:
+#   python -m pip install -r backend/requirements-dev.txt
+#   ./scripts/prompt_tokenizer.sh          # PROMPT_TOKENIZER=tiktoken + audit
+tiktoken>=0.7,<1

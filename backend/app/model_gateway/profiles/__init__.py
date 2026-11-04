@@ -43,9 +43,11 @@ def get_thinking_profile(provider_type: str) -> ThinkingProfile:
 
 def sniff_thinking_profile(base_url: str, model_name: str) -> ThinkingProfile:
     url = (base_url or "").lower()
+    _model = (model_name or "").lower()
     if "dashscope" in url or "aliyuncs" in url:
         return _PROFILES["qwen"]
-    _model = (model_name or "").lower()
+    if "deepseek" in url or "deepseek" in _model:
+        return _PROFILES["deepseek"]
     if "qwen" in _model:
         return _PROFILES["qwen3.8_vllm"]
     return _CUSTOM_COMPAT

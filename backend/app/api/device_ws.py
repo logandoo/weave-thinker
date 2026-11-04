@@ -59,6 +59,17 @@ async def device_exec_ws(
             code=status.WS_1008_POLICY_VIOLATION, reason="device binding changed"
         )
         return
+    # Only after the second ownership/revocation check: disclose the current
+    # session-scoped grant key over this authenticated TLS channel.
+    await websocket.send_json({
+        "type": "session_ready",
+        "grant": {
+            "version": 1,
+            "algorithm": "HMAC-SHA256",
+            "pairing_secret": session.pairing_secret,  # vw-approved: protocol field; random value, no literal credential
+            "canonical_args": "JSON(sort_keys, separators=(',', ':'), ensure_ascii, allow_nan=false)",
+        },
+    })
     try:
         while True:
             msg = await websocket.receive_json()

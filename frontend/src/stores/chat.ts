@@ -8,17 +8,26 @@ import type {
   SearchProgress, SearchFailed, AgentStep, SubAgentThinking,
   FileAttachment, TaskProgress,
   ToolCallEvent, ToolResultEvent, IterationEvent,
-  DisplaySequenceItem, DeathmatchVerdict,
+  DisplaySequenceItem, DeathmatchVerdict, DeathmatchPlanStep,
   PartStartedEvent, PartDeltaEvent, PartUpdatedEvent,
   ContextInfo, ModelAlias,
 } from '@/types'
+import type { AgentTaskActiveInfo } from '@/types'
+import { agentTaskApi } from '@/api/agentTasks'
 import { chatApi, isExternalizedStub } from '@/api/chat'
 import { transientHintFor } from '@/api/streamDispatch'
 import { modelsApi } from '@/api/models'
+import { getUiPreferences } from '@/api/skins'
+import { clientDevicesApi } from '@/api/clientDevices'
+import { useToast } from '@/composables/useToast'
+import { advanceExecutionTargetVersion, isExecutionTargetVersionCurrent, resolveExecutionTarget } from '@/utils/executionTarget'
 import { useAssistantStore } from '@/stores/assistant'
 import { useNotesStore } from '@/stores/notes'
-import { mergeReplayIntoSequence, pickStreamText, shouldApplyRefresh, dropDraftTextAfterLastTool, keepLongerDisplayed, caughtUpAfterAnchor, recoveryCaughtUp, trimWindowAfterFullFetch, isSyntheticMessageId, type TurnAnchor } from '@/stores/streamReducer'
+import { mergeReplayIntoSequence, pickStreamText, shouldApplyRefresh, dropDraftTextAfterLastTool, keepLongerDisplayed, caughtUpAfterAnchor, recoveryCaughtUp, trimWindowAfterFullFetch, isSyntheticMessageId, markPreToolDrafts, type TurnAnchor } from '@/stores/streamReducer'
 import { abortPredecessor, isNoneReplayTransient } from '@/stores/streamConnection'
+import { shouldApplyPollVerdict } from '@/stores/deathmatchPollGuard'
+import { pairInterjectionEcho } from '@/stores/interjectionPairing'
+import { applyLiveInterjection, mergeInterjectionItems } from '@/stores/interjectionDisplay'
 import { compareConversationsBySidebarOrder, reconcilePendingPromotions, rollbackPendingPromotion, serverCaughtUp, serverLastUserMessageMs } from '@/stores/conversationOrder'
 import type { PendingPromotion } from '@/stores/conversationOrder'
 import { estimateTextTokens } from '@/composables/useContextTokens'
@@ -40,10 +49,16 @@ interface StreamState {
   toolResults: ToolResultEvent[]
   iteration: IterationEvent | null
   displaySequence: DisplaySequenceItem[]
+  /** 2026-11-01: in-flight assistant row id (from the replay snapshot). Used to
+   *  hide a committed interjection user row while its parent is still streaming
+   *  (the parent is excluded from GET /messages until final). */
+  streamingRowId: string | null
   /** F1-1: true once the first part.* event arrives — the timeline is then
    *  driven by part_id reducer instead of legacy positional heuristics. */
   partMode: boolean
   deathmatchVerdict: DeathmatchVerdict | null
+  /** Intent generation owned by the currently attached run, not by a later resume. */
+  deathmatchIntentAtRun: number | null
   streaming: boolean
   abortController: AbortController | null
   tabSwitchAbort: boolean
@@ -76,8 +91,10 @@ function createStreamState(): StreamState {
     toolResults: [],
     iteration: null,
     displaySequence: [],
+    streamingRowId: null,
     partMode: false,
     deathmatchVerdict: null,
+    deathmatchIntentAtRun: null,
     streaming: false,
     abortController: null,
     transientReason: null,
@@ -107,6 +124,17 @@ function filterBlankPersistedMessages(list: Message[] | undefined | null): Messa
   return list.filter(m => !isBlankPersistedMessage(m))
 }
 
+// R4（诊断机制 C）：plan → 前端清单映射（单源；轮询/播种两路共用，
+// 带上 R2 的 stuck 可见卡住标记）。
+function mapPlanSteps(plan: any): DeathmatchPlanStep[] {
+  return (plan?.steps || []).map((step: any) => ({
+    id: step.id || '',
+    description: step.description || '',
+    status: step.status || 'pending',
+    stuck: !!step.stuck,
+  }))
+}
+
 export const useChatStore = defineStore('chat', () => {
   const conversations = ref<Conversation[]>([])
   const currentConversationId = ref<string | null>(null)
@@ -129,7 +157,7 @@ export const useChatStore = defineStore('chat', () => {
   // 由 run 自己作答；false 表示仍躺在队列里，终态冲刷时兜底重发。两类都只活在
   // 这个队列里，不再作为乐观气泡写进 messages —— 显示位次因此恒为「回答最下方
   // 的队列区」而不是流式回答之上的消息气泡（需求 4①）。
-  const pendingInterjections: Record<string, Array<{ localId: string; content: string; committed?: boolean; assistantId?: string | null }>> = reactive({})
+  const pendingInterjections: Record<string, Array<{ localId: string; content: string; committed?: boolean; assistantId?: string | null; clientMessageId?: string }>> = reactive({})
   const interjectionRestoreText = ref('')
   // 本轮 run 的起始边界（turn 发起前最后一条服务器消息 id）：commit-dedup
   // 闸门只扫边界之后的消息（A4.9 R2 B1）。仅 sendMessage 发起新 turn 时设置；
@@ -298,23 +326,266 @@ export const useChatStore = defineStore('chat', () => {
   }
   const deathmatchMode = ref(false)
   const deathmatchAction = ref<string | null>(null)
+  // Wave 2: active separate_v1 task owning the selected C2 (§7.1). While set,
+  // the composer sends steer instructions instead of starting a chat stream.
+  const activeSteerTask = ref<AgentTaskActiveInfo | null>(null)
+  let _activeSteerSeq = 0
+  async function refreshActiveSteerTask(conversationId: string | null = currentConversationId.value) {
+    const requested = conversationId
+    const seq = ++_activeSteerSeq
+    if (!requested) {
+      if (seq === _activeSteerSeq) activeSteerTask.value = null
+      return null
+    }
+    try {
+      const result = await agentTaskApi.getActiveTask(requested)
+      // A slow response for X must never overwrite state after switching to Y.
+      if (seq !== _activeSteerSeq || currentConversationId.value !== requested) {
+        return activeSteerTask.value
+      }
+      activeSteerTask.value = result
+      return result
+    } catch {
+      if (seq === _activeSteerSeq && currentConversationId.value === requested) {
+        activeSteerTask.value = null
+      }
+      return null
+    }
+  }
+  async function steerActiveTask(content: string): Promise<boolean> {
+    const task = activeSteerTask.value
+    if (!task) return false
+    if (task.execution_conversation_id
+        && task.execution_conversation_id !== currentConversationId.value) {
+      activeSteerTask.value = null
+      return false
+    }
+    try {
+      await agentTaskApi.steerTask(task.task_id, content)
+      await refreshActiveSteerTask()
+      return true
+    } catch (error) {
+      // 409 = task reached a terminal state between read and send; revert to
+      // the normal composer so the user's message is not silently swallowed.
+      console.warn('steerActiveTask failed; reverting to normal composer', error)
+      await refreshActiveSteerTask()
+      return false
+    }
+  }
   // W16 设备执行模式：当前会话执行环境（null=云端；device:<id>=客户端设备）。
   // set-once（D-6）：随会话切换同步；发送时随 ChatRequest 透传（首设 adopt）。
   const executionTarget = ref<string | null>(null)
+  // Distinguish an explicit user choice from a value restored from a row.
+  const executionTargetUserSelected = ref(false)
+  const _executionTargetVersions: Record<string, number> = {}
+  const _selectConversationSeqs: Record<string, number> = {}
   // A4.9 I-10：定向发送/编辑/重生成必须按目标会话派生，禁止全局 ref 跨会话泄漏
-  function resolveExecTargetFor(convId: string | null | undefined): string | null {
-    if (!convId) return executionTarget.value
-    const meta = conversationMeta.value[convId]
-    if (meta && meta.execution_target !== undefined) return meta.execution_target ?? null
-    return convId === currentConversationId.value ? executionTarget.value : null
+  function resolveExecTargetFor(
+    convId: string | null | undefined,
+    hasMessages?: boolean,
+  ): string | null {
+    const meta = convId ? conversationMeta.value[convId] : null
+    return resolveExecutionTarget({
+      conversationId: convId,
+      currentConversationId: currentConversationId.value,
+      storeTarget: executionTarget.value,
+      metaTarget: meta?.execution_target,
+      hasMessages: hasMessages ?? !!(convId && messages.value[convId]?.length),
+    })
   }
   // W18 G4：活跃会话的设备 id（workspace 面/预览/内联图 URL 派生用）
   const activeDeviceId = computed(() => {
-    const t = executionTarget.value
+    const t = resolveExecTargetFor(currentConversationId.value)
     return t && t.startsWith('device:') ? t.slice('device:'.length) : null
   })
   const grillingQuestions = ref<GrillingQuestion[]>([])
   const grillingAnswers = ref<Record<string, string>>({})
+  // A user's OFF decision is conversation-scoped and must outlive late SSE,
+  // polling, and select-away/select-back cycles. It is cleared only after the
+  // stop request is accepted or the user explicitly re-enables the mode.
+  const _PENDING_DEATHMATCH_LEGACY_KEY = 'chatllm_deathmatch_pending_stops_v1'
+  const _PENDING_DEATHMATCH_KEY_PREFIX = `${_PENDING_DEATHMATCH_LEGACY_KEY}:`
+  const _PENDING_DEATHMATCH_SESSION_PREFIX = `${_PENDING_DEATHMATCH_LEGACY_KEY}:session:`
+  interface DeathmatchStopRecord { s: 0 | 1; t: number; r: string }
+  const _pendingDeathmatchStops = new Set<string>()
+  const _volatileDeathmatchStopRecords = new Map<string, DeathmatchStopRecord>()
+  function _pendingStopKey(conversationId: string) {
+    return _PENDING_DEATHMATCH_KEY_PREFIX + conversationId
+  }
+  function _pendingStopSessionKey(conversationId: string) {
+    return _PENDING_DEATHMATCH_SESSION_PREFIX + conversationId
+  }
+  function _newDeathmatchStopRecord(pending: boolean): DeathmatchStopRecord {
+    return { s: pending ? 1 : 0, t: Date.now(), r: Math.random().toString(36).slice(2, 12) }
+  }
+  function _parseDeathmatchStopRecord(raw: string | null): DeathmatchStopRecord | null {
+    if (raw === '1') return { s: 1, t: 0, r: '' }
+    if (raw === '0') return { s: 0, t: 0, r: '' }
+    if (!raw) return null
+    try {
+      const value = JSON.parse(raw)
+      if ((value?.s === 0 || value?.s === 1) && Number.isFinite(value.t) && typeof value.r === 'string') {
+        return { s: value.s, t: value.t, r: value.r }
+      }
+    } catch {}
+    return null
+  }
+  function _isNewerDeathmatchStopRecord(candidate: DeathmatchStopRecord, incumbent: DeathmatchStopRecord) {
+    return candidate.t > incumbent.t || (candidate.t === incumbent.t && candidate.r > incumbent.r)
+  }
+  function _readPendingDeathmatchStops(): Set<string> {
+    const winners = new Map<string, DeathmatchStopRecord>()
+    const offer = (id: string, record: DeathmatchStopRecord | null) => {
+      if (!id || !record) return
+      const incumbent = winners.get(id)
+      if (!incumbent || _isNewerDeathmatchStopRecord(record, incumbent)) winners.set(id, record)
+    }
+    try {
+      const legacy = localStorage.getItem(_PENDING_DEATHMATCH_LEGACY_KEY)
+      const raw = legacy ? JSON.parse(legacy) : []
+      if (Array.isArray(raw)) {
+        // Legacy IDs are only a t=0 baseline. A newer acknowledged/cleared
+        // record always wins, so no migration or cleanup can resurrect them.
+        for (const id of raw.filter(x => typeof x === 'string')) offer(id, { s: 1, t: 0, r: '' })
+      }
+    } catch {}
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i) || ''
+        if (key.startsWith(_PENDING_DEATHMATCH_KEY_PREFIX) && key.length > _PENDING_DEATHMATCH_KEY_PREFIX.length) {
+          offer(key.slice(_PENDING_DEATHMATCH_KEY_PREFIX.length), _parseDeathmatchStopRecord(localStorage.getItem(key)))
+        }
+      }
+    } catch {}
+    try {
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i) || ''
+        if (key.startsWith(_PENDING_DEATHMATCH_SESSION_PREFIX) && key.length > _PENDING_DEATHMATCH_SESSION_PREFIX.length) {
+          offer(key.slice(_PENDING_DEATHMATCH_SESSION_PREFIX.length), _parseDeathmatchStopRecord(sessionStorage.getItem(key)))
+        }
+      }
+    } catch {}
+    for (const [id, record] of _volatileDeathmatchStopRecords) offer(id, record)
+    for (const id of _pendingDeathmatchStops) {
+      if (!winners.has(id)) offer(id, { s: 1, t: 0, r: '' })
+    }
+    return new Set([...winners].filter(([, record]) => record.s === 1).map(([id]) => id))
+  }
+  function _replacePendingDeathmatchMemory(next: Set<string>) {
+    _pendingDeathmatchStops.clear()
+    for (const id of next) _pendingDeathmatchStops.add(id)
+  }
+  function _writeDeathmatchStopRecord(conversationId: string, pending: boolean) {
+    const record = _newDeathmatchStopRecord(pending)
+    _volatileDeathmatchStopRecords.set(conversationId, record)
+    const raw = JSON.stringify(record)
+    // The two stores have independent failure modes. Either one can prove the
+    // latest intent after reload; the memory map is the final current-page net.
+    try { sessionStorage.setItem(_pendingStopSessionKey(conversationId), raw) } catch {}
+    try { localStorage.setItem(_pendingStopKey(conversationId), raw) } catch {}
+  }
+  for (const id of _readPendingDeathmatchStops()) _pendingDeathmatchStops.add(id)
+  function _clearPendingDeathmatchStops() {
+    for (const id of _readPendingDeathmatchStops()) _writeDeathmatchStopRecord(id, false)
+    _pendingDeathmatchStops.clear()
+  }
+  function _mutatePendingDeathmatchStops(mutator: (latest: Set<string>) => void) {
+    const before = _readPendingDeathmatchStops()
+    const latest = new Set(before)
+    mutator(latest)
+    for (const id of latest) {
+      if (!before.has(id)) _writeDeathmatchStopRecord(id, true)
+    }
+    for (const id of before) {
+      if (!latest.has(id)) _writeDeathmatchStopRecord(id, false)
+    }
+    _replacePendingDeathmatchMemory(_readPendingDeathmatchStops())
+  }
+  window.addEventListener('storage', (event) => {
+    if (event.key !== null && event.key !== _PENDING_DEATHMATCH_LEGACY_KEY && !event.key.startsWith(_PENDING_DEATHMATCH_KEY_PREFIX)) return
+    const eventConversationId = event.key?.startsWith(_PENDING_DEATHMATCH_KEY_PREFIX)
+      ? event.key.slice(_PENDING_DEATHMATCH_KEY_PREFIX.length)
+      : null
+    const latest = _readPendingDeathmatchStops()
+    _replacePendingDeathmatchMemory(latest)
+    const currentId = currentConversationId.value
+    if (currentId && latest.has(currentId)) {
+      deathmatchMode.value = false
+      deathmatchAction.value = 'stop'
+      _clearDeathmatchPresentation(currentId)
+    } else if (currentId && deathmatchAction.value === 'stop') {
+      deathmatchMode.value = false
+      deathmatchAction.value = null
+    }
+    const candidates = new Set<string>()
+    if (eventConversationId) candidates.add(eventConversationId)
+    if (currentId) candidates.add(currentId)
+    if (!eventConversationId) {
+      for (const id of Object.keys(streamStates)) candidates.add(id)
+    }
+    for (const id of candidates) {
+      if (latest.has(id) && getStream(id).streaming) {
+        // Stop the stream that belongs to the event's conversation, including
+        // background streams while this tab is displaying another conversation.
+        void stopStreaming(id).catch(e => {
+          console.error('Failed to stop deathmatch stream after remote OFF', e)
+        })
+      }
+    }
+    _streamVersion.value++
+  })
+
+  function _clearDeathmatchPresentation(conversationId: string | null) {
+    stopDeathmatchPolling()
+    grillingQuestions.value = []
+    grillingAnswers.value = {}
+    if (!conversationId) return
+    applyDeathmatchVerdict(conversationId, getStream(conversationId), null)
+    _streamVersion.value++
+  }
+
+  function _deathmatchStatusMessage(conversation: any): string {
+    const status = conversation?.deathmatch_status
+    if (status === 'done') return '目标已完成'
+    if (status === 'partial_complete') return '目标未完全达成，发送消息继续推进，或关闭死磕模式接受当前结果'
+    if (status === 'paused') return conversation?.deathmatch_reason || '执行已暂停，发送任意消息可继续'
+    if (status === 'human_gate') return conversation?.deathmatch_reason || '需要人工介入，发送消息继续或调整目标'
+    return conversation?.deathmatch_reason || ''
+  }
+
+  let _deathmatchIntentSeq = 0
+  let _deathmatchIntentConversationId: string | null = null
+
+  async function setDeathmatchModeEnabled(enabled: boolean) {
+    _deathmatchIntentSeq += 1
+    // Deep-link selection may not have populated currentConversationId yet.
+    // Bind intent to the route's target first; a different target remains a
+    // clean boundary instead of inheriting the previous conversation's ON.
+    _deathmatchIntentConversationId = new URLSearchParams(window.location.search).get('conv')
+      || currentConversationId.value
+    const conversationId = _deathmatchIntentConversationId
+    if (enabled) {
+      if (conversationId) {
+        _mutatePendingDeathmatchStops(latest => { latest.delete(conversationId) })
+      }
+      deathmatchMode.value = true
+      deathmatchAction.value = 'start'
+      return
+    }
+    if (conversationId) {
+      _mutatePendingDeathmatchStops(latest => { latest.add(conversationId) })
+    }
+    deathmatchMode.value = false
+    deathmatchAction.value = 'stop'
+    _clearDeathmatchPresentation(conversationId)
+    if (conversationId && getStream(conversationId).streaming) {
+      try {
+        await stopStreaming(conversationId)
+      } catch (e) {
+        console.error('Failed to stop deathmatch stream while disabling mode', e)
+      }
+    }
+  }
 
   interface PermissionRequest {
     request_id: string
@@ -411,13 +682,14 @@ export const useChatStore = defineStore('chat', () => {
     s.toolResults = []
     s.iteration = null
     s.displaySequence = []
+    s.streamingRowId = null
     s.partMode = false
     _partIndexes.delete(conversationId)
     // Preserve deathmatchVerdict when transitioning between grilling/active phases
-    if (prevDeathmatchStatus === 'grilling' || prevDeathmatchStatus === 'active') {
-      s.deathmatchVerdict = { ...s.deathmatchVerdict!, message: '' }
+    if (!_pendingDeathmatchStops.has(conversationId) && (prevDeathmatchStatus === 'grilling' || prevDeathmatchStatus === 'active')) {
+      applyDeathmatchVerdict(conversationId, s, { ...s.deathmatchVerdict!, message: '' })
     } else {
-      s.deathmatchVerdict = null
+      applyDeathmatchVerdict(conversationId, s, null)
     }
     s.streaming = true
     s.tabSwitchAbort = false
@@ -489,12 +761,13 @@ export const useChatStore = defineStore('chat', () => {
     s.toolResults = []
     s.iteration = null
     s.displaySequence = []
+    s.streamingRowId = null
     s.partMode = false
     _partIndexes.delete(conversationId)
     // Don't clear deathmatchVerdict — persist it after streaming ends
     // so the status bar remains visible for active deathmatch sessions
     // Start polling if deathmatch is still active
-    if (s.deathmatchVerdict?.status === 'active' || s.deathmatchVerdict?.status === 'grilling') {
+    if (conversationId === currentConversationId.value && !_pendingDeathmatchStops.has(conversationId) && (s.deathmatchVerdict?.status === 'active' || s.deathmatchVerdict?.status === 'grilling')) {
       startDeathmatchPolling()
     }
     _streamVersion.value++
@@ -525,6 +798,7 @@ export const useChatStore = defineStore('chat', () => {
   const currentStreamingToolResults = computed(() => getCurrentStream().toolResults)
   const currentStreamingIteration = computed(() => getCurrentStream().iteration)
   const currentStreamingDisplaySequence = computed(() => getCurrentStream().displaySequence)
+  const currentStreamingRowId = computed(() => getCurrentStream().streamingRowId)
   const currentStreamingDeathmatchVerdict = computed(() => getCurrentStream().deathmatchVerdict)
 
   /** 当前会话最近一次上报的上下文 token 用量（头部徽章）。 */
@@ -670,6 +944,7 @@ export const useChatStore = defineStore('chat', () => {
     }
     const epochAtStart = messagesEpoch[conversationId] || 0
     const seqAtStart = (refreshSeqs[conversationId] || 0) + 1
+    const targetVersionAtStart = advanceExecutionTargetVersion(_executionTargetVersions, conversationId)
     refreshSeqs[conversationId] = seqAtStart
     try {
       // fullWindow（项3 锚降级）：锚被挤出分页窗时拉全量再判——一轮至多一次
@@ -678,13 +953,19 @@ export const useChatStore = defineStore('chat', () => {
       lastFullGetAt[conversationId] = Date.now()
       hasMoreMessages[conversationId] = !!(conversation as unknown as { has_more_messages?: boolean }).has_more_messages
       oldestMessageId[conversationId] = (conversation as unknown as { oldest_message_id?: string | null }).oldest_message_id ?? null
+      const targetChangedWhileLoading = !isExecutionTargetVersionCurrent(
+        _executionTargetVersions, conversationId, targetVersionAtStart,
+      )
+      const isLatestRefresh = (refreshSeqs[conversationId] || 0) === seqAtStart
       conversationMeta.value[conversationId] = {
         ...conversationMeta.value[conversationId],
         id: conversationId,
         title: conversation.title,
         group_id: conversation.group_id,
         assistant_id: conversation.assistant_id,
-        execution_target: conversation.execution_target ?? null,
+        execution_target: targetChangedWhileLoading || !isLatestRefresh
+          ? conversationMeta.value[conversationId]?.execution_target
+          : (conversation.execution_target ?? null),
         deathmatch_mode: conversation.deathmatch_mode,
         deathmatch_status: conversation.deathmatch_status,
         deathmatch_goal: conversation.deathmatch_goal,
@@ -693,6 +974,13 @@ export const useChatStore = defineStore('chat', () => {
         deathmatch_grilling_round: conversation.deathmatch_grilling_round,
         deathmatch_grilling_round_total: conversation.deathmatch_grilling_round_total,
       } as Conversation
+      if (
+        conversationId === currentConversationId.value
+        && isLatestRefresh
+        && !targetChangedWhileLoading
+      ) {
+        executionTarget.value = conversation.execution_target ?? null
+      }
       // A newer flow (send / edit-resend / regenerate) started while this GET
       // was in flight — its optimistic bubbles must not be replaced by this
       // (possibly pre-commit) server snapshot. Skip only the message-list
@@ -774,6 +1062,9 @@ export const useChatStore = defineStore('chat', () => {
       if (conv) {
         conv.title = conversation.title
         conv.updated_at = conversation.updated_at
+        if (isLatestRefresh && !targetChangedWhileLoading) {
+          conv.execution_target = conversationMeta.value[conversationId]?.execution_target ?? null
+        }
         // 置顶字段自愈（A4.9 Important-1）：仅当服务端快照追平本地乐观置顶时
         // 清除标记、应用权威 sort_order / last_user_message_at 并重排 ——
         // 常规 refresh（无 pending）不触碰排序字段，避免旧 GET 把刚拖拽的顺序
@@ -797,27 +1088,26 @@ export const useChatStore = defineStore('chat', () => {
       }
       // Sync deathmatch verdict from conversation state when SSE is not active
       const s = getStream(conversationId)
-      if (!s.streaming && conversation.deathmatch_mode && conversation.deathmatch_status !== 'inactive') {
-        const planSteps = (conversation.deathmatch_plan?.steps || []).map((step: any) => ({
-          id: step.id || '',
-          description: step.description || '',
-          status: step.status || 'pending',
-        }))
-        s.deathmatchVerdict = {
+      const pendingStop = _pendingDeathmatchStops.has(conversationId)
+      if (!s.streaming && !pendingStop && conversation.deathmatch_mode && conversation.deathmatch_status !== 'inactive') {
+        const planSteps = mapPlanSteps(conversation.deathmatch_plan)
+        applyDeathmatchVerdict(conversationId, s, {
           status: conversation.deathmatch_status || 'active',
           verdict: null,
-          reason: null,
+          reason: conversation.deathmatch_reason || null,
           turns: conversation.deathmatch_turns || 0,
           max_turns: conversation.deathmatch_max_turns ?? 0,
           grilling_completed: conversation.deathmatch_grilling_completed || 0,
           grilling_total: conversation.deathmatch_grilling_total || 0,
           grilling_round: conversation.deathmatch_grilling_round || 0,
           grilling_round_total: conversation.deathmatch_grilling_round_total || 3,
-          message: conversation.deathmatch_status === 'done' ? '目标已完成' : conversation.deathmatch_status === 'partial_complete' ? '目标未完全达成，发送消息继续推进，或关闭死磕模式接受当前结果' : conversation.deathmatch_status === 'human_gate' ? (conversation.deathmatch_reason || '需要人工介入，发送消息继续或调整目标') : '',
+          message: _deathmatchStatusMessage(conversation),
           plan_version: conversation.deathmatch_plan_version || 0,
           plan_steps: planSteps,
+        })
+        if (conversationId === currentConversationId.value) {
+          deathmatchMode.value = conversation.deathmatch_status !== 'done'
         }
-        deathmatchMode.value = conversation.deathmatch_status !== 'done'
         _streamVersion.value++
         // 死磕盘问：SSE 事件不重放——刷新/重开会话时必须从权威 GET 恢复
         // 待答问题，否则 grillingQuestions 恒空 → ChatArea `isGrilling` 恒
@@ -837,6 +1127,11 @@ export const useChatStore = defineStore('chat', () => {
             grillingAnswers.value = {}
           }
         }
+      }
+      if (pendingStop && conversationId === currentConversationId.value) {
+        deathmatchMode.value = false
+        deathmatchAction.value = 'stop'
+        _clearDeathmatchPresentation(conversationId)
       }
       return true
     } catch (e) {
@@ -1137,8 +1432,12 @@ export const useChatStore = defineStore('chat', () => {
       // onDone 冲刷，resume（切后台回来 / watchdog 重连 / busy-attach）收尾时
       // 挂着的插话随 refresh 静默消失 —— 「回答完毕后插话被丢弃」的主要来源。
       // 自然结束 = 队列该被继续作答，语义与主 onDone 一致取 auto-send。
-      void flushUnconfirmedInterjections(conversationId, 'auto-send')
-      void refreshConversation(conversationId)
+      // W26：必须先 refresh（应用权威快照）再 flush 判重——并行触发会让 flush
+      // 的判重快照被 refreshSeqs 最后写获胜作废（重复气泡）。
+      void (async () => {
+        await refreshConversation(conversationId)
+        await flushUnconfirmedInterjections(conversationId, 'auto-send')
+      })()
     }
 
     try {
@@ -1146,14 +1445,28 @@ export const useChatStore = defineStore('chat', () => {
       // inline handlers that had drifted out of sync — missing
       // onSubAgentChunk/onPing slots, non-debounced notes refresh, and no
       // part.* handling). Only replay/done/error stay resume-specific.
-      const shared = wireStreamCallbacks(conversationId, () => {})
+      const shared = wireStreamCallbacks(
+        conversationId,
+        () => {},
+        getStream(conversationId).deathmatchIntentAtRun ?? _deathmatchIntentSeq,
+      )
       await chatApi.resumeStream(conversationId, {
         ...shared,
         signal: abortController.signal,
         onReplay: (replay) => {
           touch()
+          s.streamingRowId = replay.streaming_message_id || s.streamingRowId || null
+          // W26（B2）：断连期 commit 的插话 echo 经 replay 补齐（buffer 是
+          // resume-replay 权威）——否则 pending 永不确认 → 终态冲刷重发 →
+          // 双气泡。先于任何 early return 应用。
+          const _replayInterjections = _applyInterjectionEchoes(conversationId, replay.interjections_committed, { fromReplay: true })
           if (replay.db_message_id && !replay.content) {
             replayDbMessageId = replay.db_message_id
+            if (_replayInterjections.length) {
+              s.displaySequence = mergeInterjectionItems(
+                s.displaySequence as any, _replayInterjections as any,
+              ) as any
+            }
             return
           }
           const fullContent = replay.content || ''
@@ -1188,6 +1501,14 @@ export const useChatStore = defineStore('chat', () => {
           s.reasoning = pickStreamText({ live: s.reasoning, snapshot: replay.reasoning || '' })
           s.contentSegments = replay.content_segments || []
           s.displaySequence = mergeReplayIntoSequence(s.displaySequence, replay.display_sequence || [])
+          // Replay echoes must be inserted by after_index AFTER the snapshot
+          // merge — appending them before the merge made a fresh reload show
+          // the interjection before every replayed text/tool item.
+          if (_replayInterjections.length) {
+            s.displaySequence = mergeInterjectionItems(
+              s.displaySequence as any, _replayInterjections as any,
+            ) as any
+          }
           // 懒加载桩兼容（A4.9 fix-round）：tool_calls 数组载荷可能以 {meta, items}
           // 桩形到达（写侧 DB 数组恒定，仅列表读侧桩）——解包保数组不变量
           const _tc = replay.tool_calls
@@ -1227,10 +1548,14 @@ export const useChatStore = defineStore('chat', () => {
             // 插话绝不随 refresh 静默丢失 —— 语义与主发送流 onError 一致。
             if (conversationId === currentConversationId.value) {
               void flushUnconfirmedInterjections(conversationId, 'restore')
+              void refreshConversation(conversationId)
             } else {
-              void flushUnconfirmedInterjections(conversationId, 'auto-send')
+              // W26：后台会话 auto-send 必须先 refresh 再 flush 判重
+              void (async () => {
+                await refreshConversation(conversationId)
+                await flushUnconfirmedInterjections(conversationId, 'auto-send')
+              })()
             }
-            void refreshConversation(conversationId)
           }
         },
       })
@@ -1260,10 +1585,14 @@ export const useChatStore = defineStore('chat', () => {
         endStreaming(conversationId)
         if (conversationId === currentConversationId.value) {
           void flushUnconfirmedInterjections(conversationId, 'restore')
+          void refreshConversation(conversationId)
         } else {
-          void flushUnconfirmedInterjections(conversationId, 'auto-send')
+          // W26：后台会话 auto-send 必须先 refresh 再 flush 判重
+          void (async () => {
+            await refreshConversation(conversationId)
+            await flushUnconfirmedInterjections(conversationId, 'auto-send')
+          })()
         }
-        void refreshConversation(conversationId)
         return 'resumed'
       }
 
@@ -1442,14 +1771,125 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  async function resolveDefaultExecutionTarget() {
+    const prefs = await getUiPreferences()
+    const defaultTarget = prefs.default_execution_target || null
+    if (!defaultTarget) {
+      return { target: null, deviceDefault: false, unavailable: false }
+    }
+    const devices = await clientDevicesApi.list()
+    const device = devices.find(d => `device:${d.device_id}` === defaultTarget)
+    const unavailable = !device || !!device.revoked || !device.online
+    return {
+      target: unavailable ? null : defaultTarget,
+      deviceDefault: true,
+      unavailable,
+    }
+  }
+
+  function notifyDefaultExecutionTarget(resolution: {
+    target: string | null
+    deviceDefault: boolean
+    unavailable: boolean
+  }) {
+    if (!resolution.deviceDefault) return
+    if (resolution.unavailable) {
+      useToast().show('默认设备不可用（离线或已解绑），本次使用云端执行环境', 'error')
+      return
+    }
+    if (typeof sessionStorage !== 'undefined' && !sessionStorage.getItem('wt-default-exec-toast')) {
+      sessionStorage.setItem('wt-default-exec-toast', '1')
+      useToast().show('新会话已按你的默认设置使用设备执行', 'info')
+    }
+  }
+
+  async function bindExecutionTarget(convId: string, target: string | null) {
+    const result = await chatApi.bindExecutionTarget(convId, target)
+    const serverTarget = result.execution_target ?? null
+    advanceExecutionTargetVersion(_executionTargetVersions, convId)
+    conversationMeta.value[convId] = {
+      ...conversationMeta.value[convId],
+      id: convId,
+      execution_target: serverTarget,
+    } as Conversation
+    const row = conversations.value.find(c => c.id === convId)
+    if (row) row.execution_target = serverTarget
+    if (currentConversationId.value === convId) executionTarget.value = serverTarget
+    return serverTarget
+  }
+
+  async function reconcileExecutionTarget(convId: string) {
+    const versionAtStart = advanceExecutionTargetVersion(_executionTargetVersions, convId)
+    const conversation = await chatApi.getConversation(convId, { include: 'slim', messageLimit: 1 })
+    if (!isExecutionTargetVersionCurrent(_executionTargetVersions, convId, versionAtStart)) {
+      // Reconciliation must never report an incumbent value as fresh proof.
+      // A newer operation will publish its own result; this caller stays fail-closed.
+      throw new Error('Execution target reconciliation superseded')
+    }
+    const serverTarget = conversation.execution_target ?? null
+    conversationMeta.value[convId] = {
+      ...conversationMeta.value[convId],
+      id: convId,
+      execution_target: serverTarget,
+    } as Conversation
+    const row = conversations.value.find(c => c.id === convId)
+    if (row) row.execution_target = serverTarget
+    if (currentConversationId.value === convId) executionTarget.value = serverTarget
+    return serverTarget
+  }
+
+  async function applyDefaultExecutionTargetToConversation(convId: string): Promise<boolean> {
+    try {
+      const resolution = await resolveDefaultExecutionTarget()
+      await bindExecutionTarget(convId, resolution.target)
+      notifyDefaultExecutionTarget(resolution)
+      return true
+    } catch (e: any) {
+      console.error('Failed to apply default execution target:', e)
+      useToast().show(e?.response?.data?.detail || '执行环境绑定失败，请重试', 'error')
+      return false
+    }
+  }
+
   async function createConversation(title?: string, assistantId?: string | null) {
     try {
-      const conversation = await chatApi.createConversation(title, assistantId, executionTarget.value)
+      // Auto-creating the very first conversation must preserve an explicit ON
+      // chosen on the empty-chat view. Creating a different conversation from
+      // an existing one is instead a clean mode boundary.
+      const deathmatchIntentAtStart = _deathmatchIntentSeq
+      const originConversationId = currentConversationId.value
+      // Only an ON owned by the empty view may follow the new conversation.
+      // An ON for A/B while creation is pending is never an ON for C.
+      const preserveExplicitStart = !originConversationId
+        && !_deathmatchIntentConversationId
+        && deathmatchMode.value && deathmatchAction.value === 'start'
+      const resolution = await resolveDefaultExecutionTarget()
+      const useExplicitSelection = executionTargetUserSelected.value
+      const requestedTarget = useExplicitSelection ? executionTarget.value : resolution.target
+      const conversation = await chatApi.createConversation(title, assistantId, requestedTarget)
+      executionTargetUserSelected.value = false
       conversations.value.unshift(conversation)
       currentConversationId.value = conversation.id
       messages.value[conversation.id] = []
+      const explicitStartDuringCreate = !originConversationId
+        && !_deathmatchIntentConversationId
+        && _deathmatchIntentSeq !== deathmatchIntentAtStart
+        && deathmatchMode.value && deathmatchAction.value === 'start'
+      const preservedEmptyViewStart = preserveExplicitStart
+        && !_deathmatchIntentConversationId
+        && deathmatchMode.value && deathmatchAction.value === 'start'
+      if (!preservedEmptyViewStart && !explicitStartDuringCreate) {
+        // A different conversation is a clean mode boundary. Pending OFF
+        // decisions for older conversations remain in their own set.
+        deathmatchMode.value = false
+        deathmatchAction.value = null
+        _clearDeathmatchPresentation(conversation.id)
+      } else {
+        // An empty-view ON becomes bound to the conversation just created, so
+        // its first server snapshot cannot clear the explicit start either.
+        _deathmatchIntentConversationId = conversation.id
+      }
       executionTarget.value = conversation.execution_target ?? null
-      // W18 G4：meta 同步写入——否则文件面在无 select/refresh 前查不到目标（meta-miss）
       conversationMeta.value[conversation.id] = {
         ...conversationMeta.value[conversation.id],
         id: conversation.id,
@@ -1458,6 +1898,7 @@ export const useChatStore = defineStore('chat', () => {
         assistant_id: conversation.assistant_id,
         execution_target: conversation.execution_target ?? null,
       } as Conversation
+      if (!useExplicitSelection) notifyDefaultExecutionTarget(resolution)
       return conversation
     } catch (e) {
       console.error('Failed to create conversation:', e)
@@ -1466,9 +1907,34 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function selectConversation(id: string) {
+    executionTargetUserSelected.value = false
     if (currentConversationId.value === id) return
 
+    const targetVersionAtStart = advanceExecutionTargetVersion(_executionTargetVersions, id)
+    const deathmatchIntentAtStart = _deathmatchIntentSeq
+    const selectSeqAtStart = (_selectConversationSeqs[id] || 0) + 1
+    _selectConversationSeqs[id] = selectSeqAtStart
     currentConversationId.value = id
+    activeSteerTask.value = null
+    void refreshActiveSteerTask(id)
+    // Establish the mode boundary synchronously. Until B's GET completes (or
+    // fails), A's mode/action must never remain sendable for B.
+    const boundaryPendingStop = _pendingDeathmatchStops.has(id)
+    const boundaryExplicitStart = deathmatchMode.value
+      && deathmatchAction.value === 'start'
+      && _deathmatchIntentConversationId === id
+    stopDeathmatchPolling()
+    if (boundaryPendingStop) {
+      _clearDeathmatchPresentation(id)
+      deathmatchMode.value = false
+      deathmatchAction.value = 'stop'
+    } else if (boundaryExplicitStart) {
+      deathmatchMode.value = true
+      deathmatchAction.value = 'start'
+    } else {
+      deathmatchMode.value = false
+      deathmatchAction.value = null
+    }
     // 盘问问题/答案是会话级 UI 状态：切换会话立即清空，防止上一会话的
     // 问题泄漏到新会话（A4.9 r1 Important-3）；grilling 状态由
     // refreshConversation 重新从权威 GET 拉取。
@@ -1483,13 +1949,19 @@ export const useChatStore = defineStore('chat', () => {
       // list: a deep-linked conversation from ANOTHER assistant is (correctly)
       // not injected into the current assistant's list (guard below), but the
       // chat header still needs its title/deathmatch state.
+      const targetChangedWhileLoading = !isExecutionTargetVersionCurrent(
+        _executionTargetVersions, id, targetVersionAtStart,
+      )
+      const isLatestSelect = (_selectConversationSeqs[id] || 0) === selectSeqAtStart
       conversationMeta.value[id] = {
         ...conversationMeta.value[id],
         id: conversation.id,
         title: conversation.title,
         group_id: conversation.group_id,
         assistant_id: conversation.assistant_id,
-        execution_target: conversation.execution_target ?? null,
+        execution_target: targetChangedWhileLoading || !isLatestSelect
+          ? conversationMeta.value[id]?.execution_target
+          : (conversation.execution_target ?? null),
         deathmatch_mode: conversation.deathmatch_mode,
         deathmatch_status: conversation.deathmatch_status,
         deathmatch_goal: conversation.deathmatch_goal,
@@ -1521,6 +1993,9 @@ export const useChatStore = defineStore('chat', () => {
       // the agent background self-save after the page was reloaded.
       const conv = conversations.value.find(item => item.id === id)
       if (conv) {
+        if (isLatestSelect && !targetChangedWhileLoading) {
+          conv.execution_target = conversationMeta.value[id]?.execution_target ?? null
+        }
         if (conversation.title) conv.title = conversation.title
         if (conversation.updated_at) conv.updated_at = conversation.updated_at
         // Sync deathmatch state from backend
@@ -1548,6 +2023,7 @@ export const useChatStore = defineStore('chat', () => {
           title: conversation.title || '新对话',
           group_id: conversation.group_id ?? null,
           assistant_id: conversation.assistant_id ?? null,
+          execution_target: conversationMeta.value[id]?.execution_target,
           sort_order: conversation.sort_order ?? 0,
           created_at: conversation.created_at,
           updated_at: conversation.updated_at,
@@ -1563,48 +2039,71 @@ export const useChatStore = defineStore('chat', () => {
           deathmatch_grilling_round_total: conversation.deathmatch_grilling_round_total ?? 0,
         } as Conversation)
       }
-      // Restore deathmatchMode from conversation state
-      deathmatchMode.value = !!(conversation.deathmatch_mode && conversation.deathmatch_status !== 'inactive' && conversation.deathmatch_status !== 'done' && conversation.deathmatch_status !== 'cleared')
-      deathmatchAction.value = null
-      // W16：执行环境随会话同步（set-once，D-6）
-      executionTarget.value = conversation.execution_target ?? null
+      // Restore deathmatchMode from conversation state, but never override a
+      // pending OFF chosen for this conversation. Background selects must not
+      // rewrite the currently visible conversation's global mode/action.
+      if (id === currentConversationId.value && _deathmatchIntentSeq === deathmatchIntentAtStart) {
+        // Restore the server snapshot only while the user's mode intent is
+        // unchanged. An explicit ON/OFF during the deep-link GET is newer
+        // user intent and must never be overwritten by that stale snapshot.
+        const pendingStop = _pendingDeathmatchStops.has(id)
+        // An ON chosen before selectConversation started is equally explicit.
+        // Protect it only for its owning conversation; preserving ON merely
+        // because it is currently true would leak A's intent into ordinary B.
+        const preserveExplicitStart = deathmatchMode.value
+          && deathmatchAction.value === 'start'
+          && _deathmatchIntentConversationId === id
+        deathmatchMode.value = pendingStop ? false : preserveExplicitStart || !!(conversation.deathmatch_mode && conversation.deathmatch_status !== 'inactive' && conversation.deathmatch_status !== 'done' && conversation.deathmatch_status !== 'cleared')
+        deathmatchAction.value = pendingStop ? 'stop' : preserveExplicitStart ? 'start' : null
+        if (pendingStop) _clearDeathmatchPresentation(id)
+      }
+      // W16：执行环境随会话同步（set-once，D-6）；陈旧 GET 不覆盖更新绑定。
+      if (id === currentConversationId.value && isLatestSelect && !targetChangedWhileLoading) {
+        executionTarget.value = conversation.execution_target ?? null
+      }
       // 首次从侧栏打开死磕会话（无 deep link、本会话无历史流）：种入
       // verdict——状态栏与 isGrilling 均读 getCurrentStream().deathmatchVerdict；
-      // 缺它则问题虽拉到也不渲染（A4.9 r2 residual）。仅在无既有 verdict
-      // 且非流式中种入，绝不覆盖实时 SSE 状态；形状与 refreshConversation
-      // 的权威快照一致。
+      // 缺它则问题虽拉到也不渲染（A4.9 r2 residual）。R4（诊断机制 C）：
+      // verdict 缺失 **或 plan_version 更新/清单为空** 时重播种（否则后端
+      // 步骤推进永不同步到已打开页面）；非流式中才播种，绝不覆盖实时 SSE。
       const _selStream = getStream(id)
+      const _localPlanVersion = _selStream.deathmatchVerdict?.plan_version || 0
+      const _planFresher = !_selStream.deathmatchVerdict
+        || (conversation.deathmatch_plan_version || 0) > _localPlanVersion
+        || (!_selStream.deathmatchVerdict.plan_steps?.length
+            && (conversation.deathmatch_plan?.steps || []).length > 0)
       if (
         !_selStream.streaming
-        && !_selStream.deathmatchVerdict
+        && _planFresher
         && conversation.deathmatch_mode
         && conversation.deathmatch_status
         && conversation.deathmatch_status !== 'inactive'
+        && !_pendingDeathmatchStops.has(id)
       ) {
-        _selStream.deathmatchVerdict = {
+        applyDeathmatchVerdict(id, _selStream, {
           status: conversation.deathmatch_status,
           verdict: null,
-          reason: null,
+          reason: conversation.deathmatch_reason || null,
           turns: conversation.deathmatch_turns || 0,
           max_turns: conversation.deathmatch_max_turns ?? 0,
           grilling_completed: conversation.deathmatch_grilling_completed || 0,
           grilling_total: conversation.deathmatch_grilling_total || 0,
           grilling_round: conversation.deathmatch_grilling_round || 0,
           grilling_round_total: conversation.deathmatch_grilling_round_total || 3,
-          message: conversation.deathmatch_status === 'done' ? '目标已完成' : '',
+          message: _deathmatchStatusMessage(conversation),
           plan_version: conversation.deathmatch_plan_version || 0,
-          plan_steps: (conversation.deathmatch_plan?.steps || []).map((step: any) => ({
-            id: step.id || '',
-            description: step.description || '',
-            status: step.status || 'pending',
-          })),
-        }
+          plan_steps: mapPlanSteps(conversation.deathmatch_plan),
+          // N2（复审）：plan_version 触发的重播种沿用人工介入报告/终态附件
+          //（同 poll B-6）——否则 I3 版本推进后每次重播种都抹报告。
+          human_gate: _selStream.deathmatchVerdict?.human_gate ?? null,
+          final_attachments: _selStream.deathmatchVerdict?.final_attachments ?? [],
+        })
         _streamVersion.value++
       }
       // 应用内切换（Sidebar/Zen 只调 selectConversation，不走 refreshConversation）：
       // 顶部已清空本会话的问题，这里必须从权威 GET 重拉，否则切走再切回
       // grilling 会话时问题消失、isGrilling 恒 false（A4.9 r2 新回归）。
-      if (conversation.deathmatch_status === 'grilling') {
+      if (conversation.deathmatch_status === 'grilling' && !_pendingDeathmatchStops.has(id)) {
         await fetchGrillingQuestions(id)
       }
     } catch (e) {
@@ -1789,6 +2288,11 @@ export const useChatStore = defineStore('chat', () => {
     if (part.subtask_id != null) item.subtask_id = part.subtask_id
     if (part.subtask_name != null) item.subtask_name = part.subtask_name
     s.displaySequence.push(item)
+    // P0 R2: tool parts mark prior streamed text as a draft (same rule as
+    // the backend's parked-prose unit).
+    if (item.type === 'tool_call' || item.type === 'tool' || item.type === 'tool_placeholder') {
+      markPreToolDrafts(s.displaySequence)
+    }
     // Store the REACTIVE proxy (read back out of the reactive array) so later
     // in-place mutations through the index fire Vue reactivity.
     idx.set(part.part_id, s.displaySequence[s.displaySequence.length - 1])
@@ -1831,8 +2335,13 @@ export const useChatStore = defineStore('chat', () => {
     if (part.title != null) item.title = part.title
   }
 
-  function wireStreamCallbacks(conversationId: string, onFinalize: (messageId: string, title: string | undefined, toolResults: string | null | undefined, searchFailed: boolean | undefined, taskSubmitted?: boolean) => void) {
+  function wireStreamCallbacks(
+    conversationId: string,
+    onFinalize: (messageId: string, title: string | undefined, toolResults: string | null | undefined, searchFailed: boolean | undefined, taskSubmitted?: boolean) => void,
+    deathmatchIntentAtRun = _deathmatchIntentSeq,
+  ) {
     const s = getStream(conversationId)
+    s.deathmatchIntentAtRun = deathmatchIntentAtRun
     const touch = () => { s._lastEventTime = Date.now(); s._gotFirstEvent = true }
     // Debounced reload of the notes store after the agent's notes tool mutates
     // notes/notebooks server-side, so sidebars & lists stay in sync.
@@ -1878,8 +2387,9 @@ export const useChatStore = defineStore('chat', () => {
           if (conv) conv.title = title
         }
         // 自然结束时仍未确认的插话（run 在最后一个迭代中完成，队列不再被
-        // 消费）：自动转为普通新消息发送 —— 用户的文字永不丢失。
-        void flushUnconfirmedInterjections(conversationId, 'auto-send')
+        // 消费）：W26 冲刷移到本流 promise 结算后的权威 refresh 之后（见
+        // sendMessage 尾部）——此处即发会让 flush 的判重快照被紧随的竞对
+        // refresh 以 refreshSeqs 最后写获胜作废（重复气泡）。
       },
       onError: (error: string) => {
         touch()
@@ -1892,10 +2402,14 @@ export const useChatStore = defineStore('chat', () => {
         // 后台会话定向自动发送（文字永不丢失）。
         if (conversationId === currentConversationId.value) {
           void flushUnconfirmedInterjections(conversationId, 'restore')
+          void refreshConversation(conversationId)
         } else {
-          void flushUnconfirmedInterjections(conversationId, 'auto-send')
+          // W26：后台会话 auto-send 必须先 refresh 再 flush 判重
+          void (async () => {
+            await refreshConversation(conversationId)
+            await flushUnconfirmedInterjections(conversationId, 'auto-send')
+          })()
         }
-        void refreshConversation(conversationId)
         // The backend persists a visible failure message AFTER emitting the
         // error event (error-terminated loop); the immediate refresh above
         // usually races the save. Re-refresh once so the failure bubble
@@ -1979,6 +2493,8 @@ export const useChatStore = defineStore('chat', () => {
         touch()
         s.toolCalls = [...s.toolCalls, tc]
         if (s.partMode) return
+        // P0 R2: what streamed before this tool card is pre-tool prose.
+        markPreToolDrafts(s.displaySequence)
         s.displaySequence.push({
           type: 'tool_call',
           content: '',
@@ -2007,26 +2523,16 @@ export const useChatStore = defineStore('chat', () => {
       onIteration: (it: IterationEvent) => { touch(); s.iteration = it },
       onInterjectionCommitted: (payload) => {
         touch()
-        // 插话 commit-echo：按内容配对确认（deferred #3 + 第四波 ①）——
-        // resume 后迟到的 T2 echo 不得错配到已丢 echo 的 T1 条目；内容不
-        // 匹配任何待确认条目（跨标签/未知回声）时不再退回 FIFO-0（那会把
-        // 回声内容错配进最老气泡），仅按 id 去重追加服务器行。确认后将
-        // 乐观气泡原地替换为服务器消息（id 来自落库行）。
-        const pend = pendingInterjections[conversationId] || []
-        const matchIdx = pend.findIndex(p => p.content === payload.content)
-        // 确认后**留在队列里**并标记 committed —— 显示位次恒为「回答最下方的
-        // 队列区」，绝不在流式回答之上插入一条用户气泡（需求 4①）。出队统一
-        // 发生在回答终态的冲刷里。
-        if (matchIdx >= 0) {
-          pend[matchIdx] = { ...pend[matchIdx], committed: true }
-        }
-        // A4.9 R3 N1：echo 已确认的 commit 行登记入册，dedup 闸门排除之
-        // （echo 丢失的行不在册，保持可匹配）。
-        if (payload.id) {
-          if (!_echoConfirmedCommittedIds[conversationId]) {
-            _echoConfirmedCommittedIds[conversationId] = new Set()
-          }
-          _echoConfirmedCommittedIds[conversationId].add(payload.id)
+        // W26（B3）：连接令牌守卫 —— 旧连接迟到的 echo 不得确认新连接的
+        // pending 条目（与 onError/onDone 同一不变量）。
+        if (s.abortController !== connection) return
+        // 按 id 配对（无 id 回落内容），并登记 echo 已确认的服务器行 id ——
+        // 终态冲刷的判重闸门据此排除已确认行。
+        const items = _applyInterjectionEchoes(conversationId, [payload])
+        // 2026-11-01：commit 即内联 —— 该项插在**当前**流式时间线末尾，
+        // 后续 content delta 自然落在它下面；底部队列同步出队。
+        for (const item of items) {
+          s.displaySequence = applyLiveInterjection(s.displaySequence, item as any)
         }
       },
       onContextInfo: (info: ContextInfo) => {
@@ -2046,27 +2552,57 @@ export const useChatStore = defineStore('chat', () => {
       },
       onDeathmatchVerdict: (verdict: DeathmatchVerdict) => {
         touch()
-        s.deathmatchVerdict = verdict
-        if (verdict.status === 'active') {
-          deathmatchMode.value = true
-          grillingQuestions.value = []
-          grillingAnswers.value = {}
-          startDeathmatchPolling()
-        } else if (verdict.status === 'grilling') {
-          deathmatchMode.value = true
-          startDeathmatchPolling()
-        } else if (verdict.status === 'partial_complete') {
-          // Partial completion: stop auto-continuation but keep deathmatch mode
-          // on so the user can resume by sending a message.
-          deathmatchMode.value = true
-          stopDeathmatchPolling()
-        } else if (verdict.status === 'done' || verdict.status === 'inactive' || verdict.status === 'cleared') {
-          deathmatchMode.value = false
-          grillingQuestions.value = []
-          grillingAnswers.value = {}
-          stopDeathmatchPolling()
+        const isCurrent = conversationId === currentConversationId.value
+        if (_pendingDeathmatchStops.has(conversationId)) {
+          // A late event from the old run is stale relative to the user's OFF
+          // decision. It may update that row's status, never the visible mode.
+          const parked = conversations.value.find(item => item.id === conversationId)
+          if (parked) {
+            parked.deathmatch_mode = false
+            parked.deathmatch_status = verdict.status
+          }
+          if (isCurrent) {
+            deathmatchMode.value = false
+            deathmatchAction.value = 'stop'
+            _clearDeathmatchPresentation(conversationId)
+          }
+          return
         }
-        if (verdict.grilling_questions && verdict.grilling_questions.length > 0) {
+        if (
+          (s.deathmatchIntentAtRun ?? deathmatchIntentAtRun) !== _deathmatchIntentSeq
+          && _deathmatchIntentConversationId === conversationId
+        ) {
+          // This event belongs to an older ON/OFF generation. In particular,
+          // an old terminal verdict must not erase a newer re-ON before its
+          // replacement run has even been sent.
+          return
+        }
+        // B-6/I6：新 verdict 落地即递增序号（写点统一走 applyDeathmatchVerdict）
+        applyDeathmatchVerdict(conversationId, s, verdict)
+        if (isCurrent) {
+          if (verdict.status === 'active') {
+            deathmatchMode.value = true
+            grillingQuestions.value = []
+            grillingAnswers.value = {}
+            startDeathmatchPolling()
+          } else if (verdict.status === 'grilling') {
+            deathmatchMode.value = true
+            startDeathmatchPolling()
+          } else if (verdict.status === 'partial_complete') {
+            deathmatchMode.value = true
+            stopDeathmatchPolling()
+          } else if (verdict.status === 'paused' || verdict.status === 'human_gate') {
+            deathmatchMode.value = true
+            stopDeathmatchPolling()
+          } else if (verdict.status === 'done' || verdict.status === 'inactive' || verdict.status === 'cleared') {
+            deathmatchMode.value = false
+            deathmatchAction.value = null
+            grillingQuestions.value = []
+            grillingAnswers.value = {}
+            stopDeathmatchPolling()
+          }
+        }
+        if (isCurrent && verdict.grilling_questions && verdict.grilling_questions.length > 0) {
           const incomingRound = verdict.grilling_round || 1
           const currentMaxRound = grillingQuestions.value.length > 0
             ? Math.max(...grillingQuestions.value.map(q => q.round || 1))
@@ -2086,7 +2622,7 @@ export const useChatStore = defineStore('chat', () => {
         }
         const conv = conversations.value.find(item => item.id === conversationId)
         if (conv) {
-          conv.deathmatch_mode = deathmatchMode.value
+          conv.deathmatch_mode = verdict.status !== 'done' && verdict.status !== 'inactive' && verdict.status !== 'cleared'
           conv.deathmatch_status = verdict.status
           conv.deathmatch_turns = verdict.turns
           conv.deathmatch_max_turns = verdict.max_turns
@@ -2099,8 +2635,44 @@ export const useChatStore = defineStore('chat', () => {
         pendingPermissionRequest.value = request
       },
       onPing: () => { touch() },
-      onAuditReset: () => {
+      onAuditReset: (opts?: { keepText?: string }) => {
         touch()
+        // keep_stitch（2026-10-14 输出单元契约）：可恢复重试仅回退失败残稿——
+        // 按链锚 keepText 截断累积与在途文本项，链文本（用户已见）不蒸发、
+        // 也不做全删手术（避免直播/落库分叉，A4.9 I4）。
+        if (opts && typeof opts.keepText === 'string') {
+          s.content = opts.keepText
+          const seq = s.displaySequence
+          let lastTool = -1
+          for (let i = seq.length - 1; i >= 0; i--) {
+            const it = seq[i] as { type?: string }
+            if (it && (it.type === 'tool_call' || it.type === 'tool' || it.type === 'tool_placeholder')) {
+              lastTool = i
+              break
+            }
+          }
+          const tailTexts: number[] = []
+          for (let i = lastTool + 1; i < seq.length; i++) {
+            const it = seq[i] as { type?: string; content?: string }
+            if (it && it.type === 'text') tailTexts.push(i)
+          }
+          if (tailTexts.length) {
+            const joined = tailTexts
+              .map(i => String((seq[i] as { content?: string }).content || ''))
+              .join('')
+            if (joined.startsWith(opts.keepText) || opts.keepText.startsWith(joined)) {
+              // 正常形态：尾文本=链锚+失败残稿（或残稿尚短）——截到锚。
+              ;(seq[tailTexts[0]] as { content?: string }).content = opts.keepText
+              for (let k = tailTexts.length - 1; k >= 1; k--) seq.splice(tailTexts[k], 1)
+            } else {
+              // A4.9 I4：失配（锚跨工具链形态）不得静默 no-op——残稿契约优先，
+              // 清空尾文本项（已展示链文在工具卡之前的 text 项里，不蒸发）。
+              for (let k = tailTexts.length - 1; k >= 0; k--) seq.splice(tailTexts[k], 1)
+            }
+            _resetPartIndex(conversationId, s.displaySequence)
+          }
+          return
+        }
         // 静默质检同步（conv 827a6f78 turn-B，2026-09-03）：后端打回了已流式
         // 展示的草稿并重置其累加器。丢弃最后工具卡之后的草稿文本（思考/工具
         // 卡保留，A4 对齐）并重置 content 累加器——否则 done 气泡会包含全部
@@ -2182,6 +2754,7 @@ export const useChatStore = defineStore('chat', () => {
   async function submitGrillingRound(answers: { task_id: string; answer: string }[]) {
     const convId = currentConversationId.value
     if (!convId) return null
+    const previousAnswers = { ...grillingAnswers.value }
     try {
       // Optimistically mark answers locally.
       for (const a of answers) {
@@ -2197,6 +2770,29 @@ export const useChatStore = defineStore('chat', () => {
       })
       if (resp.ok) {
         const data = await resp.json()
+        if (_pendingDeathmatchStops.has(convId)) {
+          // The answer was accepted, but OFF was chosen while it was in
+          // flight. Confirming it must never auto-start the goal loop, and a
+          // late answer for A must not overwrite B's current UI state.
+          if (convId === currentConversationId.value) {
+            deathmatchMode.value = false
+            deathmatchAction.value = 'stop'
+            _clearDeathmatchPresentation(convId)
+          }
+          return data
+        }
+        if (convId !== currentConversationId.value) {
+          if (data.result?.status === 'grilling_complete') {
+            applyDeathmatchVerdict(convId, getStream(convId), {
+              status: 'active', verdict: null, reason: null, turns: 0,
+              max_turns: 0, grilling_completed: data.grilling_completed || 0,
+              grilling_total: data.grilling_total || 0,
+              message: '盘问已完成，发送消息开始执行',
+            })
+            _streamVersion.value++
+          }
+          return data
+        }
 
         const conv = conversations.value.find(item => item.id === convId)
         if (conv) {
@@ -2215,7 +2811,7 @@ export const useChatStore = defineStore('chat', () => {
           deathmatchAction.value = null
 
           const stream = getStream(convId)
-          stream.deathmatchVerdict = {
+          applyDeathmatchVerdict(convId, stream, {
             status: 'active',
             verdict: null,
             reason: null,
@@ -2226,7 +2822,7 @@ export const useChatStore = defineStore('chat', () => {
             grilling_round: data.grilling_round || 0,
             grilling_round_total: data.grilling_round_total || 3,
             message: '目标已明确，正在开始执行...',
-          }
+          })
           _streamVersion.value++
           await sendMessage(`目标已明确，请开始执行：${goal}`)
         } else if (data.result?.status === 'next_round') {
@@ -2243,7 +2839,7 @@ export const useChatStore = defineStore('chat', () => {
           const stream = getStream(convId)
           if (stream.deathmatchVerdict) {
             const { grilling_questions: _gq, ...prevVerdict } = stream.deathmatchVerdict
-            stream.deathmatchVerdict = {
+            applyDeathmatchVerdict(convId, stream, {
               ...prevVerdict,
               status: 'grilling',
               grilling_completed: data.grilling_completed || 0,
@@ -2251,19 +2847,32 @@ export const useChatStore = defineStore('chat', () => {
               grilling_round: data.grilling_round || 0,
               grilling_round_total: data.grilling_round_total || 3,
               message: `盘问阶段 第${data.result.round}/${data.result.max_rounds}轮`,
-            }
+            })
             _streamVersion.value++
           }
         }
         return data
       }
+      if (convId === currentConversationId.value) grillingAnswers.value = previousAnswers
+      const detail = await resp.json().catch(() => null)
+      useToast().show(`盘问回答提交失败，请重试：${detail?.detail || `HTTP ${resp.status}`}`, 'error')
     } catch (e) {
+      if (convId === currentConversationId.value) grillingAnswers.value = previousAnswers
+      useToast().show(`盘问回答提交失败，请重试：${e instanceof Error ? e.message : String(e)}`, 'error')
       console.error('Failed to submit grilling round', e)
     }
     return null
   }
 
   async function answerGrillingQuestion(taskId: string, answer: string) {
+    const convId = currentConversationId.value
+    if (!convId) return null
+    const hadPreviousAnswer = Object.prototype.hasOwnProperty.call(grillingAnswers.value, taskId)
+    const previousAnswer = grillingAnswers.value[taskId]
+    const rollbackAnswer = () => {
+      if (hadPreviousAnswer) grillingAnswers.value[taskId] = previousAnswer
+      else delete grillingAnswers.value[taskId]
+    }
     try {
       grillingAnswers.value[taskId] = answer
       const resp = await fetch(`/api/agent-tasks/grilling/${taskId}/answer`, {
@@ -2276,9 +2885,32 @@ export const useChatStore = defineStore('chat', () => {
       })
       if (resp.ok) {
         const data = await resp.json()
+        if (_pendingDeathmatchStops.has(convId)) {
+          // The answer was accepted, but OFF was chosen while it was in
+          // flight. Confirming it must never auto-start the goal loop, and a
+          // late answer for A must not overwrite B's current UI state.
+          if (convId === currentConversationId.value) {
+            deathmatchMode.value = false
+            deathmatchAction.value = 'stop'
+            _clearDeathmatchPresentation(convId)
+          }
+          return data
+        }
+        if (convId !== currentConversationId.value) {
+          if (data.result?.status === 'grilling_complete') {
+            applyDeathmatchVerdict(convId, getStream(convId), {
+              status: 'active', verdict: null, reason: null, turns: 0,
+              max_turns: 0, grilling_completed: data.grilling_completed || 0,
+              grilling_total: data.grilling_total || 0,
+              message: '盘问已完成，发送消息开始执行',
+            })
+            _streamVersion.value++
+          }
+          return data
+        }
 
         // Sync conversation-level deathmatch fields immediately
-        const conv = conversations.value.find(item => item.id === currentConversationId.value)
+        const conv = conversations.value.find(item => item.id === convId)
         if (conv) {
           conv.deathmatch_status = data.deathmatch_status ?? conv.deathmatch_status
           conv.deathmatch_grilling_completed = data.grilling_completed ?? conv.deathmatch_grilling_completed
@@ -2298,7 +2930,7 @@ export const useChatStore = defineStore('chat', () => {
           const convId = currentConversationId.value
           if (convId) {
             const stream = getStream(convId)
-            stream.deathmatchVerdict = {
+            applyDeathmatchVerdict(convId, stream, {
               status: 'active',
               verdict: null,
               reason: null,
@@ -2307,7 +2939,7 @@ export const useChatStore = defineStore('chat', () => {
               grilling_completed: data.grilling_completed || 0,
               grilling_total: data.grilling_total || 0,
               message: '目标已明确，正在开始执行...',
-            }
+            })
             _streamVersion.value++
 
             // Step 3: Send the goal message.
@@ -2324,10 +2956,11 @@ export const useChatStore = defineStore('chat', () => {
             round: q.round || data.result.round || 1,
           }))
           grillingAnswers.value = {}
-          const stream = getStream(currentConversationId.value!)
+          const _ngConvId = currentConversationId.value!
+          const stream = getStream(_ngConvId)
           if (stream.deathmatchVerdict) {
             const { grilling_questions: _gq, ...prevVerdict } = stream.deathmatchVerdict
-            stream.deathmatchVerdict = {
+            applyDeathmatchVerdict(_ngConvId, stream, {
               ...prevVerdict,
               status: 'grilling',
               grilling_completed: data.grilling_completed || 0,
@@ -2335,7 +2968,7 @@ export const useChatStore = defineStore('chat', () => {
               grilling_round: data.grilling_round || 0,
               grilling_round_total: data.grilling_round_total || 3,
               message: `盘问阶段 第${data.result.round}/${data.result.max_rounds}轮`,
-            }
+            })
             _streamVersion.value++
           }
         } else {
@@ -2344,19 +2977,24 @@ export const useChatStore = defineStore('chat', () => {
           if (convId) {
             const stream = getStream(convId)
             if (stream.deathmatchVerdict) {
-              stream.deathmatchVerdict = {
+              applyDeathmatchVerdict(convId, stream, {
                 ...stream.deathmatchVerdict,
                 grilling_completed: data.grilling_completed ?? stream.deathmatchVerdict.grilling_completed,
                 grilling_total: data.grilling_total ?? stream.deathmatchVerdict.grilling_total,
                 status: data.deathmatch_status ?? stream.deathmatchVerdict.status,
-              }
+              })
               _streamVersion.value++
             }
           }
         }
         return data
       }
+      if (convId === currentConversationId.value) rollbackAnswer()
+      const detail = await resp.json().catch(() => null)
+      useToast().show(`盘问回答提交失败，请重试：${detail?.detail || `HTTP ${resp.status}`}`, 'error')
     } catch (e) {
+      if (convId === currentConversationId.value) rollbackAnswer()
+      useToast().show(`盘问回答提交失败，请重试：${e instanceof Error ? e.message : String(e)}`, 'error')
       console.error('Failed to answer grilling question', e)
     }
     return null
@@ -2368,6 +3006,9 @@ export const useChatStore = defineStore('chat', () => {
     }
 
     const conversationId = _targetConversationId || currentConversationId.value!
+    // Resolve against the pre-send state: the optimistic user row below must not
+    // make a genuinely empty conversation look already message-locked.
+    const hadMessages = !!(messages.value[conversationId]?.length)
     // A4.9 R2 B1：记录本轮 run 的起始边界（乐观气泡入列前的最后一条服务器
     // 消息），commit-dedup 闸门只扫边界之后。仅新 turn 发起处设置。
     {
@@ -2397,6 +3038,7 @@ export const useChatStore = defineStore('chat', () => {
     // ——含 local-abort 残留气泡——一律跳过）；need=2（用户行+助手行）。
     const turnAnchor: TurnAnchor = { id: _newestPersistedId(messages.value[conversationId] || []), need: 2 }
 
+    const deathmatchIntentAtRun = _deathmatchIntentSeq
     const callbacks = wireStreamCallbacks(conversationId, (messageId, _title, toolResults, searchFailed, taskSubmitted) => {
       const finalContent = s.content
       const finalReasoning = s.reasoning
@@ -2413,31 +3055,61 @@ export const useChatStore = defineStore('chat', () => {
         created_at: new Date().toISOString(),
       }
       messages.value[conversationId].push(assistantMessage)
-      deathmatchAction.value = null
-    })
+      if (conversationId === currentConversationId.value) deathmatchAction.value = null
+    }, deathmatchIntentAtRun)
 
     try {
-      const doStream = () => chatApi.streamChat(
-        {
-          conversation_id: conversationId,
-          assistant_id: assistantId,
-          messages: buildRequestMessages(conversationId),
-          enable_reasoning: enableReasoning.value,
-          reasoning_effort: reasoningEffort.value,
-          thinking_budget: thinkingBudget.value,
-          // A4.9 M4：定向发送（插话兜底，目标必非 deathmatch——端点已拒）不
-          // 能泄漏当前会话的 deathmatchMode 全局 ref。
-          deathmatch_mode: _targetConversationId ? false : deathmatchMode.value,
-          deathmatch_action: _targetConversationId ? null : deathmatchAction.value,
-          execution_target: resolveExecTargetFor(_targetConversationId || conversationId),
-        },
-        {
-          ...callbacks,
-          signal: abortController.signal,
-          onConversationBusy: () => { busyRejected = true },
-          onConversationSuperseded: () => { supersededRejected = true },
-        },
-      )
+      let stopAccepted = false
+      const acknowledgePendingStop = () => {
+        if (!stopAccepted) return
+        let removed = false
+        _mutatePendingDeathmatchStops(latest => { removed = latest.delete(conversationId) })
+        if (removed) {
+          if (conversationId === currentConversationId.value && deathmatchAction.value === 'stop') {
+            deathmatchAction.value = null
+          }
+        }
+      }
+      const targetedOtherConversation = !!_targetConversationId && conversationId !== currentConversationId.value
+      const initialDeathmatchMode = deathmatchMode.value
+      const initialDeathmatchAction = deathmatchAction.value
+      const doStream = () => {
+        // Re-read only the ORIGINAL conversation's pending state on every
+        // attempt. A later selection must not lend its mode/action to this run.
+        _replacePendingDeathmatchMemory(_readPendingDeathmatchStops())
+        const pendingStop = _pendingDeathmatchStops.has(conversationId)
+        const useLiveConversationState = !targetedOtherConversation && conversationId === currentConversationId.value
+        const requestDeathmatchMode = pendingStop ? false : targetedOtherConversation ? false : useLiveConversationState ? deathmatchMode.value : initialDeathmatchMode
+        const requestDeathmatchAction = pendingStop ? 'stop' : targetedOtherConversation ? null : useLiveConversationState ? deathmatchAction.value : initialDeathmatchAction
+        // A retry is a new intent generation; its own verdicts must not look
+        // stale merely because the first attempt predated a same-conv re-ON.
+        s.deathmatchIntentAtRun = _deathmatchIntentSeq
+        return chatApi.streamChat(
+          {
+            conversation_id: conversationId,
+            assistant_id: assistantId,
+            messages: buildRequestMessages(conversationId),
+            enable_reasoning: enableReasoning.value,
+            reasoning_effort: reasoningEffort.value,
+            thinking_budget: thinkingBudget.value,
+            // A targeted send to another conversation is always ordinary. When
+            // it names the current conversation (e.g. interjection fallback), a
+            // pending OFF must survive as mode=false/action=stop.
+            deathmatch_mode: requestDeathmatchMode,
+            deathmatch_action: requestDeathmatchAction,
+            execution_target: resolveExecTargetFor(_targetConversationId || conversationId, hadMessages),
+          },
+          {
+            ...callbacks,
+            signal: abortController.signal,
+            onHttpStatus: (status: number) => {
+              if (requestDeathmatchAction === 'stop' && status >= 200 && status < 300) stopAccepted = true
+            },
+            onConversationBusy: () => { busyRejected = true },
+            onConversationSuperseded: () => { supersededRejected = true },
+          },
+        )
+      }
 
       // 4.8 session lock: the backend rejects a second concurrent agent on
       // the same conversation. Cancel the stale run and retry once; if it is
@@ -2447,6 +3119,7 @@ export const useChatStore = defineStore('chat', () => {
       let busyRejected = false
       let supersededRejected = false
       await doStream()
+      if (!busyRejected && !supersededRejected) acknowledgePendingStop()
       if (supersededRejected) {
         // Silent takeover (conversation_superseded): a newer request owns
         // the conversation. No error bubble — end this stale stream and
@@ -2460,7 +3133,11 @@ export const useChatStore = defineStore('chat', () => {
         await chatApi.stopStream(conversationId)
         await new Promise<void>(resolve => { window.setTimeout(() => resolve(), 800) })
         busyRejected = false
+        // Each attempt has its own acceptance lifecycle; a 2xx busy response
+        // must not authorize a later failed retry.
+        stopAccepted = false
         await doStream()
+        if (!busyRejected && !supersededRejected) acknowledgePendingStop()
         if (supersededRejected) {
           endStreaming(conversationId)
           void refreshConversation(conversationId)
@@ -2521,6 +3198,10 @@ export const useChatStore = defineStore('chat', () => {
       // Sync temp user-message IDs and any server-side state back into the store
       // so subsequent edits/regenerations reference real DB IDs.
       await refreshConversation(conversationId)
+      // 自然终态的插话冲刷锚定在此处（权威 refresh 已应用，判重门扫
+      // 的是服务器最新行）——onDone 回调内的并发 refresh 已被本调用吸收
+      // （refreshSeqs 最后写获胜），flush 内 reuseFresh 直接复用本快照。
+      await flushUnconfirmedInterjections(conversationId, 'auto-send')
     } catch (e: any) {
       if (e?.name === 'AbortError') {
         if (s.abortController !== abortController) {
@@ -2560,12 +3241,34 @@ export const useChatStore = defineStore('chat', () => {
     const s = getStream(convId)
     if (s.streaming) return
 
-    const existingMessages = messages.value[convId] || []
-    const targetIndex = [...existingMessages]
-      .map((message, index) => ({ message, index }))
-      .reverse()
-      .find(item => item.message.role === 'assistant')?.index
-    if (targetIndex === undefined) return
+    // 目标必须是服务器已持久化的助手消息（conv 92398a80 生产事故 2026-10-17）：
+    // 合成 id（temp-/bg-/resume-/interject- 等）或已被删除的 stale id 会让
+    // 服务端 _trim_messages_for_regeneration 404「待重新生成的消息不存在」。
+    // 本地解析不到有效目标时先刷新对齐服务端再解析一次；仍无则明示，不发注定
+    // 404 的请求。
+    const findTarget = (list: Message[]) =>
+      [...list]
+        .map((message, index) => ({ message, index }))
+        .reverse()
+        .find(item => item.message.role === 'assistant'
+          && !!item.message.id
+          && _isServerMessageId(item.message.id)
+          && !isSyntheticMessageId(item.message.id))?.index
+
+    let existingMessages = messages.value[convId] || []
+    let targetIndex = findTarget(existingMessages)
+    if (targetIndex === undefined) {
+      const refreshed = await refreshConversation(convId)
+      existingMessages = messages.value[convId] || []
+      targetIndex = findTarget(existingMessages)
+      if (targetIndex === undefined) {
+        // 文案分叉（评审 B-M2）：refresh 失败（网络）与确认无目标不是同一情形。
+        currentError.value = refreshed
+          ? '没有可重新生成的回答（该消息未保存成功），已为你刷新对话'
+          : '刷新对话失败，请检查网络后重试'
+        return
+      }
+    }
 
     const targetMessage = existingMessages[targetIndex]
     messages.value[convId] = existingMessages.slice(0, targetIndex)
@@ -2641,6 +3344,9 @@ export const useChatStore = defineStore('chat', () => {
         await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
+      // W26：自然终态的插话冲刷（同锚：先权威 refresh 再 flush）。
+      await refreshConversation(convId)
+      await flushUnconfirmedInterjections(convId, 'auto-send')
     } catch (e: any) {
       if (e?.name === 'AbortError') {
         if (s.abortController !== abortController) {
@@ -2677,6 +3383,12 @@ export const useChatStore = defineStore('chat', () => {
     const s = getStream(convId)
     if (s.streaming) return
 
+    // 与 regenerateLastAssistantMessage 同口径守卫（评审 B-I1 2026-10-18）：
+    // 目标必须已持久化且本地可定位；合成/失效 id 直发只会让服务端 404。
+    if (!_isServerMessageId(messageId) || isSyntheticMessageId(messageId)) {
+      currentError.value = '该消息未保存成功，已失效，请刷新后重试'
+      return
+    }
     const existingMessages = messages.value[convId] || []
     const targetIndex = existingMessages.findIndex(m => m.id === messageId)
     if (targetIndex === -1) return
@@ -2751,6 +3463,9 @@ export const useChatStore = defineStore('chat', () => {
         await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
+      // W26：自然终态的插话冲刷（同锚：先权威 refresh 再 flush）。
+      await refreshConversation(convId)
+      await flushUnconfirmedInterjections(convId, 'auto-send')
     } catch (e: any) {
       if (e?.name === 'AbortError') {
         if (s.abortController !== abortController) {
@@ -2934,6 +3649,9 @@ export const useChatStore = defineStore('chat', () => {
         await tryReconnectOrSync(convId, turnAnchor, s)
         return
       }
+      // W26：自然终态的插话冲刷（同锚：先权威 refresh 再 flush）。
+      await refreshConversation(convId)
+      await flushUnconfirmedInterjections(convId, 'auto-send')
     } catch (e: any) {
       if (e?.name === 'AbortError') {
         if (s.abortController !== abortController) {
@@ -2984,6 +3702,55 @@ export const useChatStore = defineStore('chat', () => {
     const texts = pend.filter(p => !p.committed).map(p => p.content)
     for (const p of [...pend]) _removePendingInterjection(convId, p.localId)
     return texts
+  }
+
+  /** W26（B2/B3）：把一批插话 commit-echo 应用到 pending 队列。
+   *  配对优先 client_message_id（同会话同文两条插话不会错标第一条），
+   *  旧后端/旧队列项无 id 时回落内容配对；echo 已确认的服务器行 id 登记入册，
+   *  终态冲刷的判重闸门据此排除已确认行（A4.9 R3 N1）。
+   *  幂等：live 事件与 resume replay 可能对同一条 echo 各投递一次。 */
+  function _applyInterjectionEchoes(
+    conversationId: string,
+    echoes: Array<{
+      id?: string | null
+      content?: string | null
+      client_message_id?: string | null
+      display_item?: Record<string, unknown> | null
+    }> | null | undefined,
+    opts?: { fromReplay?: boolean },
+  ): Array<Record<string, unknown>> {
+    const displayItems: Array<Record<string, unknown>> = []
+    if (!echoes || !echoes.length) return displayItems
+    for (const payload of echoes) {
+      if (!payload) continue
+      const pend = pendingInterjections[conversationId] || []
+      // 配对规则集中在 stores/interjectionPairing.ts（纯函数，行为级单测）：
+      // 有 id 只按 id；无 id 才内容兜底；replay 无 id echo 不确认带 cmid 条目。
+      const matchIdx = pairInterjectionEcho(pend, payload, opts)
+      const displayItem = (payload.display_item || null) as Record<string, unknown> | null
+      // 2026-11-01 inline placement: a committed echo moves the entry from the
+      // bottom queue into the live timeline at the commit position immediately.
+      // Old backends (no display_item) keep the legacy "committed, wait for
+      // done" behavior so they cannot render a duplicate top-level bubble.
+      if (matchIdx >= 0) {
+        if (displayItem) {
+          const matched = pend[matchIdx]
+          pendingInterjections[conversationId] = pend.filter(
+            p => p.localId !== matched.localId,
+          )
+        } else {
+          pend[matchIdx] = { ...pend[matchIdx], committed: true }
+        }
+      }
+      if (displayItem) displayItems.push(displayItem)
+      if (payload.id) {
+        if (!_echoConfirmedCommittedIds[conversationId]) {
+          _echoConfirmedCommittedIds[conversationId] = new Set()
+        }
+        _echoConfirmedCommittedIds[conversationId].add(payload.id)
+      }
+    }
+    return displayItems
   }
 
   /** 未确认条目对应的助手绑定（与 _drainUnconfirmedInterjections 同序）。 */
@@ -3042,12 +3809,15 @@ export const useChatStore = defineStore('chat', () => {
     const text = content.trim()
     if (!convId || !text) return
     const localId = `interject-pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    // W26（B3）：客户端生成的配对 id —— 服务端写进 commit-echo 回带，
+    // 同会话同文两条插话按 id 精确配对（内容配对只作旧后端兜底）。
+    const clientMessageId = `interject-cm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
     if (!pendingInterjections[convId]) pendingInterjections[convId] = []
     // assistantId 一并挂在条目上：兜底重发时透传，避免丢助手绑定
     // （此前只是把硬编码 null 换成一个从未被传入的形参 —— 是死管道）。
-    pendingInterjections[convId].push({ localId, content: text, assistantId: assistantId ?? null })
+    pendingInterjections[convId].push({ localId, content: text, assistantId: assistantId ?? null, clientMessageId })
     addContextTokenDelta(convId, text)
-    const res = await chatApi.interjectStream(convId, text)
+    const res = await chatApi.interjectStream(convId, text, clientMessageId)
     if (res.status === 'steered') return
     // A4.9 I2：条目可能已被 done 兜底排走并自动发送——remove 返回 false 时
     // 绝不再发，杜绝同文本双 turn。
@@ -3073,6 +3843,20 @@ export const useChatStore = defineStore('chat', () => {
   async function flushUnconfirmedInterjections(convId: string, mode: 'auto-send' | 'restore', assistantId?: string | null) {
     const pendAll = pendingInterjections[convId] || []
     if (!pendAll.length) return
+    if (mode === 'auto-send') {
+      // W26 重复气泡根治：auto-send 冲刷前确保判重门扫的是权威快照。
+      // commit-echo 不把服务器行插入 messages —— 去重门扫刷新前的本地列表
+      // 会把 echo 丢失但服务端已落库的插话误判「未确认」→ sendMessage 再落
+      // 一行 → 双气泡。reuseFresh：调用点已重排为「先 refresh 后 flush」
+      // （裸 refresh 会被紧随的竞对 refresh 以 refreshSeqs 最后写获胜作废，
+      // 快照永不应用=修复失效）；TTL 内直接复用已应用的快照，无竞对
+      // （syncAfterAbort/selectConversation 路径）时才真拉取。
+      try {
+        await refreshConversation(convId, { reuseFresh: true })
+      } catch {
+        // 刷新失败：保持既有本地快照判重语义
+      }
+    }
     // 已 commit 的条目已进 run 上下文并由 chat.py 落库，由 run 自己作答；
     // 只有未确认的才需要兜底重发 / 回填。两类都出队 —— 队列不得滞留。
     const assistantIds = _drainUnconfirmedAssistantIds(convId)
@@ -3172,6 +3956,16 @@ export const useChatStore = defineStore('chat', () => {
     Object.keys(refreshSeqs).forEach(k => delete refreshSeqs[k])
     conversations.value = []
     currentConversationId.value = null
+    _clearPendingDeathmatchStops()
+    deathmatchMode.value = false
+    deathmatchAction.value = null
+    _deathmatchIntentConversationId = null
+    grillingQuestions.value = []
+    grillingAnswers.value = {}
+    executionTarget.value = null
+    executionTargetUserSelected.value = false
+    Object.keys(_executionTargetVersions).forEach(k => delete _executionTargetVersions[k])
+    Object.keys(_selectConversationSeqs).forEach(k => delete _selectConversationSeqs[k])
     messages.value = {}
     contextInfoByConversation.value = {}
     try {
@@ -3219,11 +4013,34 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   let _deathmatchPollTimer: ReturnType<typeof setInterval> | null = null
+  // B-6：poll 在飞 GET 竞态守卫的 verdict 应用序号（每会话一计数）
+  const _verdictSeq = new Map<string, number>()
+
+  // I6（fix-round）：verdict 写点唯一接缝——写前递增 _verdictSeq，在飞 poll
+  // 据此弃用旧快照。所有 deathmatchVerdict 赋值必须走本 helper（test:unit
+  // 钉「写点 bump 数 ≥ verdict 赋值数」接线 pin，裸写点会被逮）。
+  function applyDeathmatchVerdict(
+    convId: string,
+    target: StreamState,
+    verdict: DeathmatchVerdict | null,
+  ) {
+    _verdictSeq.set(convId, (_verdictSeq.get(convId) || 0) + 1)
+    target.deathmatchVerdict = verdict
+  }
 
   async function pollDeathmatchStatus() {
     const convId = currentConversationId.value
     if (!convId) return
     const s = getStream(convId)
+    if (_pendingDeathmatchStops.has(convId)) {
+      deathmatchMode.value = false
+      deathmatchAction.value = 'stop'
+      _clearDeathmatchPresentation(convId)
+      return
+    }
+    const preserveExplicitStart = deathmatchMode.value
+      && deathmatchAction.value === 'start'
+      && _deathmatchIntentConversationId === convId
     // Only skip polling if actively receiving SSE events (last event within 30s)
     if (s.streaming && s._lastEventTime && (Date.now() - s._lastEventTime) < 30000) return
 
@@ -3233,14 +4050,30 @@ export const useChatStore = defineStore('chat', () => {
       // SSE): a preserved active/grilling verdict would permanently suppress
       // syncAfterAbort's stale-buffer cross-check for this conversation.
       if (s.deathmatchVerdict?.status === 'active' || s.deathmatchVerdict?.status === 'grilling') {
-        s.deathmatchVerdict = null
+        applyDeathmatchVerdict(convId, s, null)
         _streamVersion.value++
       }
+      deathmatchMode.value = preserveExplicitStart
+      deathmatchAction.value = preserveExplicitStart ? 'start' : null
+      stopDeathmatchPolling()
       return
     }
 
+    const _seqBefore = _verdictSeq.get(convId) || 0
     try {
       const conversation = await chatApi.getConversation(convId, { include: 'slim' })
+      if (convId !== currentConversationId.value) return
+      if (_pendingDeathmatchStops.has(convId)) {
+        deathmatchMode.value = false
+        deathmatchAction.value = 'stop'
+        _clearDeathmatchPresentation(convId)
+        return
+      }
+      // B-6（评审）：in-flight 竞争——GET 飞行期间可能已有新 verdict SSE
+      // 落地，应用前复检 30s 窗（与取前守卫同则），不得用旧快照盖新状态。
+      if (s.streaming && s._lastEventTime && (Date.now() - s._lastEventTime) < 30000) return
+      // B-6（遗留清偿）：流结束后同样可能有在飞旧 GET——序号不等即弃用旧快照
+      if (!shouldApplyPollVerdict(_seqBefore, _verdictSeq.get(convId) || 0)) return
       conv.deathmatch_mode = conversation.deathmatch_mode
       conv.deathmatch_status = conversation.deathmatch_status
       conv.deathmatch_goal = conversation.deathmatch_goal
@@ -3251,18 +4084,57 @@ export const useChatStore = defineStore('chat', () => {
       conv.deathmatch_grilling_round = conversation.deathmatch_grilling_round
       conv.deathmatch_grilling_round_total = conversation.deathmatch_grilling_round_total
 
-      s.deathmatchVerdict = {
+      const preserveExplicitStartAfterGet = deathmatchMode.value
+        && deathmatchAction.value === 'start'
+        && _deathmatchIntentConversationId === convId
+      if (
+        preserveExplicitStartAfterGet
+        && (s.deathmatchIntentAtRun == null || s.deathmatchIntentAtRun !== _deathmatchIntentSeq)
+      ) {
+        // The current intent has no attached run of its own (or the attached
+        // run is older). This covers re-ON both before and during the GET:
+        // an old terminal snapshot cannot close an unsent replacement intent.
+        deathmatchMode.value = true
+        deathmatchAction.value = 'start'
+        stopDeathmatchPolling()
+        return
+      }
+      if (!conversation.deathmatch_mode) {
+        // Another tab/client has parked this task. The authoritative mode=false
+        // must hide the bar and prevent a later ordinary prompt from resuming,
+        // unless the user explicitly re-enabled this exact conversation after
+        // that older snapshot was taken.
+        deathmatchMode.value = preserveExplicitStartAfterGet
+        deathmatchAction.value = preserveExplicitStartAfterGet ? 'start' : null
+        if (!preserveExplicitStartAfterGet) {
+          _clearDeathmatchPresentation(convId)
+          await refreshConversation(convId)
+        } else {
+          stopDeathmatchPolling()
+        }
+        return
+      }
+      const _prevVerdict = s.deathmatchVerdict
+      applyDeathmatchVerdict(convId, s, {
         status: conversation.deathmatch_status || 'active',
         verdict: null,
-        reason: null,
+        reason: conversation.deathmatch_reason || null,
         turns: conversation.deathmatch_turns || 0,
         max_turns: conversation.deathmatch_max_turns ?? 0,
         grilling_completed: conversation.deathmatch_grilling_completed || 0,
         grilling_total: conversation.deathmatch_grilling_total || 0,
         grilling_round: conversation.deathmatch_grilling_round || 0,
         grilling_round_total: conversation.deathmatch_grilling_round_total || 3,
-        message: '',
-      }
+        message: _deathmatchStatusMessage(conversation),
+        // R4（诊断机制 C）：轮询重建必须携带 plan（GET slim 已返回
+        // deathmatch_plan）——此前缺 plan_steps 导致 5s 轮询把清单整块抹掉。
+        plan_version: conversation.deathmatch_plan_version || 0,
+        plan_steps: mapPlanSteps(conversation.deathmatch_plan),
+        // B-6（评审）：GET 不携带 human_gate/attachments——沿用既有值，
+        // 否则人工介入报告会在 5s 轮询内整块消失（同机制 C 消失类）。
+        human_gate: _prevVerdict?.human_gate ?? null,
+        final_attachments: _prevVerdict?.final_attachments ?? [],
+      })
       _streamVersion.value++
 
       // 死磕盘问兜底：轮询发现 grilling 且本地产问题为空或落后于服务端轮次
@@ -3277,21 +4149,12 @@ export const useChatStore = defineStore('chat', () => {
         void fetchGrillingQuestions(convId)
       }
 
-      if (conversation.deathmatch_status === 'done') {
-        deathmatchMode.value = false
-        if (_deathmatchPollTimer) {
-          clearInterval(_deathmatchPollTimer)
-          _deathmatchPollTimer = null
-        }
-        await refreshConversation(convId)
-      } else if (conversation.deathmatch_status === 'partial_complete') {
-        // Partial completion: stop polling but keep deathmatch mode on
-        // so the user can resume by sending a message.
-        deathmatchMode.value = true
-        if (_deathmatchPollTimer) {
-          clearInterval(_deathmatchPollTimer)
-          _deathmatchPollTimer = null
-        }
+      if (['done', 'partial_complete', 'paused', 'human_gate'].includes(conversation.deathmatch_status)) {
+        deathmatchMode.value = !!conversation.deathmatch_mode && conversation.deathmatch_status !== 'done'
+        if (conversation.deathmatch_status === 'done') deathmatchAction.value = null
+        stopDeathmatchPolling()
+        // Terminal states can carry the only useful explanation/artifact. A
+        // missed SSE must not leave paused/human-gate messages invisible.
         await refreshConversation(convId)
       }
     } catch {
@@ -3348,6 +4211,7 @@ export const useChatStore = defineStore('chat', () => {
     currentStreamingTaskProgress,
     currentStreamingSubAgentChunks,
     currentStreamingDisplaySequence,
+    currentStreamingRowId,
     searchResults,
     searchQuery,
     searchHighlightQuery,
@@ -3361,8 +4225,13 @@ export const useChatStore = defineStore('chat', () => {
     loadModels,
     capabilitiesForAlias,
     deathmatchMode,
+    activeSteerTask,
+    refreshActiveSteerTask,
+    steerActiveTask,
     deathmatchAction,
+    setDeathmatchModeEnabled,
     executionTarget,
+    executionTargetUserSelected,
     activeDeviceId,
     resolveExecTargetFor,
     grillingQuestions,
@@ -3378,6 +4247,11 @@ export const useChatStore = defineStore('chat', () => {
     contextInfoByConversation,
     loadConversations,
     createConversation,
+    resolveDefaultExecutionTarget,
+    notifyDefaultExecutionTarget,
+    bindExecutionTarget,
+    reconcileExecutionTarget,
+    applyDefaultExecutionTargetToConversation,
     selectConversation,
     ensureMessageFull,
     ensureFullPayloads,

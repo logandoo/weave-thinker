@@ -34,8 +34,104 @@ logger = logging.getLogger(__name__)
 # sanitize_async — no measure-word heuristic (agentic principle 2026-07-20).
 _CITE_RE = re.compile(r"\[(\d{1,3})\](?![(:])")
 
+# 模型原生引用标记 `[cite:10, 11]`（DeepSeek 系原生引用形态，60 生产 conv
+# 5c89e092 实证：content 首尾各一行裸标记直达用户）。规范化为系统台账形态
+# `[10][11]` 后走既有 verify/sanitize——合法编号保留为内联引用，越界编号按
+# unknown 清理（SOTA=CiteFix ACL-2025 同族：后处理校正模型引用标记）。
+#
+# 后缀消费（2026-10-22 遗留收口）：`[cite:N](url)` / `[cite:N]: ref` 若原样
+# 留着，会以「markdown 链接/引用定义」形态对 `_CITE_RE` 永久隐身（其
+# `(?![(:])` 负前瞻按设计跳过 `[N](`/`[N]:`）——伪造编号因此绕过清理。这些
+# 后缀只可能来自模型伪造的引用链接（真实来源由系统台账渲染），整段消费后
+# 只留 `[N]`，让编号重新进入 verify 视野。
+_CITE_FAST_RE = re.compile(r"\[cite:", re.IGNORECASE)
+# 内联标记（可带一层嵌套括号的链接目标：`(https://…/Foo_(bar))`）。
+# re-review I-3：不吞行内冒号后的正文——`[cite:3]: 说明` 是「引用+冒号+解释」，
+# 只规范化标记本身；Reference-definition 形态（行首 `[cite:3]: url`）由
+# _CITE_REF_DEF_RE 单独处理（Markdown 定义行必须以行首开始）。
+_CITE_MARKER_RE = re.compile(
+    r"\[cite:\s*(\d{1,3}(?:\s*,\s*\d{1,3})*)\s*\]"
+    r"(?:\((?:[^()\n]|\([^()\n]*\))*\))?",
+    re.IGNORECASE)
+# Reference-definition 形态：行首且冒号后是 URL/路径（`<…>`、scheme://、/、./）。
+# `[cite:3]: 正文` 是「引用+冒号+解释」而非 link definition——只规范化标记、
+# 正文必须保留（re-review I-3 的语义边界）。
+_CITE_REF_DEF_RE = re.compile(
+    r"(?m)^[ \t]*\[cite:\s*(\d{1,3}(?:\s*,\s*\d{1,3})*)\s*\]:[ \t]*"
+    r"(?:<[^\n>]*>|[a-z][a-z0-9+.\-]*://\S+|/\S+|\.{1,2}/\S+)[^\n]*",
+    re.IGNORECASE)
+# 只用于**采集编号**（verify/清理判定），不参与改写：任何 [cite:…] 形态的编号
+# 都必须进入 verify 视野——含行内 `[cite:N]:`（规范化后成 `[N]:`，会被
+# `_CITE_RE` 的负前瞻按设计跳过；N-2 re-review 实证该族伪造编号可绕过清理）。
+_CITE_ANY_IDS_RE = re.compile(
+    r"\[cite:\s*(\d{1,3}(?:\s*,\s*\d{1,3})*)\s*\]", re.IGNORECASE)
+
 # Fenced/inline code — citations inside code are not citations.
 _FENCE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
+
+
+def _masked_apply(text: str, pattern: "re.Pattern", repl) -> str:
+    """Apply ``pattern.sub(repl, …)`` only OUTSIDE fenced/inline code.
+
+    Position-based masking (2026-10-22): matches are searched on the ORIGINAL
+    text and dropped when their start falls inside a code span — fragment
+    splitting (the old approach) made a fragment boundary look like a line
+    start, so ``(?m)^`` ref-definition matching could swallow the tail of a
+    line right after inline code (re-review N-3).
+    """
+    spans = [(m.start(), m.end()) for m in _FENCE_RE.finditer(text)]
+    if not spans:
+        return pattern.sub(repl, text)
+
+    def _inside(pos: int) -> bool:
+        return any(s <= pos < e for s, e in spans)
+
+    out = []
+    last = 0
+    for m in pattern.finditer(text):
+        if _inside(m.start()):
+            continue
+        out.append(text[last:m.start()])
+        out.append(repl(m))
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def normalize_cite_markers(text: str) -> str:
+    """Normalize model-native ``[cite:N, M]`` markers to the ledger form ``[N][M]``.
+
+    Only ASCII brackets with a pure comma-separated digit payload qualify;
+    ``[cite:abc]`` / ``[cite:1,x]`` are not citation markers and stay verbatim.
+    Fenced/inline code is masked (same discipline as ``_sanitize_remove_ids``)
+    so code samples never get rewritten.  A ``(link)`` / ``: reference``
+    suffix is consumed (see ``_CITE_MARKER_RE``) — otherwise the resulting
+    ``[N](`` / ``[N]:`` shapes would stay invisible to ``_CITE_RE`` by design.
+    Ids are NOT validated here — range checking stays with
+    :meth:`CitationLedger.verify` downstream.
+    """
+    if not text or not _CITE_FAST_RE.search(text):
+        return text
+
+    def _expand(m: "re.Match") -> str:
+        return "".join(f"[{int(i)}]" for i in re.findall(r"\d{1,3}", m.group(1)))
+
+    # 行首 reference-definition 先整行消费，再处理内联标记。
+    text = _masked_apply(text, _CITE_REF_DEF_RE, _expand)
+    return _masked_apply(text, _CITE_MARKER_RE, _expand)
+
+
+def strip_cite_markers(text: str) -> str:
+    """Remove every model-native ``[cite:…]`` marker (with link/ref suffix).
+
+    Used when NO ledger exists (zero-tool-activity turn): every marker is a
+    fabricated citation, so there is nothing to range-check — the whole
+    construct is dropped.  Fenced/inline code stays verbatim.
+    """
+    if not text or not _CITE_FAST_RE.search(text):
+        return text
+    text = _masked_apply(text, _CITE_REF_DEF_RE, "")
+    return _masked_apply(text, _CITE_MARKER_RE, "")
 
 _CITE_DISAMBIGUATE_PROMPT = (
     "你是引用标记判断器。下面的文本中出现了数字方括号标记 [N]，其中一部分是"
@@ -247,6 +343,32 @@ class CitationLedger:
             lines.append(line)
         return "\n\n".join(lines)
 
+    def _entry_manifest_head(self, entry: Dict[str, Any]) -> str:
+        """Title (+ author/year/volume/page suffix) exactly as manifest shows it.
+
+        Shared by ``format_manifest`` and echo matching so the accepted shape
+        cannot drift from the emitted shape (review R1 Minor-8).
+        """
+        title = sanitize_manifest_text(
+            entry.get("title") or entry.get("container") or entry.get("url") or "未题名", cap=50,
+        )
+        author = sanitize_manifest_text(entry.get("author") or "", cap=30)
+        year = sanitize_manifest_text(
+            str(entry.get("year") or "").strip() or (entry.get("published_date") or "").strip()[:4],
+            cap=10,
+        )
+        head = title
+        who = ",".join(x for x in (author, year) if x)
+        if who:
+            head += f" — {who}"
+        loc = " ".join(
+            sanitize_manifest_text(x, cap=20)
+            for x in (entry.get("volume"), entry.get("page")) if x
+        )
+        if loc:
+            head += f" | {loc}"
+        return head
+
     def format_manifest(self, max_entries: int = 120) -> str:
         """紧凑引用台账块（M5 免折叠 manifest）。
 
@@ -259,36 +381,56 @@ class CitationLedger:
             return ""
         lines = ["【引用台账（系统维护）——本轮 [N] 编号对应下表；引用时使用表内编号，禁止编造】"]
         for e in self.entries[:max_entries]:
-            title = sanitize_manifest_text(
-                e.get("title") or e.get("container") or e.get("url") or "未题名", cap=50,
-            )
-            author = sanitize_manifest_text(e.get("author") or "", cap=30)
-            year = sanitize_manifest_text(
-                str(e.get("year") or "").strip() or (e.get("published_date") or "").strip()[:4],
-                cap=10,
-            )
-            head = f"[{e.get('id')}] {title}"
-            who = ",".join(x for x in (author, year) if x)
-            if who:
-                head += f" — {who}"
-            loc = " ".join(
-                sanitize_manifest_text(x, cap=20)
-                for x in (e.get("volume"), e.get("page")) if x
-            )
-            if loc:
-                head += f" | {loc}"
-            lines.append(head)
+            lines.append(f"[{e.get('id')}] {self._entry_manifest_head(e)}")
         if len(self.entries) > max_entries:
             lines.append(f"…（台账共 {len(self.entries)} 条，其余条目仍有效可引用，编号范围 [1]-[{self.size}]）")
         return "\n".join(lines)
 
     @staticmethod
     def _cited_ids_from_text(text: str) -> Set[int]:
-        """Extract [N] markers from prose, ignoring fenced/inline code."""
+        """Extract cited ids from prose, ignoring fenced/inline code.
+
+        Harvests BOTH forms: ledger ``[N]`` and every model-native
+        ``[cite:…]`` shape (raw collection — the audit mapping view must see
+        ids that normalization would render as invisible ``[N]:``/``[N](``).
+        """
         if not text:
             return set()
         prose = _FENCE_RE.sub("", text)
-        return {int(m) for m in _CITE_RE.findall(prose)}
+        ids = {int(m) for m in _CITE_RE.findall(prose)}
+        for m in _CITE_ANY_IDS_RE.finditer(prose):
+            ids |= {int(i) for i in re.findall(r"\d{1,3}", m.group(1))}
+        return ids
+
+    def _raw_cite_unknown(self, text: str) -> Set[int]:
+        """Ids inside ``[cite:…]`` markers that are NOT valid ledger ids."""
+        if not text:
+            return set()
+        prose = _FENCE_RE.sub("", text)
+        ids: Set[int] = set()
+        for m in _CITE_ANY_IDS_RE.finditer(prose):
+            ids |= {int(i) for i in re.findall(r"\d{1,3}", m.group(1))}
+        return {n for n in ids if not self._id_valid(n)}
+
+    def _id_valid(self, n: int) -> bool:
+        return 1 <= n <= len(self.entries) and self.entries[n - 1]["id"] == n
+
+    def _filter_cite_markers(self, text: str, drop_ids: Set[int]) -> str:
+        """Drop unknown ids from ``[cite:…]`` markers (whole marker if empty).
+
+        Runs BEFORE normalization so a marker containing a fabricated id can
+        never normalize into the invisible ``[N]:``/``[N](`` shapes (N-2).
+        """
+        if not text or not drop_ids:
+            return text
+
+        def _repl(m: "re.Match") -> str:
+            ids = [int(i) for i in re.findall(r"\d{1,3}", m.group(1))]
+            keep = [i for i in ids if i not in drop_ids]
+            return "".join(f"[{i}]" for i in keep)
+
+        text = _masked_apply(text, _CITE_REF_DEF_RE, _repl)
+        return _masked_apply(text, _CITE_MARKER_RE, _repl)
 
     def verify(self, text: str) -> CitationReport:
         cited = self._cited_ids_from_text(text)
@@ -335,10 +477,108 @@ class CitationLedger:
         markers exist)."""
         if not text:
             return text
+        raw_unknown = self._raw_cite_unknown(text)
+        if raw_unknown:
+            text = self._filter_cite_markers(text, raw_unknown)
+        text = normalize_cite_markers(text)
         report = self.verify(text)
         if not report.unknown:
             return text
         return self._sanitize_remove_ids(text, report.unknown)
+
+    @staticmethod
+    def _echo_title_key(value: Any) -> str:
+        """Normalize a manifest/answer title for echo matching (deterministic).
+
+        Only structural normalization (markdown/punctuation/whitespace) — no
+        semantic/keyword judgment (D-13/D-936).  A trailing ` — author, year`
+        is left in place; prefix matching below tolerates it.
+        """
+        s = str(value or "").strip()
+        s = re.sub(r"[`*_#>【】\[\]（）()]+", " ", s)
+        s = re.sub(r"\s+", " ", s)
+        return s.strip(" \t\r\n:：-—·.").casefold()
+
+    @classmethod
+    def _echo_title_matches(cls, line_title: str, entry_title: str) -> bool:
+        a = cls._echo_title_key(line_title)
+        b = cls._echo_title_key(entry_title)
+        # EXACT normalized equality only.  Prefix matching looked safe but
+        # deleted substantive prose such as ``[1] Alpha Study Results 显示…``
+        # (review R1 Critical-1): the remainder after a valid title can be
+        # commentary, not a manifest suffix.  A miss is preferable to data
+        # loss; prompt + deterministic exact match cover the incident shape.
+        return bool(a and b and a == b)
+
+    def strip_trailing_manifest_echo(self, text: str) -> str:
+        """Remove a trailing citation-ledger echo from a persisted text surface.
+
+        Production conv 08249cf0: the model copied the synthetic system
+        manifest into the answer tail as 21 lines of ``[N] Title``.  The
+        frontend already renders sources from the ``citations`` payload, so
+        these lines are duplicate UI, and once persisted they propagate into
+        the next turn as a format example.
+
+        Conservative contract:
+        - only a TRAILING block of >= 8 lines is considered (short lists can
+          be the user's requested answer);
+        - numbered lines must use a ledger id AND a title matching that entry;
+        - plain-title lists are NOT stripped (review R1/R2 Critical: they can
+          be the requested answer; only ``[N] Title`` manifest lines qualify);
+        - inline ``[N]`` and unknown/enumeration markers are untouched;
+        - if stripping would empty the whole message, keep the original.
+        """
+        if not text or not self.entries:
+            return text
+        stripped = text.rstrip()
+        if "\n" not in stripped:
+            return text
+        # An unclosed fence means the tail may be code; never strip it.
+        if stripped.count("```") % 2 == 1:
+            return text
+        lines = stripped.split("\n")
+        start = len(lines)
+        matched_ids: set[int] = set()
+        while start > 0:
+            line = lines[start - 1].strip()
+            if not line:
+                break
+            m = re.match(r"^(?:[-*]\s*)?\[(\d{1,3})\]\s+(.+?)\s*$", line)
+            if not m:
+                break
+            entry_id = int(m.group(1))
+            if entry_id < 1 or entry_id > len(self.entries):
+                break
+            entry = self.entries[entry_id - 1]
+            line_title = m.group(2)
+            if not (
+                self._echo_title_matches(line_title, entry.get("title") or "")
+                or self._echo_title_matches(line_title, self._entry_manifest_head(entry))
+            ):
+                break
+            matched_ids.add(entry_id)
+            start -= 1
+        block_len = len(lines) - start
+        # Minimum 8 lines regardless of blank/heading layout: a short
+        # ``[N] Title`` list is structurally indistinguishable from a
+        # user-requested source list, and deleting that answer is worse than
+        # leaving a short echo (review R1/R2 rounds 2-3).  The production
+        # incident was 21 consecutive lines.
+        if block_len < 8 or not matched_ids:
+            return text
+        heading_before = bool(
+            start > 0 and re.fullmatch(
+                r"\s*(?:参考(?:资料|来源|文献)|References?|Sources?|来源)\s*[:：]?\s*",
+                lines[start - 1], re.IGNORECASE,
+            )
+        )
+        if heading_before:
+            start -= 1
+        cleaned = "\n".join(lines[:start]).rstrip()
+        if not cleaned:
+            return text
+        logger.info("citation manifest echo stripped: block_lines=%d", block_len)
+        return cleaned
 
     async def sanitize_texts(
         self,
@@ -367,6 +607,13 @@ class CitationLedger:
         texts = [t or "" for t in texts]
         if not any(texts):
             return texts
+        # [cite:N,…] 原生标记先剔除伪造编号（整枚/逐号），再归一为台账形态
+        # （60 生产 conv 5c89e092 实证）；合法编号保留为内联引用，行内
+        # `[cite:N]:` 的伪造编号不会以 `[N]:` 隐身形态存活（N-2）。
+        texts = [
+            normalize_cite_markers(self._filter_cite_markers(t, self._raw_cite_unknown(t)))
+            for t in texts
+        ]
         unknown: set[int] = set()
         for t in texts:
             unknown |= self.verify(t).unknown

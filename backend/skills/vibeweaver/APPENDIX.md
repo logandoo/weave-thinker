@@ -3,13 +3,13 @@
 
 > This file contains executable code snippets for [SKILL.md](SKILL.md). Copy and use directly in projects.
 > 
-> **Stack note**: §A1, §A2, §A4 are universal (apply to any project). §A3 is FastAPI-specific. §A5 is an example template — adapt to your project's actual config. §A6 is for the default FastAPI+React+Vite stack — adapt to your project's build tooling.
+> **Stack note**: the §A4.x test templates are universal (any project); §A4.7.2 is FastAPI-specific. §A3 is an example config template — adapt to your project. §A2 is for the default FastAPI+React+Vite stack — adapt to your build tooling.
 
 # Vibeweaver — Appendix: Executable Code Library
 
 ---
 
-## §A1. Playwright Media Capture Test — Video + Audio + Screenshot (Universal)
+## §A4.5 Playwright Media Capture Test — Video + Audio + Screenshot (Universal)
 
 Captures the page operation flow as **video** (Playwright `record_video`),
 **in-page audio** (Web Audio capture script injected via `add_init_script`),
@@ -266,7 +266,7 @@ python tests/flow_capture_test.py
 
 ---
 
-## §A2. Backend API Test — httpx (Universal)
+## §A4.7.1 Backend API Test — httpx (Universal)
 
 Save as `tests/api_test.py`:
 
@@ -325,7 +325,7 @@ if __name__ == "__main__":
 
 ---
 
-## §A3. FastAPI Fallback Route — History Routing (FastAPI Only)
+## §A4.7.2 FastAPI Fallback Route — History Routing (FastAPI Only)
 
 Add to `backend/app/main.py`:
 
@@ -344,7 +344,7 @@ async def serve_spa(full_path: str):
 
 ---
 
-## §A4. WebSocket Test — websockets (Universal)
+## §A4.7.3 WebSocket Test — websockets (Universal)
 
 Save as `tests/ws_test.py`:
 
@@ -392,7 +392,7 @@ if __name__ == "__main__":
 
 ---
 
-## §A5. config.toml Full Template (Example — Adapt to Your Project)
+## §A3 config.toml Full Template (Example — Adapt to Your Project)
 
 > **WARNING**: This is an example template for new FastAPI+PostgreSQL projects. All values below (including password `<EXAMPLE-PASSWORD>` and database name `psy`) are EXAMPLES only. **For existing projects, read and preserve the project's actual config values.** For non-PostgreSQL databases, adapt the `[database]` section accordingly.
 
@@ -425,7 +425,7 @@ max_tokens = 4096
 
 ---
 
-## §A6. Script Templates (Default: FastAPI + React + Vite — Adapt for Other Stacks)
+## §A2 Script Templates (Default: FastAPI + React + Vite — Adapt for Other Stacks)
 
 ### Linux/macOS: `script/linux/project_build.sh`
 
@@ -532,7 +532,7 @@ echo "[RESTART] Done."
 
 ---
 
-## §A7. Large-Task Implementation Plan Template
+## C3 Plan Template — Large-Task Implementation Plan
 
 Save as `docs/PLAN.md` (see [REFERENCE.md → Part C: C3](REFERENCE.md)). Write it assuming the executor has zero project context; every step carries actual content, never placeholders.
 
@@ -609,7 +609,7 @@ git commit -m "feat: add <specific behavior>"
 
 ---
 
-## §A8. G-DED Artifact Assertion Script — `tests/assert_artifacts.py`
+## §A4.4.1 G-DED Artifact Assertion Script — `tests/assert_artifacts.py`
 
 > Universal. Required by [COMPLETION_GATE.md §A4.4.1](COMPLETION_GATE.md).
 > Byte-checks the artifacts behind every `[Verification Gate]` / `[Memory Gate]`
@@ -619,7 +619,7 @@ git commit -m "feat: add <specific behavior>"
 > Flags: `--existing` (Modify-Existing task → skip new-project §A5 design-doc
 > + git checks) · `--backend-only` (no UI → skip `PAGE_DESIGN.html` and
 > `script/linux/project_build.sh`).
-> The assertion groups (1-19) mirror COMPLETION_GATE.md §A4.4.1's minimum-check table.
+> The assertion groups (1-21) mirror COMPLETION_GATE.md §A4.4.1's minimum-check table.
 
 **The canonical script is `scripts/assert_artifacts.py` in this skill's
 directory** — copy it, do NOT retype it (self-written variants omit check
@@ -674,7 +674,7 @@ incomplete variant is re-copied, never patched by hand.
 
 ---
 
-## §A9. Incident Postmortem Template — `docs/POSTMORTEM_<date>_<slug>.md`
+## C6 Incident Postmortem Template — `docs/POSTMORTEM_<date>_<slug>.md`
 
 For incidents that reached a working system (production breakage, user-reported
 failure, anything that escaped the loops or recurred). A bug found and fixed in
@@ -726,7 +726,38 @@ re-run. Until then the postmortem stays in the owner's triage queue.
 
 ---
 
-## §A11. Trusted Oracle & Deterministic Checker (Universal)
+## §A4.7b Workflow Trace Template (Universal)
+
+One scenario per file under `tests/workflows/`; real HTTP against the server
+started via `script/` (COV-2), clean start state, state transitions
+asserted, per-step results appended to `tests/workflows/<flow>.trace.log`
+(the loop's convergence evidence; assert_artifacts group 10 checks cited
+traces exist). Three hard rules: TESTING_PROTOCOLS.md §A4.7b.
+
+Save as `tests/workflows/test_registration_flow.py`:
+
+```python
+# Real HTTP, not service-direct: routing/auth/serialization are part of the test.
+import httpx
+
+BASE = "http://127.0.0.1:8000"          # from config.toml in the real project
+
+def test_register_then_create_then_persist(base_url=BASE):
+    r = httpx.post(f"{base_url}/api/register", json={"user": "u1", "pw": "x"})
+    assert r.status_code == 201                       # entry call
+    token = r.json()["token"]
+    r = httpx.post(f"{base_url}/api/items",
+                   headers={"Authorization": f"Bearer {token}"},
+                   json={"name": "n1"})
+    assert r.status_code == 201, r.text               # cross-endpoint dependency
+    r = httpx.get(f"{base_url}/api/items/1",
+                  headers={"Authorization": f"Bearer {token}"})
+    assert r.json()["owner"] == "u1"                  # state transition verified
+```
+
+---
+
+## §A4.8 Trusted Oracle & Deterministic Checker (Universal)
 
 **Oracle hierarchy — what may certify a task:**
 
@@ -877,3 +908,262 @@ function/class/method/error message from the spec, write `spec_test.py` from
 the spec's own examples, and treat it as tier 2/3 evidence (label it); a
 missing checker is itself a finding. Under-specified contract items are
 recorded as open questions, never invented.
+
+---
+
+## §A4.9 FCV Brief Template (T1 — fresh-context verify / reviewer brief)
+
+```markdown
+# FCV Brief — <task> (<date>)
+READ-ONLY run: execute the commands, report what you observe; do not fix.
+
+## Commands (run from the project root; capture exit codes)
+1. <covering test command>        → expect <N/N>
+2. <second suite>                 → expect <…>
+3. python3 tests/assert_artifacts.py --existing --final → expect exit 0
+4. python3 scripts/scan_secrets.py --all .               → expect clean
+
+## Claims to confirm (one row each)
+| claim | how to check | verdict |
+|-------|--------------|---------|
+| <e.g. tests/ exemption works for both arg shapes> | <grep/repro> | pass/fail |
+
+## Deliverable
+tests/fcv_report.md — the table above filled + `verdict: pass | fail`.
+Evidence rests on SELF-WRITTEN tests otherwise → this fresh-context re-run is
+the required `Fresh-verify: pass` field (VERIFICATION_UPGRADES §V1).
+```
+
+## §A4.1.2 Design-Copy Fidelity — Capture + Measurement (Universal)
+
+Protocol: TESTING_PROTOCOLS.md §A4.1.2 (T0 identical capture · T1 geometry/
+occlusion · T2 pixel diff · T3 VLM-semantics-only). Measurement script:
+`scripts/ui_fidelity.py` (stdlib only; no model/network). Applies when
+acceptance criteria name copy fidelity — geometry/occlusion/size criteria
+are certified by T1/T2, never by a VLM verdict.
+
+### T0 — deterministic capture (Playwright; IDENTICAL settings on both sides)
+
+```python
+# tests/fidelity_capture.py — call once per side (reference + candidate).
+import json
+from playwright.sync_api import sync_playwright
+
+FREEZE_CSS = """
+*, *::before, *::after { animation: none !important; transition: none !important; }
+* { caret-color: transparent !important; }
+"""
+
+def capture(url, out_png, out_json=None, selectors=None, full_page=True):
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        ctx = b.new_context(viewport={"width": 1280, "height": 900},
+                            device_scale_factor=1)   # same DPR on both sides
+        page = ctx.new_page()
+        page.goto(url, wait_until="domcontentloaded")
+        page.add_style_tag(content=FREEZE_CSS)
+        page.evaluate("document.fonts.ready")
+        page.wait_for_load_state("networkidle")
+        if selectors and out_json:
+            boxes = page.evaluate(BOX_DUMP_JS, selectors)
+            with open(out_json, "w") as f:
+                json.dump(boxes, f, indent=1)
+        page.screenshot(path=out_png, full_page=full_page,
+                        animations="disabled", caret="hide")
+        b.close()
+```
+
+`BOX_DUMP_JS` — pass as the `page.evaluate` string; emits per-element boxes
+in **document coordinates** (scroll-independent, so the two sides' dumps are
+comparable regardless of scroll state) plus `occluded_by` (elementsFromPoint
+sampling at 3 points, topmost-first order respected: only nodes painted
+ABOVE the element count — an element that is itself covered first, or only
+has ancestors behind it, is not occluded). Off-screen elements are scrolled
+into view for the sample and the original scroll is restored:
+
+```javascript
+(selectors) => {
+  const out = [];
+  const oldX = scrollX, oldY = scrollY;
+  const describe = (n) => n.id ? "#" + n.id
+      : n.className ? "." + String(n.className).trim().split(/\s+/)[0]
+      : n.tagName.toLowerCase();
+  const clamp = (v, hi) => Math.max(0, Math.min(hi - 1, v));
+  for (const sel of selectors) {
+    document.querySelectorAll(sel).forEach((el, i) => {
+      let r = el.getBoundingClientRect();
+      if (r.top < 0 || r.bottom > innerHeight ||
+          r.left < 0 || r.right > innerWidth) {
+        el.scrollIntoView({ block: "nearest", inline: "nearest" });
+        r = el.getBoundingClientRect();
+      }
+      const sx = scrollX, sy = scrollY;   // viewport -> document coords
+      const name = sel + (i ? "[" + i + "]" : "");
+      const pts = [[r.x + r.width / 2, r.y + r.height / 2], [r.x + 2, r.y + 2],
+                   [r.x + r.width - 2, r.y + r.height - 2]]
+                  .map(([x, y]) => [clamp(x, innerWidth), clamp(y, innerHeight)]);
+      const occ = new Set();
+      for (const [x, y] of pts) {
+        for (const n of (document.elementsFromPoint(x, y) || [])) {
+          if (n === el || el.contains(n)) break;  // el reached first: not occluded here
+          if (n.contains(el)) continue;           // ancestor paints behind el
+          occ.add(describe(n));                   // topmost node painted ABOVE el
+          break;
+        }
+      }
+      out.push({ name, x: +(r.x + sx).toFixed(2), y: +(r.y + sy).toFixed(2),
+                 w: +r.width.toFixed(2), h: +r.height.toFixed(2),
+                 occluded_by: [...occ] });
+    });
+  }
+  scrollTo(oldX, oldY);
+  return out;
+}
+```
+
+Reference is an image (design mock, screenshot): extract candidate regions
+with `python3 scripts/ui_fidelity.py refboxes REF.png --out tests` — the
+output `ui-refboxes-<name>.json` (+ a boxed preview `ui-refboxes-<name>.png`)
+uses the boxes element schema, so it serves as the REF box list (T1; pair
+the candidate dump in reading order — the ordinal fallback needs disjoint,
+equal-length name sets) and the image itself as REF.png (T2). Check the
+preview before trusting the list. `refboxes` composites alpha over white
+and assumes a near-flat background — gradients/photos produce noise regions;
+read its `N/total` line (a truncation note means the ref list is partial).
+
+### T1/T2 — measure, then cite
+
+```bash
+python3 scripts/ui_fidelity.py boxes tests/ref_boxes.json tests/cand_boxes.json \
+    --out tests --tol-px 2 --allow-overlap ".card:.card-badge"   # exit 1 -> fix
+python3 scripts/ui_fidelity.py diff tests/ref.png tests/cand.png \
+    --out tests --max-diff-percent 1                             # exit 1/3 -> fix
+```
+
+Evidence: cite the concrete generated files by name (e.g.
+`tests/ui-diff-login.png`, `tests/ui-boxes-login.json`) in
+`tests/verification_log.md` — the assert script's cited-evidence group
+checks any PNG path you name there (never cite a glob: it is checked
+literally and would fail). Failures iterate under §A4.1 with the cluster/Δ
+row quoted in the `diagnosis:`.
+
+**Notes.** Both sides MUST be captured by the same browser/OS/DPR in one
+session — cross-machine captures differ in font rasterization (calibrate
+thresholds; never hide flake behind them). Mask time-varying regions
+(timestamps, ads, carousels) identically on both sides; canvas/video pixels
+are comparable only at a pinned frame. The `full_page=True` default fits
+whole-page clones; for a fixed-size design mock use a viewport-sized
+capture (or a matching crop) on BOTH sides — mixing a mock with a taller
+full-page shot is a size mismatch (exit 3, and a failure by design even
+with `--allow-dim-mismatch`), not a diff to tune away. `--threshold` is the
+per-pixel YIQ tolerance (pixelmatch semantics, default 0.1);
+`--max-diff-percent` is the image-level budget — both are user-owned
+acceptance thresholds.
+
+**Comparative sub-probe (verifier calibration, optional).**
+`python3 scripts/mm_probe.py --compare-generate` writes a two-panel probe
+with exactly ONE difference; report `<variant> <shape>` and validate via
+`--compare-check` (variants: moved/covered/color/added/removed; shapes:
+circle/square/bar/dot). A FAIL is a finding, not a blocker: record
+comparative-judgment-unreliable in `tests/verification_log.md` and localize
+differences via T1/T2 clusters — never side-by-side eyeballing. Protocol
+guard: do NOT open `probe_compare.expected` or brute-force `--compare-check`
+— the report must come from the pixels (same rule as the token probe).
+
+## §A12 Repository Hygiene Templates (Universal)
+
+### A12.1 `.gitignore` — write BEFORE installing dependencies
+
+Adapt the sections to the detected stack; keep the **evidence** paths
+(`tests/`, `memory/`, `docs/`) unignored. Every pattern below is cheap
+insurance against the 2026-10-17 incident (pnpm store + browser cache + SQL
+dumps committed by one `git add -A`).
+
+```gitignore
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+site-packages/
+
+# Node / pnpm / yarn
+node_modules/
+.pnpm-store/
+.yarn/cache/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-error.log*
+
+# Frontend build / test output
+.next/
+.nuxt/
+.parcel-cache/
+coverage/
+playwright-report/
+test-results/
+**/ms-playwright/
+**/Library/Caches/
+
+# Secrets / local config (never commit; still scan the working tree)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+config.local.toml
+
+# Large archives / dumps (use releases or external storage)
+*.zip
+*.tar.gz
+*.tgz
+*.sql.gz
+dump-*.sql
+
+# Harness / local state
+.vibeweaver/
+```
+
+### A12.2 `script/git_safe_commit.sh` — staging budget check
+
+Use this wrapper for baseline/milestone commits. It rejects tracked vendor
+paths and oversized staged changes before `git commit`; the authoritative
+check remains `assert_artifacts.py` group 21.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+bad=$(git diff --cached --name-only | grep -E '(^|/)(node_modules|\.pnpm-store|\.venv|venv|site-packages|__pycache__|\.next|coverage|ms-playwright)(/|$)' || true)
+if [ -n "$bad" ]; then
+  echo "git_safe_commit: REFUSED — staged vendor/cache paths:" >&2
+  echo "$bad" >&2
+  echo "Run: git rm -r --cached <paths>; add .gitignore; retry." >&2
+  exit 1
+fi
+total=$(git diff --cached --numstat | awk '{s+=$1+$2} END{print s+0}')
+if [ -n "$total" ] && [ "$total" -gt 2000000 ]; then
+  echo "git_safe_commit: REFUSED — staged change has $total changed lines; split it." >&2
+  exit 1
+fi
+git commit "$@"
+```
+
+`git diff --cached --numstat` counts changed lines, not bytes (a binary file
+shows `-`); the `--final` blob check is the byte authority. For a strict
+pre-commit hook, also run `python3 tests/assert_artifacts.py --existing --json`
+and reject a non-zero exit.

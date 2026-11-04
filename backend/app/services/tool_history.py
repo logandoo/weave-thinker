@@ -223,14 +223,61 @@ def _extract_tool_result_content_by_id(tool_results_json: Optional[str]) -> Dict
         data = json.loads(tool_results_json)
     except (json.JSONDecodeError, TypeError):
         return {}
+    # 2026-11-02（跨波冲突修复）：**两种**历史形状都要能读。
+    #   dict  = legacy ToolResultsData {"agent_steps": [...]}（正常终态）
+    #   list  = 原始累积数组（W11 渐进落库 flush 与 stop 分支写入的形状）
+    # 旧实现只做 data.get(...)，遇到 list 直接 AttributeError，而该异常抛在
+    # agent loop 的 try 之外 → 整轮 run 死亡、用户消息无人应答。
+    if isinstance(data, list):
+        steps = data
+    elif isinstance(data, dict):
+        steps = data.get("agent_steps", []) or []
+    else:
+        return {}
     out: Dict[str, str] = {}
-    for step in data.get("agent_steps", []) or []:
-        if step.get("step_type") not in ("tool", "tool_call"):
+    for step in steps:
+        if not isinstance(step, dict) or step.get("_truncated"):
             continue
-        cid = step.get("name") or step.get("call_id")
+        # dict 形状用 step_type 过滤；list 形状（原始 ToolCallResult）无该字段。
+        if step.get("step_type") not in (None, "tool", "tool_call"):
+            continue
+        # 两种形状的 id 位置不同：legacy dict 用 `name` 存 call id（无 call_id
+        # 字段）；原始 ToolCallResult 用 `call_id`，其 `name` 是**工具名**。
+        # 必须 call_id 优先，否则原始形状会把结果挂到工具名上 → 配对失败。
+        cid = step.get("call_id") or step.get("name")
         if not cid:
             continue
-        out[cid] = step.get("content") or ""
+        out[str(cid)] = step.get("content") or step.get("result") or ""
+    return out
+
+
+def _normalize_persisted_tool_calls(tool_calls: List[Any]) -> List[Dict[str, Any]]:
+    """Coerce persisted tool_call entries into the OpenAI wire shape.
+
+    Accepts both the canonical ``{id,type,function:{name,arguments}}`` and the
+    raw agent-loop event shape ``{call_id,name,arguments}``. Entries that yield
+    no call id or no name are dropped (they cannot be paired with a tool
+    message, and emitting them invalid is worse than dropping one call).
+    """
+    out: List[Dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict) or tc.get("_truncated"):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else None
+        cid = tc.get("id") or tc.get("call_id")
+        name = (fn or {}).get("name") or tc.get("name")
+        if not cid or not name:
+            continue
+        args = (fn or {}).get("arguments")
+        if args is None:
+            args = tc.get("arguments")
+        if isinstance(args, dict):
+            args = json.dumps(args, ensure_ascii=False)
+        out.append({
+            "id": str(cid),
+            "type": "function",
+            "function": {"name": str(name), "arguments": args or "{}"},
+        })
     return out
 
 
@@ -264,6 +311,14 @@ def rebuild_structured_history(
         if not isinstance(tool_calls, list) or not tool_calls:
             return [build_history_message("assistant", content, reasoning_content)]
     except (json.JSONDecodeError, TypeError):
+        return [build_history_message("assistant", content, reasoning_content)]
+
+    # 2026-11-02（跨波冲突修复）：把**原始事件形状**归一化为 OpenAI 形状。
+    # W11 渐进落库与 stop 分支历史上写入的是 `{call_id, name, arguments}`；
+    # 若原样下发，条目缺 id/type/function → sanitize_api_messages 会把配对的
+    # tool 消息丢掉 → 严格 provider（DeepSeek 默认）直接 400。
+    tool_calls = _normalize_persisted_tool_calls(tool_calls)
+    if not tool_calls:
         return [build_history_message("assistant", content, reasoning_content)]
 
     result_by_id = _extract_tool_result_content_by_id(tool_results_json)

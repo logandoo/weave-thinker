@@ -16,25 +16,28 @@
 - **A4.4 Completion Output** — Covenant Recall · 9-item pre-output self-audit ·
   Gate Function · log-discipline rule · gate-line field semantics · E2E depth
   ladder · 8-column table spec + forbidden alternatives
-- **A4.4.1 G-DED Executable Artifact Assertions** — 19-group assertion table · flags ·
+- **A4.4.1 G-DED Executable Artifact Assertions** — 21-group assertion table · flags ·
   copy + self-verify
 - **A4.4.3 Artifact Chain** — every artifact names its upstream link; the
   chain is the audit trail
 - **A4.4.2 Physical Gate (plugin enforcement)** — GATE-BLOCKED / GATE-WARNING /
   stall observer semantics
 - **PRE-OUTPUT MANDATORY CHECKLIST** — full ~40-item checklist; read start→end
-  immediately before the final answer
+  immediately before writing the completion artifact
 
 ---
 
 ## A4.4 Completion Output ★ NON-NEGOTIABLE (canonical text of COV-8 final lines)
 
-This is the **SOLE final deliverable**. Do NOT output "done" or "task
-complete" without this EXACT table. No exceptions.
+This is the **SOLE completion artifact**. Write it into the current
+`tests/verification_log.md` task block. Do NOT output "done" or "task
+complete" without this EXACT table. No exceptions. COV-0 forbids pasting the
+ritual lines/table into the user-visible final answer; the final answer gives
+natural-language results + an evidence summary.
 
 ★ **Covenant Recall Check:** re-read §1 OPERATING COVENANT now. Every
-covenant must hold for THIS completion output — any gap, go back and close
-it before the table. Output the LITERAL line
+covenant must hold for THIS completion artifact — any gap, go back and close
+it before the table. Write the LITERAL line
 `[Covenant Recall] checked: all 13 covenants hold for this completion`
 immediately before the [Verification Gate] audit line, AND state
 `covenant_recall: pass` in the [Verification Gate] line itself (the
@@ -101,9 +104,11 @@ Output this audit line immediately before the completion table (the two
 `HARD-GATE` tokens are LITERAL — every `[Verification Gate]` line MUST
 contain the strings `HARD-GATE-1: NO-TEST-NO-DONE` and
 `HARD-GATE-2: SCRIPT-ONLY`, each marked `pass` / `na`):
-```
-[Verification Gate] Verifier: mm-sensor [video+audio|video|image] | model-native [image] | direct-read | Loop executed: yes/no/N/A | Media graded externally: N/N (video N · audio N · screenshots N) | Iterations: N | Tests executed with artifacts: yes/no | E2E depth: real-HTTP / workflow-trace / service-direct / unit-only | Script-only build/lifecycle: yes/no | Fresh-run on final tree: yes/no | TDD RED evidence: yes/no/N/A | Code review: clean / N-fixed / N/A | assert_artifacts.py: pass=N/fail=0 | covenant_recall: pass/na | memory_gate: pass/na | HARD-GATE-1: NO-TEST-NO-DONE=pass/na | HARD-GATE-2: SCRIPT-ONLY=pass/na
-```
+
+**The line's EXACT shape is the fenced template in SKILL.md §A4.4 — the
+single authoritative copy** (selftest T39 pins its uniqueness; this file
+explains the FIELDS below and never re-teaches the literal). Copy the
+template from SKILL.md, fill every placeholder, keep the field order.
 
 **E2E depth ladder (what each value means):** `real-HTTP` = the flow was
 exercised through the running server's HTTP API (chat/API request → handler
@@ -115,8 +120,15 @@ unit tests only — only acceptable for pure functions / single-endpoint
 tweaks (state the reason). Any runtime-affecting backend change with
 cross-endpoint behavior MUST report `real-HTTP` or `workflow-trace`.
 
-After ALL work is complete, output ONE summary table with ALL of these EXACT
-columns in this EXACT order:
+**Artifact order — the ONE authoritative order (D1 — single normative
+position; no second order exists here):**
+`[Convergence]` → `[Coverage]` → `[Memory Gate]` → `[Decisions]` →
+`[Covenant Recall]` → `[Verification Gate]` → completion table, all inside
+the current `tests/verification_log.md` task block (all "immediately
+before/after" resolve here). COV-0 applies to the user-visible answer only.
+
+After ALL work is complete, write ONE summary table with these EXACT
+columns:
 
 ```markdown
 | # | Problem | Research Sources (exa MCP / Context7) | Chosen Approach & Why | Files Changed | What Changed | Verification Evidence (Screenshot / Log) | Commit |
@@ -124,26 +136,22 @@ columns in this EXACT order:
 | 1 | ...     | Searched: X, Found: Y                | Approach Z (reason)    | src/a.ts, ... | ...          | screenshot_01.png → verified correct      | abc123 |
 ```
 
-**FORBIDDEN alternatives — NEVER use these:**
-- Do NOT split into multiple tables (e.g. a separate "Verification results" table).
-- Do NOT replace columns with `Requirement`, `Implementation`, `Key files`,
-  `Test method`, `Result`, or any other headers.
-- Do NOT omit the `Research Sources` or `Commit` columns.
-- Do NOT output prose summaries, bullet lists, or checklists as a substitute.
+**FORBIDDEN alternatives — NEVER use these:** do NOT split into multiple
+tables · replace columns (`Requirement`/`Implementation`/`Key files`/`Test
+method`/`Result`/any header substitute) · omit `Research Sources` or `Commit`
+· substitute prose summaries, bullet lists or checklists.
 
-**Column requirements (all 8 mandatory):**
-`#` sequential · `Problem` sub-problem addressed · `Research Sources` what was
-searched, key findings, rejected alternatives · `Chosen Approach & Why` chosen
-solution + rationale · `Files Changed` every modified file path · `What
-Changed` concise modification description · `Verification Evidence`
-screenshot filename+what was confirmed, or log file+key excerpt (not "tests
-passed") · `Commit` short hash; `N/A` if no commit made yet.
+**Column requirements (all 8 mandatory):** `#` sequential · `Problem`
+sub-problem · `Research Sources` searched/key findings/rejected alternatives ·
+`Chosen Approach & Why` solution + rationale · `Files Changed` every path ·
+`What Changed` concise description · `Verification Evidence` file + what was
+confirmed (log + key excerpt — not "tests passed") · `Commit` short hash or
+`N/A`.
 
 If multiple changes were made, add one row per logical change.
 
-(6) **AUTO-mode tasks** (COV-12) add the line `[Decisions] N auto-decisions
-→ tests/decisions.md` immediately before the completion table, and
-`tests/decisions.md` must exist with one ADR block per auto-decision.
+(6) **AUTO-mode** (COV-12): the `[Decisions]` line in its order slot;
+`tests/decisions.md` carries one ADR block per auto-decision.
 
 ## A4.4.1 G-DED Executable Artifact Assertions ★ NON-NEGOTIABLE
 
@@ -151,7 +159,7 @@ Formal compliance is not evidence. Before emitting the `[Verification Gate]`
 line, you MUST run the executable assertion script in the project root:
 
 ```bash
-python3 tests/assert_artifacts.py [--existing] [--backend-only] --final   # --final: completion-time run (group 19)
+python3 tests/assert_artifacts.py [--existing] [--backend-only] --final   # --final: completion-time run (groups 19+21)
 ```
 
 - Exit code 0 → append the LITERAL field `assert_artifacts.py: pass=N/fail=0`
@@ -162,15 +170,14 @@ python3 tests/assert_artifacts.py [--existing] [--backend-only] --final   # --fi
 - Flags: `--existing` (Modify-Existing task → skips the new-project §A5
   design-doc checks and the git-init expectation) · `--backend-only` (no UI
   → skips `PAGE_DESIGN.html` and `script/linux/project_build.sh`).
-  New-project tasks run WITHOUT `--existing`. **`--final`: the
-  completion-time run** (the manual A4.4.1 invocation before the gate line)
-  additionally enforces group 19 (working-note lifecycle, §A7.15); mid-task
-  runs and the physical gate (§A4.4.2) omit it so an in-use
-  `tests/working_note.md` never blocks iteration. **Record the run:** append
-  `- final-run: --final — assert_artifacts.py: pass=N/fail=0` to the current
-  task block of `tests/verification_log.md` — the audit's B12 check
-  machine-verifies this line at completion (without it, group 19's
-  enforcement is unprovable). **Profiles:**
+  New-project tasks run WITHOUT `--existing`. **`--final`: the pre-gate
+  A4.4.1 run** additionally enforces group 19 (working-note) + the group-21
+  blob check; mid-task
+  runs and the physical gate omit it so an in-use working_note never blocks iteration. **Record the run:** append
+  `- assert-run: assert_artifacts.py: all N checks pass` and
+  `- final-run: --final — pass=N/fail=0` to the current
+  task block of `tests/verification_log.md` — B12 requires both at completion
+  (group 19 is otherwise unprovable). **Profiles:**
   `--profile service|backend-api|web-static|cli|library` (or
   `tests/project_profile.json`) declaratively skips structurally-N/A groups
   (service lifecycle for libraries/CLIs; UI for backend-only kinds) — the
@@ -192,44 +199,52 @@ python3 tests/assert_artifacts.py [--existing] [--backend-only] --final   # --fi
 | 9 | Modify-Existing (`--existing`): `verification_log.md` contains `Baseline verified GREEN` or `COV-9 skipped` | COV-9 |
 | 10 | every `tests/workflows/*.trace.log` cited in `verification_log.md` exists and >0 bytes | A4.7b |
 | 11 | every `tests/*.webm` / `tests/*.wav` / `tests/*.mp4` / `tests/*.mp3` cited in `verification_log.md` exists and >0 bytes | A4.1 Step 2/3 |
-| 12 | every `- iter N FAIL:` log line carries its `diagnosis:` clause, and (12b log-format lint) the clause is substantive — ≥10 chars, not a placeholder token (`-`/`?`/`none`/`na`/`idk`/`unknown`/`tbd`) | A4.1 Step 4 |
-| 13 | no claim word (verified/confirmed/validated/tested/proven + Chinese 已验证/已确认/已测试…) appears on a prose log line without a coverage scope on that same line (fenced blocks, headings, tables, iter/baseline lines exempt) | A4.4 claim rule |
-| 14 | **secret scan** — no credential-looking string (AWS access key · `-----BEGIN … PRIVATE KEY-----` block · `ghp_`/`github_pat_`/`xox*`/`sk-` incl. `sk-proj-`/`sk-ant-` tokens · JSON or k=v form `api_key`/`secret`/`password`/`token` `= value` with value ≥12 chars; unquoted reference/call values like `os.environ.get(…)`/`config.x`/`self.x` are NOT flagged) appears on an ADDED line of the change-wave diff (per-commit patches of newest `backup: before changes` commit..HEAD + uncommitted; no backup commit → last commit + uncommitted; untracked non-ignored files are scanned whole). Lines carrying a placeholder marker (example/sample/dummy/placeholder/changeme/redacted/fake/`<…>`) are exempt; `*.md` hits print WARN but do not FAIL; any `assert_artifacts.py` is never scanned. **User-approved credentials:** a `vw-approved` marker exempts a line ONLY when the line also matches a credential pattern (prose mentions are no-ops) AND `verification_log.md` carries the path-scoped pairing `- secret-approved: <path> — <reason>` (marker count per path ≤ approvals; pairing failure FAILs regardless of file type) | A4.4 content gate |
-| 15 | **test-change guard** — no REMOVED assertion line (`assert` · `self.assert*` · `expect(` · `pytest.raises` · `require(` · `def test_` · `it(` · `test(` · `func Test` · `@Test`) in a test code file (path segment `test`/`tests`/`__tests__`/`spec` or `test_*`/`*_test.*`/`*.test.*`/`*.spec.*` basename; code extensions only — whole-file deletions included) unless `verification_log.md` carries a `- test-change: <path> — <reason>` line. An agent fixing code must not silently weaken the check on that code; writing NEW tests stays free | A4.8 test integrity |
-| 16 | **risk-tier** — when the change-wave diff or an untracked file touches a risk-tier code path (`auth`/`security`/`payment`/`billing`/`crypto`/`migration`/`permission`/`acl` path segment; code extensions only — deletions included), `tests/review_package.md` exists and >0 bytes — A4.9 review is non-skippable for risk-tier paths (existence check; package FRESHNESS is enforced by the §A4.9 scoped re-review process) | A4.9 risk tiering |
-| 17a | **DOC-asset render gate (§V11.9)** — when the change wave DELIVERS an office/document asset (`docx/doc/xlsx/xls/pptx/ppt/pdf/odt/ods/odp/rtf/odg/epub/mht/docm/xlsm/pptm`, whole-wave scope: `backup: before changes`..HEAD + uncommitted + untracked, deletions excluded), `tests/verification_log.md` carries a `render:` line naming that asset bound to existing >0-byte page evidence in `tests/` (png/webm, `probe_vision.*` excluded) — or `render: <asset> — N/A (<named missing toolchain: soffice/libreoffice/pymupdf/pdftoppm/poppler/imagemagick>)`. **NO RENDER, NO DONE**; fires in EVERY class (a mixed CODE wave shipping a docx owes the same render) | §V11.9 render gate |
-| 17b | **exec-check (§V11.9)** — every delivered office asset also needs a recorded executable-behavior check: an `exec-check:` line naming the asset with `clean` or `escalat…` (vbaProject.bin / PDF JavaScript / macro sheet — `escalated → Class CODE` promotes the wave) | §V11.9 delivery exec-check |
-| 18 | **task-class coherence (COV-13)** — `--class DOC\|CONFIG\|CODE` (or the log's `- class:` first entry of the current task block) N/A's only the class's structurally-free groups (DOC: memory 4 + service-lifecycle 5; CONFIG: memory 4 when the log carries `- memory: na (<why>)`); a `--class` flag contradicting the log's class is a NAMED failure (§V11.7 one class per task); a class never weakens an applicable group | COV-13 / §V11 |
-| 19 | **working-note lifecycle (§A7.15, `--final` only)** — `tests/working_note.md` must NOT exist at completion time: the task working memory is distilled into `memory/` (A7.9) and deleted before the completion table; a leftover is an undistilled lesson or zombie state leaking into the next task | A7.15 / A7.10 check 6 |
-| 20 | **working-note creation side (§A7.15)** — group 19 checks the note is GONE at completion; this group checks it EXISTED during the work. Current task block (last `## ` block) with ≥2 iteration entries or ≥1 FAIL owes `- working-note:` lifecycle lines (`created → updated → distilled → deleted`) or a stated `- working-note: na (<why>)` — the block's iter count is the machine proxy for the §A7.15 create rule | A7.15 creation side |
+| 12 | every `- iter N FAIL:` line carries `diagnosis:`, and (12b) it is substantive — ≥10 chars, not a placeholder (`-`/`?`/`none`/`na`/`idk`/`unknown`/`tbd`) | A4.1 Step 4 |
+| 13 | no claim word (verified/confirmed/validated/tested/proven + 已验证/已确认/已测试…) on a prose line of the CURRENT task block lacking a coverage scope on that line — COVER vocabulary (G4) below; `- iter N PARTIAL/PENDING/POST-HOC:` progress lines, fences/headings/tables, baseline/COV-skip exempt; `- claim-ack: line N "<quoted claim>" — <reason ≥10 chars>` licenses (quote binds ack↔claim; current-block refs only; fenced/drifted/misquoted acks suppress nothing → `stale claim-ack`) | A4.4 claim rule |
+| 14 | **secret scan** — no credential-looking string (AWS key · PRIVATE KEY block · `ghp_`/`github_pat_`/`xox*`/`sk-` · k=v `api_key`/`secret`/`password`/`token` = ≥12-char value; refs like `os.environ.get(…)` NOT flagged) on an ADDED wave line (anchor..HEAD + uncommitted; untracked + ignored secret-named (`.env*`, keys) whole-scanned — STRICT, every non-`.md` hit blocks; the W19 dryrun grading was reverted: tracked/anchor provenance is spoofable); placeholder-marked exempt; `*.md` WARN only; `assert_artifacts.py` never scanned. **User-approved:** `vw-approved` exempts ONLY a line matching a credential pattern AND paired `- secret-approved: <path> — <reason>` (≤1/path) | A4.4 content gate |
+| 15 | **test-change guard** — no REMOVED assertion line (`assert`·`expect(`·`pytest.raises`·`require(`·`def test_`·`it(`·`test(`·`func Test`·`@Test`) in a test code file (segment `test`/`tests`/`__tests__`/`spec` or `test_*`/`*_test.*`/`*.test.*`/`*.spec.*`; code exts; whole-file deletions included) without `- test-change: <path> — <reason>`; NEW test files need their own line (C3b hash baseline) | A4.8 test integrity |
+| 16 | **risk-tier** — when the wave diff/untracked touches a risk-tier code path (`auth`/`security`/`payment`/`billing`/`crypto`/`migration`/`permission`/`acl` segment; code exts, deletions included), `tests/review_package.md` exists and >0 bytes — A4.9 non-skippable for risk-tier (existence check; freshness via §A4.9 scoped re-review) | A4.9 risk tiering |
+| 17a | **DOC-asset render gate (§V11.9)** — a delivered office asset (`docx/doc/xlsx/xls/pptx/ppt/pdf/odt/ods/odp/rtf/odg/epub/mht/docm/xlsm/pptm`, whole-wave, deletions excluded) needs a `render:` line naming it + >0-byte page evidence in `tests/` (png/webm, `probe_vision.*` excluded) — or `render: <asset> — N/A (<named missing toolchain>)`. **NO RENDER, NO DONE**; every class | §V11.9 render gate |
+| 17b | **exec-check (§V11.9)** — every delivered office asset needs an `exec-check:` line naming it with `clean` or `escalat…` (vbaProject / PDF JS / macro — `escalated → Class CODE` promotes) | §V11.9 delivery exec-check |
+| 18 | **task-class coherence (COV-13)** — `--class DOC\|CONFIG\|CODE` (or the block's first `- class:`) N/A's only structurally-free groups (DOC: 4+5; CONFIG: 4 with `- memory: na (<why>)`); a `--class` contradicting the log is a NAMED failure (§V11.7); a class never weakens an applicable group | COV-13 / §V11 |
+| 19 | **working-note lifecycle (§A7.15, `--final` only)** — `tests/working_note.md` must NOT exist at completion: working memory is distilled into `memory/` (A7.9) and deleted before the completion table; a leftover is an undistilled lesson or zombie state | A7.15 / A7.10 check 6 |
+| 20 | **working-note creation side** — ≥2 iterations or a FAIL requires `- working-note:` lifecycle lines (created → updated → distilled → deleted) or `na (<why>)` in the block | §A7.15 |
+| 21 | **repo hygiene / VCS budget** — `.gitignore` present + stack patterns (T2 hint: `git add -f` swallowed ignores); no tracked vendor/cache; untracked ≤2,000; `.git` ≤1 GiB (warn >200 MiB); largest blob — 40 MiB ceiling on UNRECORDED debt (G3, preflight==`--final`); pre-existing debt is grandfathered ONLY by a COMMITTED shrink-only baseline (`--record-debt`; deleted-but-tracked refuses re-record, untracked buys nothing >40 MiB, raise in worktree OR history → FAIL — min spans the path's revisions (newest 50 + first-ever anchor; churn launders nothing) — held≤recorded → WARN `held at baseline`, grown → FAIL; wave >2,000 live paths fails (R3: net-deletions excluded) | COV-9 / A10.1 |
+
+**COVER vocabulary (G4 — a claim line's coverage scope):** 数量词
+`all/each/every/both`·全部/所有/逐一 · 分数/界 `3/3`·`N<M`·至少/至多/随机 ·
+criterion 引用 `criterion #2` · 产物路径 `tests/…`·`*.png`·`*.trace.log` ·
+覆盖词 `coverage/sweep`·覆盖/边界/用例/场景/包括/包含.
+
+**Machine values & anchors (G5/G6/T1):** git HEAD / sha256 enter the log only
+via `scripts/record_evidence.sh` — never hand-typed hex (15c WARNs 60-63/65+
+hex). Wave anchor = the block's `- wave-base: <sha>` (strict HEAD ancestor,
+validated; invalid → FAIL, never a smaller wave). A4.9 packages:
+`scripts/make_review_package.sh <BASE> <HEAD>`.
 
 The script byte-checks the artifacts behind every Gate Function claim — the
 external verifier for claims mm-sensor cannot see. The **canonical file is
-`scripts/assert_artifacts.py` inside this skill's installation directory**
-(e.g. `~/.config/opencode/skills/vibeweaver/scripts/assert_artifacts.py`).
+`scripts/assert_artifacts.py` inside this skill's installation directory**.
 
 **If `tests/assert_artifacts.py` does not exist in the project → COPY THE
 CANONICAL FILE** (do NOT write your own variant — self-written variants
-consistently omit check groups; observed in real runs):
+consistently omit check groups):
 
 ```bash
 cp <skill-dir>/scripts/assert_artifacts.py tests/assert_artifacts.py
 ```
 
 The only allowed edit after copying is adding project-specific assertion
-lines — never remove or weaken groups 1-19.
+lines — never remove or weaken groups 1-21.
 
-**Self-verify the copy is complete (MUST do after copying it):** the script
-MUST contain each of these 21 markers — `verification_log` · `cap=5` ·
-`screenshot` · `MEMORY.md` · `start.sh` · `git repo needs` · `FLOW_DESIGN` ·
-`README` · `Baseline verified GREEN` · `workflow trace` · `media evidence` ·
+**Self-verify the copy (MUST after copying):** the script MUST contain each of these 22 markers —
+`verification_log` · `cap=5` · `screenshot` ·
+`MEMORY.md` · `start.sh` · `git repo needs` · `FLOW_DESIGN` · `README` ·
+`Baseline verified GREEN` · `workflow trace` · `media evidence` ·
 `diagnosis:` · `claim without stated coverage` · `secret scan` ·
 `test-change:` · `risk-tier` · `secret-approved` · `DOC-asset render gate` ·
-`exec-check` · `working_note` · `working-note`. Grep the file for all 21;
-ANY
-missing marker means an incomplete variant — re-copy from the canonical file.
-A script missing a marker will not catch the missing artifact; a complete
-script is what the exit-0 gate verifies.
+`exec-check` · `working_note` · `working-note` · `repo-hygiene`. Grep all
+22; ANY missing = incomplete variant — re-copy from canonical.
 
 When running with `--backend-only` and skipping `PAGE_DESIGN.html`, the
 completion table MUST state the literal phrase
@@ -239,38 +254,68 @@ column.
 ## A4.4.2 Physical Gate (plugin enforcement — do not fight it) ★
 
 The `vibeweaver-gate` plugin (`~/.config/opencode/plugins/vibeweaver-gate.js`)
-enforces §A4.4.1 mechanically. After every `write`/`edit`, when the project
-is vibeweaver-active (has `tests/verification_log.md`), it runs
-`tests/assert_artifacts.py` (trying `--existing` / `--backend-only`
-variants) and **throws a GATE-BLOCKED error into the tool result** while
-verification evidence is missing or falsified. Bash is deliberately NOT
-gated (screenshots / server start must be free to produce evidence), and
-non-vibeweaver projects are silent. **Known boundary (named, accepted):**
-file mutations performed THROUGH bash (`sed -i`, `>`, editor scripts) bypass
-both the gate and §A7.16 cue delivery — hooking bash command text costs more
-false alarms than it catches. Mitigation is procedural, not mechanical: the
-completion-time `assert_artifacts.py --final` run + the audit's B12
-final-run check examine the resulting tree regardless of how it was edited.
+enforces §A4.4.1 mechanically. After every `write`/`edit`, when the project is
+vibeweaver-active (has `tests/verification_log.md`), it runs
+`tests/assert_artifacts.py` and **throws GATE-BLOCKED into the tool result** on
+a real violation. Bash is NOT gated (screenshots/server-start must be free to
+produce evidence); non-vibeweaver projects are silent. **Known boundary
+(named, accepted):** file mutations THROUGH bash (`sed -i`, `>`, editor
+scripts) bypass the gate and §A7.16 cue delivery — hooking bash text costs more
+false alarms than it catches. Mitigation is procedural: the `--final` run +
+audit B12 examine the tree regardless of how it was edited.
 
-- **Evidence failures BLOCK** (missing/fake `verification_log.md` entries,
-  missing `acceptance.md` cap-stall line, cited media missing/empty —
-  screenshots, `.webm` videos, `.wav` audio).
-- **Structure failures WARN only** (`memory/`, design docs, README, git
-  counts — appended as `[GATE-WARNING]`, not thrown), so the fix loop is
-  never spammed.
+- **Graduated gate (W19 — SOTA: OPA deny/warn/dryrun + pre-commit incremental):**
+  enforcement is graded by KIND+PHASE. A **real violation** (tamper, wave-added
+  secret, pin/lock/risk, destructive) blocks per-edit (deny). A **completion
+  condition** (new-project git/design-docs/requirements, seal FRESHNESS) is
+  ADVISORY during execution, enforced at `--final` (warn→deny) — code changing
+  mid-wave is normal work, not a violation. `--final` runs all groups STRICT.
+- **Fail-closed (D4):** a real violation blocks ("the check could not run" is
+  itself a BLOCK — python3 missing, timeout, crash, placeholder/stub); only `WARN`
+  + graded completion findings stay advisory during execution. A legacy prose-only
+  copy fails closed (upgrade from `scripts/`). `--json` prints
+  `{ok, passes, fails:[{code,severity,detail}]}`. Secret scan stays STRICT (every
+  non-`.md` hit blocks) — the "dryrun pre-existing" grading was reverted (W19
+  review: `tracked`/anchor provenance is spoofable); noise is handled by the
+  de-dup latch + `- secret-approved:`, never by downgrading real secrets.
+- **Banner de-dup (W19):** an unchanged blocking list dumps IN FULL once, then a
+  one-line summary points at `tests/gate_result.json` (details on disk) — never
+  re-flood the same lines per edit (alarm-flood control, same latch as warnings).
 - `session.idle` with a RED gate writes a `warn` entry to the opencode log
   (tripwire when the agent stops on a red gate).
-- **Stall observer (stateful):** the plugin keeps `.vibeweaver/state.json`
-  in the project root (atomic writes; working state — gitignore it). After
-  each gated operation it keeps the last ≤20 ops with the current
-  `iter N PASS` count; if the SAME file was edited 3× with NO new PASS
-  entry in between, it appends a `[GATE-WARNING]` stall note pointing at
-  §A4.10 (parameterize / shift — do not retry the same direction). Warnings
-  only — the observer never blocks, mirroring COV-7's model-counted bound
-  with machine counting.
+- **Stall observer (stateful):** `.vibeweaver/state.json` (gitignore it)
+  keeps the last ≤20 ops + the `iter N PASS` count; the SAME file edited 3×
+  with no new PASS gets a `[GATE-WARNING]` stall note (§A4.10). Warnings only
+  — never blocks (COV-7, machine-counted).
 - Escape hatch: `VIBEWEAVER_GATE=off` disables the plugin.
-- If `tests/assert_artifacts.py` does not exist yet, the plugin runs an
-  inline evidence check and the GATE-BLOCKED message points to §A4.4.1.
+- If `tests/assert_artifacts.py` is missing, the plugin runs an inline evidence
+  check and the GATE-BLOCKED message points to §A4.4.1.
+- **Trust model:** laziness/drift, not hostile root — fake checker → pin
+  (T2); protected evidence → lock (T2.5). `tests/` exempt.
+- **Seal three-state (G1, W18)** — `tests/evidence_manifest.json` +
+  `tests/test_baseline.json`, written ONLY by `scripts/evidence_seal.py`
+  (SLSA/in-toto verdicts — "missing" is never rendered as "stale"):
+
+  | state | condition | verdict |
+  |---|---|---|
+  | `no-seal` | neither file exists | WARN `evidence seal: none yet — run scripts/evidence_seal.py` (bootstrap; opt-in) |
+  | `partial` | baseline only | C3 finding — a seal existed; deleting the manifest clears nothing |
+  | `tamper` | hash mismatch / sealed file gone | C3 `… (C3 tamper)` / `sealed evidence missing … (C3)` |
+  | `stale` | code changed after sealing | C3 `sealed evidence is STALE (C3 freshness) …` (graded, W19) |
+  | `current` | seal matches the tree | silent |
+
+  A C3 finding enforces at `--final` (completion = the sealing moment).
+  `stale` is graded (W19): advisory during execution (code changes mid-wave
+  are normal work), enforced at `--final`. `tamper`/`missing`/`partial` block
+  always (real violations). The bootstrap window (no green PASS yet) keeps
+  findings advisory until the first green `- iter N PASS` (W12's 30+ false
+  banners). The cited-media rule (`cited media evidence is not sealed (C3)`)
+  is unconditional; the green marker uses COV-1's `PASS\b` grammar.
+- **`tests/` writes are never gated (either arg shape):** the exemption resolves
+  `args.path`/`args.filePath` (symlink-safe, EXACT first segment `tests/`·
+  `test/`·`memory/`; nested `src/tests/` is not evidence). **Protected evidence
+  (T2.5):** checker/acceptance/profile/debt/lock/gate_result stay gated; the lock
+  is written only by `scripts/evidence_lock.py`.
 
 The GATE-BLOCKED message means **keep working — fix the evidence, then the
 next write/edit re-checks automatically**. It is a completion gate, not an
@@ -285,203 +330,24 @@ are the audit trail (who asked for what, what the agent produced, who approved
 it). Each artifact MUST name its upstream link, so the chain can be walked in
 both directions:
 
-- `tests/acceptance.md` ← names the source it was derived from (user request /
-  design doc / incident record) under its heading.
-- `tests/verification_log.md` entries ← cite the acceptance criterion numbers
-  they prove (A4.1 Step 4 requires criterion refs on FAIL lines; PASS lines
-  state covered criteria/scope).
-- `tests/review_package.md` ← records the exact `git diff $BASE..$HEAD` range
-  it reviews (A4.9 Step 1).
-- `memory/fix_*.md` ← frontmatter `commit:` hash of the fix (A7.9) — the
-  memory layer's link back into the chain.
-- Incident records (`docs/POSTMORTEM_*.md`, APPENDIX §A9) ← cite the alert /
-  log / metric that triggered them; the fix they produce cites the postmortem
-  in its commit message.
+- `tests/acceptance.md` ← its source (user request / design doc / incident).
+- `tests/verification_log.md` ← criterion numbers per entry (A4.1 Step 4).
+- `tests/review_package.md` ← the `git diff $BASE..$HEAD` range (A4.9 Step 1).
+- `memory/fix_*.md` ← frontmatter `commit:` hash (A7.9).
+- `docs/POSTMORTEM_*.md` (APPENDIX C6) ← the alert/metric; the fix cites it.
 
-A break in the chain (an artifact that names no upstream) is an audit gap:
-when you write an artifact, write its link. The links are file contents —
-greppable, machine-checkable, no model judgment involved (detection stays
-deterministic): criterion refs are linted by groups 12/13, commit hashes in
-fix memory are A7.10 gate 3, the review package's range is §A4.9 Step 1.
+A break in the chain is an audit gap: write the link when you write the
+artifact. Links are greppable file contents (groups 12/13 · A7.10 gate 3 ·
+§A4.9 Step 1) — detection stays deterministic.
 
 ---
 
-## AUDIT — vibeweaver-audit plugin (Tier-0/1/2) ★ MANDATORY
+## AUDIT → AUDIT_PLUGIN.md
 
-The `vibeweaver-audit` plugin (installed beside vibeweaver-gate.js in
-`~/.config/opencode/plugins/`) mechanically audits every session that loaded
-the vibeweaver skill. It runs no LLM, needs no prompt, and requires ZERO
-cooperation from the agent — it observes passively (message parts + tool
-calls). Full architecture notes: this file's preface in the skill.
-
-**What it checks (three-state OK / BAD / UNCERTAIN):**
-- **Group A — on-disk artifacts:** verification_log has ≥1 `- iter` entry ·
-  acceptance.md first line `> cap=5  stall=3×` · every cited media/screenshot
-  exists >0 bytes · assert_artifacts.py actually runs and exits 0.
-- **Group B — narration markers in your text:** `[Verification Gate]` ·
-  `HARD-GATE-1: NO-TEST-NO-DONE` · `HARD-GATE-2: SCRIPT-ONLY` ·
-  `[Covenant Recall]` · `[Memory Gate]` · `[Convergence]` · 8-column table
-  header · `assert_artifacts.py: pass=N/fail=0` · `covenant_recall: pass` ·
-  `memory_gate: pass`.
-- **Group C — claim↔artifact cross-checks of the gate line (triage):**
-  `Loop executed: yes` ↔ iter entries · `Iterations: N` ↔ log line count ·
-  `Media graded externally: N` ↔ media files on disk · `E2E depth:
-  real-HTTP/workflow-trace` ↔ `tests/workflows/*.trace.log` · `TDD RED
-  evidence: yes` ↔ `- iter N FAIL:` line · `Fresh-run: yes` ↔ git HEAD
-  commit time vs last log write · `Code review: N/A` ↔ `A4.9 not triggered`
-  reason in text (clean/N-fixed ↔ `task` dispatch in tool log) · script-only
-  ↔ bash commands (forbidden raw `npm run build` / `vite` / `npm start` /
-  `uvicorn` / `pkill -f`) · R1/R1b/R2-5 reads ↔ read tool calls on the skill
-  files · verifier announcement (when loop executed) · COV-9 baseline entry
-  · HARD-GATE-1/2 values.
-
-**Report:** written to `tests/gate_audit.md` at session idle (refreshed at
-every session idle, which fires after EVERY assistant turn). The FULL final
-audit runs only when the session text contains the completion markers
-(`[Verification Gate]` or the 8-column table header); in-progress turns get
-the warn-only mid audit and never set BLOCKING (multi-turn tasks must not
-deadlock). First line is the verdict:
-```
-AUDIT: BAD=n UNCERTAIN=n escalate=true|false reasons=[BAD,UNCERTAIN,HIGH-RISK,SAMPLING] BLOCKING=yes|no
-```
-- `BLOCKING=yes` latches RED at the project root (persisted per project root in
-  `.vibeweaver/audit-state.json`, with the latching session's ID embedded in the
-  latch value) and the next
-  non-test `write`/`edit` throws GATE-BLOCKED (`tool.execute.before`).
-  **The latch is scoped to the session that earned it:**
-  - The latching session stays blocked while it continues — self-correct:
-    repair each `[BAD]` item (fix the evidence, append `- audit-fix: …` /
-    `- audit-ruling: …` entries to `tests/verification_log.md`) and re-emit
-    a corrected `[Verification Gate]` line in your reply. The audit
-    re-runs at every session idle and re-checks on every write; when the
-    report is GREEN the latch clears. No human action is needed.
-  - A latch must NEVER outlive its session and hold the next task hostage:
-    it auto-releases on the first write/idle of a DIFFERENT session
-    (session takeover), on the latching session's OWN next task (see the
-    new-task key below), or after the TTL (`redTtlHours` in `audit.json`,
-    default 24h), or immediately for legacy (pre session-scoping) state.
-    Every release is recorded — `redReleases` in the state file (bounded
-    to 5), the opencode app log, and a `## Stale RED releases` section of
-    the report — never silently dropped.
-  - **Same-session new-task key (2026-10-02, multi-wave DOC→CODE deadlock):**
-    the latching session never needs another session, a TTL wait, or
-    `VIBEWEAVER_AUDIT=off` to begin its next task. Per protocol the first
-    action of a new task is writing `tests/acceptance.md` (Step 1, and
-    `tests/` stays writable under the latch) — an acceptance rewrite whose
-    floor(mtime) is strictly AFTER the latch's `ts` releases the latch on
-    the session's next gated write or session idle, journaled as `new-task`
-    (an already-TTL-expired latch journals `ttl-expiry` — the dominant fact
-    wins). The old wave's debt stays in `tests/gate_audit.md`, and the new
-    wave's own completion claim re-checks everything (see the re-arm leg
-    below). Same-millisecond rewrites resolve to "no release" — the teeth
-    win ties; a backward wall-clock step between latch and rewrite is the
-    remaining skew corner (rare; fail-safe direction is "stays blocked").
-  - **BAD-signature guard (no re-latch treadmill; r2 hardening):** a final
-    audit scores the WHOLE session buffer, and multi-wave buffers keep the
-    previous wave's residue — so re-audits of an unchanged failure must not
-    re-latch. A RED final re-latches only when at least one of two legs
-    says "genuinely new failure":
-    *session signature* — the sorted BAD-check ids, keyed PER SESSION
-    (root-level keys would amnesty a DIFFERENT session's genuine first
-    failure: template-driven BAD sets are identical across sessions); and
-    *completion-marker count* — the number of `[Verification Gate]` markers
-    in the capped buffer, which grows by one on every NEW completion claim,
-    so a new claim re-arms the teeth even with an identical signature
-    (same-claim re-audits — mid-wave idles over a stale marker — stay
-    suppressed). A live latch is never refreshed (its `ts` keeps the TTL
-    backstop real); a GREEN final clears the latch, the session's signature
-    entry, and the marker count. Boundary: two completion claims separated
-    by >150KB of session text can land the earlier marker in the trimmed
-    middle (the first 20KB head is kept) — the count leg then misses one
-    re-arm (the signature leg still fires on any evidence change). Quoted
-    prose mentions of the marker count too — fail-closed (an extra re-arm
-    after a release), bounded and journaled. Latches from before this deploy carry no recorded
-    signature: after a takeover/TTL release they may re-latch once on a
-    same-signature re-audit before the guard has their signature —
-    conservative, self-healing in one cycle.
-  - Any `test`/`tests` directory in the project (top-level `tests/`,
-    `dev/tests/`, `src/test/`, …) stays writable while RED, so the
-    evidence-fix path can never deadlock.
-- `escalate=true` → the Tier-2 contract below applies.
-
-**Tier-2 escalation contract (escalate=true — YOUR obligation, NOT optional):**
-1. Read `tests/gate_audit.md` IN FULL: every `[BAD]` line names the broken
-   artifact/claim; every `[UNCERTAIN]` line names what could not be verified
-   mechanically, with a review packet (`<packet id="C9">...`) of the evidence.
-2. Dispatch a **fresh-brain reviewer** (opencode `task` tool, READ-ONLY,
-   per §A4.9 verdict contract — Strengths · Critical/Important/Minor with
-   file:line · Assessment) with ONLY: `tests/gate_audit.md` +
-   `tests/acceptance.md` + `tests/verification_log.md` + the review packets.
-   Ask it to answer, per packet: *did this step genuinely happen, on the
-   evidence in the transcript/artifacts?*
-3. Fix Critical/Important findings; log every fix as
-   `- audit-fix: <finding> | changed: <file>` in `tests/verification_log.md`
-   (machine-recognizable prefix, same format discipline as `diagnosis:`).
-   A false positive gets `- audit-ruling: <packet> — false positive, reason: …`
-   — never silently delete an audit line.
-4. Re-run the audit (any write re-checks; or read gate_audit.md after the
-   next write) until `BLOCKING=no`. `escalate` may persist on SAMPLING —
-   that is by design (asymmetry rule: an all-green mechanical report is NOT
-   a clearance; ~10% of sessions are escalated by hash regardless of
-   verdicts to catch ritual compliance — reviewer cost is the price).
-
-**Scope discipline:** sessions that never loaded the vibeweaver skill are
-not audited (subagent reviewers, unrelated chats) — silent. Doc-only tasks
-emit the gate line with `na`/`no` values; the audit accepts those claims at
-face value (no artifact demanded). Disable per-run: `VIBEWEAVER_AUDIT=off`.
-
-**Loop-guard (degenerate-generation watchdog):** the same text observation
-channel also watches for runaway output, independent of the artifact audit.
-Three shapes, detected the moment they emerge from the assistant text stream:
-(a) an identical line-group repeating at the tail — period derived from the
-data (any block period up to 640 lines within the 96KB tail window, i.e.
-realistic code up to ~50 chars/line), multi-line groups at ≥3×; a single
-repeated line needs ≥4× and punctuation-only separator lines are ignored
-(identical banner/log lines ×3 are legitimate codegen); (b) a trailing run of
-≥12 bare tokens stepping +1 — integers (`1,2,…,179`) or bijective base-26
-letters (`a,b,…,kf`); (c) line-sparse (no-newline) tails — a char-level
-suffix period: the same ≥32-char string repeated ≥4× (with a letter/digit;
-short sub-period streams are caught at their ≥32-char super-period), e.g. a
-sentence streamed back-to-back with no line breaks. Repeated JSX/HTML
-elements ×3 and pure-punctuation runs stay clean by the same bar. On trigger
-the plugin interrupts the session (v1 `session.abort` / v2
-`session.interrupt({continue:false})`) and posts a corrective prompt naming
-the pattern (restate the task in one line + the single next concrete step).
-One intervention per degeneration episode (re-arms only after clean text),
-budget 2 per session (further episodes are log-only, config
-`loopGuardMaxInterventions` in `audit.json`). Near-misses are excluded by
-construction: numbered lists with content (`1. step`) are not bare tokens;
-a 2× repetition is below the bar. Disable per-run:
-`VIBEWEAVER_LOOPGUARD=off`.
-
-**C8 self-clearing rule:** a forbidden raw command (C8) flags only ONCE per
-project root (command-hash dedup, persisted in `.vibeweaver/audit-state.json`
-`c8Flagged`). Immutable session history can never pin a session in a
-permanent RED latch — the latch clears on the next GREEN audit; every NEW
-distinct forbidden command still flags. The dedup is persisted only by the
-FINAL audit: a mid-phase warning never consumes the one-shot, so a forbidden
-command run mid-task still latches when the completion audit lands.
-
-**Config lives OUTSIDE the agent's write scope:** global only —
-`~/.config/opencode/vibeweaver/audit.json` (overrides DEFAULTS:
-`samplingRate` · `escOnUncertain` · `escOnHighRisk` · `forbiddenRaw`).
-A project-local `.vibeweaver/audit.json` is DELIBERATELY IGNORED — the agent
-can write it, and a model under prompt injection would use it to disable its
-own auditor (the optimizer must never have write access to its own objective
-function).
-
-**Known boundaries (by design, not bugs):** the audit proves tokens, files
-and orderings — never intent. `na`/`no` claims are accepted at face value;
-A4.9 trigger classification rests on the model's self-assessment; process
-compliance is not outcome correctness. Those are the reviewer's (and the
-user's) judgments — the audit's job is to make the machine-checkable layer
-honest. A truncated/aborted session's buffered text may be incomplete
-(head/tail caps), so its final audit can latch RED on partial evidence —
-that is the latch being conservative, and it is bounded precisely because
-of this: it dies with its session (takeover release), yields to the
-session's own next task (new-task key), or expires with its TTL; is fully
-recorded; its re-audit cannot feed on an unchanged failure signature; and
-it can never block a different session's task.</parameter>
+The vibeweaver-audit plugin (Tier-0/1/2 passive audit) has its own
+companion: **[AUDIT_PLUGIN.md](AUDIT_PLUGIN.md)** — Group A/B/C checks,
+the report format, the RED-latch / Tier-2 escalation contract, and the
+loop-guard. Read it per the Read Contract (R1b).
 
 ---
 
@@ -514,12 +380,13 @@ Before declaring any task complete, explicitly list and confirm:
 - [ ] §2 **ZERO: Decompose & Web Research executed FIRST (exa MCP + Context7)**
 - [ ] Git repo committed after each major change
 - [ ] (Modify Existing only) **COV-9 Baseline-GREEN before changes** —
-      commit `backup: before changes` THEN run existing build/test/start
+      carry-over commit of the previous session's work FIRST (R2), then
+      `backup: before changes`, THEN run existing build/test/start
       once via `script/`; report pre-existing failures and log to
       `tests/verification_log.md`. **Per change-wave** (previous task's
       baseline does NOT count) and recorded as the first log entry:
       `- Baseline verified GREEN` (assert group 9 machine-checks the FILE).
-      Pure-doc/config edits state-skip with `COV-9 skipped — documentation-only
+      Pure-DOC edits state-skip with `COV-9 skipped — documentation-only
       change`.
 - [ ] **Scripts in `script/` used for build, start, stop, restart — NEVER raw
       `npm run build`, `vite`, `npm start`, `uvicorn`, etc. (COV-2)**
@@ -613,6 +480,10 @@ Before declaring any task complete, explicitly list and confirm:
       assertion removed without a `- test-change: <path> — <reason>` log line
       (group 15) · risk-tier code paths reviewed with
       `tests/review_package.md` on disk (group 16)
+- [ ] ★ **Repo hygiene (group 21 / A10.1)** — `.gitignore` covers the
+      detected stack; no tracked vendor/cache path; untracked non-ignored
+      ≤2,000; `.git` ≤1 GiB; largest blob ≤40 MiB at `--final`; gate line
+      carries `repo-hygiene: pass (…)` (or `na (no git repo)`)
 - [ ] Artifact chain linked (§A4.4.3) — acceptance.md names its source, log
       entries cite criterion #s, review_package records its diff range, fix
       memory carries commit hashes
@@ -626,7 +497,15 @@ Before declaring any task complete, explicitly list and confirm:
       AND `memory_gate: pass` field in the [Verification Gate] line)
       ([MEMORY_RULES.md §A7.9 / §A7.10](MEMORY_RULES.md))
 - [ ] Acceptance checklist completed and passed
+- [ ] **Stop legality (§V12)** — turn ends only via ALL-PASS / cap-stall ❌ /
+      PAUSED packet / `[Coverage]`-honest partial; any "context exhausted"
+      claim carries its §V9 budget basis
 - [ ] (New project only) README.html / dependencies files updated / final git
       commit
+- [ ] ★ **Headless close (A7.7.1)** — when no interactive user is available
+      (CI / batch / eval harness), pending confirmations are logged as
+      `- awaiting decision:` entries (status stays ⏳) and the final output
+      ends with the completion table, never with a question or a conditional
+      offer ("say so and I'll …")
 
 **If any item is unchecked, return to fix it. Do NOT output "done".**

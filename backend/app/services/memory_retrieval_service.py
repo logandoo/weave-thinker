@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import text
+from sqlalchemy import text as _sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_config
@@ -54,12 +55,85 @@ def _time_pattern_re() -> re.Pattern:
     return re.compile("(" + "|".join(re.escape(p) for p in patterns) + ")")
 
 
+# M2a（论文 2609.37559 APM-Bench；勘正 A6）：缺证据显式声明——查询含显式
+# 记忆线索（时间/偏好/回指）且三层 above-floor 零命中时，注入上下文尾部追加
+# 1 行确定性声明（「记忆检索状态」元块，不计预算/不计引用证据）。零 LLM。
+_MEMORY_CUE_DEFAULT_PATTERNS = (
+    "上次", "之前", "以前", "曾经", "过去", "昨天", "前天", "上周", "上个月", "去年",
+    "记得", "说过", "提过", "聊过", "偏好", "喜好", "习惯", "喜欢", "讨厌", "最爱",
+    "你认识我", "了解我",
+)
+
+
+def _memory_cue_re() -> re.Pattern:
+    patterns = (
+        config.memory.get("missing_evidence_cue_patterns")
+        or list(_MEMORY_CUE_DEFAULT_PATTERNS)
+    )
+    return re.compile("(" + "|".join(re.escape(p) for p in patterns) + ")")
+
+
+def _has_memory_cue(text: str) -> bool:
+    """显式记忆线索（时间/偏好/回指）确定性判定——检索侧提示标记，非判断闸。"""
+    return bool(text) and bool(_memory_cue_re().search(str(text)))
+
+
+def _missing_evidence_notice(query_text: str, has_hits: bool, enabled: bool = True) -> str:
+    """M2a：缺证据声明 marker（1 行）。
+
+    条件（A6 勘正）：显式记忆线索 ∧ 三层 above-floor 命中数 = 0（零命中 ≠
+    空 ctx——总览基底恒定注入）。返回串自带换行前缀；空串 = 不声明。
+    """
+    if not enabled or has_hits or not _has_memory_cue(query_text):
+        return ""
+    return (
+        "\n" + _MISSING_NOTICE_TAG
+        + "[记忆检索] 已检索长期记忆：未找到与该问题直接相关的条目"
+        "</记忆检索状态>"
+    )
+
+
+_MISSING_NOTICE_TAG = "<记忆检索状态>"
+
+
+def clip_preserving_notice(text: str, limit: int) -> str:
+    """下游定长钳位时保留尾部缺证据声明（复审 minor：voice[:2000]/task[:budget]
+    从头截断会裁掉 marker，A6「语音同函数一致」被注入点破坏）。"""
+    if not text or len(text) <= limit:
+        return text
+    idx = text.rfind("\n" + _MISSING_NOTICE_TAG)
+    if idx < 0:
+        return text[:limit]
+    notice = text[idx:]
+    if len(notice) >= limit:
+        return notice[:limit]
+    body = text[:idx]
+    keep = max(limit - len(notice), 0)
+    return body[:keep] + notice
+
+
+def _finalize_ctx_with_notice(ctx: str, query_text: str, has_hits: bool) -> str:
+    """M2a 出口统一（复审 I2）：temporal 捷径/冷启动兜底与注入构建同径。
+    幂等（NEW-6）：已有声明块则直返，杜绝双 marker。"""
+    if _MISSING_NOTICE_TAG in (ctx or ""):
+        return ctx
+    note = _missing_evidence_notice(
+        query_text,
+        has_hits=has_hits,
+        enabled=bool(config.memory.get("missing_evidence_notice_enabled", True)),
+    )
+    return f"{ctx}{note}" if note else ctx
+
+
 @dataclass
 class Stage0Result:
     keywords: list[str]
     time_range: Optional[tuple[datetime, datetime]] = None
     query_type: str = "semantic"
     include_expired: bool = False
+    # fix-round I5：stage0 时间信号（时间词命中或 LLM 时间范围）——注入层
+    # 时间分支的生产判定面（stage0.has_time or query_type=="temporal_list"）。
+    has_time: bool = False
 
 
 @dataclass
@@ -88,7 +162,7 @@ async def retrieve_with_meta(
     stats: dict = {"cache_hit": False, "truncated": False, "budget_chars": 0,
                    "tier_scores": {}}
     ctx, ids, top = await _retrieve_with_meta_inner(
-        db, user_id, conversation_messages, stats)
+        db, user_id, conversation_messages, stats, conversation_id)
     try:
         _emit_recall_log(user_id, conversation_id, conversation_messages, ctx,
                          ids, top, stats, (time.monotonic() - started) * 1000.0)
@@ -101,10 +175,14 @@ def _emit_recall_log(user_id: str, conversation_id: Optional[str],
                      conversation_messages: list[dict], ctx: str,
                      ids: list[str], top: float, stats: dict,
                      elapsed_ms: float) -> None:
-    """C1：组装台账行并 fire-and-forget 落库（独立会话，失败静默）。"""
+    """C1：组装台账行并 fire-and-forget 落库（独立会话，失败静默）。
+    M2b（APM-Bench）：补 miss（零 above-floor 注入）与 providers_queried 元数据。"""
     from app.services.memory_recall_log_service import (
         record_recall_log_bg, query_hash_of,
     )
+    providers = list(stats.get("providers_queried") or []) or ["overview"]
+    if stats.get("cache_hit"):
+        providers.append("session_cache")
     record_recall_log_bg(
         user_id=user_id,
         conversation_id=conversation_id,
@@ -113,16 +191,19 @@ def _emit_recall_log(user_id: str, conversation_id: Optional[str],
         tier_scores=stats.get("tier_scores") or {},
         gate_score=float(top or 0.0),
         budget_chars=int(stats.get("budget_chars") or 0),
-        injected_chars=len(ctx or ""),
+        injected_chars=int(stats.get("injected_chars") or len(ctx or "")),
         truncated=bool(stats.get("truncated")),
         elapsed_ms=int(elapsed_ms),
         cache_hit=bool(stats.get("cache_hit")),
+        miss=not bool(ids),
+        providers_queried=providers,
+        rejects=stats.get("gate_rejects") or [],
     )
 
 
 async def _retrieve_with_meta_inner(
     db: AsyncSession, user_id: str, conversation_messages: list[dict],
-    stats: dict,
+    stats: dict, conversation_id: Optional[str] = None,
 ) -> tuple[str, list[str], float]:
     if not config.memory.get("retrieval_enabled", False):
         return await _fallback_context(db, user_id), [], 0.0
@@ -132,14 +213,15 @@ async def _retrieve_with_meta_inner(
         # 无用户查询仍注入恒定基底（用户长期记忆总览），避免零记忆
         ctx, meta = await _build_injection_context_ex(
             db, user_id, [], Stage0Result(keywords=[], query_type="general", include_expired=False),
-            query_text="")
+            query_text="", conversation_messages=conversation_messages,
+            conversation_id=conversation_id)
         stats.update(meta)
         return ctx, [], 0.0
 
     # §5.2 工程要求 4：会话级缓存（最近 3 轮消息哈希，TTL 5 分钟）。
     # 缓存值携带完整 meta（ctx, ids, top）：语音 vmem 的跨轮 id 去重与
     # 插话仲裁预筛依赖 meta，只存 ctx 会让命中轮次的仲裁候选丢失。
-    cache_key = _session_cache_key(user_id, user_queries)
+    cache_key = _session_cache_key(user_id, user_queries, conversation_id)
     cached = _session_cache_get(cache_key)
     if cached is not None:
         if len(cached) >= 4 and isinstance(cached[3], dict):
@@ -150,12 +232,32 @@ async def _retrieve_with_meta_inner(
         return cached[0], cached[1], cached[2]
 
     query_text = " ".join(user_queries)
+    # M1（复审）：providers_queried = 实际被查询的管线段（与命中无关），
+    # 评测台零命中行也能算 per-provider 零命中率。
+    stats["providers_queried"] = [
+        "stage0", "stage1_bm25", "stage2_desc", "stage3_embedding", "stage4_rerank",
+    ]
     stage0 = await _stage0_query_expansion(query_text, user_id=user_id, db=db)
 
     # temporal_list 捷径（§5.2 Stage 0）：episodic-first，跳过 Stage 2-4
     if stage0.query_type == "temporal_list":
-        tctx, tids, ttop = await _temporal_list_shortcut(db, user_id, stage0)
+        _guard = bool(config.memory_retrieval.get("self_reference_guard_enabled", True))
+        _since = (
+            await _conversation_self_reference_since(db, conversation_id)
+            if _guard else None
+        )
+        tctx, tids, ttop = await _temporal_list_shortcut(
+            db, user_id, stage0,
+            self_reference_since=_since,
+            recent_user_texts=(
+                _recent_user_texts(conversation_messages) if _guard else None
+            ),
+        )
+        # I2（复审）：捷径出口同样要缺证据声明（temporal 线索∧零命中恰是主场景）
+        tctx = _finalize_ctx_with_notice(
+            tctx, user_queries[-1] if user_queries else "", bool(tids))
         stats.update({"truncated": False, "budget_chars": 0,
+                      "providers_queried": ["stage0", "temporal_list"],
                       "tier_scores": {"episodic": [[i, None] for i in tids]} if tids else {}})
         _session_cache_put(cache_key, tctx, (tids, ttop), stats)
         return tctx, tids, ttop
@@ -164,6 +266,9 @@ async def _retrieve_with_meta_inner(
     if cold_start:
         ctx = await _try_cold_start_fallback(db, user_id, conversation_messages, cache_key)
         if ctx is not None:
+            # I2/B-NEW-1（复审）：声明已在 _try_cold_start_fallback 缓存前 wrap
+            #（首发/回放同形）——此处不得二次 wrap（NEW-6 双 marker）。
+            stats["providers_queried"] = ["stage0", "cold_start"]
             return ctx, [], 0.0
     candidates = await _stage1_bm25_search(db, user_id, stage0, cold_start)
 
@@ -230,7 +335,7 @@ async def _retrieve_with_meta_inner(
     memory_ids: list[str] = []
     top_gate_score = 0.0
     try:
-        injected = _select_injected(final_candidates)
+        injected = _select_injected(final_candidates, stats)
         memory_ids = [c.id for tier_list in injected.values() for c in tier_list]
         top_gate_score = max(
             (_cand_gate_score(c) for tier_list in injected.values() for c in tier_list),
@@ -262,8 +367,19 @@ async def _retrieve_with_meta_inner(
     _remember_text_injected(user_id, memory_ids)
 
     ctx, meta = await _build_injection_context_ex(
-        db, user_id, final_candidates, stage0, query_text=query_text)
+        db, user_id, final_candidates, stage0,
+        query_text=(user_queries[-1] if user_queries else ""),
+        conversation_messages=conversation_messages,
+        conversation_id=conversation_id)
     stats.update(meta)
+    # M1a（MemAgent 2609.32521 零训练 Begin 门；勘正 A1/A2）：注入组装后、
+    # 返回前按确定性门重组注入段顺序——只动段序（注入集合/预算/stage1-4 计算
+    # 全不动）。开关默认关=逐字节现状；开启时台账 providers_queried 追加
+    # route:<name>（评测台 A/B 判据）。
+    ctx, _route = _apply_injection_route(query_text, stage0, final_candidates, ctx)
+    if _route != "off":
+        stats["providers_queried"] = list(
+            stats.get("providers_queried") or []) + [f"route:{_route}"]
     _session_cache_put(cache_key, ctx, (memory_ids, top_gate_score), stats)
     return ctx, memory_ids, top_gate_score
 
@@ -437,12 +553,17 @@ async def _try_cold_start_fallback(
                 logger.warning("multimodal cold-start fallback error for user=%s", user_id, exc_info=True)
                 ctx = None
             if ctx:
+                # B-NEW-1（复审）：缺证据声明 wrap 在入缓存之前（首发/回放同形）
+                _q = _extract_recent_user_queries(conversation_messages)
+                ctx = _finalize_ctx_with_notice(ctx, _q[-1] if _q else "", False)
                 _session_cache_put(cache_key, ctx)
                 return ctx
             # §9.9：多模态渲染/LLM 失败 → 回退 Stage 1-2-3 RRF（继续正常管线），不走旧摘要
             return None
 
     ctx = await _fallback_context(db, user_id)
+    _q = _extract_recent_user_queries(conversation_messages)
+    ctx = _finalize_ctx_with_notice(ctx, _q[-1] if _q else "", False)
     _session_cache_put(cache_key, ctx)
     return ctx
 
@@ -490,11 +611,14 @@ async def _stage0_query_expansion(
                 time_range=time_range,
                 query_type=llm_query_type or "semantic",
                 include_expired=llm_include_expired,
+                # fix-round I5：时间信号留痕（时间词命中或 LLM 给出时间范围）
+                has_time=bool(has_time or time_range is not None),
             )
         except Exception:
             logger.debug("stage0 LLM time normalization failed, fallback jieba", exc_info=True)
 
-    return Stage0Result(keywords=_jieba_keywords(query_text), include_expired=False)
+    return Stage0Result(keywords=_jieba_keywords(query_text), include_expired=False,
+                        has_time=bool(has_time))
 
 
 def _jieba_keywords(text: str) -> list[str]:
@@ -693,9 +817,13 @@ def _remember_text_injected(user_id: str, memory_ids: list[str]) -> None:
             _text_injected_ids.pop(k, None)
 
 
-def _session_cache_key(user_id: str, user_queries: list[str]) -> str:
+def _session_cache_key(user_id: str, user_queries: list[str], conversation_id: Optional[str] = None) -> str:
     import hashlib
-    h = hashlib.sha1(("|".join(user_queries[-3:])).encode("utf-8")).hexdigest()[:16]
+    # Conversation id is part of the key: the cached context is now
+    # conversation-scoped (self-reference guard/filtering), so two chats with
+    # identical short messages must not share an entry.
+    payload = f"{conversation_id or ''}|" + "|".join(user_queries[-3:])
+    h = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     return f"{user_id}:{h}"
 
 
@@ -776,6 +904,8 @@ async def _apply_window_boosts(db: AsyncSession, user_id: str) -> None:
 
 async def _temporal_list_shortcut(
     db: AsyncSession, user_id: str, stage0: "Stage0Result | None" = None,
+    self_reference_since: Optional[datetime] = None,
+    recent_user_texts: Optional[list[str]] = None,
 ) -> tuple[str, list[str], float]:
     """§5.2 temporal_list 捷径：episodic-first（10）→ 不足补 concept（8）→
     不足补 subconscious（10）。
@@ -784,14 +914,27 @@ async def _temporal_list_shortcut(
     top = 1.0（时间型查询按构造即强相关，只要选中了候选就够仲裁门槛）。"""
     sections: list[str] = []
     ids: list[str] = []
+    recent_user_texts = recent_user_texts or []
+    cutoff = self_reference_since or (datetime.utcnow() + timedelta(days=3650))
+
+    def _self_ref(text, ts) -> bool:
+        if recent_user_texts and _matches_recent_user_text(text, recent_user_texts):
+            return True
+        if self_reference_since is not None:
+            dt = _to_dt(ts)
+            # Unknown age is treated as self-referential (conservative).
+            if dt is None or dt >= self_reference_since:
+                return True
+        return False
 
     epi_r = await db.execute(
         text("""SELECT id, narrative, valid_from FROM memory_episodes
                 WHERE user_id = :uid AND valid_to IS NULL
+                  AND (valid_from IS NULL OR valid_from < :cutoff)
                 ORDER BY valid_from DESC NULLS LAST LIMIT 10"""),
-        {"uid": user_id},
+        {"uid": user_id, "cutoff": cutoff},
     )
-    episodes = epi_r.fetchall()
+    episodes = [r for r in epi_r.fetchall() if not _self_ref(r[1], r[2])]
     if episodes:
         lines = ["[相关事件 Episodic]"]
         for r in episodes:
@@ -801,13 +944,14 @@ async def _temporal_list_shortcut(
 
     if len(episodes) < 5:
         con_r = await db.execute(
-            text("""SELECT id, canonical_name, description_short, aliases, weight, source_trust
+            text("""SELECT id, canonical_name, description_short, aliases, weight, source_trust, created_at
                     FROM memory_concepts
                     WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL
+                      AND (created_at IS NULL OR created_at < :cutoff)
                     ORDER BY last_recalled_at DESC NULLS LAST LIMIT 8"""),
-            {"uid": user_id},
+            {"uid": user_id, "cutoff": cutoff},
         )
-        concepts = con_r.fetchall()
+        concepts = [r for r in con_r.fetchall() if not _self_ref(r[1], r[6])]
         if concepts:
             lines = ["[相关概念 Concept]"]
             for r in concepts:
@@ -822,11 +966,12 @@ async def _temporal_list_shortcut(
     if len(episodes) + (0 if concept_count == 99 else concept_count) < 8:
         sub_r = await db.execute(
             text("""SELECT id, raw_text, created_at FROM subconscious_log
-                    WHERE user_id = :uid AND created_at >= now() - interval '30 days' AND embedding IS NOT NULL
+                    WHERE user_id = :uid AND created_at >= now() - interval '30 days'
+                      AND created_at < :cutoff AND embedding IS NOT NULL
                     ORDER BY created_at DESC LIMIT 10"""),
-            {"uid": user_id},
+            {"uid": user_id, "cutoff": cutoff},
         )
-        subs = sub_r.fetchall()
+        subs = [r for r in sub_r.fetchall() if not _self_ref(r[1], r[2])]
         if subs:
             lines = ["[近期原文片段 Subconscious]"]
             for r in subs:
@@ -834,7 +979,10 @@ async def _temporal_list_shortcut(
                 lines.append(f"- [{r[2]}] {_clip_marked(r[1], 200)} (未经整理)")
             sections.append("\n".join(lines))
 
-    return "\n\n".join(sections), ids, 1.0 if ids else 0.0
+    ctx = "\n\n".join(sections)
+    if ctx and bool(config.memory_retrieval.get("injection_boundary_enabled", True)):
+        ctx = MEMORY_INJECTION_BOUNDARY + "\n\n" + ctx
+    return ctx, ids, 1.0 if ids else 0.0
 
 
 def _concept_status_ok(detail: dict, include_expired: bool) -> bool:
@@ -1642,6 +1790,158 @@ def strategy_profile_params(profile: str, cfg: dict) -> dict:
     return base
 
 
+# ── M1a 注入层路由（MemAgent 2609.32521 零训练 Begin 门；勘正 A1/A2）────────
+# A1：不新增 purpose（memory.router 三处接线收回）——确定性门零 LLM、零接线；
+# A2：正名「注入层选择」——只重组注入段顺序，不省 stage1-4 计算、不动注入
+# 集合与预算（收益=注入噪声/token↓，不声称计算/延迟节省；检索层跳过=二期）。
+
+ROUTE_FULL = "full"
+ROUTE_TEMPORAL = "temporal_first"
+ROUTE_PREFERENCE = "preference_first"
+ROUTE_RECENT = "recent_first"
+
+_ROUTE_PREFERENCE_PATTERNS = (
+    "偏好", "喜好", "喜欢", "讨厌", "最爱", "习惯", "口味",
+    "改用", "换成", "不再用", "你认识我", "了解我",
+)
+_ROUTE_RECENT_PATTERNS = ("刚才", "刚刚", "今天", "今早", "今晚", "这会儿")
+
+
+def _route_pattern_re(patterns) -> re.Pattern:
+    return re.compile("(" + "|".join(re.escape(p) for p in patterns) + ")")
+
+
+_ROUTE_PREFERENCE_RE = _route_pattern_re(_ROUTE_PREFERENCE_PATTERNS)
+_ROUTE_RECENT_RE = _route_pattern_re(_ROUTE_RECENT_PATTERNS)
+
+
+def _route_tier_present(candidates, tier: str) -> bool:
+    return any(getattr(c, "tier", None) == tier for c in (candidates or []))
+
+
+def select_injection_route(query_text: str, stage0, candidates) -> str:
+    """M1a 零训练确定性门（纯函数）：按 query_type/线索选注入段优先序。
+
+    路由名（fail-open：零命中/无候选支撑/中性查询 → `"full"`=现状全量序）：
+    - `"temporal_first"`：时间型（stage0 时间信号或时间词）→ episodic 段先行；
+    - `"preference_first"`：偏好/画像型 → profile/concept 段先行；
+    - `"recent_first"`：近事型 → subconscious 段先行；
+    - `"full"`：默认（注入段序与现状逐字节一致）。
+    纯确定性：无随机、无时钟、与候选顺序无关；不省 stage1-4 计算。
+    """
+    q = str(query_text or "")
+    # fix-round I5：时间分支 = stage0.has_time or query_type=="temporal_list"
+    # （生产可达——has_time 由 _stage0_query_expansion 捕获：时间词命中或 LLM
+    # 时间范围信号；时间信号先行于偏好/近事分支）。
+    if (bool(getattr(stage0, "has_time", False))
+            or str(getattr(stage0, "query_type", "") or "") == "temporal_list"):
+        return ROUTE_TEMPORAL if _route_tier_present(candidates, "episodic") else ROUTE_FULL
+    if _ROUTE_PREFERENCE_RE.search(q):
+        return ROUTE_PREFERENCE if _route_tier_present(candidates, "concept") else ROUTE_FULL
+    if _ROUTE_RECENT_RE.search(q):
+        return ROUTE_RECENT if _route_tier_present(candidates, "subconscious") else ROUTE_FULL
+    if _time_pattern_re().search(q):
+        return ROUTE_TEMPORAL if _route_tier_present(candidates, "episodic") else ROUTE_FULL
+    return ROUTE_FULL
+
+
+# 路由 → 注入段 kind 优先序（越前越先注入；只动段序，集合/预算不动）
+_ROUTE_SECTION_ORDER: dict = {
+    ROUTE_TEMPORAL: ("episodic", "concept", "clusters", "subconscious",
+                     "overview", "dream", "profile", "clarification"),
+    ROUTE_PREFERENCE: ("profile", "concept", "clusters", "overview",
+                       "episodic", "subconscious", "dream", "clarification"),
+    ROUTE_RECENT: ("subconscious", "episodic", "concept", "clusters",
+                   "overview", "dream", "profile", "clarification"),
+}
+
+# 注入段头 → kind（与 _build_injection_context_ex 的段头一一对应；
+# 未知段（使用指令/截断标注/[相关记忆] 分组包）原位不动）
+_INJECTION_SECTION_HEADERS: dict = {
+    "[用户长期记忆总览]": "overview",
+    "[相关事件 Episodic]": "episodic",
+    "[相关概念 Concept]": "concept",
+    "[相关概念集合 Clusters]": "clusters",
+    "[近期 Dream]": "dream",
+    # W3-2（2026-10-23）：带「推测，非事实」标签的 dream 节头同 route 类
+    "[近期 Dream]（推测，非事实）": "dream",
+    "[用户画像 Profile]": "profile",
+    "[近期原文片段 Subconscious]": "subconscious",
+    "[澄清提示]": "clarification",
+}
+
+
+def _injection_section_kind(block: str) -> Optional[str]:
+    head = (block or "").split("\n", 1)[0].strip()
+    return _INJECTION_SECTION_HEADERS.get(head)
+
+
+# fix-round I4：节头行形态（`^[\\[（].*[\\]）]$`）——块边界。
+_SECTION_HEADER_RE = re.compile(r"^[\[（].*[\]）]$")
+
+
+def _split_injection_blocks(ctx: str) -> list[str]:
+    """fix-round I4：段切分=**节头块**——「节头行 + 后续行直至下一节头」为
+    一块，只整块换位（多段落小节（段体带空行）不拆散）。未知段（使用指令/
+    截断标注/分组包）自成块或归前块，原位不动；块间规范分隔 \\n\\n（同槽
+    换序语义，full/off 路由在上层逐字节原样返回）。"""
+    if not ctx:
+        return []
+    lines = ctx.split("\n")
+    starts = [i for i, ln in enumerate(lines) if _SECTION_HEADER_RE.match(ln)]
+    if not starts:
+        return [ctx]
+    raw: list[list[str]] = []
+    if starts[0] > 0:
+        raw.append(lines[: starts[0]])
+    for j, i in enumerate(starts):
+        end = starts[j + 1] if j + 1 < len(starts) else len(lines)
+        raw.append(lines[i:end])
+    out: list[str] = []
+    for k, chunk in enumerate(raw):
+        if k < len(raw) - 1:
+            while chunk and not chunk[-1].strip():
+                chunk = chunk[:-1]
+        if chunk:
+            out.append("\n".join(chunk))
+    return out
+
+
+def _apply_injection_route(query_text: str, stage0, candidates, ctx: str,
+                           enabled: Optional[bool] = None) -> tuple[str, str]:
+    """M1a 应用层：按开关确定性重组注入段顺序。返回 (ctx, route)。
+
+    - `enabled=None` → 读 `[memory] provider_routing_enabled`（默认关）；
+    - 关 → `(ctx, "off")` 注入逐字节不变（回归锚，开关关=零行为变化）；
+    - 开 → 按 `select_injection_route` 重排内存段占位（同槽换序：未知段/
+      截断标注/使用指令原位不动；M2a 缺证据声明钉在原尾）；route 名由调用方
+      回填 recall log `providers_queried`（`route:<name>`）。
+    """
+    if enabled is None:
+        enabled = bool(config.memory_provider_routing_enabled)
+    if not enabled:
+        return ctx, "off"
+    route = select_injection_route(query_text, stage0, candidates)
+    order = _ROUTE_SECTION_ORDER.get(route)
+    if not order or not ctx:
+        return ctx, route
+    suffix = ""
+    idx = ctx.rfind("\n" + _MISSING_NOTICE_TAG)
+    if idx >= 0:
+        suffix = ctx[idx:]
+        ctx = ctx[:idx]
+    # fix-round I4：段切分改「节头块」（只整块换位——多段落小节不拆散）。
+    blocks = _split_injection_blocks(ctx)
+    slots = [i for i, b in enumerate(blocks) if _injection_section_kind(b) in order]
+    src = sorted(
+        range(len(slots)),
+        key=lambda j: (order.index(_injection_section_kind(blocks[slots[j]])), j))
+    new_blocks = list(blocks)
+    for dst, j in zip(slots, src):
+        new_blocks[dst] = blocks[slots[j]]
+    return "\n\n".join(new_blocks) + suffix, route
+
+
 def _cand_gate_score(c) -> float:
     """门槛专用绝对相关分（A4.9 审查 I2 修复 + 2026-08-16 盲区 A 修正）。
 
@@ -1954,12 +2254,19 @@ async def _stage4_cross_encoder(
 def _to_dt(val):
     if val is None:
         return None
+    dt = None
     if isinstance(val, datetime):
-        return val
-    try:
-        return datetime.fromisoformat(str(val))
-    except (ValueError, TypeError):
-        return None
+        dt = val
+    else:
+        try:
+            dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    # All memory comparisons use naive UTC; normalize aware values so
+    # `utcnow() - dt` never raises (2026-10-18 review I).
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def _composite_score_by_tier(
@@ -2047,6 +2354,7 @@ def _composite_score_by_tier(
 
 def _select_injected(
     candidates: list[RetrievalCandidate],
+    stats: Optional[dict] = None,
 ) -> dict[str, list[RetrievalCandidate]]:
     """注入切片选择（SOTA 硬门槛：ScoreGate/Databricks relevance floor）。
 
@@ -2055,24 +2363,41 @@ def _select_injected(
     注入即boost→权重更高"的自我强化死循环（实测：科技新闻查询在 03:30:07
     把《火焰守望者》概念卷入注入）。现在低于 injection_min_relevance 的
     概念级候选直接丢弃，零命中时宁可空段也不注入噪声。
-    """
+
+    W2-3（2026-10-23）：门槛拒绝面 shadow 可观测——被拒候选（id/tier/score/
+    floor）写入 stats["gate_rejects"]，随 recall log rejects_json 落档，
+    false-quarantine 可统计（误杀率 ≤10% 验收面）。"""
     ret_cfg = config.memory_retrieval
     concept_floor = float(ret_cfg.get("injection_min_relevance", 0.35))
     episodic_floor = float(ret_cfg.get("injection_min_relevance_episodic", 0.30))
     sub_floor = float(ret_cfg.get("injection_min_relevance_subconscious", 0.30))
     floors = {"concept": concept_floor, "episodic": episodic_floor,
               "subconscious": sub_floor}
+    rejects: list[dict] = []
 
     def _slice(tier: str, max_n: int) -> list[RetrievalCandidate]:
         floor = floors.get(tier, 0.0)
-        eligible = [c for c in candidates if c.tier == tier and _cand_gate_score(c) >= floor]
+        eligible = []
+        for c in candidates:
+            if c.tier != tier:
+                continue
+            score = _cand_gate_score(c)
+            if score >= floor:
+                eligible.append(c)
+            elif stats is not None:
+                rejects.append({"id": getattr(c, "id", ""), "tier": tier,
+                                "score": round(float(score), 4),
+                                "floor": floor})
         return eligible[:max_n]
 
-    return {
+    result = {
         "concept": _slice("concept", int(ret_cfg.get("injection_max_concept", 4))),
         "episodic": _slice("episodic", int(ret_cfg.get("injection_max_episodic", 2))),
         "subconscious": _slice("subconscious", int(ret_cfg.get("injection_max_subconscious", 2))),
     }
+    if stats is not None:
+        stats["gate_rejects"] = rejects
+    return result
 
 
 _boost_tasks: set = set()
@@ -2120,8 +2445,14 @@ async def _apply_recall_boosts_bg(
 
 async def _build_memory_overview(
     db: AsyncSession, user_id: str, max_chars: int | None = None,
+    exclude_recent_minutes: float = 0,
 ) -> tuple[str, set, set]:
-    """用户长期记忆总览基底段（方案 A''，2026-08-03）。
+    """用户长期记忆总览基底段（方案 A''，2026-08-03；2026-10-18 默认关闭）。
+
+    2026-10-18（conv dca19082）：概念与事件都按权重/时间排序，不是
+    query-ranked；默认同时关闭（`overview_include_concepts/episodes=false`）。
+    记忆注入改由 [用户画像 Profile] + [近期 Dream] + stage1-4 相关检索承担。
+    保留两开关与函数供回滚/评测。
 
     从 memory_concepts / memory_episodes 纯 SQL 聚合（请求路径无 LLM /
     embedding 调用，仅 ~2 次索引点查，ms 级）。恒定注入，保证检索零命中
@@ -2138,30 +2469,49 @@ async def _build_memory_overview(
     lines = ["[用户长期记忆总览]"]
     cids: set = set()
     eids: set = set()
+    # 2026-10-18: overview is weight-ranked, not query-ranked. Exclude rows
+    # created inside the active window so the current conversation's own
+    # just-extracted events cannot pose as long-term memory. When the guard is
+    # off, a far-future cutoff keeps every row (the parameter always has a
+    # concrete timestamp type — `:cutoff IS NULL` is ambiguous to asyncpg).
+    if exclude_recent_minutes and exclude_recent_minutes > 0:
+        cutoff = datetime.utcnow() - timedelta(minutes=float(exclude_recent_minutes))
+    else:
+        cutoff = datetime.utcnow() + timedelta(days=3650)
 
     def _over_budget() -> bool:
         return sum(len(l) for l in lines) > max_chars
 
     try:
-        # 2026-08-16 盲区 B 修复：与 dream/decay 同一有效权重排序——旧实现按原始
-        # weight DESC，衰减写回生效前高权重旧概念仍恒定出现在每个请求的基底里。
-        # A4.9 wave2/3 审查 M5/M7：SELECT 展示有效权重（与排序依据一致，口径与
-        # dream payload 统一）；weight > 0.05 粗筛缩小行集（触底概念无展示价值）。
-        from app.services.memory_weight_service import effective_weight_sql
-        eff_expr = effective_weight_sql()
-        result = await db.execute(
-            text(
-                "SELECT canonical_name, description_short, weight, memory_type, aliases, id, source_trust, "
-                "ROUND(CAST(" + eff_expr + " AS numeric), 2) "
-                "FROM memory_concepts "
-                "WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 "
-                "AND valid_to IS NULL AND (valid_from IS NULL OR valid_from <= NOW()) "
-                "AND memory_type != 'profile' AND weight > 0.05 "
-                "ORDER BY " + eff_expr + " DESC, created_at DESC LIMIT :limit"
-            ),
-            {"uid": user_id, "limit": max_concepts},
+        # 2026-10-18（conv dca19082 全局记忆污染）：默认不再把“按权重排序”
+        # 的语义概念塞进每个请求的基底。权重高 ≠ 与本轮相关——DeepSeek
+        # Harness / Agent 自进化 / 模型规格等跨项目观点就是这样进入每次对话
+        # 的。相关概念由 stage1-4 检索按查询召回；这里只保留事件时间线。
+        include_concepts = bool(
+            config.memory_retrieval.get("overview_include_concepts", False)
         )
-        rows = result.fetchall()
+        rows = []
+        if include_concepts:
+            # 2026-08-16 盲区 B 修复：与 dream/decay 同一有效权重排序——旧实现按原始
+            # weight DESC，衰减写回生效前高权重旧概念仍恒定出现在每个请求的基底里。
+            # A4.9 wave2/3 审查 M5/M7：SELECT 展示有效权重（与排序依据一致，口径与
+            # dream payload 统一）；weight > 0.05 粗筛缩小行集（触底概念无展示价值）。
+            from app.services.memory_weight_service import effective_weight_sql
+            eff_expr = effective_weight_sql()
+            result = await db.execute(
+                text(
+                    "SELECT canonical_name, description_short, weight, memory_type, aliases, id, source_trust, "
+                    "ROUND(CAST(" + eff_expr + " AS numeric), 2) "
+                    "FROM memory_concepts "
+                    "WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 "
+                    "AND valid_to IS NULL AND (valid_from IS NULL OR valid_from <= NOW()) "
+                    "AND created_at IS NOT NULL AND created_at < :cutoff "
+                    "AND memory_type != 'profile' AND weight > 0.05 "
+                    "ORDER BY " + eff_expr + " DESC, created_at DESC LIMIT :limit"
+                ),
+                {"uid": user_id, "limit": max_concepts, "cutoff": cutoff},
+            )
+            rows = result.fetchall()
     except Exception:
         logger.exception("memory overview concepts query failed")
         rows = []
@@ -2190,16 +2540,24 @@ async def _build_memory_overview(
             break
 
     try:
-        result = await db.execute(
-            text(
-                "SELECT narrative, valid_from, id FROM memory_episodes "
-                "WHERE user_id = :uid AND valid_to IS NULL AND superseded_by IS NULL "
-                "AND (valid_from IS NULL OR valid_from <= NOW()) "
-                "ORDER BY valid_from DESC NULLS LAST, created_at DESC LIMIT :limit"
-            ),
-            {"uid": user_id, "limit": max_episodes},
-        )
-        epi_rows = result.fetchall()
+        # 2026-10-18: same rationale as concepts — a weight-ranked event
+        # timeline is not query-ranked. The current conversation's own
+        # just-extracted event was appearing here on every turn. Relevant
+        # events are retrieved by stage1-4 (`[相关事件 Episodic]`) and pass
+        # through the self-reference guard; the unconditional timeline is off.
+        epi_rows = []
+        if bool(config.memory_retrieval.get("overview_include_episodes", False)):
+            result = await db.execute(
+                text(
+                    "SELECT narrative, valid_from, id FROM memory_episodes "
+                    "WHERE user_id = :uid AND valid_to IS NULL AND superseded_by IS NULL "
+                    "AND (valid_from IS NULL OR valid_from <= NOW()) "
+                    "AND valid_from IS NOT NULL AND valid_from < :cutoff "
+                    "ORDER BY valid_from DESC NULLS LAST, created_at DESC LIMIT :limit"
+                ),
+                {"uid": user_id, "limit": max_episodes, "cutoff": cutoff},
+            )
+            epi_rows = result.fetchall()
     except Exception:
         logger.exception("memory overview episodes query failed")
         epi_rows = []
@@ -2219,6 +2577,39 @@ async def _build_memory_overview(
     return "\n".join(lines), cids, eids
 
 
+def _emit_evidence_shadow(*slices) -> None:
+    """W2 续波 A1/A2（2026-10-23，判据 #48-#51）：证据视图裁决 + 隐式冲突
+    shadow 接线消费点。只记录不改注入集合（shadow）；稀有事件落
+    memory_eval_runs；config 关闭（`[memory] evidence_view_shadow_enabled
+    = false`）时零调用零落档；任何失败 fail-open，绝不影响注入文本。"""
+    try:
+        if not config.memory_evidence_view_shadow_enabled:
+            return
+        from app.services import memory_evidence_view_service as evs
+        cands = []
+        for sl in slices:
+            for c in (sl or []):
+                meta = dict(c.metadata or {})
+                # fact 取注入渲染同源文本（episodic=narrative/subconscious=
+                # raw_text，与注入段一致）；id/content/fact 显式覆盖防 metadata
+                # 同名键篡改（A 评审 Minor）。
+                meta.update({
+                    "id": c.id,
+                    "content": c.content,
+                    "fact": meta.get("narrative") or meta.get("raw_text") or c.content,
+                })
+                cands.append(meta)
+        report = evs.shadow_report(cands)
+        if not report:
+            return
+        # LLM 兜底键预留（判据 #51）：默认 false=纯规则；本波不做 LLM 调用，
+        # 该字段只回显配置供 A/B 台账分臂。
+        report["llm_fallback"] = bool(config.memory_implicit_conflict_llm_fallback)
+        evs.record_evidence_shadow_bg(report)
+    except Exception:
+        logger.debug("evidence shadow emit failed (fail-open)", exc_info=True)
+
+
 async def _build_injection_context(
     db: AsyncSession, user_id: str,
     candidates: list[RetrievalCandidate], stage0: Stage0Result,
@@ -2230,13 +2621,148 @@ async def _build_injection_context(
     return ctx
 
 
+async def _conversation_self_reference_since(
+    db: AsyncSession, conversation_id: Optional[str],
+) -> Optional[datetime]:
+    """Conversation start minus 5 min; rows created after it are self-output."""
+    if not conversation_id:
+        return None
+    try:
+        row = (await db.execute(
+            _sql_text("SELECT created_at FROM conversations WHERE id = :cid"),
+            {"cid": conversation_id},
+        )).fetchone()
+        if row and row[0]:
+            start = _to_dt(row[0])
+            if start is not None:
+                return start - timedelta(minutes=5)
+    except Exception:
+        logger.warning("conversation start lookup failed (fallback to recency)", exc_info=True)
+    return None
+
+
+def _recent_user_texts(conversation_messages: Optional[list], limit: int = 5) -> list[str]:
+    """Normalized recent user messages (for self-reference detection).
+
+    Accepts dict messages AND ORM rows — chat.py passes `Message` objects,
+    while tests/voice paths pass dicts. The old dict-only version made the
+    text-prefix half of the guard dead in the main chat path.
+    """
+    texts: list[str] = []
+    for msg in reversed(list(conversation_messages or [])):
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            raw = msg.get("content")
+        else:
+            role = getattr(msg, "role", None)
+            raw = getattr(msg, "content", None)
+        if role != "user":
+            continue
+        text = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if text:
+            texts.append(text[:160])
+        if len(texts) >= limit:
+            break
+    return texts
+
+
+def _strip_role_prefix(text: str) -> str:
+    """Drop replay prefixes such as `用户:` / `User:` before comparing."""
+    return re.sub(
+        r"^\s*(?:用户|用户说|助手|小航|user|assistant|ai)\s*[:：]\s*",
+        "",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+
+
+def _matches_recent_user_text(text: str, recent_texts: list[str]) -> bool:
+    """True when a candidate is the user's own current-conversation text."""
+    norm = re.sub(r"\s+", " ", _strip_role_prefix(text)).strip()
+    if len(norm) < 12:
+        return False
+    for recent in recent_texts:
+        recent = re.sub(r"\s+", " ", _strip_role_prefix(recent)).strip()
+        if len(recent) < 12:
+            continue
+        a, b = norm[:80], recent[:80]
+        if a.startswith(b) or b.startswith(a):
+            return True
+    return False
+
+
+def _within_recent_minutes(value, minutes: float) -> bool:
+    """True when a stored candidate timestamp is inside the active window."""
+    if not minutes or minutes <= 0:
+        return False
+    dt = _to_dt(value)
+    if dt is None:
+        return False
+    now = datetime.utcnow()
+    return (now - dt).total_seconds() < minutes * 60
+
+
+def _self_reference_guard(
+    items: list, tier: str, recent_texts: list[str], minutes: float,
+    since_dt=None,
+) -> list:
+    """Drop candidates that are this conversation's own fresh output.
+
+    subconscious units carry `raw_text` + `created_at`; episodes carry
+    `narrative` + `valid_from`. Both are matched by text prefix (deterministic,
+    no ML) and by recency (the extraction pipeline is asynchronous, so the
+    current turn can land in memory while the conversation is still running).
+    `since_dt` extends the recency test to the whole conversation lifetime:
+    a long-running conversation must not see its own 3-hour-old events either.
+    """
+    kept = []
+    for cand in items:
+        meta = cand.metadata or {}
+        if tier == "subconscious":
+            text = str(meta.get("raw_text") or cand.content or "")
+            ts = meta.get("created_at")
+        elif tier == "concept":
+            text = str(meta.get("canonical_name") or cand.content or "")
+            ts = meta.get("created_at")
+        else:
+            text = str(meta.get("narrative") or cand.content or "")
+            ts = meta.get("valid_from") or meta.get("created_at")
+        if recent_texts and _matches_recent_user_text(text, recent_texts):
+            continue
+        if since_dt is not None:
+            dt = _to_dt(ts)
+            # Unknown age is treated as self-referential: a NULL timestamp
+            # cannot prove the row predates this conversation.
+            if dt is None or dt >= since_dt:
+                continue
+        if _within_recent_minutes(ts, minutes):
+            continue
+        kept.append(cand)
+    return kept
+
+
 async def _build_injection_context_ex(
     db: AsyncSession, user_id: str,
     candidates: list[RetrievalCandidate], stage0: Stage0Result,
     query_text: str = "",
+    conversation_messages: Optional[list] = None,
+    conversation_id: Optional[str] = None,
 ) -> tuple[str, dict]:
-    """构建注入上下文 + C1 元数据（budget/truncated/injected_chars）。"""
+    """构建注入上下文 + C1 元数据（budget/truncated/injected_chars）.
+
+    2026-10-18（conv dca19082）：跨会话记忆污染防护。`conversation_messages`
+    用于识别“当前会话自身”的原文/事件——记忆提取与检索并发时，刚写下的
+    用户原话会以 subconscious 片段或当日事件的形式回灌，模型把自己的上一条
+    消息当成长期记忆事实。`_self_reference_guard` 丢弃这些自指候选，并在
+    注入头加使用边界。
+    """
     ret_cfg = config.memory_retrieval
+    recent_user_texts = _recent_user_texts(conversation_messages)
+    guard_enabled = bool(ret_cfg.get("self_reference_guard_enabled", True))
+    guard_minutes = float(ret_cfg.get("self_reference_recent_minutes", 30))
+    # Conversation-scoped self-reference cutoff: every memory row created
+    # after this conversation started is (almost certainly) its own output.
+    self_reference_since = await _conversation_self_reference_since(db, conversation_id)
     # (priority, text)：按相关性降序注入，预算截断从最低优先段开始，
     # 保证高相关内容（常为 subconscious 原文）不被恒定基底挤掉（A4.6 根因 3）。
     # 段优先级用绝对相关分（CE raw rerank_score > embedding_sim > calibrated）
@@ -2280,7 +2806,19 @@ async def _build_injection_context_ex(
     try:
         overview, overview_cids, overview_eids = await _build_memory_overview(
             db, user_id, max_chars=overview_chars,
+            exclude_recent_minutes=(
+                float(ret_cfg.get("overview_exclude_recent_minutes", 120))
+                if guard_enabled else 0
+            ),
         )
+        if overview and strong_hit:
+            # 2026-10-18: a strong query-relevant hit already fills the
+            # budget. The fixed "长期记忆总览" is weight-ranked, not
+            # query-ranked — injecting it next to strong hits is exactly how
+            # unrelated topics (other projects/incidents) leak into the
+            # current turn. Keep it only as a zero-hit baseline.
+            overview = ""
+            overview_cids, overview_eids = set(), set()
         if overview:
             sections.append((0.35, overview))
     except Exception:
@@ -2332,9 +2870,27 @@ async def _build_injection_context_ex(
         epi_slice = epi_eligible[:max_epi]
         concept_slice = concept_eligible[:max_concept]
         sub_slice = injected["subconscious"][:max_sub]
+    if guard_enabled:
+        # 2026-10-18: never inject the current conversation's own fresh
+        # writing back as "memory" (self-referential contamination).
+        epi_slice = _self_reference_guard(
+            epi_slice, "episodic", recent_user_texts, guard_minutes,
+            since_dt=self_reference_since)
+        sub_slice = _self_reference_guard(
+            sub_slice, "subconscious", recent_user_texts, guard_minutes,
+            since_dt=self_reference_since)
+        concept_slice = _self_reference_guard(
+            concept_slice, "concept", recent_user_texts, guard_minutes,
+            since_dt=self_reference_since)
     if ret_cfg.get("contradicts_read_downgrade_enabled", False) and concept_slice:
         # D2（默认关）：contradicts 读侧互斥降级（保留高分端点）
         concept_slice = await _drop_contradicted(db, user_id, concept_slice)
+
+    # W2 续波 A1/A2（2026-10-23，判据 #48-#51）：证据视图裁决 + 隐式冲突
+    # shadow 接线。对**实际注入切片**（去重/门槛/guard 后的最终集合）产出
+    # 裁决与冲突报告，稀有事件落 memory_eval_runs——只记录不改注入集合
+    # （shadow；A/B 后另波换注入集）。fail-open：任何失败不影响注入文本。
+    _emit_evidence_shadow(epi_slice, concept_slice, sub_slice)
 
     if epi_slice:
         lines = ["[相关事件 Episodic]"]
@@ -2373,7 +2929,7 @@ async def _build_injection_context_ex(
 
     dream_text = await _get_latest_dream(db, user_id)
     if dream_text:
-        sections.append((0.25, f"[近期 Dream]\n{_clip_marked(dream_text, 500)}"))
+        sections.append((0.25, dream_section_text(dream_text)))
 
     # 用户画像基底（A4.6 根因 4；2026-08-09 写路径版）：profile 概念由
     # 调度器每日 LLM 提炼入库（memory_profile_service.sync_profile_concepts），
@@ -2463,13 +3019,39 @@ async def _build_injection_context_ex(
         instruction = str(ret_cfg.get("injection_usage_instruction_text")
                           or _DEFAULT_USAGE_INSTRUCTION)[:60]
         text = f"{instruction}\n\n{text}"
-    return text, {"truncated": truncated, "budget_chars": budget,
-                  "injected_chars": len(text)}
+    # M2a（APM-Bench）：缺证据显式声明——尾部 1 行元块，不参与预算竞争，
+    # 不计入 injected_chars（非记忆内容）。
+    # I1（复审）：has_hits 用三层 above-floor 命中（_select_injected 口径，
+    # 与 M2b miss=not ids 同源）——不得用 overview 去重后的切片（那会与
+    # 同页总览/遥测三方互斥）。
+    _missing_notice = _missing_evidence_notice(
+        query_text,
+        has_hits=any(bool(v) for v in injected.values()),
+        enabled=bool(config.memory.get("missing_evidence_notice_enabled", True)),
+    )
+    if _missing_notice:
+        text = f"{text}{_missing_notice}"
+    # 2026-10-18（conv dca19082）：记忆使用边界。跨会话记忆是背景，不是
+    # 当前对话的事实来源；不占记忆预算、不计入 injected_chars。
+    _boundary_notice = ""
+    if text and bool(ret_cfg.get("injection_boundary_enabled", True)):
+        _boundary_notice = MEMORY_INJECTION_BOUNDARY + "\n\n"
+        text = _boundary_notice + text
+    meta = {"truncated": truncated, "budget_chars": budget,
+            "injected_chars": len(text) - len(_missing_notice) - len(_boundary_notice)}
+    # 无 marker 时保持旧 meta 形状（既有契约测试 test_memory_batch_cdef_fixes
+    # 钉 3 键集合）；触发时才携带标志键。
+    if _missing_notice:
+        meta["missing_evidence_notice"] = True
+    return text, meta
 
 
 # C1（2026-09-14）：截断必须显式标注（信息完整性原则；零数字，避免模型把
 # 标注当数据）。标注本身不计入记忆内容预算。
 _TRUNCATION_NOTE = "\n\n（部分记忆因长度预算未完整展示）"
+
+# 2026-10-18（conv dca19082）：跨会话记忆使用边界（所有注入出口共用）。
+from app.prompts.fragments import MEMORY_RELEVANCE_BOUNDARY as MEMORY_INJECTION_BOUNDARY  # SEC-MEM-02
 
 # E1（2026-09-14，默认关）：注入头部使用指令（≤60 字符，零数字）
 _DEFAULT_USAGE_INSTRUCTION = "以上历史记忆可能过时或不适用于当前任务，请结合当前对话判断。"
@@ -2519,6 +3101,19 @@ def _apply_token_budget_ex(
     return text, truncated, used
 
 
+def dream_injectable(scanned, provenance_taint) -> bool:
+    """W3-2（记忆/长程 v2，2026-10-23）：dream 读取门——未扫描/高 taint 不注入
+    （B2 投毒放大器面：未过写入扫描的 dream 叙事不得进入上下文）。"""
+    if not scanned:
+        return False
+    return str(provenance_taint or "").strip().lower() != "untrusted"
+
+
+def dream_section_text(text: str) -> str:
+    """注入段带「推测，非事实」标签（dream 是叙事推断，不是事实源——B2）。"""
+    return f"[近期 Dream]（推测，非事实）\n{_clip_marked(text, 500)}"
+
+
 async def _get_latest_dream(db: AsyncSession, user_id: str) -> str | None:
     # 2026-08-09 修复：① 限定 consolidation 类型（passive dream 每天由 consolidation
     # 管线写入，不受 dreaming_enabled 门控；该开关只门控主动 dream 第 6 步）；
@@ -2529,14 +3124,14 @@ async def _get_latest_dream(db: AsyncSession, user_id: str) -> str | None:
     # A4.9 复审 Minor：runtime 禁用（v1 模式）时 consolidation 调度停止、v1 行被
     # nightly 过滤 → 本函数返回空——退回任意类型最新行（v1 模式无注入歧义）。
     result = await db.execute(
-        text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) AND dream_type = 'consolidation' ORDER BY created_at DESC NULLS LAST, generated_for_date DESC LIMIT 1"),
+        text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) AND dream_type = 'consolidation' AND scanned = TRUE AND COALESCE(provenance_taint, '') <> 'untrusted' ORDER BY created_at DESC NULLS LAST, generated_for_date DESC LIMIT 1"),
         {"uid": user_id},
     )
     row = result.fetchone()
     if row:
         return row[0]
     result = await db.execute(
-        text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) ORDER BY created_at DESC NULLS LAST, generated_for_date DESC LIMIT 1"),
+        text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) AND scanned = TRUE AND COALESCE(provenance_taint, '') <> 'untrusted' ORDER BY created_at DESC NULLS LAST, generated_for_date DESC LIMIT 1"),
         {"uid": user_id},
     )
     row = result.fetchone()

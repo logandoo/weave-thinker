@@ -9,6 +9,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_config
+from app.prompts.memory import (
+    MEMORY_ACTIVE_DREAMING_REHEARSE_PROMPT,
+    MEMORY_ACTIVE_DREAMING_SCENARIOS_PROMPT,
+)
 from app.services.memory_weight_service import apply_reinforcement_signal
 
 config = get_config()
@@ -49,7 +53,7 @@ async def _generate_scenarios(concepts: list[dict]) -> list[str]:
         llm = _memory_llm("dream")
         resp = await llm.complete_chat(
             [
-                {"role": "system", "content": "生成 2-3 个假设性用户问题/任务场景，用于测试概念间的一致性。输出 JSON array of strings。"},
+                {"role": "system", "content": MEMORY_ACTIVE_DREAMING_SCENARIOS_PROMPT},
                 {"role": "user", "content": f"概念：\n{concepts_text}"},
             ],
             temperature=0.3,
@@ -71,7 +75,7 @@ async def _rehearse_scenarios(scenarios: list[str], concepts: list[dict]) -> lis
             llm = _memory_llm("dream")
             resp = await llm.complete_chat(
                 [
-                    {"role": "system", "content": "根据以下概念回答用户问题，然后自评每个概念是否被正确使用。输出JSON：{\"concept_evaluations\": [{\"concept_id\": \"...\", \"verdict\": \"confirmed|contradicted|gap_found\", \"note\": \"...\"}], \"new_insights\": [...], \"contradictions_found\": [...]}"},
+                    {"role": "system", "content": MEMORY_ACTIVE_DREAMING_REHEARSE_PROMPT},
                     {"role": "user", "content": f"已知概念：\n{concepts_text}\n\n场景：{scenario}"},
                 ],
                 temperature=0.2,

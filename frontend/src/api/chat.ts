@@ -68,6 +68,17 @@ export const chatApi = {
     return data
   },
 
+  async bindExecutionTarget(
+    conversationId: string,
+    target: string | null,
+  ): Promise<{ execution_target: string | null }> {
+    const { data } = await api.post(
+      `/conversations/${encodeURIComponent(conversationId)}/execution-target`,
+      { target },
+    )
+    return data
+  },
+
   async getConversations(assistantId?: string | null): Promise<Conversation[]> {
     const params = assistantId ? { assistant_id: assistantId } : {}
     const { data } = await api.get('/conversations', { params })
@@ -186,9 +197,13 @@ export const chatApi = {
    *  （无法确认入队：429 队列积压或请求失败/网络中断——提交结果不可知，
    *  调用方一律回填稍后重发，绝不可回退普通发送：那会杀掉在途 run）。
    *  仅服务端 200 明确答复 steered/unsupported_mode 才按其语义处理。 */
-  async interjectStream(conversationId: string, content: string): Promise<{ status: 'steered' | 'not_running' | 'unsupported_mode' | 'rate_limited' }> {
+  async interjectStream(conversationId: string, content: string, clientMessageId?: string): Promise<{ status: 'steered' | 'not_running' | 'unsupported_mode' | 'rate_limited' }> {
     try {
-      const { data } = await api.post(`/chat/stream/interject/${conversationId}`, { content })
+      // W26（B3）：client_message_id 由 echo 回带，前端按 id 精确配对。
+      // 旧后端忽略未知字段，缺失时前端回落内容配对。
+      const body: { content: string; client_message_id?: string } = { content }
+      if (clientMessageId) body.client_message_id = clientMessageId
+      const { data } = await api.post(`/chat/stream/interject/${conversationId}`, body)
       const status = data?.status
       if (status === 'steered' || status === 'unsupported_mode') return { status }
       if (status === 'not_running') return { status: 'not_running' }
@@ -209,13 +224,23 @@ export const chatApi = {
       signal: handlers.signal,
     })
 
+    handlers.onHttpStatus?.(response.status)
     if (!response.ok) {
       if (response.status === 401) {
         clearStoredAuth()
         window.location.href = '/app/frontend/login?expired=1'
         return
       }
-      handlers.onError(`HTTP error: ${response.status}`)
+      // 透传服务端 detail（如「待重新生成的消息不存在」——stale/合成 id 的
+      // 重生成目标，conv 92398a80），不再只给用户裸「HTTP error: 404」。
+      let detail = ''
+      try {
+        const body: any = await response.json()
+        if (body && typeof body.detail === 'string') detail = body.detail
+      } catch {
+        // 非 JSON 错误体——保留状态码文案兜底
+      }
+      handlers.onError(detail ? `${detail}（HTTP ${response.status}）` : `HTTP error: ${response.status}`)
       return
     }
 

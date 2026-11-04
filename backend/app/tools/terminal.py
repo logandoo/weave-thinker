@@ -205,13 +205,25 @@ def _is_within_workspace(path: Path, workspace_root: Path) -> bool:
         return False
 
 
+def _tenant_workspace_root():
+    from app.services.tenant_service import scoped_root
+    return scoped_root(config.workspace_root).resolve()
+
+
 def _resolve_working_dir(args: dict, kwargs: dict) -> tuple[str, Optional[str]]:
-    workspace_root = config.workspace_root.resolve()
+    workspace_root = _tenant_workspace_root()
 
     wd = args.get("working_dir", "").strip()
     if wd:
         resolved = Path(wd)
-        if _is_within_workspace(resolved, workspace_root) or config.super_admin_bypass:
+        # A caller may pass a persisted (pre-tenant) workspace path; accept it
+        # only when it is inside the configured global root, never `/etc`.
+        _caller_root = Path(kwargs.get("workspace_path") or workspace_root).resolve()
+        if (
+            _is_within_workspace(resolved, _caller_root)
+            or _is_within_workspace(resolved, workspace_root)
+            or config.super_admin_bypass
+        ):
             return str(resolved.resolve()), None
         if args.get("_permission_granted"):
             return str(resolved.resolve()), None
@@ -220,7 +232,18 @@ def _resolve_working_dir(args: dict, kwargs: dict) -> tuple[str, Optional[str]]:
     workspace_path = kwargs.get("workspace_path", "")
     if workspace_path:
         resolved = Path(workspace_path)
-        if _is_within_workspace(resolved, workspace_root) or config.super_admin_bypass:
+        # Accept the caller's persisted workspace even when it predates a
+        # tenant namespace (enabling WT_TENANT_ID must not brick terminal for
+        # existing users).  The path is server-resolved from the user's
+        # workspace row, not user input.
+        if (
+            _is_within_workspace(resolved, workspace_root)
+            or (
+                _is_within_workspace(resolved, config.workspace_root)
+                and resolved.resolve() != config.workspace_root.resolve()
+            )
+            or config.super_admin_bypass
+        ):
             return str(resolved.resolve()), None
         return "", f"Workspace path '{workspace_path}' is outside the allowed workspace"
 
@@ -236,22 +259,57 @@ def _command_accesses_outside_workspace(command: str, cwd: str, workspace_path: 
     if workspace_path:
         workspace_root = Path(workspace_path).resolve()
     else:
-        workspace_root = config.workspace_root.resolve()
+        workspace_root = _tenant_workspace_root()
     cwd_path = Path(cwd).resolve()
     if not _is_within_workspace(cwd_path, workspace_root):
         return cwd
     path_patterns = [
         re.compile(r'\b(cd|ls|cat|head|tail|less|more|cp|mv)\s+(/[^\s;|&]+)', re.IGNORECASE),
         re.compile(r'\b(open|read|write)\s*\(\s*["\'](/[^"\']+)["\']'),
+        # Relative traversal (`cat ../other/x`, `cd ..`) resolved against cwd.
+        re.compile(r'\b(cat|head|tail|less|more|cp|mv)\s+(\.\.?/[^\s;|&]+)', re.IGNORECASE),
+        re.compile(r'\bcd\s+([^\s;|&]+)', re.IGNORECASE),
     ]
     for pat in path_patterns:
         for m in pat.finditer(command):
-            target = m.group(2) if m.lastindex >= 2 else ""
+            target = m.group(2) if (m.lastindex or 0) >= 2 else (m.group(1) if m.lastindex else "")
             if target:
-                target_path = Path(target).resolve()
+                target = target.strip("'\"")
+                target_path = (cwd_path / target).resolve() if not target.startswith("/") else Path(target).resolve()
                 if not _is_within_workspace(target_path, workspace_root):
                     return target
     return None
+
+
+def _timeout_guidance(timeout: float, has_output: bool) -> str:
+    """超时分支的改写文案（F3，2026-11-01 审计）。
+
+    旧文案无条件断言「已产生上述部分 stdout 输出」，而 Python 子进程默认块缓冲
+    被 SIGKILL 后缓冲丢失（现场 conv a4d54ec7 即空输出），把模型引向错误前提；
+    且逃生口指向研究型的 background_task，而不是同工具的 durable=true。
+    实现与 execute_code 共用 `app/tools/timeout_guidance.py`。
+    """
+    from app.tools.timeout_guidance import build_timeout_guidance
+    return build_timeout_guidance(timeout, has_output, tool_name="terminal")
+
+
+def _sandbox_env(path: str, cwd: str, bundled_git_env: dict) -> dict:
+    """终端沙箱 env（F1 2026-10-26）：HOME 隔离进工作区的同时，把 playwright
+    浏览器注册表钉到服务端共享目录（避免每工作区复制 641M 浏览器）。"""
+    from app.services.sandbox_env import playwright_browsers_env
+    return {
+        "PATH": path,
+        "HOME": cwd,
+        "LANG": "C.UTF-8",
+        "TERM": "dumb",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        # F1（2026-11-01 审计）：python 子进程接管道时默认块缓冲，被 SIGKILL
+        # 时缓冲丢失 → 超时"部分输出"恒为空。强制不缓冲。
+        "PYTHONUNBUFFERED": "1",
+        "TZ": "Asia/Shanghai",
+        **playwright_browsers_env(),
+        **(bundled_git_env or {}),
+    }
 
 
 async def terminal(args: dict, **kwargs) -> str:
@@ -285,7 +343,8 @@ async def terminal(args: dict, **kwargs) -> str:
         return json.dumps({"error": dir_error}, ensure_ascii=False)
 
     # Check if the command itself references paths outside the allowed workspace.
-    outside_path = _command_accesses_outside_workspace(command, cwd, str(config.workspace_root))
+    _allowed_root = str(kwargs.get("workspace_path") or _tenant_workspace_root())
+    outside_path = _command_accesses_outside_workspace(command, cwd, _allowed_root)
     if outside_path and not args.get("_permission_granted") and not config.super_admin_bypass:
         return json.dumps({
             "error": f"Command references path outside workspace: {outside_path}",
@@ -370,16 +429,23 @@ async def terminal(args: dict, **kwargs) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
-            env={
-                "PATH": _terminal_path,
-                "HOME": cwd,
-                "LANG": "C.UTF-8",
-                "TERM": "dumb",
-                "PYTHONDONTWRITEBYTECODE": "1",
-                "TZ": "Asia/Shanghai",
-                **_bundled_git_env,
-            },
+            env=_sandbox_env(_terminal_path, cwd, _bundled_git_env),
         )
+        # F2（2026-10-26）：登记子进程组，后台子孙（cmd &）在关停/重启清扫时可回收
+        # A4.9 I1：登记已知命令串（leader 可能秒退，不赌 /proc 回读）；pgid 兜底 proc.pid
+        try:
+            from app.services.spawn_registry import (
+                register as _spawn_register,
+                unregister as _spawn_unregister,
+                unregister_if_empty as _spawn_unreg_if_empty,
+            )
+            try:
+                _pgid = os.getpgid(proc.pid)
+            except Exception:
+                _pgid = proc.pid
+            _spawn_register(_pgid, command, cwd, "terminal")
+        except Exception:
+            _pgid = proc.pid
 
         # Background reading tasks preserve partial output on timeout
         # (same rationale as code_execution_service.py — conv 01d08b67).
@@ -403,6 +469,11 @@ async def terminal(args: dict, **kwargs) -> str:
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
             _timed_out = False
+            # A4.9 I2：自然结束且组内无幸存后台子孙 → 销记（防 manifest 无界增长）
+            try:
+                _spawn_unreg_if_empty(_pgid)
+            except Exception:
+                pass
         except asyncio.TimeoutError:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -410,6 +481,10 @@ async def terminal(args: dict, **kwargs) -> str:
                 proc.kill()
             await proc.wait()
             _timed_out = True
+            try:
+                _spawn_unregister(_pgid)
+            except Exception:
+                pass
 
         # Collect output from reading tasks (they finish after pipe close).
         stdout_bytes = b""
@@ -426,25 +501,21 @@ async def terminal(args: dict, **kwargs) -> str:
         _ws_archive = kwargs.get("workspace_path", "")
         _tag = str(kwargs.get("tool_call_id") or uuid.uuid4().hex[:12])
         if _timed_out:
+            _out = await _persist_stream_if_large(
+                _decode_output_capped(stdout_bytes), _ws_archive, f"{_tag}-timeout-stdout")
+            _err = await _persist_stream_if_large(
+                _decode_output_capped(stderr_bytes), _ws_archive, f"{_tag}-timeout-stderr")
             return json.dumps({
-                "stdout": await _persist_stream_if_large(
-                    _decode_output_capped(stdout_bytes), _ws_archive, f"{_tag}-timeout-stdout"),
-                "stderr": await _persist_stream_if_large(
-                    _decode_output_capped(stderr_bytes), _ws_archive, f"{_tag}-timeout-stderr"),
+                "stdout": _out,
+                "stderr": _err,
                 "return_code": -1,
                 "error": f"Command timed out after {timeout}s",
                 "timed_out": True,
-                "guidance": (
-                    "命令执行超过超时限制被终止。命令在被终止前已产生上述部分 stdout 输出——"
-                    "请先查看部分输出判断进度，然后调整方案："
-                    "(1) 减少单次处理的数据量；"
-                    "(2) 分批执行，每批保存中间结果；"
-                    "(3) 将长任务拆分为多个小步骤；"
-                    "(4) 检查是否存在死循环或阻塞等待。"
-                    "对于确实需要长时间运行的任务，使用 background_task 工具提交到后台执行。"
-                    "不要用相同命令重复调用——会再次超时。"
-                    "（若输出尾部标注了捕获上限截断，请分页/重定向到文件后读取完整输出。）"
-                ),
+                # F5（2026-11-01 审计）：-1 只表示"未正常结束"，补上可判读的信号
+                # 与真正生效的超时值（timeout 参数会被 clamp 到 [5, max]）。
+                "killed_by": "SIGKILL",
+                "timeout_effective": timeout,
+                "guidance": _timeout_guidance(timeout, bool(_out.strip() or _err.strip())),
                 "working_dir": cwd,
             }, ensure_ascii=False)
 

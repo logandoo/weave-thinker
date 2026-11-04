@@ -38,31 +38,43 @@
 kind = "llm"
 base_url = "https://api.deepseek.com/v1"
 api_key = ""              # ← 填入 DeepSeek key
-model_name = "deepseek-v4-flash"
+model_name = "deepseek-flash"
 display_name = "默认模型"
 # 自包含（2026-08-31）：采样随端点携带，[api] legacy 兜底不再需要
 is_custom = true
 # F5（2026-09-14）：可选端点级上下文窗口（未声明时压缩/守卫回退全局
-# [agent.compression].context_length，绝不猜小）
-# [endpoints.main.extra]
-# context_window = 128000
-# max_output_tokens = 8192
+# [agent.compression].context_length，绝不猜小）。DeepSeek-V4.1-Flash /
+# MiMo V2.6 均为 1M 窗口；如实声明可避免 262k 兜底导致过早压缩。
+[endpoints.main.extra]
+context_window = 1000000
+max_output_tokens = 393216
 
 [endpoints.deepseek]
 kind = "llm"
 base_url = "https://api.deepseek.com/v1"
 api_key = ""              # ← 填入 DeepSeek key
-model_name = "deepseek-v4-flash"
+model_name = "deepseek-flash"
 is_custom = true
 provider_type = "deepseek"
 
+[endpoints.deepseek.extra]
+context_window = 1000000
+max_output_tokens = 393216
+
+[endpoints.deepseek.params]
+top_p = 0.95
+
 [endpoints.mimo]
 kind = "llm"
-base_url = "https://api.xiaomimimo.com/v1"
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
 api_key = ""              # ← 填入 MiMo key
-model_name = "mimo-v2.5-pro-ultraspeed"
+model_name = "mimo-v2.6-pro"
 is_custom = true
 provider_type = "mimo"
+
+[endpoints.mimo.extra]
+context_window = 1000000
+max_output_tokens = 131072
 
 [endpoints."qwen3.8"]
 kind = "llm"
@@ -72,6 +84,9 @@ model_name = "qwen3.8_27b"
 display_name = "Qwen3.8(Local)"
 is_custom = true
 provider_type = "qwen3.8_vllm"
+
+[endpoints."qwen3.8".extra]
+context_window = 262144
 
 # Doubao（火山方舟 Ark，OpenAI 兼容）：thinking{type} + 顶层 reasoning_effort
 # （high/medium/low；minimal≡关闭已并入「关闭」开关，2026-10-04）；无 thinking_budget。
@@ -86,6 +101,8 @@ is_custom = true
 provider_type = "doubao"
 
 # ── VLM（视觉语言；purpose "vlm"：agent vision_interpret 工具 + 死磕视觉批评）──
+# 优先顺序：先探针当前主模型（助手端点），主模型能看图就用主模型；
+# 只有探针不通过才回落到这里配置的独立视觉端点。空=不提供回落端点。
 [endpoints.vlm]
 kind = "llm"
 base_url = ""
@@ -113,7 +130,7 @@ vocabulary_prefix = ""
 # ── TTS（语音合成；音色/风格随端点携带）──
 [endpoints.tts]
 kind = "tts"
-base_url = "https://api.xiaomimimo.com/v1"
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
 api_key = ""              # ← 填入 MiMo key
 model_name = "mimo-v2.5-tts"
 is_custom = true

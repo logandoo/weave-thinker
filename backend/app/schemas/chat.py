@@ -137,6 +137,9 @@ class MessageResponse(BaseModel):
     # 渐进落库交付状态（2026-10-06）：final（默认）| interrupted（中断残稿，
     # 前端「已中断」徽标）。streaming 在途行被列表接口过滤，永不下发。
     delivery_status: str = "final"
+    # 2026-11-01 插话内联：assistant 行的小型侧车 + user 行的渲染归属。
+    interjection_items: Optional[str] = None
+    embedded_in_message_id: Optional[str] = None
     created_at: str
 
 

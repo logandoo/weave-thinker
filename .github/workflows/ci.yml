@@ -74,6 +74,12 @@ jobs:
       - name: Prompt lint / coverage / contracts / golden set
         run: |
           cd backend
+          # The public distribution intentionally omits backend/tests and the
+          # prompt-eval fixtures; the same workflow file runs in both trees.
+          if [ ! -f scripts/prompt_audit.py ] || [ ! -f ../docs/prompt_manifest.json ] || [ ! -d tests/prompt_evals ]; then
+            echo "prompt governance assets not shipped in this tree — skip"
+            exit 0
+          fi
           python -m scripts.prompt_audit verify --check
           python -m scripts.prompt_audit budget --check
           python -m scripts.prompt_eval --check

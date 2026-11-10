@@ -12,6 +12,10 @@ port = 8158
 [security]
 jwt_secret_key = "<YOUR-SECRET>"
 super_admin_bypass = false
+# 自助注册开关（默认 true = 开放）；false 时只能由管理员经 /api/admin/users 建号
+# registration_open = true
+# 非空 = 注册须提供匹配的 invite_code（默认空 = 不需要邀请码）
+# registration_invite_code = ""
 user_mcp_stdio_enabled = true
 user_mcp_allow_private_hosts = true
 memory_provenance_strict = false

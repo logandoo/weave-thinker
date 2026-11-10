@@ -9,18 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_user, get_db
+from app.core.deps import get_current_user, get_db, require_admin
 from app.db.database import User, MemoryConcept, MemoryEpisode
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
 logger = logging.getLogger(__name__)
-
-
-async def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    """§8.5.1：admin 端点鉴权（fail-closed）。users.role == 'admin' 才放行。"""
-    if getattr(current_user, "role", "user") != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
-    return current_user
 
 
 @router.get("/concepts")

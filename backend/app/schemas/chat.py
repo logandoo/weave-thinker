@@ -183,6 +183,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RegisterRequest(LoginRequest):
+    # [security] registration_invite_code 非空时必填且须匹配；否则忽略
+    invite_code: Optional[str] = None
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str

@@ -21,8 +21,9 @@
   有效期 `[security] token_expire_days`（默认 7 天）；`POST /api/auth/refresh` 用仍有效的 Token 滑动续期
   （单条原子 CAS 轮换，登出后其 token 永久不可续期——详见二.1）。WebSocket 以 `?token=<jwt>` 或
   `Authorization` 头认证。标注「公开」的接口无需 Token。
-- **管理员路由**：`/api/admin/*` 目前仅校验登录、**无角色校验**——任何已登录用户均可调用（已知限制，
-  商业版规划收口）。
+- **管理员路由**：`/api/admin/users/*` 与 `/api/admin/memory/*` 统一依赖 `require_admin`——仅 `users.role='admin'`
+  放行，其他已登录用户返回 `403 {"detail": "Admin role required"}`；`POST /api/admin/reload-config` 另以
+  `X-Admin-Secret` 请求头校验。
 - **错误约定**：4xx 响应体均为 `{"detail": "<原因>"}`。
   `401`=无/坏 Token；`403`=权限不足或敏感操作拒绝；`404`=资源不存在或非本人资源
   （越权访问他人资源一律 404 而非 403，防探测）；`409`=冲突（重名等）；`400`=参数/业务校验失败；
@@ -263,6 +264,7 @@ curl -k -X POST "https://<host>:8158/api/auth/refresh" -H "Authorization: Bearer
 |---|---|---|---|
 | `username` | string | 是 |  |
 | `password` | string | 是 |  |
+| `invite_code` | ∪string|null | 否 | `[security] registration_invite_code` 非空时必填且须匹配，否则 403 `邀请码无效`；`registration_open = false` 时一律 403 `注册已关闭，请联系管理员` |
 
 **输出**
 
@@ -5406,7 +5408,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### GET `/api/admin/users`
 **List Users**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role='admin'`，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
@@ -5450,7 +5452,7 @@ curl -k -X GET "https://<host>:8158/api/admin/users" -H "Authorization: Bearer $
 ### POST `/api/admin/users`
 **Create User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role='admin'`，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
@@ -5480,7 +5482,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### DELETE `/api/admin/users/{user_id}`
 **Delete User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role='admin'`，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
@@ -5509,7 +5511,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### GET `/api/admin/users/{user_id}`
 **Get User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role='admin'`，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
@@ -5555,7 +5557,7 @@ curl -k -X GET "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization
 ### PUT `/api/admin/users/{user_id}`
 **Update User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role='admin'`，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 

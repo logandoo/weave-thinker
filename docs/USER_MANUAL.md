@@ -634,7 +634,8 @@ WT_MOUNT_OPTS=ro,z
 
 ## 16. 安全说明
 
-- **服务边界**：本项目面向个人/小团队自托管。管理接口（`/api/admin/*`）当前没有独立角色校验（任何登录用户可调用），**不要把服务直接暴露到不可信网络**；公网部署请置于 VPN、内网或加一层带认证的反向代理之后。
+- **服务边界**：本项目面向个人/小团队自托管，**不要把服务直接暴露到不可信网络**；公网部署请置于 VPN、内网或加一层带认证的反向代理之后。
+- **管理员与注册**：用户管理与记忆迁移管理接口（`/api/admin/users/*`、`/api/admin/memory/*`）只允许 `users.role = 'admin'` 的用户调用，其他登录用户返回 403。管理员需在数据库中手工指定：`UPDATE users SET role='admin' WHERE username='<用户名>';`。自助注册默认开放；在 `config.toml` 的 `[security]` 中设 `registration_open = false` 可关闭注册（管理员仍可通过 `/api/admin/users` 建号），或设 `registration_invite_code = "<邀请码>"` 要求注册时提供匹配的邀请码（`POST /api/auth/register` 的 `invite_code` 字段；登录页暂无邀请码输入框，需通过 API 注册）。改完重启服务生效。
 - **密钥**：`config.toml` 与 `config_model.toml` 含数据库密码、JWT 密钥、模型 API key；不要提交到代码库、不要打进镜像（本项目 Docker 配置已排除并运行时挂载）。
 - **权限审批**：终端执行、删除笔记等敏感工具默认走审批；可在「权限管理」收紧或放宽（放宽前请确认使用场景）。
 - **提示词注入防护**：网页/文件内容会被当作数据处理；记忆写入有注入扫描与不可见字符防护。

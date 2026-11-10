@@ -218,6 +218,20 @@ class Config:
         return bool(self.security.get("super_admin_bypass", False))
 
     @property
+    def registration_open(self) -> bool:
+        """Whether POST /api/auth/register accepts new accounts. Default true
+        keeps the historical open-registration behaviour; set false on a
+        deployment reachable by untrusted users (admins can still create
+        accounts via /api/admin/users)."""
+        return bool(self.security.get("registration_open", True))
+
+    @property
+    def registration_invite_code(self) -> str:
+        """Non-empty = /api/auth/register requires a matching invite_code
+        (constant-time compare). Empty (default) = no invite code needed."""
+        return str(self.security.get("registration_invite_code", "") or "").strip()
+
+    @property
     def memory_provenance_strict(self) -> bool:
         """P0 TMA-NM: quarantine unverified file-memory entries on read.
 

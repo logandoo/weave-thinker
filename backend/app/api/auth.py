@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.db.database import get_db, User, UserSession
-from app.schemas.chat import UserCreate, UserResponse, LoginRequest, TokenResponse
+from app.schemas.chat import UserCreate, UserResponse, LoginRequest, RegisterRequest, TokenResponse
+from app.core.config import get_config
 from app.services.auth_service import hash_password, verify_password, create_access_token
 from app.services.assistant_service import create_default_assistant_if_needed
 from app.services.memory_service import ensure_user_agent_state
@@ -18,6 +19,7 @@ from app.services.agent_permissions import (
 )
 from datetime import datetime
 import json
+import secrets
 from typing import Dict, Any
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -35,7 +37,26 @@ def _user_response(user) -> UserResponse:
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(request: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    # 注册开关 / 邀请码（[security] registration_open / registration_invite_code）。
+    # 默认开放且无邀请码，与历史行为一致；网关先于字段校验，关闭时不泄露任何校验细节。
+    cfg = get_config()
+    if not cfg.registration_open:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="注册已关闭，请联系管理员"
+        )
+    expected_code = cfg.registration_invite_code
+    if expected_code:
+        supplied = (request.invite_code or "").strip()
+        if not supplied or not secrets.compare_digest(
+            supplied.encode("utf-8"), expected_code.encode("utf-8")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="邀请码无效"
+            )
+
     if not request.username or not request.password:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -9,7 +9,7 @@ from typing import List
 from app.db.database import get_db, User
 from app.schemas.chat import UserResponse
 from app.services.auth_service import hash_password
-from app.core.deps import get_current_user
+from app.core.deps import require_admin
 from datetime import datetime
 
 router = APIRouter(prefix="/api/admin/users", tags=["admin"])
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/api/admin/users", tags=["admin"])
 @router.get("", response_model=List[UserResponse])
 async def list_users(
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin)
 ):
     result = await db.execute(select(User).order_by(desc(User.created_at)))
     users = result.scalars().all()
@@ -37,7 +37,7 @@ async def create_user(
     username: str,
     password: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin)
 ):
     # 遗留清偿 #4：对齐注册路径 2–50（空/超长曾直进 DB——空串更会污染配对身份链）
     if len(username) < 2 or len(username) > 50:
@@ -67,7 +67,7 @@ async def create_user(
 async def get_user(
     user_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin)
 ):
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
@@ -87,7 +87,7 @@ async def update_user(
     password: str = None,
     is_active: bool = None,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin)
 ):
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
@@ -124,7 +124,7 @@ async def update_user(
 async def delete_user(
     user_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin)
 ):
     if user_id == current_user.id:
         raise HTTPException(

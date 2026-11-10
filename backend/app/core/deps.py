@@ -95,3 +95,10 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db)
 ) -> User:
     return await get_user_from_token(credentials.credentials, db)
+
+
+async def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """§8.5.1：admin 端点鉴权（fail-closed）。users.role == 'admin' 才放行。"""
+    if getattr(current_user, "role", "user") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+    return current_user

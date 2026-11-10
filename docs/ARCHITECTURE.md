@@ -152,7 +152,7 @@ weave-thinker/
 | asr | `/api/asr` | 文件转写、热词管理、`WS /ws/transcribe/stream` 流式转写代理 |
 | files / file_upload / image_upload | `/api/files` `/api/images` | workspace 下载（路径校验）、多文件上传解析（docx/pptx/xlsx/pdf/csv）、图片与音视频上传 |
 | skills | `/api/skills` | 用户技能 CRUD + zip/文件夹上传（可执行文件安全扫描） |
-| sessions / admin / config / system | — | 登录会话与聊天会话统计；用户管理（**无角色网关**）；provider 脱敏列表；`/api/system/capabilities` 能力清单 |
+| sessions / admin / config / system | — | 登录会话与聊天会话统计；用户管理（`require_admin` 角色网关）；provider 脱敏列表；`/api/system/capabilities` 能力清单 |
 
 ### 3.3 关键服务（`backend/app/services/`）
 
@@ -310,7 +310,7 @@ sequenceDiagram
 
 ### 5.5 权限与安全
 
-工具权限键（`terminal_execution`/`note_delete` 等）→ SSE `permission_request` → 用户前端审批 → `/permission/respond` 回填；死磕模式下带 permission_key 的工具自动放行（`registry.py` auto_allowed）；JWT + WebSocket token 认证；admin 用户管理（**当前无角色网关**：`/api/admin/*` 仅 `get_current_user`，任何登录用户可调用——已知待修项）。
+工具权限键（`terminal_execution`/`note_delete` 等）→ SSE `permission_request` → 用户前端审批 → `/permission/respond` 回填；死磕模式下带 permission_key 的工具自动放行（`registry.py` auto_allowed）；JWT + WebSocket token 认证；admin 用户管理（`/api/admin/users/*` 与 `/api/admin/memory/*` 统一依赖 `app/core/deps.py::require_admin`，fail-closed：仅 `users.role='admin'` 放行、其余 403；管理员由 SQL 指定：`UPDATE users SET role='admin' WHERE username='<用户名>';`）；自助注册受 `[security] registration_open`（默认 `true`）与 `registration_invite_code`（默认空 = 不需要邀请码，非空则 `/api/auth/register` 须带匹配的 `invite_code`）控制。
 
 ### 5.6 导出
 

@@ -16,8 +16,9 @@ super_admin_bypass = false
 # registration_open = true
 # 非空 = 注册须提供匹配的 invite_code（默认空 = 不需要邀请码）
 # registration_invite_code = ""
-user_mcp_stdio_enabled = true
-user_mcp_allow_private_hosts = true
+# 开启 stdio 后任何注册用户都能以服务端用户身份启动进程，仅在受信任部署中开启
+user_mcp_stdio_enabled = false
+user_mcp_allow_private_hosts = false
 memory_provenance_strict = false
 memory_hmac_key = ""
 multi_tenant_experimental = false

@@ -32,10 +32,16 @@ export const fileUploadApi = {
     onProgress?: (percent: number) => void,
     notebookId?: string,
     signal?: AbortSignal,
+    scope?: { conversationId: string },
   ): Promise<FileUploadResponse> {
     const formData = new FormData()
     for (const file of files) {
       formData.append('files', file)
+    }
+    // 任务作用域（§10）：带会话上下文时后端按绑定/活跃 run 决定落点
+    // （Task inputs 或 staging）；run/attempt/epoch 由服务端推导，客户端不背书。
+    if (scope?.conversationId) {
+      formData.append('conversation_id', scope.conversationId)
     }
 
     const params: Record<string, string | boolean> = { save_to_notebook: saveToNotebook }

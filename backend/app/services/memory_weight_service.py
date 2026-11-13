@@ -173,6 +173,7 @@ async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_t
                 0),
               updated_at = NOW()
             WHERE id = :id AND valid_to IS NULL
+              AND (verification_state IS NULL OR verification_state != 'contradicted')
         """),
         {
             "delta": delta, "id": concept_id,
@@ -180,6 +181,23 @@ async def apply_reinforcement_signal(db: AsyncSession, concept_id: str, signal_t
             "cap_ext": float(config.memory_concept.get("trust_cap_external", 0.5)),
         },
     )
+    # P0-06（2026-11-08）：权重信号后同步 retention_score（公式单一真源 =
+    # retention_score_for；同事务读回原子 UPDATE 后的值，并发竞态由下一次信号自愈）。
+    try:
+        row = (await db.execute(
+            text("""SELECT weight, stability, recurrence_count, last_recurrence_at, created_at
+                    FROM memory_concepts WHERE id = :id"""),
+            {"id": concept_id},
+        )).fetchone()
+        if row is not None:
+            from app.services.memory_retention_service import retention_score_for
+            score = retention_score_for(row[0], row[1], row[2], row[3], row[4])
+            await db.execute(
+                text("UPDATE memory_concepts SET retention_score = :score WHERE id = :id"),
+                {"score": score, "id": concept_id},
+            )
+    except Exception:
+        logger.debug("retention_score refresh after reinforcement failed", exc_info=True)
 
 
 async def run_weight_decay(db: AsyncSession, user_id: str) -> dict:

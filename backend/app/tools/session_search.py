@@ -54,6 +54,52 @@ async def _annotate_result_taints(
     return results
 
 
+async def _task_scope_clause(args: dict, kwargs: dict) -> tuple[str, dict, dict | None]:
+    """任务作用域收口（2026-11-10 §7.5）：scoped 模式下 session_search 只能命中
+    当前 Task 的消息（按 `workspace_message_contexts` 逐消息快照限定）。
+
+    搜索其他 Task 的对话必须持 `kind=session` 的服务端 grant；off/shadow 保持旧语义
+    （legacy 会话继续按用户搜索，并在返回里明确标注不继承新隔离保证）。
+    """
+    from app.services import workspace_scope as ws
+    from app.services import workspace_scope_service as svs
+    from app.services.cross_scope_grant_service import verify_grant
+
+    setting = svs.scoping_mode()
+    if setting != "enforce":
+        return "1=1", {}, ({"scope": "legacy", "note": "legacy 会话搜索不按任务隔离"}
+                           if setting == "off" else None)
+    ctx = kwargs.get("workspace_ctx")
+    if not isinstance(ctx, ws.WorkspaceContext):
+        return "1=0", {}, {"error": ws.CODE_SCOPE_MISSING,
+                           "note": "scoped 会话缺少任务上下文，拒绝全用户对话搜索"}
+    tasks = [ctx.task_id]
+    db = kwargs.get("db")
+    grant_id = svs.grant_id_from(kwargs) or str(args.get("grant_id") or "").strip()
+    if grant_id and db is not None:
+        check = await verify_grant(db, grant_id, ctx=ctx, kind="session", mode="read")
+        from app.services.cross_scope_grant_service import claims_of
+
+        claims = await claims_of(check.grant) if check.grant is not None else {}
+        if check.ok and claims.get("source_task_id"):
+            # 只信已按 claims_hash 校验过的 payload，不信可被旁写的行列
+            tasks.append(str(claims["source_task_id"]))
+        elif not check.ok:
+            return "1=0", {}, {"error": check.code, "note": check.message}
+    params = {"_sc_uid": ctx.user_id}
+    ors = []
+    for i, tid in enumerate(dict.fromkeys(tasks)):
+        key = f"_sc_task_{i}"
+        params[key] = tid
+        ors.append(f"task_id = :{key}")
+    clause = (
+        "m.id IN (SELECT message_id FROM workspace_message_contexts "
+        f"WHERE user_id = :_sc_uid AND ({' OR '.join(ors)}))"
+    )
+    return clause, params, {"scope": "current_task", "task_id": ctx.task_id,
+                            "cross_task": len(tasks) > 1}
+
+
 async def session_search(args: dict, **kwargs) -> str:
     query = args.get("query", "").strip()
     limit = min(int(args.get("limit", 5)), 20)
@@ -73,7 +119,12 @@ async def session_search(args: dict, **kwargs) -> str:
                               ensure_ascii=False)
         try:
             read_limit = max(1, min(int(args.get("read_limit") or 20), 50))
-            params: dict = {"uid": user.id, "cid": conversation_id, "lim": read_limit}
+            scope_clause, scope_params, scope_meta = await _task_scope_clause(args, kwargs)
+            if scope_meta and scope_meta.get("error"):
+                return json.dumps({"error": scope_meta["error"], "success": False},
+                                  ensure_ascii=False)
+            params: dict = {"uid": user.id, "cid": conversation_id, "lim": read_limit,
+                            **scope_params}
             clauses = []
             if args.get("before_id"):
                 clauses.append("AND (m.created_at, m.id) < (SELECT created_at, id FROM messages WHERE id = :before_id AND conversation_id = :cid)")
@@ -92,6 +143,7 @@ async def session_search(args: dict, **kwargs) -> str:
                     FROM messages m
                     JOIN conversations c ON m.conversation_id = c.id
                     WHERE c.user_id = :uid AND m.conversation_id = :cid
+                      AND {scope_clause}
                       AND m.role IN ('user', 'assistant')
                       AND m.delivery_status != 'streaming' {clause}
                     ORDER BY m.created_at {order}, m.id {order}
@@ -142,14 +194,19 @@ async def session_search(args: dict, **kwargs) -> str:
         # and asyncpg raises AmbiguousParameterError for the whole query.
         current_cid = str(getattr(kwargs.get("conversation"), "id", "") or "")
 
+        scope_clause, scope_params, scope_meta = await _task_scope_clause(args, kwargs)
+        if scope_meta and scope_meta.get("error"):
+            return json.dumps({"error": scope_meta["error"], "success": False},
+                              ensure_ascii=False)
         result = await db.execute(
-            text("""
+            text(f"""
                 SELECT m.id, m.content, m.role, m.created_at,
                        c.id AS conversation_id, c.title AS conversation_title,
                        ts_rank(m.search_vector, to_tsquery('simple', :q)) AS rank
                 FROM messages m
                 JOIN conversations c ON m.conversation_id = c.id
                 WHERE c.user_id = :uid
+                  AND {scope_clause}
                   AND m.role IN ('user', 'assistant')
                   AND m.delivery_status != 'streaming'
                   AND m.conversation_id != :ccid
@@ -157,18 +214,20 @@ async def session_search(args: dict, **kwargs) -> str:
                 ORDER BY rank DESC
                 LIMIT :lim
             """),
-            {"uid": user.id, "q": fts_query, "lim": limit, "ccid": current_cid},
+            {"uid": user.id, "q": fts_query, "lim": limit, "ccid": current_cid,
+             **scope_params},
         )
         rows = result.fetchall()
 
         if not rows:
             result2 = await db.execute(
-                text("""
+                text(f"""
                     SELECT m.id, m.content, m.role, m.created_at,
                            c.id AS conversation_id, c.title AS conversation_title
                     FROM messages m
                     JOIN conversations c ON m.conversation_id = c.id
                     WHERE c.user_id = :uid
+                      AND {scope_clause}
                       AND m.role IN ('user', 'assistant')
                       AND m.delivery_status != 'streaming'
                       AND m.conversation_id != :ccid
@@ -176,7 +235,8 @@ async def session_search(args: dict, **kwargs) -> str:
                     ORDER BY m.created_at DESC
                     LIMIT :lim
                 """),
-                {"uid": user.id, "pattern": f"%{query}%", "lim": limit, "ccid": current_cid},
+                {"uid": user.id, "pattern": f"%{query}%", "lim": limit, "ccid": current_cid,
+                 **scope_params},
             )
             rows2 = result2.fetchall()
             results = []

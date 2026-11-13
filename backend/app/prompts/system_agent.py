@@ -84,6 +84,31 @@ def _memory_injection_sections(shared_context) -> List[str]:
     return sections
 
 
+def _scoped_workspace_section(ctx: Any) -> str:
+    """§9 的 scoped 段：最小高信号上下文，不列文件树、不预注入其他任务。"""
+    from app.services import workspace_memory_service as wmem
+
+    lines = [
+        f"当前项目：{getattr(ctx, 'project_name', None) or ctx.project_id}（{ctx.project_id}）",
+        f"当前任务：{getattr(ctx, 'task_title', None) or ctx.task_id}（{ctx.task_id}）",
+        f"当前任务文件域：{ctx.rel.get('workspace', '')}",
+        f"当前绑定版本：{ctx.binding_version}（attempt {ctx.attempt_id[:8]} · epoch {ctx.lease_epoch}）",
+        "",
+        "默认只能发现和修改当前任务文件域。用户根、其他任务和同名旧文件不是本任务的既往证据。",
+        "确需项目共享、其他任务或 legacy 文件时，使用显式 scope 做按需只读检索，并保留来源。",
+        "不要因路径相邻、文件名相同或历史对话出现而推断关联。",
+    ]
+    task_index = wmem.index_section_for_injection(ctx.task_memory_root) if ctx.task_memory_root else ""
+    if task_index:
+        lines += ["", "当前任务记忆索引（按需读取 topic 文件；工程经验层级，非系统长期记忆）:",
+                  task_index]
+    project_index = (wmem.index_section_for_injection(ctx.project_memory_root)
+                     if ctx.project_memory_root else "")
+    if project_index:
+        lines += ["", "当前项目记忆索引（只含对项目通用的经验）:", project_index]
+    return "\n".join(lines)
+
+
 async def build_agent_system_prompt(
     *,
     assistant: Optional[Assistant],
@@ -98,6 +123,7 @@ async def build_agent_system_prompt(
     deathmatch_mode: bool = False,
     offered_tool_names: Optional[List[str]] = None,
     task: str = "",
+    workspace_ctx: Optional[Any] = None,
 ) -> str:
     """Build system prompt with prefix-caching affinity.
 
@@ -123,8 +149,9 @@ async def build_agent_system_prompt(
     # volatile 内的变动永不破坏 stable 前缀，provider 前缀缓存保持命中。
 
     static_sections.append("## 系统指令")
-    from app.prompts.fragments import MEMORY_INSTRUCTION_BOUNDARY
+    from app.prompts.fragments import MEMORY_EVIDENCE_RULE, MEMORY_INSTRUCTION_BOUNDARY
     static_sections.append(MEMORY_INSTRUCTION_BOUNDARY)
+    static_sections.append(MEMORY_EVIDENCE_RULE)
 
     # P1.5 (2026-10-18): user-editable assistant text is a PERSONA override.
     # It is emitted after platform/mode/task rules and can never replace the
@@ -362,8 +389,16 @@ async def build_agent_system_prompt(
         "必须如实、准确地描述自己的 harness 能力："
         "你是一个智能体框架（harness），具备工具调用循环、死磕模式（PEVR 多轮目标循环）、"
         "定时任务、双层记忆子系统（文件 + 数据库）、技能系统、子代理委派、后台任务、"
-        "工作区文件操作、PDF 导出等能力，可用工具包括 web_search、browser、terminal、execute_code、"
-        "pdf_export、provide_file、memory、schedule、delegate_task 等。\n"
+        "工作区文件操作、PDF 导出等能力，可用工具包括 web_search、browser（只读抓取）、"
+        # 交互式浏览器四件套只在 [browser.interaction] enabled 时注册；开关关闭
+        # 仍宣称这些工具 = 反向幻觉（本波修复的正是这类不自知/自欺）。
+        + (
+            "browser_navigate/browser_click/browser_type/browser_mouse（交互式浏览器：可在任何网页上"
+            "点击、输入、坐标级拖动与拖放，滑块类验证=在滑块上按下→沿轨道拖动→松开，"
+            "适用于任何页面，不限于 canvas 应用）、"
+            if config.browser_interaction_enabled else ""
+        )
+        + "terminal、execute_code、pdf_export、provide_file、memory、schedule、delegate_task 等。\n"
         "6. 严禁提及底层模型的具体名称、API提供商、模型版本号或品牌名称"
         "（如DeepSeek、MiMo、GPT、Claude、Llama、Qwen、ChatGPT、OpenAI、Anthropic、"
         "Transformer 等）——这些是底层模型实现细节，受保密规则限制。"
@@ -551,7 +586,12 @@ async def build_agent_system_prompt(
     # 条目取前 min(max_items, 8) 条、每条 250 chars（v1 条目层保留）。
     dynamic_sections.extend(_memory_injection_sections(shared_context))
 
-    dynamic_sections.append(f"用户工作区根目录（仅供参考）: {workspace.root_path}")
+    # 任务作用域（2026-11-10 · DESIGN_20261108 §9）：scoped 会话不再给「仅供参考的用户根」，
+    # 而是明确当前项目/任务/文件域/绑定版本与边界语义；legacy 会话保持原文（零行为变化）。
+    if workspace_ctx is not None:
+        dynamic_sections.append(_scoped_workspace_section(workspace_ctx))
+    else:
+        dynamic_sections.append(f"用户工作区根目录（仅供参考）: {workspace.root_path}")
 
     if conversation_id:
         from app.services.canary_marker import make_canary, canary_prompt_section

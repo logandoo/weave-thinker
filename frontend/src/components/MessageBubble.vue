@@ -2321,8 +2321,13 @@ onMounted(() => {
     padding: 8px 12px;
   }
 
+  /* 手机端：agent/助手回复不再保留头像占位，内容占满横向空间 */
+  .message-bubble .avatar {
+    display: none;
+  }
+
   .message-bubble .content {
-    max-width: 85%;
+    max-width: 100%;
   }
 
   /* 手机端：助手回答的复制/重新生成按钮组靠左（仅水平位置，其余不变） */
@@ -2347,7 +2352,7 @@ onMounted(() => {
   }
 
   .message-bubble .content {
-    max-width: 88%;
+    max-width: 100%;
   }
 
   .message-bubble .text {

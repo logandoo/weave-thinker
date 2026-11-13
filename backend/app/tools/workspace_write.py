@@ -61,6 +61,7 @@ async def _resolve_workspace(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Opt
 
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
     user_root = Path(workspace.root_path).resolve()
+    legacy_root = str(user_root)
     override = str(kwargs.get("workspace_path") or "").strip()
     if override:
         # Worktree/scratch tasks set AgentLoop.workspace_path to a task-scoped
@@ -68,10 +69,18 @@ async def _resolve_workspace(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Opt
         candidate = Path(override).resolve()
         try:
             candidate.relative_to(user_root)
-            return str(candidate), None
+            legacy_root = str(candidate)
         except ValueError:
             return None, "任务工作区路径超出用户工作区，禁止写入。"
-    return str(user_root), None
+    # 任务作用域收口（2026-11-10）：enforce 下写域是当前 Task（覆盖旧的窄 root）；
+    # off/shadow 保持上面的 legacy_root 计算，现网行为零变化。
+    from app.services.workspace_scope_service import apply_scope_or_error
+
+    scoped, scope_err = await apply_scope_or_error(kwargs, default_root=legacy_root,
+                                                   access="write")
+    if scope_err:
+        return None, scope_err.get("error") or "任务作用域拒绝写入。"
+    return scoped, None
 
 
 def _unified_diff(old: str, new: str, name: str) -> Tuple[str, str]:

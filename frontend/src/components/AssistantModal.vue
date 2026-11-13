@@ -625,7 +625,7 @@ function handleSave() {
     max-height: 90dvh;
     border-radius: var(--radius-lg) var(--radius-lg) 0 0;
     max-width: 100%;
-    padding-bottom: env(safe-area-inset-bottom, 0);
+    padding-bottom: var(--safe-bottom);
   }
 }
 

@@ -18,6 +18,7 @@ from app.core.config import get_config
 from app.db.database import AsyncSessionLocal
 from app.services.agent_permissions import (
     PermissionContext,
+    fresh_permissions,
     is_permission_allowed,
     permission_description,
     permission_key_for_tool_request,
@@ -263,6 +264,7 @@ class AgentToolMixin:
                     conversation=conversation,
                     assistant=assistant,
                     workspace_path=self.workspace_path,
+                    workspace_ctx=getattr(self, "workspace_ctx", None),
                 )
                 if getattr(self, "task_principal", ""):
                     dispatch_kwargs["_task_principal"] = self.task_principal
@@ -276,6 +278,10 @@ class AgentToolMixin:
                 if current_turn_tool_results:
                     dispatch_kwargs["current_turn_tool_results"] = current_turn_tool_results
 
+                # 2026-11-12：每次工具调用新鲜读取权限（进行中会话改设置立即
+                # 生效）；读失败回落请求期快照。同一份快照同时供 registry 闸、
+                # 工具内部自检（permission_snapshot）与设备 RPC 使用。
+                _fresh_perms = await fresh_permissions(db, user)
                 perm_ctx = PermissionContext(
                     super_admin_bypass=config.super_admin_bypass,
                     deathmatch_active=(
@@ -283,7 +289,9 @@ class AgentToolMixin:
                         and self.deathmatch_manager.is_goal_active
                     ),
                     user=user,
+                    permissions=_fresh_perms,
                 )
+                dispatch_kwargs["permission_snapshot"] = _fresh_perms
                 dispatch_kwargs["permission_context"] = perm_ctx
                 if self._visible_tool_names is not None:
                     dispatch_kwargs["allowed_tools"] = self._visible_tool_names
@@ -678,7 +686,13 @@ class AgentToolMixin:
                         ):
                             auto_allowed = True
                         elif perm_key and user is not None:
-                            auto_allowed = is_permission_allowed(user, perm_key)
+                            # 2026-11-12：与 registry 闸同源的新鲜权限快照
+                            _fresh_perms = getattr(perm_ctx, "permissions", None)
+                            auto_allowed = (
+                                bool(_fresh_perms.get(perm_key, False))
+                                if _fresh_perms is not None
+                                else is_permission_allowed(user, perm_key)
+                            )
 
                         async def dispatch_approved_retry():
                             nonlocal result
@@ -702,11 +716,24 @@ class AgentToolMixin:
                                     pairing_secret = device_session_manager.pairing_secret_for(device_id)
                                     if not pairing_secret:
                                         raise RuntimeError("live device grant session unavailable")
+                                    _vctx = getattr(self, "workspace_ctx", None)
+                                    _vscope = None
+                                    if _vctx is not None:
+                                        # §11.2：grant 签名覆盖作用域，设备侧拿到的就是签的那份
+                                        _vscope = {
+                                            "storage_authority": _vctx.storage_authority,
+                                            "task_id": _vctx.task_id, "run_id": _vctx.run_id,
+                                            "attempt_id": _vctx.attempt_id,
+                                            "binding_version": _vctx.binding_version,
+                                            "lease_epoch": _vctx.lease_epoch,
+                                            "scope": "current_task",
+                                        }
                                     grant = issue_device_grant(
                                         pairing_secret,
                                         device_id,
                                         tool_name,
                                         strip_internal_args(tool_args),
+                                        scope=_vscope,
                                     )
                                     retry_kwargs = {
                                         **dispatch_kwargs,
@@ -727,11 +754,43 @@ class AgentToolMixin:
                                         error=True,
                                     )
                             tool_args["_permission_granted"] = True
+                            # 2026-11-12：真实用户批准标记（kwargs 注入，模型无法伪造；
+                            # 与 voice/PTC 的批量 `_permission_granted` 区分开）。
+                            retry_kwargs["_user_approved"] = True
                             result = await registry.dispatch(
                                 tool_name,
                                 tool_args,
                                 **retry_kwargs,
                             )
+                            if remote_retry and getattr(result, "_remote_execution", False):
+                                # 2026-11-12（A4.9 评审 Important #3）：旧客户端不认
+                                # grant，批准后重发仍返回 _permission_needed。不得把
+                                # 二次挑战当成功结果交给模型（会重试到 doom-loop），
+                                # 明确提示升级客户端。只认云端创建的 RemoteToolResult
+                                # 类型标记 + 结构化 _permission_key（设备返回的普通
+                                # 字符串无法伪造该类型，评审 NEW-C）。
+                                try:
+                                    _after = json.loads(result)
+                                except (json.JSONDecodeError, TypeError):
+                                    _after = None
+                                if (
+                                    isinstance(_after, dict)
+                                    and _after.get("_permission_needed")
+                                    and _after.get("_permission_key")
+                                ):
+                                    return ToolCallResult(
+                                        call_id=call_id,
+                                        name=tool_name,
+                                        arguments=tool_args,
+                                        result=json.dumps({
+                                            "error": (
+                                                "设备未执行已批准的调用：客户端版本过旧"
+                                                "（不支持设备授权 grant），请升级客户端后重试。"
+                                            ),
+                                            "recoverable": True,
+                                        }, ensure_ascii=False),
+                                        error=True,
+                                    )
                             return None
 
                         if auto_allowed and not remote_permission:

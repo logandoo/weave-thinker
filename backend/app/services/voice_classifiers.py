@@ -13,9 +13,12 @@ from typing import Optional
 from app.prompts.voice import (
     VOICE_ASR_CORRECTION_HINT,
     VOICE_BARGE_IN_SYSTEM,
+    VOICE_DELEGATION_CLAIM_SYSTEM,
+    VOICE_DELEGATION_REQUEST_SYSTEM,
     VOICE_EOT_SYSTEM,
     VOICE_INTENT_SYSTEM,
     VOICE_INTERJECTION_SYSTEM,
+    VOICE_STALE_REPLY_SYSTEM,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +87,24 @@ _BARGE_IN_RESPONSE_FORMAT = _json_schema_format(
         },
     },
     ["verdict"],
+)
+
+_DELEGATION_REQUEST_RESPONSE_FORMAT = _json_schema_format(
+    "voice_delegation_request",
+    {"requested": {"type": "boolean", "description": "用户是否明确授权委派"}},
+    ["requested"],
+)
+
+_DELEGATION_CLAIM_RESPONSE_FORMAT = _json_schema_format(
+    "voice_delegation_claim",
+    {"claimed": {"type": "boolean", "description": "无工具文本是否声称委派已发生"}},
+    ["claimed"],
+)
+
+_STALE_REPLY_RESPONSE_FORMAT = _json_schema_format(
+    "voice_stale_reply",
+    {"suppress": {"type": "boolean", "description": "旧回答是否已无播报价值"}},
+    ["suppress"],
 )
 
 _INTERJECTION_RESPONSE_FORMAT = _json_schema_format(
@@ -181,16 +202,6 @@ class VoiceClassifyMixin:
                     verdict = v
             except Exception:
                 pass
-        if not verdict:
-            # Backward compat: a degraded rung (no response_format) may return
-            # the legacy bare word.
-            low = raw.lower()
-            if "interrupt" in low:
-                verdict = "interrupt"
-            elif "backchannel" in low:
-                verdict = "backchannel"
-            elif "defer" in low:
-                verdict = "defer"
         if verdict:
             return verdict
         # LLM returned nothing usable (subagent timeout / malformed output).
@@ -201,10 +212,50 @@ class VoiceClassifyMixin:
         # deferred notice. Short acknowledgements still resolve to
         # backchannel (they are filler, not turns). A real user can always
         # press the stop button to interrupt explicitly.
-        if len(text) <= 4 and re.fullmatch(r"[嗯对哦好是的啊呃]+", text):
-            return "backchannel"
         logger.warning("voice barge-in classify unavailable — deferring turn: %r", text)
         return "defer"
+
+    async def _delegation_guard_verdict(self, text: str, claim: bool) -> bool:
+        field = "claimed" if claim else "requested"
+        raw = await self._quick_classify(
+            VOICE_DELEGATION_CLAIM_SYSTEM if claim else VOICE_DELEGATION_REQUEST_SYSTEM,
+            text,
+            "voice.delegation_guard",
+            response_format=(
+                _DELEGATION_CLAIM_RESPONSE_FORMAT
+                if claim else _DELEGATION_REQUEST_RESPONSE_FORMAT
+            ),
+        )
+        try:
+            value = json.loads((raw or "").strip()).get(field)
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            value = None
+        if type(value) is not bool:
+            # Authorization fails closed. A possible fake tool-success receipt is
+            # discarded so generation continues through the real tool loop.
+            return True if claim else False
+        return value
+
+    async def _user_turn_requests_delegation(self, text: str) -> bool:
+        return await self._delegation_guard_verdict(text, claim=False)
+
+    async def _claims_delegation_success(self, text: str) -> bool:
+        return await self._delegation_guard_verdict(text, claim=True)
+
+    async def _should_suppress_stale_reply(self, text: str, user_turn: bool) -> bool:
+        if not user_turn or self._generation_input_seq >= self._latest_input_seq:
+            return False
+        raw = await self._quick_classify(
+            VOICE_STALE_REPLY_SYSTEM,
+            text,
+            "voice.stale_reply",
+            response_format=_STALE_REPLY_RESPONSE_FORMAT,
+        )
+        try:
+            value = json.loads((raw or "").strip()).get("suppress")
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            value = None
+        return value is True
 
     async def _classify_intent(self, text: str, history: Optional[list[dict]] = None) -> dict:
         """Return {should_respond, needs_tools, reason}.

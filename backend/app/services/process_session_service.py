@@ -106,6 +106,12 @@ class _Session:
     err: _Stream = field(default_factory=_Stream)
     readers: List[asyncio.Task] = field(default_factory=list)
     last_activity: float = field(default_factory=time.monotonic)
+    # 任务作用域（2026-11-10 §7.3）：会话属于哪个 task/run/attempt + 当时的 epoch。
+    # scoped 调用只能操作本任务的会话；空 task_id = legacy 会话（scoped 调用看不见）。
+    task_id: str = ""
+    run_id: str = ""
+    attempt_id: str = ""
+    lease_epoch: int = 0
 
 
 class ProcessSessionManager:
@@ -140,9 +146,13 @@ class ProcessSessionManager:
         return max(200, int(value if value is not None else _cfg_int("agent_process_max_read_chars", 20000)))
 
     # ------------------------------------------------------------- helpers
-    def _get(self, user_id: str, session_id: str) -> Optional[_Session]:
+    def _get(self, user_id: str, session_id: str, *,
+             task_id: Optional[str] = None) -> Optional[_Session]:
         session = self._sessions.get(str(session_id or ""))
         if session is None or session.user_id != str(user_id):
+            return None
+        if task_id is not None and str(session.task_id or "") != str(task_id):
+            # 跨任务控制他人进程需要显式管理授权，这里 fail closed
             return None
         return session
 
@@ -265,6 +275,9 @@ class ProcessSessionManager:
         cwd: str,
         workspace_root: str,
         wait_ms: int = 300,
+        *,
+        scope: Optional[dict] = None,
+        user_approved: bool = False,
     ) -> Dict[str, Any]:
         command = (command or "").strip()
         if not command:
@@ -276,7 +289,10 @@ class ProcessSessionManager:
         if safety:
             if safety.get("error"):
                 return {"ok": False, "error": f"命令被拒绝: {safety['error']}"}
-            if safety.get("_permission_needed"):
+            if safety.get("_permission_needed") and not user_approved:
+                # 2026-11-12（A4.9 评审 NEW-E）：用户已批准该次调用（云端
+                # `_user_approved` / 设备单次 grant）时不得再拒——否则批准被
+                # 静默浪费。硬拦截（error 类）仍在上方无条件拒绝。
                 return {"ok": False, "error": safety.get("_permission_description") or "命令需要用户授权。"}
 
         workspace = str(Path(workspace_root).resolve())
@@ -333,6 +349,10 @@ class ProcessSessionManager:
             cwd=resolved_cwd,
             started_at=time.time(),
             proc=proc,
+            task_id=str((scope or {}).get("task_id") or ""),
+            run_id=str((scope or {}).get("run_id") or ""),
+            attempt_id=str((scope or {}).get("attempt_id") or ""),
+            lease_epoch=int((scope or {}).get("lease_epoch") or 0),
         )
         session.readers = [
             asyncio.create_task(self._reader(session, proc.stdout, session.out)),
@@ -365,8 +385,9 @@ class ProcessSessionManager:
             "running": initial.get("running", True),
         }
 
-    async def write(self, user_id: str, session_id: str, data: str, newline: bool = True) -> Dict[str, Any]:
-        session = self._get(user_id, session_id)
+    async def write(self, user_id: str, session_id: str, data: str, newline: bool = True,
+               task_id: Optional[str] = None) -> Dict[str, Any]:
+        session = self._get(user_id, session_id, task_id=task_id)
         if session is None:
             return {"ok": False, "error": "会话不存在或不属于当前用户。"}
         if session.proc.returncode is not None:
@@ -389,8 +410,10 @@ class ProcessSessionManager:
         session_id: str,
         wait_ms: int = 0,
         max_chars: Optional[int] = None,
+        *,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        session = self._get(user_id, session_id)
+        session = self._get(user_id, session_id, task_id=task_id)
         if session is None:
             return {"ok": False, "error": "会话不存在或不属于当前用户。"}
         # A4.9 M-3: 契约（start/read/list 惰性回收）——read 也触发空闲清理，
@@ -436,19 +459,22 @@ class ProcessSessionManager:
             "dropped_total": session.out.dropped + session.err.dropped,
         }
 
-    async def kill(self, user_id: str, session_id: str) -> Dict[str, Any]:
-        session = self._get(user_id, session_id)
+    async def kill(self, user_id: str, session_id: str,
+                task_id: Optional[str] = None) -> Dict[str, Any]:
+        session = self._get(user_id, session_id, task_id=task_id)
         if session is None:
             return {"ok": False, "error": "会话不存在或不属于当前用户。"}
         await self._terminate(session)
         session.last_activity = time.monotonic()
         return {"ok": True, "session_id": session.session_id, "exit_code": session.proc.returncode, "killed": True}
 
-    def list(self, user_id: str) -> Dict[str, Any]:
+    def list(self, user_id: str, *, task_id: Optional[str] = None) -> Dict[str, Any]:
         self._evict_idle()
         sessions = []
         for session in self._sessions.values():
             if session.user_id != str(user_id):
+                continue
+            if task_id is not None and str(session.task_id or "") != str(task_id):
                 continue
             sessions.append(
                 {

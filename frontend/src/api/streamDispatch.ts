@@ -70,6 +70,13 @@ export interface ReplayPayload {
   streaming_message_id?: string | null
 }
 
+/** P2（2026-11-09）：流首个 meta 事件携带的服务端权威会话标识。 */
+export interface StreamMeta {
+  conversation_id: string
+  requested_conversation_id?: string
+  reminted?: boolean
+}
+
 /** Handler bundle for streamChat. Options-object form replaces the previous
  * 22-positional-parameter signature — positional drift had already silently
  * miswired 3 of 5 callsites (onDeathmatchVerdict/onPermissionRequest/onPing
@@ -78,6 +85,12 @@ export interface StreamHandlers {
   onMessage: (content: string) => void
   onDone: (conversationId: string, messageId: string, title?: string, toolResults?: string | null, searchFailed?: boolean, taskSubmitted?: boolean) => void
   onError: (error: string) => void
+  /** 任务作用域歧义（workspace_task_ambiguous）：候选任务交选择器消费。 */
+  onTaskAmbiguous?: (payload: {
+    question: string
+    candidates: Array<{ task_id: string; project_id?: string; title?: string; reason?: string;
+                         last_active_at?: string | null }>
+  }) => void
   /** Raw HTTP status for transport-sensitive actions (e.g. stop acceptance). */
   onHttpStatus?: (status: number) => void
   onReasoning?: (content: string) => void
@@ -109,6 +122,12 @@ export interface StreamHandlers {
   onContextInfo?: (info: ContextInfo) => void
   /** 4.8 session lock: the conversation already has a running agent. */
   onConversationBusy?: (conversationId?: string) => void
+  /** P2（2026-11-09，spec §4.8 第 1 项）：服务端权威 conversation_id。
+   *  前端持有的 id 可能服务端从不认识（跨设备删除 / 库重置 / 陈旧缓存），此时
+   *  服务端会另铸新 id 承载本轮工作；不把新 id 回传，前端就会一直轮询一个不
+   *  存在的会话（60 事故里 08:58/13:56 的 GET /api/conversations/<id> 全 404），
+   *  回答落在别的会话下而用户永远看不到。 */
+  onStreamMeta?: (meta: StreamMeta) => void
   /** A newer request took over the conversation while this stream was still
    *  in its setup phase. The stream must end silently (no error bubble) and
    *  resync from the DB — the newer run owns the answer. */
@@ -247,9 +266,22 @@ export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
       h.onConversationSuperseded()
       return true
     }
+    if (data.code === 'workspace_task_ambiguous' && h.onTaskAmbiguous) {
+      // §6.1「歧义只问一次」：候选任务交给作用域 store 渲染选择器，
+      // 不走通用 error 气泡（用户需要的是选择，不是报错）。
+      h.onTaskAmbiguous({
+        question: typeof data.error === 'string' ? data.error : '你想继续哪个任务？',
+        candidates: Array.isArray(data.candidates) ? data.candidates : [],
+      })
+      return true
+    }
     h.onError(typeof data.error === 'string' ? data.error : '未知错误')
     return true
   }
+
+  // P2（2026-11-09）：服务端权威会话标识（流首个事件）。必须在其它分支之前
+  // 走这一条——它决定后面所有事件该挂到哪个会话上。
+  if (data.meta && h.onStreamMeta) h.onStreamMeta(data.meta)
 
   if (data.part_started && h.onPartStarted) h.onPartStarted(data.part_started)
   if (data.part_delta && h.onPartDelta) {

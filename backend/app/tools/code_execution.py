@@ -209,6 +209,11 @@ async def generate_and_execute_code(args: dict, **kwargs) -> str:
 
     workspace_path = kwargs.get("workspace_path", "")
     assistant = kwargs.get("assistant")
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='read')
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
     provider_type = getattr(assistant, "provider_type", "deepseek") or "deepseek"
     ptc_enabled = use_tools and config.agent_ptc_enabled
 

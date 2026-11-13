@@ -245,7 +245,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 18px 22px;
+  padding: calc(18px + var(--safe-top, 0px)) 22px 18px; /* wave-2 透明边到边：顶部避让状态栏 */
 }
 
 .voice-icon-btn {
@@ -529,6 +529,7 @@ onMounted(async () => {
   max-width: 85vw;
   height: 100vh;
   height: 100dvh;
+  padding-top: var(--safe-top, 0px); /* wave-2：面板顶到屏幕缘，头部避让状态栏 */
   background: var(--surface-panel-strong, #1e1e2e);
   border-left: 1px solid var(--panel-border, rgba(255,255,255,0.1));
   box-shadow: -8px 0 32px rgba(0,0,0,0.3);

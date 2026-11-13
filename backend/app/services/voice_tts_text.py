@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 
-from app.services.voice_text import _normalize_style_tag
+from app.services.voice_text import _normalize_style_tag, strip_pseudo_tool_tags
 
 
 _MD_LINK_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)|\[([^\]]*)\]\([^)]*\)")
@@ -26,6 +26,18 @@ def _sanitize_tts_tags(text: str) -> str:
     - ``[音频标签]`` audio tags: strip any that produce non-speech sounds
       (laughs/sighs/moans/breaths); keep harmless rate/rhythm tags.
     """
+    if not text:
+        return ""
+    # DSML 从严：一旦出现，其后整段截断不朗读（落库/历史面按块剥离保留
+    # 尾随正文；朗读面宁可少读也不念 markup——参数值文本含标点会被切进
+    # 独立分段，逐段剥离后仍会漏读内容文本）。必须先于通用剥离：块剥离
+    # 会保留 DSML 之后的正文，令此处 find 落空。
+    _dsml_cut = text.find("<｜｜DSML")
+    if _dsml_cut != -1:
+        text = text[:_dsml_cut]
+    # 伪工具标记绝不入耳（2026-11-07 语音事故）：完整标签与流式尾部半截
+    # 开标签都在此丢弃，先于风格/音频标签处理。
+    text = strip_pseudo_tool_tags(text)
     if not text:
         return ""
 

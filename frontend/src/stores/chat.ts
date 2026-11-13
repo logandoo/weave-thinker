@@ -23,7 +23,8 @@ import { useToast } from '@/composables/useToast'
 import { advanceExecutionTargetVersion, isExecutionTargetVersionCurrent, resolveExecutionTarget } from '@/utils/executionTarget'
 import { useAssistantStore } from '@/stores/assistant'
 import { useNotesStore } from '@/stores/notes'
-import { mergeReplayIntoSequence, pickStreamText, shouldApplyRefresh, dropDraftTextAfterLastTool, keepLongerDisplayed, caughtUpAfterAnchor, recoveryCaughtUp, trimWindowAfterFullFetch, isSyntheticMessageId, markPreToolDrafts, type TurnAnchor } from '@/stores/streamReducer'
+import { useWorkspaceScopeStore } from '@/stores/workspaceScope'
+import { mergeReplayIntoSequence, pickStreamText, shouldApplyRefresh, dropDraftTextAfterLastTool, keepLongerDisplayed, caughtUpAfterAnchor, recoveryCaughtUp, trimWindowAfterFullFetch, isSyntheticMessageId, markPreToolDrafts, planConversationRebind, moveConversationKey, type TurnAnchor } from '@/stores/streamReducer'
 import { abortPredecessor, isNoneReplayTransient } from '@/stores/streamConnection'
 import { shouldApplyPollVerdict } from '@/stores/deathmatchPollGuard'
 import { pairInterjectionEcho } from '@/stores/interjectionPairing'
@@ -2335,6 +2336,98 @@ export const useChatStore = defineStore('chat', () => {
     if (part.title != null) item.title = part.title
   }
 
+  /** 服务端重铸 conversation id 后把本地会话切到新 id（P2 2026-11-09）。
+   *
+   *  时机很关键：meta 是流的**首个**事件，此刻除了乐观用户气泡外还没有内容流过，
+   *  迁移成本最低。迁完之后用服务端 id 走既有 `resumeActiveStream` 重新接管——
+   *  它内部先 `abortPredecessor`（作用在已迁到新桶的同一个流状态对象上，正好掐断
+   *  挂在幽灵 id 上的旧连接）再挂新连接并回放 buffer，因此**不新造**一条连接
+   *  生命周期，复用 watchdog / 切后台回来的同一条已测通道。 */
+  async function handleStreamMeta(meta: any, clientId: string) {
+    const plan = planConversationRebind(clientId, meta)
+    if (!plan.rebind) return
+    const serverId = plan.serverId
+    try {
+      if (messages.value[serverId]) {
+        // 服务端 id 已有桶（用户此前打开过这条会话）⇒ 以服务端为准，丢掉幽灵桶
+        delete messages.value[clientId]
+      } else if (messages.value[clientId]) {
+        messages.value[serverId] = messages.value[clientId]
+        delete messages.value[clientId]
+      }
+      // `streamStates` 不能无条件覆盖：目标桶里可能已有一条**活连接**（用户此前
+      // 打开过这条会话 / 另一个 tab 的 run）。覆盖会把那个状态对象从桶里摘掉，
+      // 而它的闭包 handler 还在往里写 ⇒ 同一个会话 id 上出现两条活 SSE
+      // （streamConnection.ts 声明这是不可能的状态）。正确做法：保住服务端桶里
+      // 已有的那份，把幽灵那份中止掉。（A4.9 二轮评审 A·I3）
+      const ghostStream = streamStates[clientId]
+      if (ghostStream && streamStates[serverId] && streamStates[serverId] !== ghostStream) {
+        abortPredecessor(ghostStream)
+        delete streamStates[clientId]
+      } else {
+        moveConversationKey(streamStates, clientId, serverId)
+      }
+      moveConversationKey(conversationMeta.value, clientId, serverId)
+      moveConversationKey(hasMoreMessages, clientId, serverId)
+      moveConversationKey(oldestMessageId, clientId, serverId)
+      moveConversationKey(lastFullGetAt, clientId, serverId)
+      moveConversationKey(messagesEpoch, clientId, serverId)
+      moveConversationKey(refreshSeqs, clientId, serverId)
+      moveConversationKey(pendingInterjections, clientId, serverId)
+      moveConversationKey(_runBoundaryMessageIds, clientId, serverId)
+      moveConversationKey(_echoConfirmedCommittedIds, clientId, serverId)
+      moveConversationKey(_executionTargetVersions, clientId, serverId)
+      // 死磕停止记录的内存孪生：`_readPendingDeathmatchStops` 会按 id 回放它，
+      // 只搬集合不搬 Map ⇒ 旧 id 的记录会把停止意图重新灌回来。
+      if (_volatileDeathmatchStopRecords.has(clientId)) {
+        _volatileDeathmatchStopRecords.set(
+          serverId, _volatileDeathmatchStopRecords.get(clientId) as DeathmatchStopRecord)
+        _volatileDeathmatchStopRecords.delete(clientId)
+      }
+      if (_recoveryInFlight.delete(clientId)) _recoveryInFlight.add(serverId)
+      // `_resumingSet` 是"这个 id 正在 resume"的互斥位，**不是**会话状态桶，
+      // 所以绝不能把它搬到 serverId 上：搬过去就等于自己给紧接着的
+      // `resumeActiveStream(serverId)` 挂了 `return 'failed'` 的牌子（两次尝试都撞），
+      // 而在飞的旧 resume 的 finally 只会 `delete(clientId)` ⇒ serverId 永久滞留，
+      // 该会话直到刷新前都失去重挂能力（A4.9 二轮评审 A·C2）。正确做法是只摘掉
+      // 幽灵 id 那一位；在飞的那条马上会被 abortPredecessor 打死，它的 finally
+      // 再删一次是幂等的。
+      _resumingSet.delete(clientId)
+      if (_pendingDeathmatchStops.has(clientId)) {
+        // 走既有 mutator：它会同时把 localStorage/sessionStorage 里的停止记录
+        // 从旧 id 改判 false、给新 id 写 true，而不是只动内存集合。
+        _mutatePendingDeathmatchStops((latest) => {
+          latest.delete(clientId)
+          latest.add(serverId)
+        })
+      }
+      if (currentConversationId.value === clientId) {
+        currentConversationId.value = serverId
+      }
+      if (!conversations.value.some((c: any) => c.id === serverId)) {
+        void loadConversations()
+      }
+      // 先中止挂在幽灵 id 上的连接，再用服务端 id 重新接管。
+      // 顺序是硬要求：`resumeActiveStream` 有结构守卫——"resume 的语义是重挂一条
+      // **已经断掉**的流，不是替换任意活流"（防掐断插话兜底刚开启的下一 turn，
+      // 见 stores/streamConnection.ts 与 chat.ts 的接管守卫注释）。不先 abort 就会被
+      // 守卫判为 'failed' 而静默不接管。
+      const moved = streamStates[serverId]
+      if (moved) abortPredecessor(moved)
+      let verdict = await resumeActiveStream(serverId)
+      if (verdict !== 'resumed') {
+        await new Promise<void>((resolve) => { window.setTimeout(() => resolve(), 1500) })
+        verdict = await resumeActiveStream(serverId)
+      }
+      if (verdict !== 'resumed') {
+        console.warn('[chat] remint rebind: resume 未接管，退到整窗刷新', verdict)
+        await refreshConversation(serverId)
+      }
+    } catch (err) {
+      console.warn('[chat] conversation rebind after remint failed', err)
+    }
+  }
+
   function wireStreamCallbacks(
     conversationId: string,
     onFinalize: (messageId: string, title: string | undefined, toolResults: string | null | undefined, searchFailed: boolean | undefined, taskSubmitted?: boolean) => void,
@@ -2359,6 +2452,16 @@ export const useChatStore = defineStore('chat', () => {
     // 精确双写（用户看到整段叠字，入库正常）。
     const connection = s.abortController
     const rawHandlers = {
+      // P2（2026-11-09，spec §4.8 第 1 项）：服务端把它解析出来的**权威**
+      // conversation_id 随流首个 meta 事件回传。若前端持有的 id 服务端根本不
+      // 认识（跨设备删除/库重置/陈旧缓存），服务端已另铸新 id 承载本轮工作——
+      // 不切换就会一直轮询一个不存在的会话（60 事故的 404 风暴），回答落在
+      // 别的会话下而用户永远看不到。
+      onStreamMeta: (meta: any) => {
+        touch()
+        if (s.abortController !== connection) return
+        void handleStreamMeta(meta, conversationId)
+      },
       onMessage: (chunk: string) => {
         touch()
         s.content += chunk
@@ -3107,6 +3210,15 @@ export const useChatStore = defineStore('chat', () => {
             },
             onConversationBusy: () => { busyRejected = true },
             onConversationSuperseded: () => { supersededRejected = true },
+            onTaskAmbiguous: (payload) => {
+              // §6.1 歧义只问一次：候选交选择器；本流到此终结（后端 error 帧后无 done），
+              // 必须自己收尾，否则 streaming 卡到 stall watchdog（评审 r3 #3）。
+              // 连接令牌守卫：被取代旧连接的迟到事件不得复活选择器（评审 r3 #4）。
+              if (getStream(conversationId).abortController !== abortController) return
+              useWorkspaceScopeStore().setAmbiguous(conversationId, payload)
+              endStreaming(conversationId)
+              void refreshConversation(conversationId)
+            },
           },
         )
       }
@@ -3319,6 +3431,15 @@ export const useChatStore = defineStore('chat', () => {
           signal: abortController.signal,
           onConversationBusy: () => { busyRejected = true },
           onConversationSuperseded: () => { supersededRejected = true },
+          onTaskAmbiguous: (payload) => {
+            // §6.1 歧义只问一次：候选交选择器；本流到此终结（后端 error 帧后无 done），
+            // 必须自己收尾，否则 streaming 卡到 stall watchdog（评审 r3 #3）。
+            // 连接令牌守卫：被取代旧连接的迟到事件不得复活选择器（评审 r3 #4）。
+            if (getStream(convId).abortController !== abortController) return
+            useWorkspaceScopeStore().setAmbiguous(convId, payload)
+            endStreaming(convId)
+            void refreshConversation(convId)
+          },
         },
       )
       if (supersededRejected) {
@@ -3441,6 +3562,15 @@ export const useChatStore = defineStore('chat', () => {
           signal: abortController.signal,
           onConversationBusy: () => { busyRejected = true },
           onConversationSuperseded: () => { supersededRejected = true },
+          onTaskAmbiguous: (payload) => {
+            // §6.1 歧义只问一次：候选交选择器；本流到此终结（后端 error 帧后无 done），
+            // 必须自己收尾，否则 streaming 卡到 stall watchdog（评审 r3 #3）。
+            // 连接令牌守卫：被取代旧连接的迟到事件不得复活选择器（评审 r3 #4）。
+            if (getStream(convId).abortController !== abortController) return
+            useWorkspaceScopeStore().setAmbiguous(convId, payload)
+            endStreaming(convId)
+            void refreshConversation(convId)
+          },
         },
       )
       if (supersededRejected) {
@@ -3602,6 +3732,15 @@ export const useChatStore = defineStore('chat', () => {
         signal: abortController.signal,
         onConversationBusy: () => { busyRejected = true },
         onConversationSuperseded: () => { supersededRejected = true },
+        onTaskAmbiguous: (payload) => {
+          // §6.1 歧义只问一次：候选交选择器；本流到此终结（后端 error 帧后无 done），
+          // 必须自己收尾，否则 streaming 卡到 stall watchdog（评审 r3 #3）。
+          // 连接令牌守卫：被取代旧连接的迟到事件不得复活选择器（评审 r3 #4）。
+          if (getStream(convId).abortController !== abortController) return
+          useWorkspaceScopeStore().setAmbiguous(convId, payload)
+          endStreaming(convId)
+          void refreshConversation(convId)
+        },
       },
     )
 

@@ -50,19 +50,20 @@
     <div class="hotwords-list">
       <div v-if="hotwords.length === 0" class="hotwords-empty">暂无热词</div>
       <div
-        v-for="(item, index) in hotwords"
-        :key="index"
+        v-for="(item, index) in pagedHotwords"
+        :key="item.text"
         class="hotword-item"
       >
         <span class="hotword-text">{{ item.text }}</span>
         <span class="hotword-meta">权重 {{ item.weight }}{{ item.lang ? ` · ${item.lang}` : '' }}</span>
-        <button class="remove-btn" @click="removeHotword(index)" title="删除">
+        <button class="remove-btn" @click="removeHotword(pageStart + index)" title="删除">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="18" y1="6" x2="6" y2="18"/>
             <line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
         </button>
       </div>
+      <PaginationBar v-model:page="currentPage" :total-pages="totalPages" />
     </div>
 
     <div class="hotwords-actions">
@@ -75,9 +76,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { computed, ref, onMounted, nextTick, watch } from 'vue'
 import { useAsrHotwords } from '@/composables/useAsrHotwords'
 import type { HotwordItem } from '@/api/asr'
+import PaginationBar from './PaginationBar.vue'
 
 const props = defineProps<{
   embedded?: boolean
@@ -90,10 +92,20 @@ const emit = defineEmits<{
 
 const { hotwords: sharedHotwords, load: loadSharedHotwords, save: saveSharedHotwords } = useAsrHotwords()
 
+const PAGE_SIZE = 10
 const hotwords = ref<HotwordItem[]>([])
 const newHotword = ref<HotwordItem>({ text: '', weight: 4, lang: '' })
 const textInputRef = ref<HTMLInputElement | null>(null)
 const saving = ref(false)
+const currentPage = ref(1)
+
+const totalPages = computed(() => Math.max(1, Math.ceil(hotwords.value.length / PAGE_SIZE)))
+const pageStart = computed(() => (currentPage.value - 1) * PAGE_SIZE)
+const pagedHotwords = computed(() => hotwords.value.slice(pageStart.value, pageStart.value + PAGE_SIZE))
+
+watch(totalPages, (pages) => {
+  if (currentPage.value > pages) currentPage.value = pages
+})
 
 async function resetDialogState() {
   await loadSharedHotwords()
@@ -113,6 +125,8 @@ function handleAdd() {
     weight: Math.max(1, Math.min(5, Number(newHotword.value.weight) || 4)),
     lang: newHotword.value.lang || undefined,
   })
+  // 新增条目落在末页：翻到末页，避免用户看不到刚添加的词。
+  currentPage.value = totalPages.value
   newHotword.value.text = ''
   nextTick(() => textInputRef.value?.focus())
 }
@@ -262,8 +276,6 @@ onMounted(() => {
 }
 
 .hotwords-list {
-  max-height: 300px;
-  overflow-y: auto;
   border: 1px solid var(--panel-border);
   border-radius: 8px;
   padding: 8px;

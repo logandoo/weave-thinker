@@ -3,6 +3,16 @@
 
 import api from './client'
 
+export interface MemoryEvidence {
+  source_ids: string[]
+  unit_ids: string[]
+  source_kind?: string | null
+  quote: string
+  reason: string
+  checked_at?: string | null
+  manual?: boolean | null
+}
+
 export interface MemoryConcept {
   id: string
   canonical_name: string
@@ -17,8 +27,38 @@ export interface MemoryConcept {
   valid_from: string | null
   valid_to: string | null
   created_at: string | null
+  verification_state?: string | null
+  last_verified_at?: string | null
+  invalid_reason?: string | null
+  superseded_by?: string | null
+  superseded_by_name?: string | null
+  needs_review?: boolean
   aliases?: string[] | null
   recurrence_count?: number | null
+  source_type?: string | null
+  source_kind?: string | null
+  source_message_ids?: string[] | null
+  evidence?: MemoryEvidence | null
+  verification_correction?: string | null
+  is_history?: boolean
+}
+
+export interface MemoryHealth {
+  total: number
+  active: number
+  merged: number
+  retracted: number
+  source_lost: number
+  forgotten: number
+  expired: number
+  needs_review: number
+  verified: number
+  contradicted: number
+  insufficient: number
+  verify_coverage: number
+  dream_injectable_rate: number | null
+  last_verify: Record<string, any> | null
+  recall_7d_avg_injected_chars: number | null
 }
 
 export interface MemoryRecallLogItem {
@@ -69,11 +109,41 @@ export interface CostGovernanceStatus {
 }
 
 export const memoryApi = {
-  async getConcepts(limit = 100): Promise<MemoryConcept[]> {
-    const { data } = await api.get<{ concepts: MemoryConcept[] }>('/memory/concepts', {
-      params: { limit }
-    })
-    return data.concepts || []
+  async getConcepts(limit = 100, opts: {
+    includeHistory?: boolean
+    verificationState?: string
+    q?: string
+    offset?: number
+    historyOffset?: number
+  } = {}): Promise<{ items: MemoryConcept[]; total: number; activeTotal: number; historyTotal: number }> {
+    const params: Record<string, any> = { limit }
+    if (opts.includeHistory) params.include_history = true
+    if (opts.verificationState && opts.verificationState !== 'any') params.verification_state = opts.verificationState
+    if (opts.q) params.q = opts.q
+    if (opts.offset) params.offset = opts.offset
+    if (opts.historyOffset) params.history_offset = opts.historyOffset
+    const { data } = await api.get<{
+      concepts: MemoryConcept[]; total?: number;
+      active_total?: number; history_total?: number
+    }>('/memory/concepts', { params })
+    const items = data.concepts || []
+    return {
+      items,
+      total: Number(data.total ?? items.length),
+      // 后端未升级时退化：active_total 缺省按合并列表长度与 total 取小
+      activeTotal: Number(data.active_total ?? Math.min(items.length, Number(data.total ?? 0))),
+      historyTotal: Number(data.history_total ?? 0),
+    }
+  },
+
+  async verifyConcept(conceptId: string, action: 'confirm' | 'reject' | 'retry' | 'apply_correction', note = '') {
+    const { data } = await api.post(`/memory/concepts/${conceptId}/verify`, { action, note })
+    return data
+  },
+
+  async getHealth(): Promise<MemoryHealth> {
+    const { data } = await api.get<MemoryHealth>('/memory/health')
+    return data
   },
 
   async getDreams(limit = 10): Promise<MemoryDream[]> {
@@ -140,13 +210,5 @@ export const memoryApi = {
 
   async undoRetention(conceptIds: string[]): Promise<void> {
     await api.post('/memory/retention/undo', { concept_ids: conceptIds })
-  },
-
-  // W3-3 dream 修复报告
-  async getDreamRepairReports(limit = 20): Promise<any[]> {
-    const { data } = await api.get<{ items: any[] }>('/memory/dream_repair_reports', {
-      params: { limit }
-    })
-    return data.items || []
   }
 }

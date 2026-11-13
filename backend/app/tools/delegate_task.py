@@ -186,11 +186,14 @@ async def _run_child_agent(
             {"role": "user", "content": goal},
         ]
 
+        # §10 同步 delegate_task：子代理继承同一 Task 的读写域与 taint（写并发仍受路径锁）；
+        # 需要强隔离时由调用方显式创建 child Task，而不是共享父作用域。
         loop = AgentLoop(
             llm=child_llm,
             tool_schemas=child_tool_schemas,
             max_iterations=_cfg.agent_tool_loop_max_iterations,
             workspace_path=workspace_path,
+            workspace_ctx=kwargs.get("workspace_ctx"),
             blocked_tools=blocked,
             delegation_depth=depth + 1,
             provider_type=factory.wire_provider_type(
@@ -298,6 +301,8 @@ async def delegate_task(args: dict, **kwargs) -> str:
         "user": kwargs.get("user"),
         "conversation": kwargs.get("conversation"),
         "assistant": kwargs.get("assistant"),
+        # 同一 Task 的冻结作用域随子代理继承（§10 同步 delegate_task）
+        "workspace_ctx": kwargs.get("workspace_ctx"),
     }
 
     child_timeout = _get_default_child_timeout()

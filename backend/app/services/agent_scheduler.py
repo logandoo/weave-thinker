@@ -471,11 +471,21 @@ class AgentScheduler:
                 messages.extend(setup_scalars["history_messages"])
                 messages.append({"role": "user", "content": setup_scalars["user_prompt"]})
 
+                # 任务作用域（§10 scheduler）：enforce 未放开该模式 → 启动前拒绝；
+                # 放开则按 execution binding（owner=scheduled_task）恢复同一 run。
+                from app.services.workspace_scoping_runtime import attach_execution_scope as _ws_attach_sc
+
+                _scoped_sc = await _ws_attach_sc(
+                    ws_db, user_id=task.user_id, workspace_root=str(workspace.root_path),
+                    owner_kind="scheduled_task", owner_id=str(task.id),
+                    mode_name="scheduler")
+
                 from app.model_gateway.factory import wire_provider_type as _wire_pt
                 loop = AgentLoop(
                     llm=llm,
                     max_iterations=cfg.agent_tool_loop_max_iterations,
                     workspace_path=str(workspace.root_path),
+                    workspace_ctx=_scoped_sc.ctx,
                     provider_type=_wire_pt(llm, setup_scalars["assistant_provider_type"]),
                     enable_reasoning=False,
                     enable_compression=cfg.agent_compression_enabled,
@@ -732,6 +742,13 @@ class AgentScheduler:
             task_row.last_run_at = now
             task_row.run_count = (task_row.run_count or 0) + 1
             task_row.fail_count = 0
+
+            # 任务作用域收尾：每次执行都终态化本 run —— recurring 下一次 tick 才会开
+            # **新 run**（复用终态 run 会让 manifest/handoff 失真，且 Task 改绑被
+            # workspace_run_active 永久卡死；评审 r2 #4）。
+            from app.services.workspace_scoping_runtime import finish_execution_scope
+            await finish_execution_scope(_scoped_sc.run_id,
+                                         status="failed" if execution_failed else "completed")
 
             if execution_failed:
                 task_row.status = "failed"

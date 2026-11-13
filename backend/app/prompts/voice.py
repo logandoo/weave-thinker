@@ -155,6 +155,26 @@ VOICE_INTERJECTION_SYSTEM = (
 )
 
 
+VOICE_STALE_REPLY_SYSTEM = (
+    "一个新的用户输入已经接管对话。判断旧候选回答是否已失去播报价值。"
+    "只有纯接话、等待、无信息量的确认才 suppress=true；包含事实、解释、结果、问题或其他实质内容"
+    "必须 suppress=false。拿不准时保留旧回答。"
+    '只输出 JSON：{"suppress":true或false}。'
+)
+
+VOICE_DELEGATION_REQUEST_SYSTEM = (
+    "你是语音委派授权判定器。判断用户当前这句话是否明确要求把任务交给独立助手或后台执行。"
+    "讨论、定义、提问、建议、否定委派（例如不要委派）都不算授权。拿不准时不授权。"
+    '只输出 JSON：{"requested":true或false}。'
+)
+
+VOICE_DELEGATION_CLAIM_SYSTEM = (
+    "你检查一段尚未使用任何工具的预生成回答是否声称委派/后台任务已经实际提交或执行。"
+    "只有声称事实已经发生才算 claimed；提议、询问、定义、能力介绍和将来时都不算。"
+    '只输出 JSON：{"claimed":true或false}。'
+)
+
+
 VOICE_ASR_CORRECTION_HINT = (
     "语音识别（ASR）提示：你看到的用户语句来自语音识别系统，它并不完全可靠。"
     "环境噪音、同音词、口音、连读或语速问题都可能让转写文本偏离用户真正想表达的意思。"

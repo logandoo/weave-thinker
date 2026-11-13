@@ -181,7 +181,7 @@ const availableNotebooks = computed(() => {
     width: 100%;
     max-height: 60vh;
     border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-    padding-bottom: env(safe-area-inset-bottom, 0);
+    padding-bottom: var(--safe-bottom);
   }
 }
 </style>

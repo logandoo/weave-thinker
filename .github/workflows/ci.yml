@@ -107,6 +107,16 @@ jobs:
             echo "backend/tests 未随发行树——跳过单测（发行面由 docker-smoke job 覆盖）"
           fi
 
+      - name: Worktree hygiene — suite leaves no repo residue (W38 handoff T11)
+        run: |
+          # 会话产物不得由测试运行悄悄写进工作树：checkout 后干净、跑完仍须干净。
+          # 波次自有证据走 `git add -f` 显式提交（见 .gitignore W38 T11 段）。
+          if ! test -z "$(git status --porcelain)"; then
+            echo "::error::工作树出现测试运行残留（白名单外）："
+            git status --porcelain
+            exit 1
+          fi
+
   frontend:
     name: Frontend (install / build)
     runs-on: ubuntu-latest

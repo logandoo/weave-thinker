@@ -81,6 +81,9 @@ class ConversationBuffer:
     display_sequence: List[dict] = field(default_factory=list)
     tool_calls: List[dict] = field(default_factory=list)
     tool_results: List[dict] = field(default_factory=list)
+    # 驻留口径（spec §4.7 三载体之三）：本 buffer 累积 tool_results 里的图片信封
+    # 字符数。只做形状检查累加，不解析 base64，因此挂在每个事件上的成本是常数。
+    envelope_chars: int = 0
     agent_steps: List[dict] = field(default_factory=list)
     file_attachments: List[dict] = field(default_factory=list)
     search_progress: List[dict] = field(default_factory=list)
@@ -405,6 +408,12 @@ class ConversationBuffer:
             elif "tool_result" in event:
                 tr = event["tool_result"]
                 self.tool_results.append(tr)
+                try:
+                    from app.services.tool_image_results import envelope_chars_of_tool_result
+
+                    self.envelope_chars += envelope_chars_of_tool_result(tr)
+                except Exception:
+                    pass
                 delta = {"seq": self._next_seq, "type": "tool_result", "data": tr}
 
             elif "iteration" in event:
@@ -686,6 +695,14 @@ class StreamBufferManager:
                 buf._rendered_content_len = snap.get("rendered_content_len", 0)
                 buf.tool_calls = [dict(tc) for tc in snap.get("tool_calls", [])]
                 buf.tool_results = [dict(tr) for tr in snap.get("tool_results", [])]
+                try:
+                    from app.services.tool_image_results import envelope_chars_of_tool_result
+
+                    buf.envelope_chars = sum(
+                        envelope_chars_of_tool_result(tr) for tr in buf.tool_results
+                    )
+                except Exception:
+                    buf.envelope_chars = 0
                 buf.agent_steps = [dict(s) for s in snap.get("agent_steps", [])]
                 buf.display_sequence = [dict(d) for d in snap.get("display_sequence", [])]
                 buf.interjections_committed = [dict(x) for x in snap.get("interjections_committed", [])]
@@ -762,6 +779,14 @@ class StreamBufferManager:
     async def _snapshot_running_buffers(self) -> None:
         async with self._lock:
             buffers = list(self._buffers.items())
+        try:
+            # 驻留第三载体（spec §4.7）：所有活跃 buffer 的信封字符合计。
+            # 逐出/完成的修正随下一个 tick（gauge 语义，允许一个周期的滞后）。
+            from app.services import image_blob_metrics as _ibm
+
+            _ibm.set_carrier("stream_buffer", sum(b.envelope_chars for _, b in buffers))
+        except Exception:
+            pass
         for cid, buf in buffers:
             if not buf.is_running:
                 continue

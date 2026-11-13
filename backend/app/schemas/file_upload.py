@@ -12,6 +12,9 @@ class FileParseResult(BaseModel):
     filename: str = ""
     file_path: str | None = None
     rel_path: str | None = None
+    # 任务作用域（§10）：Task 文件域内 agent 可直接解析的路径
+    # （staging 附件为交接后的 inputs/<name>）；legacy 上传为 None。
+    display_path: str | None = None
     size: int = 0
 
 

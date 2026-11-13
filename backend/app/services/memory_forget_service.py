@@ -136,11 +136,15 @@ async def scan_residuals(db: Any, user_id: str, needles: List[str]) -> Dict[str,
     from sqlalchemy import text
 
     memory, retained = {}, {}
+    scan_errors: list[str] = []  # P1-13/D1：扫描面失败可见化
     checks = [
         ("memory_concepts", ["canonical_name", "description_full"], "memory",
          "user_id = :uid AND status = 'active'"),
         ("memory_episodes", ["narrative"], "memory", "user_id = :uid"),
         ("subconscious_log", ["raw_text"], "memory", "user_id = :uid"),
+        # P1-13（2026-11-08）：实体页是派生数据但含概念摘要文本，擦除清单必须能
+        # 证明页面已清（prune/forget 双路径都重建，扫描负责证明）。
+        ("memory_pages", ["title", "summary", "aliases"], "memory", "user_id = :uid"),
         ("conversations", ["title"], "retained", "user_id = :uid"),
         ("messages", ["content"], "retained",
          "conversation_id IN (SELECT id FROM conversations WHERE user_id = :uid)"),
@@ -159,8 +163,10 @@ async def scan_residuals(db: Any, user_id: str, needles: List[str]) -> Dict[str,
                             {"uid": user_id, "n": f"%{_like_escape(n)}%"})).scalar() or 0
                         total += int(v)
                 except Exception:
+                    # P1-13/D1：吞异常≠证明干净——失败面计入 scan_errors（可解释的非零）。
                     logger.debug("residual scan miss %s.%s", table, col,
                                  exc_info=True)
+                    scan_errors.append(f"{table}.{col}")
         if total:
             (memory if bucket == "memory" else retained)[table] = total
     # agent 系（agent_state_id 结构，无 user_id）
@@ -178,6 +184,7 @@ async def scan_residuals(db: Any, user_id: str, needles: List[str]) -> Dict[str,
                     total += int(v)
             except Exception:
                 logger.debug("residual scan miss %s.%s", table, col, exc_info=True)
+                scan_errors.append(f"{table}.{col}")
         if total:
             memory[table] = memory.get(table, 0) + total
     # pinned constraints（活跃面）
@@ -193,7 +200,16 @@ async def scan_residuals(db: Any, user_id: str, needles: List[str]) -> Dict[str,
                         memory.get("conversation_pinned_constraints", 0) + int(c))
         except Exception:
             logger.debug("residual scan pins miss", exc_info=True)
-    return {"memory": memory, "retained": retained}
+            scan_errors.append("conversation_pinned_constraints.text")
+    out = {"memory": memory, "retained": retained}
+    if scan_errors:
+        out["scan_errors"] = scan_errors
+    return out
+
+
+class ForgetManifestNotFound(Exception):
+    """P0-08/D4（2026-11-08）：manifest 不存在或非本人——路由映射 404，
+    不再以裸 ValueError 冒泡成 500。"""
 
 
 async def execute_forget(db: Any, user_id: str, manifest_id: str) -> Dict[str, Any]:
@@ -205,7 +221,7 @@ async def execute_forget(db: Any, user_id: str, manifest_id: str) -> Dict[str, A
 
     man = await db.get(DeletionManifest, manifest_id)
     if man is None or man.user_id != user_id:
-        raise ValueError("manifest not found")
+        raise ForgetManifestNotFound("manifest not found")
     needles = list((man.scope_json or {}).get("needles") or [])
     if not needles:
         man.status = "completed"
@@ -230,6 +246,9 @@ async def execute_forget(db: Any, user_id: str, manifest_id: str) -> Dict[str, A
     for pat in like:
         await _exec_savepoint(
             "UPDATE memory_concepts SET status='forgotten', valid_to=NOW(),"
+            " invalid_reason='forgotten', validity_updated_at=NOW(),"
+            " verification_state=NULL, last_verified_at=NULL,"
+            " verification_evidence=NULL, verification_correction=NULL,"
             " weight=0, updated_at=NOW() WHERE user_id=:uid AND ("
             "canonical_name ILIKE :p OR description_full ILIKE :p)",
             {"uid": user_id, "p": pat})
@@ -258,18 +277,37 @@ async def execute_forget(db: Any, user_id: str, manifest_id: str) -> Dict[str, A
             {"uid": user_id, "p": pat})
     # 文件层
     _scrub_file_store(user_id, needles)
+    # I1：遗忘后实体页/索引不得残留原概念摘要（派生数据，重建即可）。
+    # P1-13（2026-11-08）：rebuild 失败不再静默 fail-open——清单必须可见失败并
+    # 保持 residual 状态（页面残留无法证明已清 = 擦除未完成语义）。
+    page_rebuild_failed = False
+    try:
+        from app.services.memory_page_service import build_pages
+        async with db.begin_nested():
+            await build_pages(db, user_id)
+    except Exception:
+        page_rebuild_failed = True
+        logger.warning("page rebuild after forget failed", exc_info=True)
 
     scan = await scan_residuals(db, user_id, needles)
     retained_hits = scan.get("retained", {})
+    scan_errors = list(scan.get("scan_errors") or [])
     rep = residual_report(needles=needles, hits=retained_hits,
                           memory_hits=scan.get("memory", {}))
-    man.status = "completed" if rep["residual_count"] == 0 else "residual"
+    # 扫描面失败/页面重建失败 = 不可证明干净 → residual（fail-closed）
+    clean = rep["residual_count"] == 0 and not scan_errors and not page_rebuild_failed
+    man.status = "completed" if clean else "residual"
     man.residual_json = {
         "residual_count": rep["residual_count"],
         "memory_hits": rep["memory_hits"],
         "retained_hits": rep["retained_hits"],
         "disclosure": rep["disclosure"],
+        "page_rebuild_failed": page_rebuild_failed,
+        "scan_errors": scan_errors,
     }
+    rep["page_rebuild_failed"] = page_rebuild_failed
+    rep["scan_errors"] = scan_errors
+    rep["manifest_status"] = man.status
     man.completed_at = datetime.utcnow()
     await db.flush()
     return rep
@@ -287,8 +325,12 @@ async def erase_extended_surfaces(db: Any, user_id: str) -> Dict[str, int]:
 
     async def _exec(name: str, stmt: str, params: Dict[str, Any]) -> None:
         try:
-            res = await db.execute(text(stmt), params)
-            counts[name] = int(getattr(res, "rowcount", 0) or 0)
+            # 评审复审钉（Critical）：per-surface savepoint——PG 事务内任一语句
+            # 失败即整笔 aborted，后续擦除面全部级联失败（GDPR 全擦除扇出必须
+            # 逐面隔离，一个缺失表不得带走其余表面）。
+            async with db.begin_nested():
+                res = await db.execute(text(stmt), params)
+                counts[name] = int(getattr(res, "rowcount", 0) or 0)
         except Exception:
             logger.warning("erase_extended_surfaces %s failed", name, exc_info=True)
             counts[name] = -1

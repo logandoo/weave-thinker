@@ -964,7 +964,7 @@ html[data-skin="mono-brutal"] .tool-pending .tool-card-icon { color: var(--tool-
   }
   html[data-skin="mono-brutal"] .chat-input-wrapper {
     /* 任务块 8（2026-10-11 用户指令）：输入框距屏幕侧边距 16→10px */
-    padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0));
+    padding: 8px 10px calc(8px + var(--safe-bottom));
   }
   /* 任务块 8：按钮间距收窄（gap 8→4px、行内 padding 14→8px） */
   html[data-skin="mono-brutal"] .input-bottom-toolbar {
@@ -1555,6 +1555,13 @@ html[data-skin="mono-brutal"] .notes-panel-list { padding: 0; }
 
 /* 任务块 9（2026-10-11）：移动端底 tab 对齐 mockup——白面 3px 硬边 + 5px 偏移硬影 +
    黑 fill 活动块；规格源 design/mockups/04-mono-brutal/mobile.html .m-tabbar */
+/* wave-2（2026-11-07 真机反馈）：移动端顶栏保真——mockup .m-top 无背景=暖纸底，
+   透明边到边后顶栏即状态栏带，纯白读作「不匹配」；对齐皮肤基色。 */
+html[data-skin="mono-brutal"] .mobile-header {
+  background-color: var(--color-bg);
+  border-bottom-color: var(--skin-line);
+}
+
 html[data-skin="mono-brutal"] .mobile-tab-bar {
   gap: 0;
   padding: 0;

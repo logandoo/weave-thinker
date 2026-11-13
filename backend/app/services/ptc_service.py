@@ -91,6 +91,11 @@ class PTCBridge:
             request = json.loads(data.decode("utf-8"))
             tool_name = request.get("tool", "")
             tool_args = request.get("args", {})
+            # 2026-11-12（A4.9 评审 NEW-A）：模型代码可自造 `_` 前缀内部键
+            # （`_permission_granted`/`_user_approved`）旁路权限闸——PTC 是模型
+            # 代码面，必须与 agent_loop 同口径剥离。
+            if isinstance(tool_args, dict):
+                tool_args = {k: v for k, v in tool_args.items() if not str(k).startswith("_")}
 
             if tool_name not in self.allowed_tools:
                 response = json.dumps({"error": f"Tool '{tool_name}' not in PTC allowed list"})

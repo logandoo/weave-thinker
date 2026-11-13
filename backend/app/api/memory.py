@@ -9,60 +9,525 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_user, get_db
-from app.db.database import User, MemoryConcept, MemoryEpisode
+from app.core.config import get_config
+from app.core.deps import get_current_user, get_db, require_admin
+from app.db.database import (
+    User, MemoryConcept, MemoryEpisode, MemoryEvalRun,
+)
+from app.schemas.memory import (
+    MemoryConceptItem,
+    MemoryConceptList,
+    MemoryEvidence,
+    MemoryHealth,
+    MemoryPageItem,
+    MemoryPageLinkItem,
+    MemoryPageList,
+    MemoryVerifyRequest,
+    MemoryVerifyResponse,
+)
 
 router = APIRouter(prefix="/api/memory", tags=["memory"])
 logger = logging.getLogger(__name__)
 
-
-async def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    """§8.5.1：admin 端点鉴权（fail-closed）。users.role == 'admin' 才放行。"""
-    if getattr(current_user, "role", "user") != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
-    return current_user
+_VERIFY_STATES = {"confirmed", "contradicted", "insufficient"}
 
 
-@router.get("/concepts")
+def _json_list(raw):
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw) if isinstance(raw, str) else raw
+        return [str(x) for x in val] if isinstance(val, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _parse_evidence(raw) -> MemoryEvidence | None:
+    if not raw:
+        return None
+    try:
+        val = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(val, dict):
+        return None
+    return MemoryEvidence(
+        source_ids=[str(x) for x in (val.get("source_ids") or [])][:10],
+        unit_ids=[str(x) for x in (val.get("unit_ids") or [])][:10],
+        source_kind=(str(val.get("source_kind"))[:20] if val.get("source_kind") else None),
+        quote=str(val.get("quote") or "")[:200],
+        reason=str(val.get("reason") or "")[:120],
+        checked_at=(str(val.get("checked_at"))[:40] if val.get("checked_at") else None),
+        manual=(bool(val.get("manual")) if val.get("manual") is not None else None),
+    )
+
+
+def _iso(value):
+    return str(value) if value else None
+
+
+def _concept_item(row) -> MemoryConceptItem:
+    r = row._mapping if hasattr(row, "_mapping") else row
+    return MemoryConceptItem(
+        id=r["id"],
+        canonical_name=r["canonical_name"],
+        description_short=r["description_short"] or "",
+        description_full=r["description_full"],
+        weight=float(r["weight"] or 0),
+        importance=float(r["importance"] or 0),
+        source_trust=r["source_trust"] or "",
+        memory_type=r["memory_type"] or "",
+        activation_strength=float(r["activation_strength"] or 0),
+        status=r["status"] or "",
+        valid_from=_iso(r["valid_from"]),
+        valid_to=_iso(r["valid_to"]),
+        created_at=_iso(r["created_at"]),
+        verification_state=r["verification_state"],
+        last_verified_at=_iso(r["last_verified_at"]),
+        invalid_reason=r["invalid_reason"],
+        superseded_by=r["superseded_by"],
+        superseded_by_name=r["superseded_by_name"],
+        needs_review=bool(r["needs_review"]),
+        aliases=_json_list(r["aliases"]),
+        recurrence_count=int(r["recurrence_count"] or 0),
+        source_type=r["source_type"],
+        source_kind=r["source_kind"],
+        source_message_ids=_json_list(r["source_message_ids"]),
+        evidence=_parse_evidence(r["verification_evidence"]),
+        verification_correction=r["verification_correction"],
+        is_history=bool(r["valid_to"]),
+    )
+
+
+@router.get("/concepts", response_model=MemoryConceptList)
 async def list_concepts(
     limit: int = 50,
+    offset: int = 0,
+    history_offset: int = 0,
+    include_history: bool = False,
+    verification_state: str | None = None,
+    q: str | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        text("""
-            SELECT id, canonical_name, description_short, description_full,
-                   weight, importance, source_trust, memory_type, activation_strength,
-                   status, valid_from, valid_to, created_at
-            FROM memory_concepts
-            WHERE user_id = :uid
-            ORDER BY importance DESC, weight DESC, created_at DESC LIMIT :lim
+    """概念列表。默认只返回现行（valid_to IS NULL）；历史需显式 include_history。
+
+    每条返回 validity 原因、后继名称、needs_review、验证状态/证据与来源消息
+    （A1/A2/B7/C3/E1）。
+
+    分页（评审修复 2026-11-08）：`offset` 只偏移现行段，`history_offset` 只偏移
+    历史段——两段共享游标会让合并列表翻页时现行/历史同时跳步产生空洞。
+    响应附 active_total/history_total 供前端分别推进游标。
+    """
+    lim = max(1, min(int(limit or 50), 200))
+    off = max(0, int(offset or 0))
+    hoff = max(0, int(history_offset or 0))
+    clauses = ["c.user_id = :uid", "c.valid_to IS NULL"]
+    params: dict = {"uid": current_user.id, "lim": lim, "off": off, "hoff": hoff}
+    vs = (verification_state or "").strip().lower()
+    if vs and vs not in ("any", "all"):
+        if vs == "unverified":
+            clauses.append("c.verification_state IS NULL")
+        elif vs in _VERIFY_STATES:
+            clauses.append("c.verification_state = :vs")
+            params["vs"] = vs
+    if q and q.strip():
+        clauses.append("(c.canonical_name ILIKE :q OR c.description_full ILIKE :q "
+                       "OR c.aliases ILIKE :q)")
+        params["q"] = f"%{q.strip()[:100]}%"
+    where = " AND ".join(clauses)
+    total_where = " AND ".join(c for c in clauses if c != "c.valid_to IS NULL")
+    # c.id 决胜（评审修复）：importance/weight/created_at 全同的批量数据下
+    # 无决胜列时 PG 行序不稳定，offset 翻页可能重复/漏行。
+    order_clause = "c.importance DESC, c.weight DESC, c.created_at DESC, c.id"
+    rows = (await db.execute(
+        text(f"""
+            SELECT c.id, c.canonical_name, c.description_short, c.description_full,
+                   c.weight, c.importance, c.source_trust, c.memory_type,
+                   c.activation_strength, c.status, c.valid_from, c.valid_to,
+                   c.created_at, c.verification_state, c.last_verified_at,
+                   c.invalid_reason, c.superseded_by,
+                   s.canonical_name AS superseded_by_name, c.needs_review,
+                   c.aliases, c.recurrence_count, c.source_type, c.source_kind,
+                   c.source_message_ids, c.verification_evidence,
+                   c.verification_correction
+            FROM memory_concepts c
+            LEFT JOIN memory_concepts s
+              ON s.id = c.superseded_by AND s.user_id = c.user_id
+            WHERE {where}
+            ORDER BY {order_clause}
+            LIMIT :lim OFFSET :off
         """),
-        {"uid": current_user.id, "lim": max(1, min(limit, 200))},
+        params,
+    )).fetchall()
+    if include_history:
+        # A2/E1：现行段与历史段分开取，避免 700+ 现行概念把历史挤出 limit；
+        # 历史只在显式 include_history 时追加（最多再一页）。
+        history_rows = (await db.execute(
+            text(f"""
+                SELECT c.id, c.canonical_name, c.description_short, c.description_full,
+                       c.weight, c.importance, c.source_trust, c.memory_type,
+                       c.activation_strength, c.status, c.valid_from, c.valid_to,
+                       c.created_at, c.verification_state, c.last_verified_at,
+                       c.invalid_reason, c.superseded_by,
+                       s.canonical_name AS superseded_by_name, c.needs_review,
+                       c.aliases, c.recurrence_count, c.source_type, c.source_kind,
+                       c.source_message_ids, c.verification_evidence,
+                       c.verification_correction
+                FROM memory_concepts c
+                LEFT JOIN memory_concepts s
+                  ON s.id = c.superseded_by AND s.user_id = c.user_id
+                WHERE {total_where} AND c.valid_to IS NOT NULL
+                ORDER BY c.importance DESC, c.weight DESC, c.created_at DESC, c.id
+                LIMIT :lim OFFSET :hoff
+            """),
+            params,
+        )).fetchall()
+        seen = {r[0] for r in rows}
+        rows = list(rows) + [r for r in history_rows if r[0] not in seen]
+    # 分段 total：前端按「已加载的本类条数」分别推进 offset / history_offset。
+    active_total = int((await db.execute(
+        text(f"SELECT COUNT(*) FROM memory_concepts c WHERE {where}"),
+        {k: v for k, v in params.items() if k in ("uid", "vs", "q")},
+    )).scalar() or 0)
+    history_total = 0
+    if include_history:
+        history_total = int((await db.execute(
+            text(f"SELECT COUNT(*) FROM memory_concepts c "
+                 f"WHERE {total_where} AND c.valid_to IS NOT NULL"),
+            {k: v for k, v in params.items() if k in ("uid", "vs", "q")},
+        )).scalar() or 0)
+    total = active_total + history_total
+    items = [_concept_item(r) for r in rows]
+    return MemoryConceptList(
+        concepts=items, count=len(items), total=total,
+        active_total=active_total, history_total=history_total,
+        include_history=bool(include_history))
+
+
+@router.post("/concepts/{concept_id}/verify", response_model=MemoryVerifyResponse)
+async def verify_concept(
+    concept_id: str,
+    body: MemoryVerifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """用户手动确认/否认/重验/应用修正草案（B8/E5）。
+
+    与 valid_to 语义分离：reject 只标 contradicted（待核实），不写失效。
+    """
+    concept = await db.get(MemoryConcept, concept_id)
+    if not concept or concept.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Concept not found")
+    action = body.action
+    now = datetime.utcnow()
+    applied = False
+    # G5 评审修复：记录操作前的验证态——false_contradiction_rate 只数
+    # 「把 contradicted 确认回来」的 confirm（对 insufficient/未验证的确认不是误判翻案）。
+    prev_state = concept.verification_state
+    if action == "confirm":
+        concept.verification_state = "confirmed"
+        concept.last_verified_at = now
+        concept.needs_review = False
+        evidence = _parse_evidence(concept.verification_evidence) or MemoryEvidence()
+        concept.verification_evidence = json.dumps({
+            "source_ids": evidence.source_ids,
+            "unit_ids": evidence.unit_ids,
+            "source_kind": evidence.source_kind,
+            "quote": evidence.quote,
+            "reason": (body.note or "user_confirmed")[:120],
+            "checked_at": now.isoformat(),
+            "manual": True,
+        }, ensure_ascii=False)
+    elif action == "reject":
+        concept.verification_state = "contradicted"
+        concept.last_verified_at = now
+        # 用户否认 ≠ 来源丢失：不进入 needs_review 的 nightly source_lost 链。
+        concept.needs_review = False
+        evidence = _parse_evidence(concept.verification_evidence) or MemoryEvidence()
+        concept.verification_evidence = json.dumps({
+            "source_ids": evidence.source_ids,
+            "unit_ids": evidence.unit_ids,
+            "source_kind": evidence.source_kind,
+            "quote": evidence.quote,
+            "reason": (body.note or "user_rejected")[:120],
+            "checked_at": now.isoformat(),
+            "manual": True,
+        }, ensure_ascii=False)
+    elif action == "retry":
+        concept.verification_state = None
+        concept.last_verified_at = None
+        concept.verification_evidence = None
+        concept.verification_correction = None
+    else:  # apply_correction
+        correction = (concept.verification_correction or "").strip()
+        if not correction:
+            raise HTTPException(status_code=400, detail="No correction proposal to apply")
+        try:
+            _meta = json.loads(concept.metadata_json) if concept.metadata_json else {}
+        except (TypeError, ValueError):
+            _meta = {}
+        if not isinstance(_meta, dict):
+            _meta = {}
+        concept.metadata_json = json.dumps({
+            **_meta,
+            "audit_old_description": concept.description_full,
+            "audit_old_description_short": concept.description_short,
+            "audit_correction_source": "dream_verify",
+        }, ensure_ascii=False)
+        from app.services.memory_concept_service import update_concept_description
+        await update_concept_description(db, concept_id, correction[:80], correction[:5000])
+        concept.verification_correction = None
+        concept.needs_review = False
+        applied = True
+    concept.updated_at = now
+    audit = MemoryEvalRun(
+        run_id=f"manual-{now.strftime('%Y%m%d%H%M%S')}",
+        suite="manual_verify",
+        arm=action,
+        user_id=current_user.id,
+        metrics_json={"concept_id": concept_id, "note": (body.note or "")[:200],
+                      "prev_state": prev_state or "unverified"},
     )
-    concepts = []
-    for row in result.fetchall():
-        concepts.append({
-            "id": row[0],
-            "canonical_name": row[1],
-            "description_short": row[2],
-            "description_full": row[3],
-            "weight": row[4],
-            "importance": row[5],
-            "source_trust": row[6],
-            "memory_type": row[7],
-            "activation_strength": row[8],
-            "status": row[9],
-            "valid_from": str(row[10]) if row[10] else None,
-            "valid_to": str(row[11]) if row[11] else None,
-            "created_at": str(row[12]) if row[12] else None,
-        })
-    return {"concepts": concepts, "count": len(concepts)}
+    db.add(audit)
+    await db.commit()
+    await db.refresh(concept)
+    return MemoryVerifyResponse(
+        id=concept_id, action=action,
+        verification_state=concept.verification_state,
+        description_short=concept.description_short,
+        description_full=concept.description_full,
+        applied=applied, audit_id=audit.id,
+    )
+
+
+@router.get("/pages", response_model=MemoryPageList)
+async def list_pages(
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """C4：实体页索引（短 wiki）；详情用 GET /pages/{id} 展开。"""
+    lim = max(1, min(int(limit or 50), 200))
+    off = max(0, int(offset or 0))
+    rows = (await db.execute(
+        text("""SELECT id, entity_key, title, aliases, summary, concept_ids,
+                       importance, last_built_at
+                FROM memory_pages WHERE user_id = :uid
+                ORDER BY importance DESC, title ASC LIMIT :lim OFFSET :off"""),
+        {"uid": current_user.id, "lim": lim, "off": off},
+    )).fetchall()
+    links = await _links_for_pages(db, current_user.id, [r[0] for r in rows])
+    items = [_page_item(r, links.get(r[0], [])) for r in rows]
+    return MemoryPageList(pages=items, count=len(items))
+
+
+async def _links_for_pages(db: AsyncSession, user_id: str, page_ids: list[str]) -> dict:
+    if not page_ids:
+        return {}
+    rows = (await db.execute(
+        text("""SELECT l.source_page_id, l.target_page_id, t.title,
+                       l.relation_type, l.weight
+                FROM memory_page_links l
+                LEFT JOIN memory_pages t ON t.id = l.target_page_id AND t.user_id = l.user_id
+                WHERE l.user_id = :uid AND l.source_page_id = ANY(:ids)"""),
+        {"uid": user_id, "ids": page_ids},
+    )).fetchall()
+    out: dict = {}
+    for src, tid, title, rtype, weight in rows:
+        out.setdefault(src, []).append(MemoryPageLinkItem(
+            target_page_id=tid, target_title=title,
+            relation_type=rtype or "related", weight=float(weight or 0.5)))
+    return out
+
+
+def _page_item(row, links: list) -> MemoryPageItem:
+    r = row._mapping if hasattr(row, "_mapping") else row
+    return MemoryPageItem(
+        id=r["id"], entity_key=r["entity_key"], title=r["title"],
+        aliases=_json_list(r["aliases"]), summary=r["summary"],
+        concept_ids=_json_list(r["concept_ids"]),
+        importance=float(r["importance"] or 0),
+        last_built_at=_iso(r["last_built_at"]),
+        links=links,
+    )
+
+
+@router.get("/pages/{page_id}", response_model=MemoryPageItem)
+async def get_page(
+    page_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    row = (await db.execute(
+        text("""SELECT id, entity_key, title, aliases, summary, concept_ids,
+                       importance, last_built_at
+                FROM memory_pages WHERE id = :id AND user_id = :uid"""),
+        {"id": page_id, "uid": current_user.id},
+    )).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Page not found")
+    links = (await _links_for_pages(db, current_user.id, [page_id])).get(page_id, [])
+    return _page_item(row, links)
+
+
+@router.post("/pages/rebuild")
+async def rebuild_pages(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """C4：手动重建实体页（夜间也会由 consolidation 调用）。"""
+    from app.services.memory_page_service import build_pages
+    stats = await build_pages(db, current_user.id)
+    await db.commit()
+    return stats
+
+
+@router.get("/health", response_model=MemoryHealth)
+async def memory_health(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """E6/G5：记忆健康度（失效原因、验证覆盖、dream 可注入率、注入字符）。"""
+    row = (await db.execute(
+        text("""SELECT
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE valid_to IS NULL) AS active,
+            COUNT(*) FILTER (WHERE invalid_reason = 'merged') AS merged,
+            COUNT(*) FILTER (WHERE invalid_reason = 'retracted') AS retracted,
+            COUNT(*) FILTER (WHERE invalid_reason = 'source_lost') AS source_lost,
+            COUNT(*) FILTER (WHERE invalid_reason = 'forgotten') AS forgotten,
+            COUNT(*) FILTER (WHERE invalid_reason = 'expired') AS expired,
+            COUNT(*) FILTER (WHERE needs_review) AS needs_review,
+            COUNT(*) FILTER (WHERE verification_state = 'confirmed' AND valid_to IS NULL) AS verified,
+            COUNT(*) FILTER (WHERE verification_state = 'contradicted' AND valid_to IS NULL) AS contradicted,
+            COUNT(*) FILTER (WHERE verification_state = 'insufficient' AND valid_to IS NULL) AS insufficient
+            FROM memory_concepts WHERE user_id = :uid"""),
+        {"uid": current_user.id},
+    )).mappings().first() or {}
+    active = int(row.get("active") or 0)
+    verified = int(row.get("verified") or 0)
+    # P1-15：legacy 记账行（user_id 不可归属）只出全局卫生计数，不泄漏内容。
+    eval_legacy = (await db.execute(
+        text("""SELECT COUNT(*) FROM memory_eval_runs
+                WHERE user_id IS NULL AND jsonb_typeof(metrics_json) = 'object'
+                  AND metrics_json->>'user_id_unknown' = 'true'"""),
+    )).scalar() or 0
+    # G5/P1-11（2026-11-08）：告警阈值（[memory.alerts]；crit = 2× warn 阈值）。
+    al_cfg = (get_config().memory.get("alerts") or {})
+    th_fail = float(al_cfg.get("verify_fail_rate", 0.5))
+    th_zero_days = int(al_cfg.get("zero_inject_days", 7))
+    th_false = float(al_cfg.get("false_contradiction_rate", 0.1))
+    th_cost = int(al_cfg.get("daily_llm_cost_units", 50))
+
+    def _level(value: float, threshold: float) -> str:
+        if threshold <= 0 or value < threshold:
+            return "ok"
+        return "crit" if value >= threshold * 2 else "warn"
+
+    vsum = (await db.execute(
+        text("""SELECT COALESCE(SUM((metrics_json->>'selected')::int),0) AS sel,
+                       COALESCE(SUM((metrics_json->>'skipped')::int),0) AS sk,
+                       COUNT(*) FILTER (
+                         WHERE created_at >= date_trunc('day', (NOW() AT TIME ZONE 'UTC'))
+                       ) AS runs_today
+                FROM memory_eval_runs
+                WHERE suite = 'dream_verify' AND user_id = :uid
+                  AND created_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days'"""),
+        {"uid": current_user.id},
+    )).mappings().first() or {}
+    sel7 = int(vsum.get("sel") or 0)
+    fail_rate = round(int(vsum.get("sk") or 0) / sel7, 4) if sel7 else 0.0
+    inj_age = (await db.execute(
+        text("""SELECT EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) / 86400.0 AS age_days,
+                       (metrics_json->>'injectable')::int AS injectable
+                FROM memory_eval_runs
+                WHERE suite = 'dream_injection' AND user_id = :uid
+                ORDER BY created_at DESC LIMIT 1"""),
+        {"uid": current_user.id},
+    )).mappings().first()
+    zero_days = float(inj_age["age_days"] or 0.0) if (inj_age and int(inj_age.get("injectable") or 0) == 0) else 0.0
+    # 评审修复：分母不用「当前 contradicted 存量」——用户把积压确认后存量=0，
+    # 告警恰在要它工作的场景自熄。改窗口内审计口径：分母 = 7 天内对
+    # contradicted 概念的所有人工判定（confirm/reject/retry），分子 = 其中
+    # confirm（=「判矛盾但用户说没错」= 误判率）。
+    fc = (await db.execute(
+        text("""SELECT COUNT(*) FILTER (WHERE arm = 'confirm') AS confirms,
+                       COUNT(*) AS judged
+                FROM memory_eval_runs
+                WHERE suite = 'manual_verify' AND user_id = :uid
+                  AND metrics_json->>'prev_state' = 'contradicted'
+                  AND created_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days'"""),
+        {"uid": current_user.id},
+    )).mappings().first() or {}
+    fc_confirms = int(fc.get("confirms") or 0)
+    fc_judged = int(fc.get("judged") or 0)
+    # 评审复审钉：最小样本守卫——n<3 时单条 confirm 就能把率推到 1.0 触发
+    # crit（统计噪音）；样本不足按 0 处理（宁缺毋误报）。
+    false_rate = round(fc_confirms / fc_judged, 4) if fc_judged >= 3 else 0.0
+    runs_today = int(vsum.get("runs_today") or 0)
+    alerts = [
+        {"key": "verify_fail_rate", "value": fail_rate, "threshold": th_fail,
+         "level": _level(fail_rate, th_fail)},
+        {"key": "zero_injection", "value": round(zero_days, 2), "threshold": th_zero_days,
+         "level": _level(zero_days, th_zero_days)},
+        {"key": "false_contradiction_rate", "value": false_rate, "threshold": th_false,
+         "level": _level(false_rate, th_false)},
+        {"key": "verify_cost_units_today", "value": runs_today, "threshold": th_cost,
+         "level": _level(runs_today, th_cost)},
+    ]
+    last_verify = (await db.execute(
+        text("""SELECT metrics_json, created_at FROM memory_eval_runs
+                WHERE suite = 'dream_verify' AND user_id = :uid
+                ORDER BY created_at DESC LIMIT 1"""),
+        {"uid": current_user.id},
+    )).mappings().first()
+    dream_metric = (await db.execute(
+        text("""SELECT metrics_json FROM memory_eval_runs
+                WHERE suite = 'dream_injection' AND user_id = :uid
+                ORDER BY created_at DESC LIMIT 1"""),
+        {"uid": current_user.id},
+    )).scalar()
+    recall_avg = (await db.execute(
+        text("""SELECT AVG(injected_chars) FROM memory_recall_log
+                WHERE user_id = :uid
+                  AND created_at >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '7 days'"""),
+        {"uid": current_user.id},
+    )).scalar()
+    injectable_rate = None
+    if dream_metric:
+        try:
+            dm = json.loads(dream_metric) if isinstance(dream_metric, str) else dream_metric
+            scanned = int(dm.get("scanned") or 0)
+            injectable = int(dm.get("injectable") or 0)
+            injectable_rate = round(injectable / scanned, 4) if scanned else None
+        except (TypeError, ValueError, AttributeError):
+            injectable_rate = None
+    return MemoryHealth(
+        total=int(row.get("total") or 0), active=active,
+        merged=int(row.get("merged") or 0),
+        retracted=int(row.get("retracted") or 0),
+        source_lost=int(row.get("source_lost") or 0),
+        forgotten=int(row.get("forgotten") or 0),
+        expired=int(row.get("expired") or 0),
+        needs_review=int(row.get("needs_review") or 0),
+        verified=verified,
+        contradicted=int(row.get("contradicted") or 0),
+        insufficient=int(row.get("insufficient") or 0),
+        verify_coverage=round(verified / active, 4) if active else 0.0,
+        dream_injectable_rate=injectable_rate,
+        last_verify=(dict(last_verify["metrics_json"]) if isinstance(last_verify.get("metrics_json"), dict) else None) if last_verify else None,
+        recall_7d_avg_injected_chars=round(float(recall_avg), 1) if recall_avg is not None else None,
+        eval_runs_legacy=int(eval_legacy),
+        alerts=alerts,
+    )
 
 
 @router.get("/dreams")
 async def list_dreams(
     limit: int = 10,
+    include_legacy: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -73,9 +538,11 @@ async def list_dreams(
             FROM agent_dreams d
             JOIN user_agent_states s ON d.agent_state_id = s.id
             WHERE s.user_id = :uid
+              AND (:include_legacy OR d.dream_type = 'consolidation')
             ORDER BY d.created_at DESC NULLS LAST, d.generated_for_date DESC LIMIT :lim
         """),
-        {"uid": current_user.id, "lim": max(1, min(limit, 50))},
+        {"uid": current_user.id, "lim": max(1, min(limit, 50)),
+         "include_legacy": bool(include_legacy)},
     )
     dreams = []
     for row in result.fetchall():
@@ -112,6 +579,12 @@ async def delete_concept(
         text("DELETE FROM concept_relations WHERE source_id = :id OR target_id = :id"),
         {"id": concept_id},
     )
+    try:
+        from app.services.memory_page_service import build_pages
+        async with db.begin_nested():
+            await build_pages(db, current_user.id)
+    except Exception:
+        logger.warning("page rebuild after concept delete failed", exc_info=True)
     await db.commit()
     return {"deleted": concept_id}
 
@@ -140,6 +613,14 @@ async def delete_all_memory(
     for obj in concepts:
         await db.delete(obj)
     await db.flush()
+    await db.execute(
+        text("DELETE FROM memory_page_links WHERE user_id = :uid"),
+        {"uid": uid},
+    )
+    await db.execute(
+        text("DELETE FROM memory_pages WHERE user_id = :uid"),
+        {"uid": uid},
+    )
     await db.execute(
         text("DELETE FROM memory_clusters WHERE user_id = :uid"),
         {"uid": uid},
@@ -231,8 +712,19 @@ async def delete_all_memory(
         await db.commit()
     except Exception:
         logger.warning("erase_extended_surfaces failed", exc_info=True)
-        erase_counts = {}
-    return {"deleted": "all", "extended_surfaces": erase_counts}
+        erase_counts = {"_all": -1}
+    # 评审复审钉（Critical）：任一模糊面失败（-1）都不得声称 deleted=all——
+    # GDPR 擦除 fail-closed：partial + failed_surfaces 显式上报。
+    return _erase_response(erase_counts)
+
+
+def _erase_response(erase_counts: dict) -> dict:
+    """擦除响应构造（纯函数，可测）：任一模糊面失败（-1）都不得声称
+    deleted=all——GDPR 擦除 fail-closed，partial + failed_surfaces 显式上报。"""
+    failed_surfaces = sorted(k for k, v in (erase_counts or {}).items() if v < 0)
+    deleted = "all" if not failed_surfaces else "partial"
+    return {"deleted": deleted, "extended_surfaces": erase_counts,
+            "failed_surfaces": failed_surfaces}
 
 
 @router.get("/clarifications")
@@ -384,10 +876,17 @@ async def forget_concept(
         raise HTTPException(status_code=404, detail="Concept not found")
     # 同步发射侧契约：ORM 变更触发捕获事件（memory_concepts 同步域）；
     # status/weight/valid_to 为真实变更，显式 bump 保 ts 单调。
-    concept.valid_to = datetime.utcnow()
-    concept.weight = 0
+    from app.services.memory_validity_service import apply_invalidation
+    apply_invalidation(concept, "forgotten", status="forgotten")
+    # 发射侧契约（同步域）：显式 ORM 写点 + ts bump。
     concept.status = "forgotten"
     concept.updated_at = datetime.utcnow()
+    try:
+        from app.services.memory_page_service import build_pages
+        async with db.begin_nested():
+            await build_pages(db, current_user.id)
+    except Exception:
+        logger.warning("page rebuild after forget failed", exc_info=True)
     await db.commit()
     return {"forgotten": concept_id}
 
@@ -503,7 +1002,8 @@ async def forget_memory(
     请求文本用「」括起要遗忘的词条，或以『删除记忆：』开头。
     """
     from app.services.memory_forget_service import (
-        create_deletion_manifest, execute_forget, parse_forget_needles)
+        ForgetManifestNotFound, create_deletion_manifest, execute_forget,
+        parse_forget_needles)
 
     text = str(request.get("text") or "")
     needles = parse_forget_needles(text)
@@ -516,7 +1016,13 @@ async def forget_memory(
         str(request.get("request_id") or "req-" + man_id_hint(request)),
         {"needles": needles})
     await db.commit()
-    rep = await execute_forget(db, current_user.id, man.id)
+    try:
+        rep = await execute_forget(db, current_user.id, man.id)
+    except ForgetManifestNotFound:
+        # P0-08/D4：不存在/非本人 manifest = 404 语义，不再 500。
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="遗忘清单不存在或无权访问") from None
     await db.commit()
     rep["manifest_id"] = man.id
     rep["status"] = man.status
@@ -598,16 +1104,3 @@ async def retention_undo(
     n = await undo_eviction(db, current_user.id, ids)
     await db.commit()
     return {"restored": int(n)}
-
-
-@router.get("/dream_repair_reports")
-async def dream_repair_reports(
-    limit: int = 20,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """W3-3：梦境 probe/repair 报告（默认关；14 天无正收益自动停，W3-4）。"""
-    from app.services.memory_dream_repair_service import list_repair_reports
-
-    items = await list_repair_reports(db, current_user.id, min(int(limit or 20), 100))
-    return {"items": items}

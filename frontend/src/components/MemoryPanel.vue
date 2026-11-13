@@ -25,6 +25,19 @@
 
     <!-- 概念 -->
     <div v-if="activeSubTab === 'concepts'" class="memory-section">
+      <div class="memory-toolbar">
+        <label class="memory-toggle">
+          <input v-model="includeHistory" type="checkbox" />
+          显示历史版本
+        </label>
+        <select v-model="verificationFilter" class="memory-select">
+          <option value="any">全部验证状态</option>
+          <option value="confirmed">已验证</option>
+          <option value="contradicted">待核实</option>
+          <option value="insufficient">证据不足</option>
+          <option value="unverified">未验证</option>
+        </select>
+      </div>
       <div v-if="loading.concepts" class="memory-loading">加载中…</div>
       <div v-else-if="concepts.length === 0" class="memory-empty">
         暂无概念记忆。新记忆架构未启用或尚未积累概念。
@@ -34,7 +47,7 @@
           v-for="c in concepts"
           :key="c.id"
           class="memory-item"
-          :class="{ inactive: c.status !== 'active' || c.valid_to }"
+          :class="{ inactive: c.is_history || c.status !== 'active' }"
         >
           <div class="memory-item-main">
             <div class="memory-item-name">
@@ -42,12 +55,19 @@
               <span v-if="c.source_trust === 'agent_inferred'" class="tag inferred">推断</span>
               <span v-if="c.status === 'silent'" class="tag silent">沉默</span>
               <span v-if="c.status === 'cold_forgotten'" class="tag cold">冷遗忘</span>
-              <span v-if="c.valid_to" class="tag expired">已失效</span>
+              <span v-if="c.invalid_reason" class="tag" :class="reasonTagClass(c.invalid_reason)">
+                {{ reasonLabel(c.invalid_reason) }}
+              </span>
+              <span v-if="c.needs_review" class="tag review" title="来源待复核（nightly 溯源链）">需复核</span>
+              <span v-if="c.verification_state === 'confirmed'" class="tag verified">已验证</span>
+              <span v-else-if="c.verification_state === 'contradicted'" class="tag contradicted">待核实</span>
+              <span v-else-if="c.verification_state === 'insufficient'" class="tag insufficient">证据不足</span>
             </div>
             <div class="memory-item-desc">{{ c.description_short }}</div>
             <div class="memory-item-meta">
               重要度 {{ c.importance.toFixed(2) }} · 权重 {{ c.weight.toFixed(2) }} · {{ trustLabel(c.source_trust) }} · {{ typeLabel(c.memory_type) }}
               <template v-if="c.created_at"> · {{ formatDate(c.created_at) }}</template>
+              <template v-if="c.is_history"> · 历史</template>
             </div>
             <button class="memory-expand-btn" @click="toggleConcept(c.id)">
               {{ expandedConcepts.has(c.id) ? '收起详情' : '详情' }}
@@ -61,9 +81,60 @@
                 权重 {{ c.weight.toFixed(2) }} · 状态 {{ statusLabel(c.status) }}
                 <template v-if="c.recurrence_count != null"> · 复现 {{ c.recurrence_count }} 次</template>
               </div>
+              <div v-if="c.invalid_reason" class="memory-item-meta">
+                生命周期：{{ validityText(c) }}
+              </div>
+              <div v-if="c.superseded_by_name" class="memory-item-meta">
+                后继版本：{{ c.superseded_by_name }}
+              </div>
+              <div v-if="c.source_message_ids && c.source_message_ids.length" class="memory-item-meta">
+                来源消息：{{ c.source_message_ids.slice(0, 3).join('、') }}
+              </div>
+              <div v-if="c.evidence" class="verify-evidence">
+                <div class="verify-evidence-title">
+                  验证证据
+                  <span v-if="c.evidence.manual" class="tag applied">人工</span>
+                </div>
+                <div v-if="c.evidence.quote" class="verify-quote">“{{ truncate(c.evidence.quote, 200) }}”</div>
+                <div class="memory-item-meta">
+                  {{ c.evidence.reason || '—' }}
+                  <template v-if="c.evidence.checked_at"> · {{ formatDateTime(c.evidence.checked_at) }}</template>
+                </div>
+                <div v-if="c.evidence.source_ids && c.evidence.source_ids.length" class="memory-item-meta">
+                  来源：{{ c.evidence.source_ids.slice(0, 3).join('、') }}
+                </div>
+              </div>
+              <div v-if="c.verification_correction" class="verify-correction">
+                <div class="verify-evidence-title">修正建议</div>
+                <div class="memory-item-desc">{{ c.verification_correction }}</div>
+                <button class="memory-delete-btn" :disabled="verifyingId === c.id" @click="handleVerify(c, 'apply_correction')">
+                  {{ verifyingId === c.id ? '应用中…' : '应用修正' }}
+                </button>
+              </div>
             </div>
           </div>
           <div class="memory-item-actions">
+            <template v-if="!c.is_history">
+              <button
+                class="memory-delete-btn verify"
+                :disabled="verifyingId === c.id || c.verification_state === 'confirmed'"
+                title="确认仍然有效"
+                @click="handleVerify(c, 'confirm')"
+              >{{ verifyingId === c.id ? '…' : '仍然有效' }}</button>
+              <button
+                class="memory-delete-btn verify"
+                :disabled="verifyingId === c.id || c.verification_state === 'contradicted'"
+                title="否认这条记忆（待核实，不写失效）"
+                @click="handleVerify(c, 'reject')"
+              >{{ verifyingId === c.id ? '…' : '否认' }}</button>
+              <button
+                v-if="c.verification_state"
+                class="memory-delete-btn verify"
+                :disabled="verifyingId === c.id"
+                title="清除验证状态，等待重新对照"
+                @click="handleVerify(c, 'retry')"
+              >{{ verifyingId === c.id ? '…' : '重验' }}</button>
+            </template>
             <button
               class="memory-delete-btn forget"
               :disabled="forgettingId === c.id"
@@ -83,19 +154,39 @@
           class="memory-more-btn"
           :disabled="loading.concepts"
           @click="loadMoreConcepts"
-        >{{ loading.concepts ? '加载中…' : '加载更多' }}</button>
+        >{{ loading.concepts ? '加载中…' : `加载更多（已载 ${concepts.length}/${conceptsTotal}）` }}</button>
       </template>
+    </div>
+
+    <!-- 健康度 -->
+    <div v-else-if="activeSubTab === 'health'" class="memory-section">
+      <div v-if="loading.health" class="memory-loading">加载中…</div>
+      <template v-else-if="health">
+        <div class="status-card">
+          <div class="status-row"><span class="status-label">概念总数</span><span class="status-value">{{ health.total }}</span></div>
+          <div class="status-row"><span class="status-label">现行 / 合并 / 撤回 / 来源丢失</span><span class="status-value">{{ health.active }} / {{ health.merged }} / {{ health.retracted }} / {{ health.source_lost }}</span></div>
+          <div class="status-row"><span class="status-label">遗忘 / 过期</span><span class="status-value">{{ health.forgotten }} / {{ health.expired }}</span></div>
+          <div class="status-row"><span class="status-label">需复核 / 验证覆盖</span><span class="status-value">{{ health.needs_review }} / {{ (health.verify_coverage * 100).toFixed(1) }}%</span></div>
+          <div class="status-row"><span class="status-label">已验证 / 待核实 / 证据不足（均现行口径）</span><span class="status-value">{{ health.verified }} / {{ health.contradicted }} / {{ health.insufficient }}</span></div>
+          <div v-if="health.dream_injectable_rate != null" class="status-row"><span class="status-label">Dream 可注入率</span><span class="status-value">{{ (health.dream_injectable_rate * 100).toFixed(1) }}%</span></div>
+          <div v-if="health.recall_7d_avg_injected_chars != null" class="status-row"><span class="status-label">7 日平均注入字符</span><span class="status-value">{{ health.recall_7d_avg_injected_chars }}</span></div>
+        </div>
+        <div v-if="health.last_verify" class="memory-note">
+          最近一次 Dream Verify：selected {{ health.last_verify.selected ?? 0 }} · confirmed {{ health.last_verify.confirmed ?? 0 }} · contradicted {{ health.last_verify.contradicted ?? 0 }} · insufficient {{ health.last_verify.insufficient ?? 0 }}
+        </div>
+      </template>
+      <div v-else class="memory-empty">暂无健康度数据</div>
     </div>
 
     <!-- Dream -->
     <div v-else-if="activeSubTab === 'dreams'" class="memory-section">
       <div v-if="loading.dreams" class="memory-loading">加载中…</div>
       <div v-else-if="dreams.length === 0" class="memory-empty">暂无 dream 记录</div>
-      <div v-else v-for="d in dreams" :key="d.id" class="memory-item">
+      <template v-else>
+      <div v-for="d in pagedDreams" :key="d.id" class="memory-item">
         <div class="memory-item-main">
           <div class="memory-item-name">
             {{ d.generated_for_date }}
-            <span v-if="d.dream_type === 'legacy'" class="tag legacy">旧版</span>
           </div>
           <div
             class="memory-item-desc dream-summary"
@@ -112,13 +203,17 @@
           >{{ expandedDreams.has(d.id) ? '收起' : '展开全文' }}</button>
         </div>
       </div>
+      <PaginationBar v-model:page="dreamsPage" :total-pages="dreamsPages" />
+      <div v-if="dreamsTruncated" class="memory-note">仅显示最近 {{ DREAM_CAP }} 条 dream，更早的记录未在此列出。</div>
+      </template>
     </div>
 
     <!-- 澄清 -->
     <div v-else-if="activeSubTab === 'clarifications'" class="memory-section">
       <div v-if="loading.clarifications" class="memory-loading">加载中…</div>
       <div v-else-if="clarifications.length === 0" class="memory-empty">暂无澄清记录</div>
-      <div v-else v-for="cl in clarifications" :key="cl.id" class="memory-item">
+      <template v-else>
+      <div v-for="cl in pagedClarifications" :key="cl.id" class="memory-item">
         <div class="memory-item-main">
           <div class="memory-item-name">
             {{ correctionLabel(cl.correction_type) }}
@@ -139,6 +234,9 @@
           @click="handleRevert(cl)"
         >{{ revertingId === cl.id ? '…' : '撤销' }}</button>
       </div>
+      <PaginationBar v-model:page="clarPage" :total-pages="clarPages" />
+      <div v-if="clarTruncated" class="memory-note">仅显示最近 {{ CLAR_CAP }} 条澄清记录，更早的记录未在此列出。</div>
+      </template>
     </div>
 
     <!-- 状态 -->
@@ -236,7 +334,7 @@
       <div v-if="loading.constraints" class="memory-loading">加载中…</div>
       <div v-else-if="constraints.length === 0" class="memory-empty">暂无固定约束</div>
       <template v-else>
-        <div v-for="c in constraints" :key="c.id" class="ledger-item">
+        <div v-for="c in pagedConstraints" :key="c.id" class="ledger-item">
           <div class="ledger-row">
             <span class="constraint-text">{{ c.text }}</span>
             <span class="ledger-badges">
@@ -255,6 +353,7 @@
             >{{ revokingId === c.id ? '撤销中…' : '撤销' }}</button>
           </div>
         </div>
+        <PaginationBar v-model:page="constraintsPage" :total-pages="constraintsPages" />
       </template>
     </div>
 
@@ -272,7 +371,7 @@
           <span>活跃 {{ retentionPreview.active }} / 容量 {{ retentionPreview.capacity }}</span>
           <span>mode: {{ retentionPreview.mode }}</span>
         </div>
-        <div v-for="c in retentionPreview.candidates" :key="c.id" class="ledger-item">
+        <div v-for="c in pagedRetentionCandidates" :key="c.id" class="ledger-item">
           <div class="ledger-row">
             <span class="constraint-text">{{ c.canonical_name }}</span>
             <span class="ledger-badges">
@@ -289,68 +388,68 @@
             >{{ undoingId === c.id ? '恢复中…' : (c.fidelity_state === 'archived' ? '恢复 full' : '预览淘汰（未执行）') }}</button>
           </div>
         </div>
+        <PaginationBar v-model:page="retentionPage" :total-pages="retentionPages" />
       </template>
     </div>
 
-    <!-- Dream 修复报告（W3-3：probe→hit/miss→只修 miss，默认关） -->
-    <div v-else-if="activeSubTab === 'repairs'" class="memory-section">
-      <div class="memory-note">
-        梦境主动探测/修复报告（MemDream 式）：探测查询 hit/miss → 只修 miss → hit@k 前后对比。默认关（[memory.dream_repair]），14 天无正收益自动停。
-      </div>
-      <div v-if="loading.repairs" class="memory-loading">加载中…</div>
-      <div v-else-if="dreamRepairs.length === 0" class="memory-empty">暂无修复报告（机制默认关）</div>
-      <template v-else>
-        <div v-for="r in dreamRepairs" :key="r.id" class="ledger-item">
-          <div class="ledger-row">
-            <span class="ledger-time">{{ r.run_date }}</span>
-            <span class="ledger-badges">
-              <span class="tag cache">hit@k {{ (r.hit_at_k_before ?? 0).toFixed(2) }} → {{ (r.hit_at_k_after ?? 0).toFixed(2) }}</span>
-              <span class="tag truncated">{{ r.cost_tokens }} tokens</span>
-            </span>
-          </div>
-          <div class="ledger-row ledger-meta">
-            <span>探测 {{ r.probe_count }} · 命中 {{ r.hit_count }} · 缺口 {{ r.miss_count }}</span>
-            <span>修复 {{ (r.repairs || []).join('、') || '无' }}</span>
-          </div>
-        </div>
-      </template>
-    </div>
+    <!-- Dream 修复报告（W3-3）已随 dreaming 收敛删除（2026-11-08） -->
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, nextTick } from 'vue'
+import { ref, watch, onMounted, computed, nextTick } from 'vue'
 import {
   memoryApi,
   type MemoryConcept,
   type MemoryDream,
   type MemoryClarification,
   type CostGovernanceStatus,
+  type MemoryHealth,
   type MemoryRecallLogItem,
 } from '@/api/memory'
+import { dualCursors, dualShouldLoadMore, mergePages, totalPages as calcTotalPages, pageSlice as calcPageSlice } from '@/composables/memoryPagination'
+import PaginationBar from './PaginationBar.vue'
 
 defineProps<{ embedded?: boolean }>()
 defineEmits<{ (e: 'close'): void }>()
 
 const subTabs = [
   { key: 'concepts', label: '概念' },
+  { key: 'health', label: '健康度' },
   { key: 'dreams', label: 'Dream' },
   { key: 'clarifications', label: '澄清' },
   { key: 'constraints', label: '约束' },
   { key: 'retention', label: '保留/淘汰' },
-  { key: 'repairs', label: 'Dream修复' },
   { key: 'status', label: '状态' },
   { key: 'ledger', label: '台账' },
 ]
 const activeSubTab = ref('concepts')
 
 const CONCEPT_LIMIT_STEP = 100
-const CONCEPT_LIMIT_MAX = 200
 const conceptLimit = ref(CONCEPT_LIMIT_STEP)
 const conceptsExhausted = ref(false)
+// P1-19（2026-11-08）：offset 翻页取代「加大 limit」（旧实现 200 封顶，645+ 现行看不全）
+const conceptsTotal = ref(0)
+// 评审修复：include_history 模式下现行/历史两段独立游标（各自 total）
+const conceptsActiveTotal = ref(0)
+const conceptsHistoryTotal = ref(0)
+
+function conceptPageState() {
+  const loadedActive = concepts.value.filter((c) => !c.valid_to).length
+  return {
+    loadedActive,
+    activeTotal: conceptsActiveTotal.value,
+    loadedHistory: concepts.value.length - loadedActive,
+    historyTotal: conceptsHistoryTotal.value,
+  }
+}
 const expandedConcepts = ref<Set<string>>(new Set())
 
 const concepts = ref<MemoryConcept[]>([])
+const includeHistory = ref(false)
+const verificationFilter = ref('any')
+const health = ref<MemoryHealth | null>(null)
+const verifyingId = ref('')
 const dreams = ref<MemoryDream[]>([])
 const clarifications = ref<MemoryClarification[]>([])
 const costStatus = ref<CostGovernanceStatus | null>(null)
@@ -384,7 +483,7 @@ function toggleDream(id: string): void {
   expandedDreams.value = next
 }
 
-const loading = ref({ concepts: false, dreams: false, clarifications: false, status: false, ledger: false, constraints: false, retention: false, repairs: false })
+const loading = ref({ concepts: false, health: false, dreams: false, clarifications: false, status: false, ledger: false, constraints: false, retention: false })
 const errorMsg = ref('')
 const deletingId = ref('')
 const forgettingId = ref('')
@@ -412,21 +511,39 @@ interface RetentionCandidate {
   fidelity_state: string
   action: string
 }
-interface DreamRepairRow {
-  id: string
-  run_date: string
-  probe_count: number
-  hit_count: number
-  miss_count: number
-  repairs: string[]
-  hit_at_k_before: number | null
-  hit_at_k_after: number | null
-  cost_tokens: number
-}
 const constraints = ref<PinnedConstraint[]>([])
 const retentionPreview = ref<{ capacity: number; active: number; mode: string; loaded: boolean; candidates: RetentionCandidate[] }>(
   { capacity: 0, active: 0, mode: 'shadow', loaded: false, candidates: [] })
-const dreamRepairs = ref<DreamRepairRow[]>([])
+
+// 客户端分页（Dream/澄清/约束/保留淘汰）：与 MCP/热词/技能/设备 面板同口径
+// PAGE_SIZE=10 + PaginationBar；概念/台账走各自服务端翻页，不在此列（ADR D-20261112-mem-pagination）。
+const PAGE_SIZE = 10
+const dreamsPage = ref(1)
+const clarPage = ref(1)
+const constraintsPage = ref(1)
+const retentionPage = ref(1)
+
+// 后端上限（dreams min(limit,50)、clarifications min(limit,200)），用于「仅显示最近 N 条」披露
+const DREAM_CAP = 50
+const CLAR_CAP = 200
+const totalPages = (n: number) => calcTotalPages(n, PAGE_SIZE)
+const pageSlice = <T>(arr: T[], page: number) => calcPageSlice(arr, page, PAGE_SIZE)
+const dreamsPages = computed(() => totalPages(dreams.value.length))
+const clarPages = computed(() => totalPages(clarifications.value.length))
+const constraintsPages = computed(() => totalPages(constraints.value.length))
+const retentionPages = computed(() => totalPages(retentionPreview.value.candidates.length))
+const pagedDreams = computed(() => pageSlice(dreams.value, dreamsPage.value))
+const pagedClarifications = computed(() => pageSlice(clarifications.value, clarPage.value))
+const pagedConstraints = computed(() => pageSlice(constraints.value, constraintsPage.value))
+const pagedRetentionCandidates = computed(() => pageSlice(retentionPreview.value.candidates, retentionPage.value))
+// 命中后端上限 ⇒ 更早的记录不可达（客户端分页无法触达），显式披露避免「看起来完整」（评审 A6-I5）
+const dreamsTruncated = computed(() => dreams.value.length >= DREAM_CAP)
+const clarTruncated = computed(() => clarifications.value.length >= CLAR_CAP)
+// 数据变化后钳制页码（删除/重载/切筛选都可能缩短页数）
+watch(dreamsPages, (p) => { if (dreamsPage.value > p) dreamsPage.value = p })
+watch(clarPages, (p) => { if (clarPage.value > p) clarPage.value = p })
+watch(constraintsPages, (p) => { if (constraintsPage.value > p) constraintsPage.value = p })
+watch(retentionPages, (p) => { if (retentionPage.value > p) retentionPage.value = p })
 
 function trustLabel(t: string): string {
   return { user_stated: '用户陈述', user_authored: '用户笔记', agent_inferred: '助手推断', external: '外部内容' }[t] || t
@@ -438,6 +555,37 @@ function typeLabel(t: string): string {
 
 function statusLabel(s: string): string {
   return { active: '活跃', silent: '沉默', cold_forgotten: '冷遗忘', forgotten: '已遗忘' }[s] || s
+}
+
+function reasonLabel(r: string | null | undefined): string {
+  return {
+    merged: '历史版本',
+    retracted: '用户已否认',
+    source_lost: '来源已丢失',
+    forgotten: '用户已遗忘',
+    expired: '已过期',
+  }[r || ''] || (r || '')
+}
+
+function reasonTagClass(r: string | null | undefined): string {
+  return {
+    merged: 'history',
+    retracted: 'retracted',
+    source_lost: 'source-lost',
+    forgotten: 'forgotten',
+    expired: 'expired',
+  }[r || ''] || 'expired'
+}
+
+function validityText(c: MemoryConcept): string {
+  if (c.invalid_reason === 'merged') {
+    return `历史版本，已并入 ${c.superseded_by_name || '新版本'}`
+  }
+  return reasonLabel(c.invalid_reason)
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + '…' : s
 }
 
 function correctionLabel(t: string): string {
@@ -488,9 +636,15 @@ function tierSummary(t: Record<string, [string, number][]> | null): string {
 async function loadConcepts() {
   loading.value.concepts = true
   try {
-    const items = await memoryApi.getConcepts(conceptLimit.value)
+    const { items, total, activeTotal, historyTotal } = await memoryApi.getConcepts(conceptLimit.value, {
+      includeHistory: includeHistory.value,
+      verificationState: verificationFilter.value,
+    })
     concepts.value = items
-    conceptsExhausted.value = items.length < conceptLimit.value || conceptLimit.value >= CONCEPT_LIMIT_MAX
+    conceptsTotal.value = total
+    conceptsActiveTotal.value = activeTotal
+    conceptsHistoryTotal.value = historyTotal
+    conceptsExhausted.value = !dualShouldLoadMore(conceptPageState())
   } catch (e: any) {
     errorMsg.value = '概念加载失败：' + (e?.message || '未知错误')
   } finally {
@@ -498,15 +652,53 @@ async function loadConcepts() {
   }
 }
 
-function loadMoreConcepts() {
-  conceptLimit.value = Math.min(conceptLimit.value + CONCEPT_LIMIT_STEP, CONCEPT_LIMIT_MAX)
+function reloadConcepts() {
+  conceptLimit.value = CONCEPT_LIMIT_STEP
   loadConcepts()
+}
+
+async function handleVerify(c: MemoryConcept, action: 'confirm' | 'reject' | 'retry' | 'apply_correction') {
+  verifyingId.value = c.id
+  errorMsg.value = ''
+  try {
+    await memoryApi.verifyConcept(c.id, action)
+    await loadConcepts()
+    if (activeSubTab.value === 'health') await loadHealth()
+  } catch (e: any) {
+    errorMsg.value = '验证操作失败：' + (e?.response?.data?.detail || e?.message || '未知错误')
+  } finally {
+    verifyingId.value = ''
+  }
+}
+
+function loadMoreConcepts() {
+  // P1-19 + 评审修复：现行/历史双游标各自推进（合并列表的总 loaded 数做单
+  // offset 会让两段同时跳步漏行）；按 id 去重追加，不受 200 上限约束。
+  const { offset, historyOffset } = dualCursors(conceptPageState())
+  loading.value.concepts = true
+  memoryApi.getConcepts(conceptLimit.value, {
+    includeHistory: includeHistory.value,
+    verificationState: verificationFilter.value,
+    offset,
+    historyOffset,
+  }).then(({ items, total, activeTotal, historyTotal }) => {
+    concepts.value = mergePages(concepts.value, items)
+    conceptsTotal.value = total
+    conceptsActiveTotal.value = activeTotal
+    conceptsHistoryTotal.value = historyTotal
+    conceptsExhausted.value = items.length === 0 || !dualShouldLoadMore(conceptPageState())
+  }).catch((e: any) => {
+    errorMsg.value = '概念加载失败：' + (e?.message || '未知错误')
+  }).finally(() => {
+    loading.value.concepts = false
+  })
 }
 
 async function loadDreams() {
   loading.value.dreams = true
   try {
-    dreams.value = await memoryApi.getDreams()
+    // 拉满后端上限（50）再客户端分页；旧值 10 会让分页恒为单页
+    dreams.value = await memoryApi.getDreams(50)
   } catch (e: any) {
     errorMsg.value = 'Dream 加载失败：' + (e?.message || '未知错误')
   } finally {
@@ -517,11 +709,24 @@ async function loadDreams() {
 async function loadClarifications() {
   loading.value.clarifications = true
   try {
-    clarifications.value = await memoryApi.getClarifications()
+    // 拉满后端上限（200）再客户端分页
+    clarifications.value = await memoryApi.getClarifications(200)
   } catch (e: any) {
     errorMsg.value = '澄清记录加载失败：' + (e?.message || '未知错误')
   } finally {
     loading.value.clarifications = false
+  }
+}
+
+async function loadHealth() {
+  loading.value.health = true
+  errorMsg.value = ''
+  try {
+    health.value = await memoryApi.getHealth()
+  } catch (e: any) {
+    errorMsg.value = '健康度加载失败：' + (e?.message || '未知错误')
+  } finally {
+    loading.value.health = false
   }
 }
 
@@ -671,28 +876,18 @@ async function handleUndoRetention(id: string): Promise<void> {
   }
 }
 
-async function loadDreamRepairs(): Promise<void> {
-  loading.value.repairs = true
-  errorMsg.value = ''
-  try {
-    dreamRepairs.value = await memoryApi.getDreamRepairReports()
-  } catch (e: any) {
-    errorMsg.value = '加载修复报告失败：' + (e?.message || '未知错误')
-  } finally {
-    loading.value.repairs = false
-  }
-}
+watch([includeHistory, verificationFilter], () => reloadConcepts())
 
 watch(activeSubTab, (tab) => {
   errorMsg.value = ''
   if (tab === 'concepts' && !concepts.value.length) loadConcepts()
+  else if (tab === 'health') loadHealth()
   else if (tab === 'dreams' && !dreams.value.length) loadDreams()
   else if (tab === 'clarifications' && !clarifications.value.length) loadClarifications()
   else if (tab === 'status' && !costStatus.value) loadStatus()
   else if (tab === 'ledger' && !recallLog.value.length) loadRecallLog()
   else if (tab === 'constraints' && !constraints.value.length) loadConstraints()
   else if (tab === 'retention' && !retentionPreview.value.candidates.length && !retentionPreview.value.loaded) loadRetention()
-  else if (tab === 'repairs' && !dreamRepairs.value.length) loadDreamRepairs()
 })
 
 onMounted(loadConcepts)
@@ -729,12 +924,19 @@ onMounted(loadConcepts)
 
 .memory-subtabs {
   display: flex;
+  flex-wrap: nowrap;
   gap: 6px;
   border-bottom: 1px solid var(--panel-border);
   padding-bottom: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
 }
 
 .memory-subtab {
+  flex: 0 0 auto;
+  white-space: nowrap;
   padding: 6px 14px;
   border: none;
   background: transparent;
@@ -866,7 +1068,9 @@ onMounted(loadConcepts)
 .tag.silent { color: #6b7280; }
 .tag.cold { color: #6b7280; }
 .tag.expired { color: #6b7280; text-decoration: line-through; }
-.tag.legacy { color: #6b7280; }
+.tag.verified { color: #15803d; border-color: #15803d; }
+.tag.contradicted { color: #b91c1c; border-color: #b91c1c; }
+.tag.insufficient { color: #b45309; border-color: #b45309; }
 .tag.applied { color: #15803d; border-color: #15803d; }
 .tag.pending { color: #b45309; border-color: #b45309; }
 
@@ -1121,5 +1325,65 @@ onMounted(loadConcepts)
   font-size: 13px;
   color: var(--color-text);
   word-break: break-word;
+}
+
+/* 2026-11-08 validity / verify / health */
+.memory-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.memory-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-light);
+}
+
+.memory-select {
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+  background: var(--surface-panel-subtle);
+  color: var(--color-text);
+}
+
+.tag.history { color: var(--color-text-light); }
+.tag.retracted { color: var(--color-danger, #b91c1c); border-color: var(--color-danger, #b91c1c); }
+.tag.source-lost { color: var(--color-warning, #b45309); border-color: var(--color-warning, #b45309); }
+.tag.forgotten { color: var(--color-text-light); text-decoration: line-through; }
+.tag.review { color: var(--color-warning, #b45309); border-color: var(--color-warning, #b45309); }
+
+.verify-evidence,
+.verify-correction {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--panel-border);
+  border-radius: 8px;
+  background: var(--surface-panel-subtle);
+}
+
+.verify-evidence-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 4px;
+}
+
+.verify-quote {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text);
+  word-break: break-word;
+}
+
+.memory-delete-btn.verify {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
 }
 </style>

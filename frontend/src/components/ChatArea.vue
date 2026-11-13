@@ -18,6 +18,7 @@
         </svg>
         本轮 {{ formatContextTokens(chatStore.currentContextInfo.tokens) }} tokens
       </span>
+      <WorkspaceScopeChip />
       <button
         v-if="chatStore.currentConversationId && chatStore.currentMessages.length > 0 && !saveMode"
         class="header-save-note-btn"
@@ -520,6 +521,7 @@ import SubAgentStatus from './SubAgentStatus.vue'
 import TaskProgress from './TaskProgress.vue'
 import FileAttachmentComp from './FileAttachment.vue'
 import BackgroundTaskPanel from './BackgroundTaskPanel.vue'
+import WorkspaceScopeChip from '@/components/WorkspaceScopeChip.vue'
 import ConversationTimeline from './ConversationTimeline.vue'
 import LogoIcon from './LogoIcon.vue'
 import ExportProgressDialog from './ExportProgressDialog.vue'
@@ -1776,11 +1778,7 @@ watch(
   max-width: 70%;
 }
 
-@media (max-width: 480px) {
-  .streaming-message .content {
-    max-width: 85%;
-  }
-}
+
 
 .reasoning-block {
   margin-bottom: 8px;
@@ -2540,6 +2538,22 @@ watch(
 
   .streaming-message {
     padding: 8px 12px;
+  }
+
+  /* 手机端：流式 agent 回复不再保留头像占位，内容占满横向空间 */
+  .streaming-message .avatar {
+    display: none;
+  }
+  .streaming-message .content {
+    max-width: 100%;
+  }
+
+  /* 手机端：盘问气泡同样去掉头像占位 */
+  .grilling-bubble-avatar {
+    display: none;
+  }
+  .grilling-bubble-content {
+    max-width: 100%;
   }
 
 .grilling-answer-submit-btn {

@@ -342,7 +342,8 @@ async def _stop_guard_hook(ctx: hook_service.StopContext) -> Optional[hook_servi
         from app.services.vibeweaver_gate_service import resolve_session_root
 
         key = ctx.conversation_id or ctx.session_id or ""
-        root = resolve_session_root(ctx.workspace_path, key)
+        root = resolve_session_root(ctx.workspace_path, key,
+                                    scope_ctx=getattr(ctx, "workspace_ctx", None))
         if root is None:
             return None
         a_tail = (ctx.assistant_content or "")[-_TAIL_SCAN:]

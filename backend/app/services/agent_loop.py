@@ -43,6 +43,7 @@ _PARALLEL_SAFE_TOOLS: Set[str] = {
     "web_search",
     "browser",
     "memory",
+    "memory_search",
     "context7_resolve_library_id",
     "context7_query_docs",
     "workspace_read",
@@ -770,7 +771,7 @@ def _draft_ships_as_final(live: bool, enable_reasoning: bool, retry_thinking_off
 # and keep notes). Undeclared → full registry (default, opt-in-by-absence).
 _DM_STEP_TOOL_CORE = frozenset({
     "workspace_read", "workspace_write", "workspace_glob", "execute_code",
-    "calculate", "memory", "notes", "provide_file", "word_count",
+    "calculate", "memory", "memory_search", "notes", "provide_file", "word_count",
     # 引用格式波（2026-09-27 A4.9 ②）：论文完稿工具必须在步骤核心集内，
     # 否则步骤 tools 子集 fail-closed 会拒绝通稿「必须调用」的 citation_render。
     "citation_render",
@@ -2882,7 +2883,7 @@ async def _load_full_tool_result(
 
 
 _AUDIT_GROUNDING_TOOLS = frozenset({
-    "memory", "workspace_read", "web_search", "browser", "workspace_glob",
+    "memory", "memory_search", "workspace_read", "web_search", "browser", "workspace_glob",
     # NPG (2026-09-02, conv 83d97ede): computed outputs are the canonical
     # numeric ground truth — the auditor template says the ONLY legal basis
     # for numeric rejections is visible execute_code/calculate/terminal
@@ -3986,6 +3987,7 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
         max_iterations: int = None,
         workspace_path: str = "",
+        workspace_ctx=None,
         enabled_toolsets: Optional[List[str]] = None,
         enable_compression: bool = False,
         blocked_tools: Optional[Set[str]] = None,
@@ -4211,6 +4213,10 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
         self.max_empty_answer_retries = config.agent_tool_loop_max_empty_answer_retries
         self.max_force_stage_rounds = config.agent_tool_loop_max_force_stage_rounds
         self.workspace_path = workspace_path
+        # 任务作用域（2026-11-10）：单次 run 冻结的 WorkspaceContext；None = legacy/off。
+        # 与 workspace_path 并存：off/shadow 档继续用 workspace_path，enforce 档由
+        # workspace_ctx 决定工具根，缺 context 时各工具 fail closed（不回用户根）。
+        self.workspace_ctx = workspace_ctx
         # C3: first judge evaluation of a run counts as the user-initiated
         # turn (does not consume the deathmatch max_turns budget). chat.py
         # constructs one AgentLoop per user message and run() is called once,
@@ -4373,6 +4379,7 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
                     conversation_id=str(getattr(conversation, "id", "") or ""),
                     user_id=str(getattr(user, "id", "") or ""),
                     workspace_path=self.workspace_path or "",
+                    workspace_ctx=getattr(self, "workspace_ctx", None),
                     assistant_content=assistant_content or "",
                     vibeweaver_active=self.vibeweaver_active,
                     iterations=state.iterations,
@@ -6473,6 +6480,16 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
                 await event_queue.put(None)
 
         cancelled = asyncio.Event()
+        # P1a（2026-11-09，spec §4.1/§4.3）：图片 blob 物化的授权与告警上下文。
+        # run() 是 chat / worker / scheduler / delegate_task 四条 AgentLoop 构造
+        # 路径的唯一必经点，且四处都已显式传 user_id ⇒ owner 校验有唯一装配点。
+        # producer_task 在本行之后创建 ⇒ 继承本上下文（LLM 调用全在 producer 侧）。
+        from app.services import image_blob_context as _image_blob_ctx
+
+        _ib_ctx_tokens = _image_blob_ctx.set_run_context(
+            user_id=getattr(user, "id", None) or self.user_id,
+            session_key=getattr(conversation, "id", None),
+        )
         keepalive_task = asyncio.create_task(_keepalive(cancelled))
         producer_task = asyncio.create_task(_produce())
 
@@ -6485,6 +6502,10 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
         finally:
             cancelled.set()
             state.cancelled = True
+            try:
+                _image_blob_ctx.clear_run_context(_ib_ctx_tokens)
+            except Exception:
+                pass
             keepalive_task.cancel()
             try:
                 from app.services.vibeweaver_audit_service import unregister_run as _lg_unregister
@@ -7508,6 +7529,7 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
                 conversation_id=str(getattr(conversation, "id", "") or ""),
                 user_id=str(getattr(user, "id", "") or ""),
                 workspace_path=self.workspace_path or "",
+                workspace_ctx=getattr(self, "workspace_ctx", None),
                 vibeweaver_active=self.vibeweaver_active,
                 turn_key=f"iter-{state.iterations}",
             )

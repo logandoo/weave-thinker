@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db, User, Notebook, Note
@@ -39,6 +39,29 @@ _IMAGE_EXT_BY_MIME = {
     "image/svg+xml": ".svg",
     "image/bmp": ".bmp",
 }
+
+
+async def _stream_save_to_path(upload: UploadFile, target: Path,
+                               max_size: int = MAX_FILE_SIZE) -> tuple[str, int]:
+    """把上传字节流式写到**指定文件路径**（staging lease 的锚点路径）。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    try:
+        with open(target, "wb") as f:
+            while True:
+                chunk = await upload.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_size:
+                    raise ValueError(
+                        f"文件过大 ({total // (1024 * 1024)}MB)，"
+                        f"最大支持 {max_size // (1024 * 1024)}MB")
+                f.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return str(target), total
 
 
 def _write_temp_file(suffix: str, content: bytes) -> str:
@@ -78,12 +101,17 @@ async def _stream_save_uploaded_file(
     filename: str,
     workspace_root: str | Path,
     max_size: int = MAX_FILE_SIZE,
+    subdir: str = "uploads",
 ) -> tuple[str, int]:
-    """Stream an upload directly to disk without loading it into memory."""
+    """Stream an upload directly to disk without loading it into memory.
+
+    `subdir` 默认 `uploads`（legacy 根）；作用域目标（Task inputs/staging）传 ""，
+    文件直接落在给定目录里，不再叠一层 uploads/。
+    """
     safe_name = _sanitize_filename(filename)
     ext = Path(safe_name).suffix.lower() or ".bin"
     unique_name = f"{uuid.uuid4().hex}_{safe_name}"
-    uploads_dir = Path(workspace_root) / "uploads"
+    uploads_dir = (Path(workspace_root) / subdir) if subdir else Path(workspace_root)
     await asyncio.to_thread(uploads_dir.mkdir, parents=True, exist_ok=True)
     file_path = uploads_dir / unique_name
 
@@ -245,6 +273,12 @@ async def upload_and_parse_files(
     files: list[UploadFile] = File(...),
     save_to_notebook: bool = False,
     notebook_id: str | None = None,
+    conversation_id: str | None = Form(None),
+    task_id: str | None = Form(None),
+    expected_binding_version: int | None = Form(None),
+    run_id: str | None = Form(None),
+    attempt_id: str | None = Form(None),
+    lease_epoch: int | None = Form(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -267,6 +301,68 @@ async def upload_and_parse_files(
     )
     workspace_root = str(Path(workspace.root_path).resolve())
 
+    # 任务作用域（§10 上传）：enforce 下 scoped 会话的上传只能进当前 Task。
+    # run 身份由**服务端**按会话活跃 run 推导（客户端字段只是断言，不符即 409）：
+    # 有活跃 run → writer lease 校验后落 `workspace/inputs/`；
+    # 无活跃 run（含首条消息前）→ 先确定绑定（新会话按 §6.1 解析进收件箱空 Task），
+    # 每个文件一张 staging lease，字节落 lease 锚定路径，首 run 激活时自动交接为
+    # inputs——不产生无 lease 的不可追踪文件。legacy 会话保持原 uploads/ 路径。
+    from app.services import workspace_scope as _ws
+    from app.services import workspace_scope_service as _wss
+
+    _upload_target_root: str | None = None
+    _staging_view = None
+    _staging_prefix = ""
+    _task_rel_root: str | None = None
+    if _wss.scoping_mode() == "enforce" and conversation_id:
+        from app.db.database import Conversation as _Conv
+        from app.services import task_binding_service as _tbs
+        from app.services import workspace_artifact_service as _arts
+        from app.services import workspace_run_service as _yrs
+        from app.services import workspace_task_service as _svc
+        from app.services.workspace_scope import build_binding_view as _build_view
+
+        _conv = await db.get(_Conv, str(conversation_id))
+        if _conv is None or str(_conv.user_id) != str(current_user.id):
+            raise HTTPException(status_code=404, detail={"error": "conversation not found"})
+        _binding = await _tbs.get_binding(db, user_id=current_user.id,
+                                          conversation_id=str(conversation_id))
+        if _binding is None:
+            _res = await _tbs.TaskBindingService.resolve(
+                db, user_id=current_user.id, user_root=workspace_root, conversation=_conv)
+            _binding = _res.binding
+            await db.commit()
+        if task_id and str(_binding.task_id) != str(task_id):
+            raise HTTPException(status_code=409, detail={
+                "error": "上传的 task_id 与会话当前绑定不一致", "code": _ws.CODE_BINDING_STALE})
+        if expected_binding_version is not None and \
+                int(expected_binding_version) != int(_binding.binding_version):
+            raise HTTPException(status_code=409, detail={
+                "error": "绑定已变更，请重试上传", "code": _ws.CODE_BINDING_STALE})
+        _task = await _svc.get_task(db, user_id=current_user.id, task_id=str(_binding.task_id))
+        if _task is None:
+            raise HTTPException(status_code=404, detail={"error": "task not found"})
+        _task_rel_root = f"{_task.root_rel}/workspace"
+        _active = await _yrs.active_run_for(db, conversation_id=str(conversation_id))
+        if _active is not None:
+            _ctx = await _yrs.load_run_context(
+                db, user_id=current_user.id, user_root=workspace_root, run_id=str(_active.id))
+            if run_id or attempt_id or lease_epoch is not None:
+                if (str(_ctx.run_id) != str(run_id or "")
+                        or _ctx.attempt_id != str(attempt_id or "")
+                        or _ctx.lease_epoch != int(lease_epoch or -1)):
+                    raise HTTPException(status_code=409, detail={
+                        "error": "attempt/epoch 已更替，stale writer 的字节不得进入稳定 root",
+                        "code": _ws.CODE_ATTEMPT_STALE})
+            _upload_target_root = str(_ctx.write_root / "inputs")
+        else:
+            _project = await _svc.get_project(db, user_id=current_user.id,
+                                              project_id=_task.project_id)
+            _staging_view = _build_view(user_id=current_user.id, user_root=workspace_root,
+                                        project=_project, task=_task, binding=_binding,
+                                        conversation_id=str(conversation_id))
+            _upload_target_root = str(_staging_view.staging_root)
+
     max_size_mb = MAX_FILE_SIZE // (1024 * 1024)
     results: list[FileParseResult] = []
 
@@ -275,16 +371,34 @@ async def upload_and_parse_files(
         for upload in files:
             filename = upload.filename or "unknown"
             try:
-                file_path, size = await _stream_save_uploaded_file(
-                    upload, filename, workspace_root
-                )
+                if _staging_view is not None:
+                    # 每文件一张 staging lease：字节只落在 lease 锚定路径上，
+                    # 没有 lease 行的 staging 文件是不被允许的（sweep 无法追踪）。
+                    from app.services import workspace_artifact_service as _arts
+
+                    _lease = await _arts.issue_staging_lease(db, view=_staging_view,
+                                                             filename_hint=filename)
+                    await db.commit()
+                    file_path, size = await _stream_save_to_path(upload, Path(_lease.path))
+                else:
+                    file_path, size = await _stream_save_uploaded_file(
+                        upload, filename, _upload_target_root or workspace_root,
+                        subdir="" if _upload_target_root else "uploads",
+                    )
                 ext = os.path.splitext(filename)[1].lower()
                 rel_path = os.path.relpath(file_path, workspace_root).replace(os.sep, "/")
+                _display = None
+                if _task_rel_root:
+                    # agent 侧按 Task 根解析：inputs 直传即 inputs/<name>；
+                    # staging 附件按首 run 激活后的交接位置 inputs/<lease 文件名> 引用。
+                    _leaf = Path(file_path).name
+                    _display = f"inputs/{_leaf}"
                 results.append(FileParseResult(
                     success=True,
                     filename=filename,
                     file_path=file_path,
                     rel_path=rel_path,
+                    display_path=_display,
                     size=size,
                     file_type=ext.lstrip(".") or "bin",
                 ))

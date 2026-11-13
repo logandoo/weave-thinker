@@ -209,6 +209,8 @@
             @compositionend="onCompositionEnd"
             @paste="onPaste"
             @click="onEditorClick"
+            @mousedown="onEditorMouseDown"
+            @mouseup="onEditorMouseUp"
           ></div>
         </div>
 
@@ -1271,6 +1273,136 @@ function onEditorClick(e: MouseEvent) {
   ensureTrailingLineAnchor()
 }
 
+// ── 笔记芯片与鼠标选区（2026-11-11 报障修复）───────────────────────────────
+// .note-tag 是 contenteditable=false 的原子芯片。用鼠标从正文拖拽、最终停在芯片
+// 上方松开时，Chromium 会把选区的**两端**都吸进芯片内部（实测 selectionchange 序列：
+// 端点先落在芯片文本节点、选中「测试×」，再塌成折叠选区）——原始正文锚点被浏览器丢
+// 弃，所以「实时钳位」救不回来（两端都在芯片里时钳完必塌）。正确做法：mousedown 记下
+// 正文按下锚点，mouseup 若发现选区被原子芯片吞掉（折叠或端点在芯片内），用「锚点 +
+// 松开点的可编辑光标（落进芯片则钳到芯片朝向锚点一侧的边）」重建非折叠选区。普通选字
+// 与非芯片拖拽一律不动；点芯片预览/删除（按下即落在芯片上）不记锚点，交互不受影响。
+function _nonEditableBoundaryHost(container: Node | null): HTMLElement | null {
+  if (!container) return null
+  const el = container.nodeType === Node.TEXT_NODE
+    ? container.parentElement
+    : (container as HTMLElement)
+  if (!el) return null
+  const host = el.closest<HTMLElement>('[contenteditable="false"]')
+  const ed = editorRef.value
+  if (host && ed && host !== ed && ed.contains(host)) return host
+  return null
+}
+
+// 命中测试：屏幕坐标处的可编辑光标位置（caretRangeFromPoint 为 Chromium 专有）。
+function _caretAtPoint(x: number, y: number): { node: Node; offset: number } | null {
+  const doc = document as any
+  let r: Range | null = null
+  if (typeof doc.caretRangeFromPoint === 'function') {
+    r = doc.caretRangeFromPoint(x, y)
+  } else if (typeof doc.caretPositionFromPoint === 'function') {
+    const p = doc.caretPositionFromPoint(x, y)
+    if (p) {
+      r = document.createRange()
+      r.setStart(p.offsetNode, p.offset)
+      r.collapse(true)
+    }
+  }
+  if (!r) return null
+  return { node: r.startContainer, offset: r.startOffset }
+}
+
+// 点在文档序上相对另一位置的先后（<0：a 在 b 前）。
+function _cmpPos(an: Node, ao: number, bn: Node, bo: number): number {
+  const r = document.createRange()
+  r.setStart(an, ao)
+  r.collapse(true)
+  const c = r.comparePoint(bn, bo) // 1=b 在 a 后 → a<b；-1=b 在 a 前 → a>b；0=同点
+  return c === 0 ? 0 : (c > 0 ? -1 : 1)
+}
+
+// 把落在不可编辑芯片内的端点钳到芯片朝向 anchor 一侧的相邻可编辑位置。
+function _clampIslandEdge(
+  host: HTMLElement,
+  anchorNode: Node,
+  anchorOffset: number,
+): { node: Node; offset: number } {
+  const ed = editorRef.value!
+  const parent = host.parentElement || ed
+  const idx = Array.prototype.indexOf.call(parent.childNodes, host)
+  const atBefore = document.createRange()
+  atBefore.setStart(parent, idx)
+  atBefore.collapse(true)
+  const anchorAfter = atBefore.comparePoint(anchorNode, anchorOffset) > 0
+  return { node: parent, offset: anchorAfter ? idx + 1 : idx }
+}
+
+let dragStartAnchor: { node: Node; offset: number } | null = null
+
+function onEditorMouseDown(e: MouseEvent) {
+  const ed = editorRef.value
+  const target = e.target as HTMLElement
+  // 只接管编辑器内的左键拖拽；按下点本身在芯片上（预览 / × 删除）→ 不记锚点，交给 onEditorClick。
+  if (!ed || e.button !== 0 || target.closest('[contenteditable="false"]')) {
+    dragStartAnchor = null
+    return
+  }
+  const c = _caretAtPoint(e.clientX, e.clientY)
+  // 锚点必须落在编辑器内、且不在芯片里（caretRangeFromPoint 理论上可命中芯片内部 → 排除）
+  const inEditor = !!c && ed.contains(c.node.nodeType === Node.TEXT_NODE ? c.node : (c.node as HTMLElement))
+  dragStartAnchor = inEditor && c && !_nonEditableBoundaryHost(c.node) ? c : null
+}
+
+function onEditorMouseUp(e: MouseEvent) {
+  const anchor = dragStartAnchor
+  dragStartAnchor = null
+  const ed = editorRef.value
+  if (!ed || !anchor) return
+  // 锚点可能在拖拽期间被 ASR 流式写入 / 插话回填的 textContent 重建干掉 → 已脱离编辑器则放弃重建
+  if (!ed.contains(anchor.node.nodeType === Node.TEXT_NODE ? anchor.node : (anchor.node as HTMLElement))) return
+  const sel = window.getSelection()
+  if (!sel) return
+  const r = sel.rangeCount ? sel.getRangeAt(0) : null
+  const startHost = r ? _nonEditableBoundaryHost(r.startContainer) : null
+  const endHost = r ? _nonEditableBoundaryHost(r.endContainer) : null
+  const hijacked = !!(startHost || endHost)
+  const collapsed = !r || r.collapsed
+  // 原生选区已健全（非折叠且两端都不在芯片内）→ 不打扰：避免在「会把原子芯片并入选区」的
+  // 浏览器上把用户选区改窄（评审 A3-I3）。只有被吞/塌了才重建。
+  if (!hijacked && !collapsed) return
+  // 芯片来源优先取被吞的选区端点（松开点落在芯片外几像素时 elementFromPoint 会漏判），再退回命中点。
+  const under = document.elementFromPoint(e.clientX, e.clientY)
+  const host = startHost || endHost || (under ? _nonEditableBoundaryHost(under) : null)
+  if (!host) return
+  const nr = document.createRange()
+  try {
+    const end = _clampIslandEdge(host, anchor.node, anchor.offset)
+    if (_cmpPos(end.node, end.offset, anchor.node, anchor.offset) < 0) {
+      nr.setStart(end.node, end.offset)
+      nr.setEnd(anchor.node, anchor.offset)
+    } else {
+      nr.setStart(anchor.node, anchor.offset)
+      nr.setEnd(end.node, end.offset)
+    }
+  } catch {
+    return
+  }
+  if (nr.collapsed) return
+  // 浏览器 mouseup 的默认选区收尾在事件之后落地，同步 setSelection 会被它覆盖
+  // （实测间歇性把选区重新吞回芯片）→ 用宏任务把重建放到浏览器收尾之后。
+  setTimeout(() => {
+    const s2 = window.getSelection()
+    if (!s2 || !ed.isConnected) return
+    s2.removeAllRanges()
+    s2.addRange(nr)
+  }, 0)
+}
+
+// 拖拽在编辑器外松开（工具栏/文件列表/窗口外）时 @mouseup 不触发，锚点会滞留并
+// 劫持下一次无关的 mouseup → 用 document 级 mouseup 兜底清除（编辑器内 mouseup 已先消费）。
+function clearDragAnchor(): void {
+  dragStartAnchor = null
+}
+
 async function onMicClick() {
   if (isProcessing.value || chatStore.isStreamingCurrentConversation) return
   asrBaseText = getEditorText()
@@ -1457,7 +1589,7 @@ async function handleSend() {
               ? `${(f.size / 1024).toFixed(1)} KB`
               : `${(f.size / 1048576).toFixed(1)} MB`
           : '未知'
-        fullContent += `[file-ref:${f.filename}]\n工作区路径: ${f.rel_path || f.file_path}\n文件类型: ${f.file_type || 'unknown'}\n文件大小: ${sizeStr}\n[/file-ref]\n\n`
+        fullContent += `[file-ref:${f.filename}]\n工作区路径: ${f.display_path || f.rel_path || f.file_path}\n文件类型: ${f.file_type || 'unknown'}\n文件大小: ${sizeStr}\n[/file-ref]\n\n`
       }
     }
   }
@@ -1557,7 +1689,10 @@ async function uploadIncomingFiles(files: File[]) {
   ]
   const controller = uploadStore.startUpload()
   try {
-    const response = await fileUploadApi.uploadFiles(ordered, false, undefined, undefined, controller.signal)
+    const response = await fileUploadApi.uploadFiles(
+      ordered, false, undefined, undefined, controller.signal,
+      chatStore.currentConversationId ? { conversationId: chatStore.currentConversationId } : undefined,
+    )
     const successful = response.results.filter(r => r.success && r.file_path)
     if (successful.length > 0) {
       uploadStore.addFiles(successful)
@@ -1973,6 +2108,7 @@ function onEditorEscape() {
 onMounted(() => {
   document.addEventListener('keydown', handleKeyDown)
     document.addEventListener('click', handleOutsideClick)
+  document.addEventListener('mouseup', clearDragAnchor)
   chatStore.loadModels() // 模型别名能力表（思考菜单驱动），懒加载一次
   // G7：新会话起点来自用户默认，而非上一会话残留；设备可用性同时核验。
   // execUserSelected 护栏：恢复在途时显式选择不得被晚到结果覆盖。
@@ -2004,6 +2140,7 @@ onMounted(() => {
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeyDown)
     document.removeEventListener('click', handleOutsideClick)
+  document.removeEventListener('mouseup', clearDragAnchor)
   document.body.classList.remove('voice-mode-active')
   removeDocTouchListeners()
   if (isRecording.value || isProcessing.value) {
@@ -2079,7 +2216,7 @@ defineExpose({ setEditContent })
 <style scoped>
 .chat-input-wrapper {
   flex-shrink: 0;
-  padding: 12px 20px calc(16px + env(safe-area-inset-bottom, 0));
+  padding: 12px 20px calc(16px + var(--safe-bottom));
   background: transparent;
   display: flex;
   flex-direction: column;
@@ -3485,7 +3622,7 @@ defineExpose({ setEditContent })
 
 /* Visual refresh overrides */
 .chat-input-wrapper {
-  padding: 12px 20px calc(10px + env(safe-area-inset-bottom, 0));
+  padding: 12px 20px calc(10px + var(--safe-bottom));
   background: transparent;
 }
 

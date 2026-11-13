@@ -161,12 +161,97 @@ def recent_project_root(key: str) -> Optional[Path]:
     return root
 
 
+_PENDING_HASH: "OrderedDict[tuple[str, str], tuple[str, Optional[str]]]" = None
+
+
+def scoped_vibeweaver_root(scope_ctx: Any) -> Optional[Path]:
+    """双根协议（DESIGN_20261108 §5.1）：证据域 = 当前 attempt root。
+
+    不是用户根，也不是共享 run 根——两个同根 Task 的 acceptance / working note /
+    gate state 因此天然不串。
+    """
+    root = getattr(scope_ctx, "vibeweaver_root", None)
+    return Path(root) if root else None
+
+
+def scoped_write_root(scope_ctx: Any) -> Optional[Path]:
+    root = getattr(scope_ctx, "write_root", None)
+    return Path(root) if root else None
+
+
+def enforce_without_dual_root(ctx: Any) -> bool:
+    """enforce 档缺双根 context → 拒绝启用门禁，而不是静默降级成无门禁。"""
+    try:
+        from app.services.workspace_scope_service import scoping_mode
+
+        return scoping_mode() == "enforce" and getattr(ctx, "workspace_ctx", None) is None
+    except Exception:
+        return False
+
+
+def _hash_before(scope_ctx: Any, file_path: Optional[str]) -> None:
+    """tool.before 记写入前哈希，after 阶段写 change manifest 用。"""
+    global _PENDING_HASH
+    if _PENDING_HASH is None:
+        from collections import OrderedDict
+
+        _PENDING_HASH = OrderedDict()
+    attempt_id = str(getattr(scope_ctx, "attempt_id", "") or "")
+    if not attempt_id or not file_path:
+        return
+    try:
+        path = Path(file_path).expanduser()
+        if not path.is_absolute():
+            write_root = scoped_write_root(scope_ctx)
+            path = (write_root / path) if write_root else path
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    except OSError:
+        digest = None
+    _PENDING_HASH[(attempt_id, str(file_path))] = (digest, attempt_id)
+    while len(_PENDING_HASH) > 512:
+        _PENDING_HASH.popitem(last=False)
+
+
+def _take_before_hash(scope_ctx: Any, file_path: Optional[str]) -> Optional[str]:
+    attempt_id = str(getattr(scope_ctx, "attempt_id", "") or "")
+    entry = (_PENDING_HASH or {}).pop((attempt_id, str(file_path)), None)
+    return entry[0] if entry else None
+
+
+def _record_task_change(scope_ctx: Any, file_path: Optional[str]) -> None:
+    """任务文件副作用 → attempt root 的 workspace_change_manifest（§5.1）。"""
+    if scope_ctx is None or not file_path:
+        return
+    write_root = scoped_write_root(scope_ctx)
+    if write_root is None:
+        return
+    try:
+        target = Path(file_path).expanduser()
+        target = target if target.is_absolute() else (write_root / target)
+        target.resolve().relative_to(write_root.resolve())
+    except (OSError, ValueError, RuntimeError):
+        return
+    try:
+        from app.services import workspace_artifact_service as arts
+
+        before = _take_before_hash(scope_ctx, file_path)
+        after = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else None
+        arts.append_change(scope_ctx, path=arts.ws.os_relpath(target, scope_ctx.user_root),
+                           before_hash=before, after_hash=after, operation="tool_write")
+    except Exception:
+        logger.debug("workspace change manifest skipped", exc_info=True)
+
+
 def resolve_session_root(
     workspace_path: Optional[str],
     key: str,
     starts: Optional[List[Optional[str]]] = None,
     prefer_hints: bool = False,
+    scope_ctx: Any = None,
 ) -> Optional[Path]:
+    scoped = scoped_vibeweaver_root(scope_ctx)
+    if scoped is not None:
+        return scoped
     """会话项目根解析（W12；评审修复：hint 优先）。
 
     - ``prefer_hints=True``（tool 调用，带写入文件路径提示）：按提示路径在 bound
@@ -962,13 +1047,20 @@ async def _tool_before_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_
     except Exception:
         return None
     key = ctx.conversation_id or ctx.session_id
+    scope_ctx = getattr(ctx, "workspace_ctx", None)
     if ctx.tool_name in _GATED_TOOLS:
         file_path = (ctx.args or {}).get("file_path") or (ctx.args or {}).get("path")
+        if enforce_without_dual_root(ctx):
+            return hook_service.HookDecision(
+                block="GATE-BLOCKED (vibeweaver dual root): [workspace.task_scoping] mode=enforce "
+                      "时缺少 write_root/vibeweaver_root 双根上下文，拒绝以无门禁方式继续写任务文件。")
+        _hash_before(scope_ctx, file_path)
         root = resolve_session_root(
             ctx.workspace_path,
             key,
             starts=[file_path],
             prefer_hints=True,
+            scope_ctx=scope_ctx,
         )
         if root is None:
             return None
@@ -983,7 +1075,7 @@ async def _tool_before_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_
         return hook_service.HookDecision(block=block) if block else None
     if ctx.tool_name in ("terminal", "process"):
         command = str((ctx.args or {}).get("command") or "")
-        root = resolve_session_root(ctx.workspace_path, key)
+        root = resolve_session_root(ctx.workspace_path, key, scope_ctx=scope_ctx)
         if root is None or not command:
             return None
         block = risk_command_block(root, command) or destructive_block(root, command)
@@ -998,17 +1090,24 @@ async def _tool_after_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_s
     if ctx.tool_name not in _GATED_TOOLS:
         return None
     key = ctx.conversation_id or ctx.session_id
-    # 评审修复：tool 调用必须按本次写入路径归属裁决（hint 优先于注册表），
-    # 否则 A 项目先被触达后，写 B 项目会被按 A 的证据/封禁误判。
+    scope_ctx = getattr(ctx, "workspace_ctx", None)
+    if enforce_without_dual_root(ctx):
+        return hook_service.HookDecision(
+            block="GATE-BLOCKED (vibeweaver dual root): enforce 档缺少双根上下文，"
+                  "任务文件写入不能被记为已门禁评审。")
+    # 双根下 checker/证据在 attempt root，稳定 Task 文件的合法性按 write_root 判定；
+    # 不能因文件位于 attempt 外而跳过 gate（§5.1）。
     root = resolve_session_root(
         ctx.workspace_path,
         key,
         starts=[(ctx.args or {}).get("file_path"), (ctx.args or {}).get("path")],
         prefer_hints=True,
+        scope_ctx=scope_ctx,
     )
     if root is None:
         return None
     file_path = (ctx.args or {}).get("file_path") or (ctx.args or {}).get("path")
+    _record_task_change(scope_ctx, file_path)
     from app.services import vibeweaver_delivery_service as _delivery
 
     out = await gate_check_write_async(root, file_path)
@@ -1048,7 +1147,8 @@ async def _stop_hook(ctx: hook_service.StopContext) -> Optional[hook_service.Sto
     """stop 语义：证据红 → 拦下收尾 + 纠正反馈续跑（预算由 hook_service 执行）。"""
     if not ctx.vibeweaver_active:
         return None  # W17 轮次门控：非激活轮不拦收尾
-    root = resolve_session_root(ctx.workspace_path, ctx.conversation_id or ctx.session_id)
+    root = resolve_session_root(ctx.workspace_path, ctx.conversation_id or ctx.session_id,
+                                scope_ctx=getattr(ctx, "workspace_ctx", None))
     if root is None:
         return None
     out = await gate_idle_check_async(root)

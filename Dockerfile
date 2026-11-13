@@ -98,6 +98,8 @@ RUN mkdir -p /app/user_workspaces \
              /app/backend/tma_checkpoints \
              /app/backend/skins_custom \
              /app/backend/Fonts \
+             /app/data/image_blobs \
+    && chmod 700 /app/data/image_blobs \
     && chmod +x /app/docker/entrypoint.sh \
     && useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app \

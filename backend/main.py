@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import os
 import re
+import secrets
 import signal
 import sys
 import asyncio
@@ -19,7 +20,7 @@ logging.basicConfig(
 
 from app.api import chat, conversation, auth, assistant, asr, admin, sessions, notes, scheduled_tasks, files, agent_tasks, export_tasks, file_upload, image_upload, models as models_api, skills, voice, system, memory as memory_api, skins as skins_api, user_settings, sync as sync_api, citations as citations_api, server_admin
 from app.db.database import init_db, AsyncSessionLocal
-from app.core.config import get_config, clear_config_cache, production_security_errors
+from app.core.config import get_config, clear_config_cache, production_security_errors, security_config_warnings
 from app.services.agent_scheduler import agent_scheduler
 from app.services.agent_worker import agent_worker
 from app.services.export_worker import export_worker
@@ -73,9 +74,11 @@ app.include_router(chat.router)
 app.include_router(conversation.router)
 app.include_router(server_admin.router)
 from app.api import message_payloads as message_payloads_api
+from app.api import workspace as workspace_api
 from app.api import mcp as mcp_api
 app.include_router(message_payloads_api.router)
 app.include_router(mcp_api.router)
+app.include_router(workspace_api.router)
 app.include_router(assistant.router)
 app.include_router(asr.router)
 app.include_router(admin.router)
@@ -177,6 +180,11 @@ async def startup_event():
     _prod_errors = production_security_errors(config)
     if _prod_errors:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(_prod_errors))
+    # 2026-11-11 补救清单 #3（AUDIT_20261111 §3 M-2）：安全门开关被严格解析纠正或
+    # 拒绝时，启动日志必须点名——否则 `registration_open = "false"` 这类笔误会让
+    # 站点静默保持开放注册，运维却以为已经关掉。
+    for _sec_warn in security_config_warnings(config):
+        logger.warning("SECURITY CONFIG: %s", _sec_warn)
     if config.super_admin_bypass and not os.environ.get("WT_ENV"):
         logger.warning(
             "SECURITY: super_admin_bypass=true is active with WT_ENV unset. "
@@ -450,11 +458,51 @@ index_path = os.path.join(static_dir, "index.html")
 
 @app.post("/api/admin/reload-config")
 async def reload_config(request: Request):
-    if request.headers.get("x-admin-secret") != config.security_jwt_secret_key:
-        from fastapi import HTTPException, status
+    """重载配置（2026-11-11 补救 #5a）：独立密钥 + 恒定时间比较 + 真正重载模型注册表。
+
+    此前用 `x-admin-secret != [security].jwt_secret_key` 做校验——一密两用（JWT 签名
+    密钥兼作管理口令）且非恒定时间比较；且只清配置缓存、**不**重载模型注册表
+    （2026-09-04 审计「三条热重载链路全断」的遗留项）。
+
+    未配置 `[security] admin_reload_secret` 时端点 fail-closed（403），不复用 JWT 密钥。
+    """
+    from fastapi import HTTPException, status
+
+    expected = str(get_config().security.get("admin_reload_secret", "") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="reload-config 未启用：请在 config.toml [security] 配置独立的 admin_reload_secret",
+        )
+    supplied = request.headers.get("x-admin-secret", "") or ""
+    if not secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    # 先验证新配置能解析，再清缓存：否则一个畸形的 config.toml 会让全站 get_config()
+    # 抛错（评审 C Important）。校验失败时旧缓存原样保留，服务继续可用。
+    from app.core.config import Config
+
+    try:
+        Config()
+    except Exception as exc:  # noqa: BLE001 — 必须让运维看见具体解析错误
+        logger.error("reload-config: 新配置无法解析，已保留旧配置: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"新配置无法解析，已保留旧配置：{exc}",
+        )
+
     clear_config_cache()
-    return {"status": "ok"}
+    try:
+        from app.model_gateway.registry import reload_model_registry
+
+        reload_model_registry()
+    except Exception as exc:  # noqa: BLE001 — 重载失败必须让运维看见，不能静默
+        logger.error("reload-config: 模型注册表重载失败: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"配置缓存已清，但模型注册表重载失败（旧注册表已保留）：{exc}",
+        )
+    return {"status": "ok", "model_registry": "reloaded"}
 
 
 # 2026-09-19: content-hashed bundles are safe to cache forever; index.html
@@ -491,10 +539,14 @@ async def spa_fallback(full_path: str):
 
 
 @app.get("/")
-def root():
+def root(request: Request):
     frontend_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
     if os.path.exists(frontend_path):
-        return RedirectResponse(url="/app/frontend/")
+        # 保留深链 query（?conv= 等）：8159 vite 直接服务 `/` 不丢参，
+        # 生产 8158 若丢参则所有走根路径的深链（任务通知/分享链接）失效。
+        query = request.url.query
+        target = f"/app/frontend/?{query}" if query else "/app/frontend/"
+        return RedirectResponse(url=target)
     return {"message": "Weave Thinker API is running", "docs": "/docs"}
 
 

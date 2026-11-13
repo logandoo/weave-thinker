@@ -59,6 +59,12 @@ async def diff(args: Dict[str, Any], **kwargs) -> str:
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
     workspace_root = str(Path(workspace.root_path).resolve())
 
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root,
+                                                            args=args)
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
     def _resolve(target: str) -> str | None:
         stripped = target.strip().strip("'\"")
         if not stripped:
@@ -169,7 +175,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "file_a": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "file_a": {
                     "type": "string",
                     "description": "文件 A 的路径（旧文件）。",
                 },

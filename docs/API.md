@@ -21,12 +21,19 @@
   有效期 `[security] token_expire_days`（默认 7 天）；`POST /api/auth/refresh` 用仍有效的 Token 滑动续期
   （单条原子 CAS 轮换，登出后其 token 永久不可续期——详见二.1）。WebSocket 以 `?token=<jwt>` 或
   `Authorization` 头认证。标注「公开」的接口无需 Token。
-- **管理员路由**：`/api/admin/*` 目前仅校验登录、**无角色校验**——任何已登录用户均可调用（已知限制，
-  商业版规划收口）。
+- **管理员路由**：`/api/admin/users/*` 与 `/api/admin/memory/*` 统一依赖 `require_admin`——仅 `users.role` ∈ {`admin`,`super_admin`}（`app/core/deps.py::ADMIN_ROLES`）
+  放行，其他已登录用户返回 `403 {"detail": "Admin role required"}`；`POST /api/admin/reload-config` 另以
+  `X-Admin-Secret` 请求头校验（独立密钥 `[security] admin_reload_secret`，恒定时间比较；未配置即 403）。
+  管理员由 SQL 指定：`UPDATE users SET role='admin' WHERE username='<用户名>';`。
+- **自助注册**：`POST /api/auth/register` 受 `[security] registration_open`（默认 `true`，严格布尔：
+  `false` 与 `"false"` 都算关闭，无法解析的值按安全方向关闭并在启动日志告警）与
+  `registration_invite_code`（默认空 = 不需要；非空须带匹配的 `invite_code`，否则 403）控制。
 - **错误约定**：4xx 响应体均为 `{"detail": "<原因>"}`。
   `401`=无/坏 Token；`403`=权限不足或敏感操作拒绝；`404`=资源不存在或非本人资源
   （越权访问他人资源一律 404 而非 403，防探测）；`409`=冲突（重名等）；`400`=参数/业务校验失败；
-  `422`=Pydantic 请求模型校验失败（FastAPI 默认 `{"detail": [校验条目]}`）。
+  `422`=Pydantic 请求模型校验失败（FastAPI 默认 `{"detail": [校验条目]}`）；
+  `429`=`/api/auth/register|login` 应用层速率限制（`[security] auth_rate_limit_enabled`，默认开），
+  响应带 `Retry-After` 秒数。
 - **分页/排序**：列表接口默认不带分页 token，由 limit 参数（如 `limit=200`）或全量返回，排序见各接口说明。
 - **时间字段**：全部 ISO-8601（UTC 存储，序列化含时区）；客户端本地按 UTC+8 展示（约定见 README）。
 
@@ -263,6 +270,7 @@ curl -k -X POST "https://<host>:8158/api/auth/refresh" -H "Authorization: Bearer
 |---|---|---|---|
 | `username` | string | 是 |  |
 | `password` | string | 是 |  |
+| `invite_code` | ∪string|null | 否 | `[security] registration_invite_code` 非空时必填且须匹配，否则 403 `邀请码无效`；`registration_open = false` 时一律 403 `注册已关闭，请联系管理员` |
 
 **输出**
 
@@ -5406,7 +5414,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### GET `/api/admin/users`
 **List Users**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role` ∈ {`admin`,`super_admin`}，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
@@ -5450,14 +5458,14 @@ curl -k -X GET "https://<host>:8158/api/admin/users" -H "Authorization: Bearer $
 ### POST `/api/admin/users`
 **Create User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role` ∈ {`admin`,`super_admin`}，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
 | 字段 | 位置 | 类型 | 必填 | 说明 |
 |---|---|---|---|---|
-| `username` | query | string | 是 |  |
-| `password` | query | string | 是 |  |
+| `username` | body | string | 是 |  |
+| `password` | body | string | 是 | 口令走 body，不再进 URL / access log |
 
 **输出**
 
@@ -5468,7 +5476,7 @@ curl -k -X GET "https://<host>:8158/api/admin/users" -H "Authorization: Bearer $
 **请求示例**
 
 ```bash
-curl -k -X POST "https://<host>:8158/api/admin/users?username=<value>&password=<value>" -H "Authorization: Bearer $TOKEN"
+curl -k -X POST "https://<host>:8158/api/admin/users" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"username": "<用户名>", "password": "<口令>"}'
 ```
 
 **返回示例**
@@ -5480,7 +5488,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### DELETE `/api/admin/users/{user_id}`
 **Delete User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role` ∈ {`admin`,`super_admin`}，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
@@ -5509,7 +5517,7 @@ HTTP 200 — `application/json` 流式/二进制响应（按端点说明处理�
 ### GET `/api/admin/users/{user_id}`
 **Get User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role` ∈ {`admin`,`super_admin`}，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
@@ -5555,16 +5563,16 @@ curl -k -X GET "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization
 ### PUT `/api/admin/users/{user_id}`
 **Update User**
 
-认证：需登录（`Authorization: Bearer <token>`）　|　源码模块：`app/api/admin.py`
+认证：需管理员（`Authorization: Bearer <token>`，`users.role` ∈ {`admin`,`super_admin`}，否则 403）　|　源码模块：`app/api/admin.py`
 
 **输入**
 
 | 字段 | 位置 | 类型 | 必填 | 说明 |
 |---|---|---|---|---|
 | `user_id` | path | string | 是 |  |
-| `username` | query | string | 否 |  |
-| `password` | query | string | 否 |  |
-| `is_active` | query | bool | 否 |  |
+| `username` | body | string | 否 |  |
+| `password` | body | string | 否 | 口令走 body，不再进 URL / access log |
+| `is_active` | body | bool | 否 |  |
 
 **输出**
 
@@ -5575,7 +5583,7 @@ curl -k -X GET "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization
 **请求示例**
 
 ```bash
-curl -k -X PUT "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization: Bearer $TOKEN"
+curl -k -X PUT "https://<host>:8158/api/admin/users/{user_id}" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"password": "<新口令>"}'
 ```
 
 **返回示例**
@@ -7519,7 +7527,8 @@ API 分布在聊天流（`/api/chat/stream`）、后台任务（`/api/agent-task
 
 ## 10. 管理端点补充
 
-- `POST /api/admin/reload-config`：需请求头 `x-admin-secret: <[security].jwt_secret_key>`，否则 403。
+- `POST /api/admin/reload-config`：需请求头 `x-admin-secret: <[security].admin_reload_secret>`（**独立密钥**，
+  不再复用 JWT 签名密钥；恒定时间比较；未配置该密钥时端点一律 403）。成功后清配置缓存**并**重载模型注册表。
 - `GET /app/frontend/{path}`：SPA 静态资源 + `index.html` 兜底（路由前缀见 `vite.config.ts` / `router`）。
 - `GET /`：有前端构建 → 307 到 `/app/frontend/`；否则 JSON 运行标记。
 

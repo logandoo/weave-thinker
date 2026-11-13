@@ -613,7 +613,7 @@
       </div>
     </Teleport>
 
-    <!-- Move to Group Sub-menu -->
+    <!-- Move to Group Sub-menu（搜索 + 按助手折叠分区：助手/分组很多时可搜索定位，当前助手默认展开、其余折叠，可一次点击跨助手移入分组）-->
     <Teleport to="body">
       <div v-if="showMoveToGroupMenu" class="move-group-overlay" @mousedown.self="closeAllMenus"></div>
       <div
@@ -622,36 +622,37 @@
         :style="moveMenuStyle"
         @click.stop
       >
-        <button
-          class="menu-item"
-          @click="moveConversationToGroup(moveTargetConv!.id, null)"
-        >
-          <span>未分组</span>
-        </button>
-        <button
-          v-for="group in groupStore.getGroupsForAssistant(assistantStore.currentAssistantId)"
-          :key="group.id"
-          class="menu-item"
-          :class="{ active: moveTargetConv?.group_id === group.id }"
-          @click="moveConversationToGroup(moveTargetConv!.id, group.id)"
-        >
-          <span class="group-color-dot" :style="{ backgroundColor: group.color }"></span>
-          <span>{{ group.name }}</span>
-        </button>
-        <div class="menu-divider" v-if="otherAssistantsForMove.length"></div>
-        <div class="menu-section-label" v-if="otherAssistantsForMove.length">移动到其他助手</div>
-        <button
-          v-for="assistant in otherAssistantsForMove"
-          :key="assistant.id"
-          class="menu-item"
-          @click="moveConversationToAssistant(moveTargetConv!.id, assistant.id)"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-            <circle cx="12" cy="7" r="4"/>
-          </svg>
-          <span>{{ assistant.name }}</span>
-        </button>
+        <div class="move-group-search">
+          <input v-model="moveMenuQuery" type="text" placeholder="搜索助手或分组" aria-label="搜索助手或分组" @click.stop />
+        </div>
+        <template v-for="section in filteredMoveMenuSections" :key="section.assistantId ?? '__no_assistant__'">
+          <div v-if="!section.isCurrent" class="menu-divider"></div>
+          <button class="menu-section-label move-group-section-toggle" :aria-expanded="isSectionExpanded(section)" @click.stop="toggleSection(section)">
+            <span class="move-group-section-name">{{ section.assistantName || (section.isCurrent ? '当前助手' : '未命名助手') }}</span>
+            <span class="move-group-section-count">{{ section.groups.length }}</span>
+            <svg class="move-group-chevron" :class="{ expanded: isSectionExpanded(section) }" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+          <template v-if="isSectionExpanded(section)">
+            <button
+              class="menu-item"
+              :class="{ active: section.isCurrent && moveTargetConv?.group_id == null }"
+              @click="handleMovePick(null, section.assistantId)"
+            >
+              <span>未分组</span>
+            </button>
+            <button
+              v-for="group in section.groups"
+              :key="group.id"
+              class="menu-item"
+              :class="{ active: moveTargetConv?.group_id === group.id }"
+              @click="handleMovePick(group.id, section.assistantId)"
+            >
+              <span class="group-color-dot" :style="{ backgroundColor: group.color }"></span>
+              <span>{{ group.name }}</span>
+            </button>
+          </template>
+        </template>
+        <div v-if="filteredMoveMenuSections.length === 0" class="move-group-empty">无匹配的助手或分组</div>
       </div>
     </Teleport>
 
@@ -811,6 +812,7 @@ import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useAuth } from '@/composables/useAuth'
 import { isMobileViewport, navigateWithMobileHistory } from '@/composables/useMobileNavigation'
 import { useMediaQuery } from '@/composables/useMediaQuery'
+import { useMoveToGroupMenu } from '@/composables/useMoveToGroupMenu'
 import AssistantModal from './AssistantModal.vue'
 import NotebookPicker from './NotebookPicker.vue'
 import NotesPanelInline from './NotesPanelInline.vue'
@@ -828,6 +830,7 @@ const notesStore = useNotesStore()
 const auth = useAuth()
 const { show: showToast } = useToast()
 const { confirm: showConfirm } = useConfirmDialog()
+const { filteredMoveMenuSections, moveMenuQuery, isSectionExpanded, toggleSection, resetMoveMenuState, refreshMoveMenuGroups, moveToTarget } = useMoveToGroupMenu()
 
 const notesPanelRef = ref<InstanceType<typeof NotesPanelInline> | null>(null)
 const showNotebookPicker = ref(false)
@@ -917,10 +920,6 @@ const editingGroup = ref<ConversationGroup | null>(null)
 const newGroupName = ref('')
 const newGroupAssistantId = ref<string | null>(null)
 
-/** 移动到分组菜单里的「移动到其他助手」列表（排除当前助手）。 */
-const otherAssistantsForMove = computed(() =>
-  assistantStore.assistants.filter(a => a.id !== assistantStore.currentAssistantId)
-)
 const newGroupColor = ref('#3b82f6')
 const showDeleteGroupDialog = ref(false)
 const deletingGroup = ref<ConversationGroup | null>(null)
@@ -1977,7 +1976,7 @@ function openMoveToGroupMenu(event: MouseEvent) {
   moveTargetConv.value = menuTargetConv.value
   const target = event.currentTarget as HTMLElement
   const rect = target.getBoundingClientRect()
-  const SUB_MENU_WIDTH = 180
+  const SUB_MENU_WIDTH = 340
   const PADDING = 8
   const GAP = 4
 
@@ -1992,19 +1991,62 @@ function openMoveToGroupMenu(event: MouseEvent) {
 
   moveMenuStyle.value = { top: `${top}px`, left: `${left}px` }
   showMoveToGroupMenu.value = true
-
-  // After render, measure actual height and adjust if overflows bottom
-  nextTick(() => {
-    const menuEl = document.querySelector('.move-group-menu') as HTMLElement
-    if (!menuEl) return
-    const menuRect = menuEl.getBoundingClientRect()
-    if (menuRect.bottom > window.innerHeight - PADDING) {
-      let newTop = window.innerHeight - menuRect.height - PADDING
-      if (newTop < PADDING) newTop = PADDING
-      moveMenuStyle.value = { top: `${newTop}px`, left: `${left}px` }
-    }
-  })
+  resetMoveMenuState()
+  refreshMoveMenuGroups()
+  nextTick(() => { clampMoveMenuToViewport(); setupMenuResizeObserver() })
 }
+
+/**
+ * 菜单底边/右边溢出视口时钳位（两轴）。全量分组（loadAllGroups）异步到达后菜单会增高/增宽，
+ * 故 watch filteredMoveMenuSections + ResizeObserver 再次钳位；以实际渲染 rect 为准，桌面/移动/任意触发位置都不溢出视口。
+ */
+function clampMoveMenuToViewport() {
+  const menuEl = document.querySelector('.move-group-menu') as HTMLElement
+  if (!menuEl) return
+  const PADDING = 8
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const r = menuEl.getBoundingClientRect()
+  let top = r.top
+  let left = r.left
+  if (r.bottom > vh - PADDING) top = vh - r.height - PADDING
+  if (r.right > vw - PADDING) left = vw - r.width - PADDING
+  if (top < PADDING) top = PADDING
+  if (left < PADDING) left = PADDING
+  moveMenuStyle.value = { top: `${top}px`, left: `${left}px` }
+}
+
+// 异步分组到达 / 搜索过滤变化 → 菜单尺寸变化 → 按最终尺寸重新钳位（仅在菜单打开时）。
+watch(filteredMoveMenuSections, () => {
+  if (showMoveToGroupMenu.value) nextTick(clampMoveMenuToViewport)
+})
+
+// 菜单尺寸变化（展开/收起分区、搜索、异步分组到达）→ 重新钳位，任何一轴都不溢出。
+let menuResizeObserver: ResizeObserver | null = null
+function setupMenuResizeObserver() {
+  if (menuResizeObserver) return
+  const el = document.querySelector('.move-group-menu') as HTMLElement
+  if (!el) return
+  menuResizeObserver = new ResizeObserver(() => {
+    if (showMoveToGroupMenu.value) clampMoveMenuToViewport()
+  })
+  menuResizeObserver.observe(el)
+}
+function teardownMenuResizeObserver() {
+  menuResizeObserver?.disconnect()
+  menuResizeObserver = null
+}
+watch(showMoveToGroupMenu, (open) => {
+  if (!open) teardownMenuResizeObserver()
+})
+onUnmounted(teardownMenuResizeObserver)
+
+// 视口尺寸变化（旋转/缩放）时重新钳位，避免菜单留在视口外。
+function onViewportResize() {
+  if (showMoveToGroupMenu.value) clampMoveMenuToViewport()
+}
+onMounted(() => window.addEventListener('resize', onViewportResize))
+onUnmounted(() => window.removeEventListener('resize', onViewportResize))
 
 function handleSwipeMoveGroup(convId: string) {
   const conv = chatStore.conversations.find(c => c.id === convId)
@@ -2015,6 +2057,9 @@ function handleSwipeMoveGroup(convId: string) {
   const left = Math.max(8, (window.innerWidth - MENU_WIDTH) / 2)
   moveMenuStyle.value = { top: '40%', left: `${left}px` }
   showMoveToGroupMenu.value = true
+  resetMoveMenuState()
+  refreshMoveMenuGroups()
+  nextTick(() => { clampMoveMenuToViewport(); setupMenuResizeObserver() })
 }
 
 function closeMoveToGroupMenu() {
@@ -2022,40 +2067,24 @@ function closeMoveToGroupMenu() {
   moveTargetConv.value = null
 }
 
-async function moveConversationToGroup(convId: string, groupId: string | null) {
-  try {
-    await groupStore.moveConversation(convId, groupId)
-    const conv = chatStore.conversations.find(c => c.id === convId)
-    if (conv) {
-      conv.group_id = groupId
-    }
+/** 菜单里点某节的「未分组」或某分组 → 统一移动（同助手/跨助手/跨助手到分组）；成功后关菜单并同步拖拽列表。 */
+async function handleMovePick(groupId: string | null, targetAssistantId: string | null) {
+  const convId = moveTargetConv.value?.id
+  if (!convId) return
+  const ok = await moveToTarget(convId, groupId, targetAssistantId)
+  if (ok) {
     closeMoveToGroupMenu()
     closeAllMenus()
-    showToast(groupId ? '已移动到分组' : '已移出分组', 'success')
     nextTick(() => syncDragLists())
-  } catch (e) {
-    console.error('Failed to move conversation:', e)
-    showToast('移动失败', 'error')
   }
 }
 
+/** 右键菜单「移出分组」：留在当前助手，仅清 group。 */
 async function removeConversationFromGroup(convId: string) {
-  await moveConversationToGroup(convId, null)
-}
-
-/** 把单个对话移动到另一个助手（目标助手内未分组）。 */
-async function moveConversationToAssistant(convId: string, assistantId: string) {
-  try {
-    await groupStore.moveConversation(convId, null, assistantId)
-    chatStore.removeConversationFromList(convId)
-    const target = assistantStore.getAssistantById(assistantId)
-    closeMoveToGroupMenu()
+  const ok = await moveToTarget(convId, null, null)
+  if (ok) {
     closeAllMenus()
-    showToast(target ? `已移动到助手「${target.name}」` : '已移动到其他助手', 'success')
     nextTick(() => syncDragLists())
-  } catch (e) {
-    console.error('Failed to move conversation:', e)
-    showToast('移动失败', 'error')
   }
 }
 
@@ -3747,7 +3776,7 @@ const emit = defineEmits<{
     border-right: none;
     border-radius: 0 var(--shell-workbench-radius) var(--shell-workbench-radius) 0;
     box-shadow: var(--frame-shadow);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-bottom: var(--safe-bottom);
   }
 
   .sidebar.drawer-open {
@@ -4005,14 +4034,7 @@ const emit = defineEmits<{
 
 
 
-.menu-section-label {
-  padding: 6px 12px 2px;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--color-text-secondary);
-  opacity: 0.75;
-  letter-spacing: 0.02em;
-}
+/* .menu-section-label 已移至共享 sidebar-panels.css（agent/工作台同一份，避免两模式字体不一致）。 */
 
 /* ─── Modal / Dialog ──────────────────────────────────────────── */
 

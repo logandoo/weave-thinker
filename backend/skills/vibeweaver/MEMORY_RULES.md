@@ -425,10 +425,22 @@ DIRECTION is right (defer-to-verifier when committed, 2606.22936); it overlaps
 A4.9 but fires EARLIER (at commitment, not completion).
 
 **Form (≤50 lines, REWRITTEN each update — it is state, not chronicle; git
-history is the audit trail):**
+history is the audit trail).** Preferred: a fenced machine-readable state block
+at the top, followed by optional Markdown context. This lets the harness keep
+`next_action` and the active criterion when the note approaches the delivery
+budget (the delivery composer reserves space for the header, debt and resume
+rule; freeform notes remain valid via the head+tail fallback).
 
+````markdown
+```vibeweaver-state
+{"version":1,"task":"<short task>","updated":"iter N / <time>",
+ "current_criterion":"#2","next_action":"<one concrete action>",
+ "assumption":"<core assumption>","falsifier":"<test that would disprove it>",
+ "confirmed":["..."],"open":["..."],"excluded":["..."],
+ "key_files":["path:line — why"],"blocked":[]}
 ```
-# Working Note — <task> (updated: iter N / <time>)
+
+# Working Note — <task>
 ## Hypothesis ledger
 confirmed: <what evidence proved true>
 doubted:   <leaning but unproven>
@@ -441,7 +453,17 @@ consulted: <memory topics read this task>
 ❌ <direction — one clause why it died>
 ## Next action
 <one line>
-```
+````
+
+Schema v1 rules: `task` and `next_action` are required; other fields are
+optional. Arrays (`confirmed/open/excluded/key_files/blocked`) are clipped to
+200 items at parse time and 260 bytes per item (220 for `key_files`), then
+trimmed by the delivery renderer — every omitted item is counted in a visible
+`… (+N more <field>)` marker. Malformed JSON, wrong container/element types, or
+an unsupported version are reported as `WORKING-STATE SCHEMA WARNING` and fall
+back to freeform head+tail (never silently drops the note). The source snapshot
+stores up to 64KB; delivery remains capped at 4096B, and a snapshot truncated at
+64KB says so.
 
 **Lifecycle (binding):**
 1. Create after §A4.1 Step 1 (acceptance criteria) when the create-rule
@@ -468,7 +490,9 @@ re-injected on that session's next model request after every
 opencode 1.18.35), and pointed to by a one-line cue on the session's first
 gated write. Delivery counts land in `.vibeweaver/state.json`
 (`memoryDeliveries`); a harness-owned snapshot (`.vibeweaver/memory-snapshot.json`)
-keeps boundary delivery working even if the note file itself disappears mid-task. These channels are host features and degrade quietly
+keeps boundary delivery working only for the SAME active task when the note
+file disappears mid-task (W23: a new task key or a GREEN
+`- final-run: --final … fail=0` invalidates the snapshot). These channels are host features and degrade quietly
 where absent — treat them as reliable when present, never as a license to
 skip the note discipline. Consequence for the author: **keep the note FRESH**
 — the harness delivers whatever is in the file verbatim; a stale ledger is
@@ -538,3 +562,14 @@ update the glob in the same commit (a stale trigger is a silent
 non-delivery, same failure class as a stale reference — A7.6 rule 8
 applies). Trust-tier semantics carry over: ⛔/❌ topics are the prime
 candidates for triggers.
+
+### Multi-agent memory — run-local proposal & outbox (MULTI_AGENT.md §MA7)
+Run-local memory writes stay normal (the final gate keeps working). Shared
+mainline memory is curator-published, never agent-written; user-global memory
+serves runs read-only. Unmerged/failed-run lessons stay candidate/quarantine.
+Backlog claims are transactional with lease and run/attempt/evidence refs. ADR:
+run-local `(run_id, D-n)`; cross-run decisions via the central registry; AUTO
+never approves global/irreversible ADRs. Publication goes through the outbox
+(stable idempotency key; reconciler diffs git vs registry; `cleaned` is
+unreachable while publication is pending). Ordering uses server-side versions
+— never agent-local clocks or mtimes.

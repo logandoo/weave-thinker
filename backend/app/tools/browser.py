@@ -4,7 +4,7 @@
 import json
 import logging
 from app.tools.registry import registry
-from app.services.browser_service import BrowserService
+from app.services.browser_service import BrowserService, challenge_escalation_hint
 from app.core.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,12 @@ async def browser(args: dict, **kwargs) -> str:
         else:
             title_line = f" - {page.title}" if page.title else ""
             part = f"{idx}. {page.url}{title_line}\n{page.text}"
+            # 验证页升级提示（2026-11-12，Issue #1）：只读抓取过不了滑块/人机验证，
+            # 但交互浏览器（browser_navigate + browser_mouse 坐标操作）可以试——
+            # 不把这条路径递到眼前，模型会宣称「没有鼠标通道」（conv 2c4780d4）。
+            _hint = challenge_escalation_hint(page.title, page.text)
+            if _hint:
+                part += "\n" + _hint
             # 图片直址清单（图片能力缺口修复）：正文之后列出，agent 可据此
             # 内嵌 ![alt](src) 或下载后 provide_file。
             if page.images:

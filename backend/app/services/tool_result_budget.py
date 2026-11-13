@@ -28,7 +28,7 @@ class BudgetConfig:
 DEFAULT_BUDGET = BudgetConfig()
 
 
-_UNLIMITED_TOOLS = frozenset({"memory", "session_search", "workspace_read", "word_count", "workspace_glob", "provide_file", "grep", "diff", "workspace_write", "workspace_edit", "workspace_snapshot"})
+_UNLIMITED_TOOLS = frozenset({"memory", "memory_search", "session_search", "workspace_read", "word_count", "workspace_glob", "provide_file", "grep", "diff", "workspace_write", "workspace_edit", "workspace_snapshot"})
 
 
 def _is_inline_image_message(msg: Dict) -> bool:
@@ -37,10 +37,13 @@ def _is_inline_image_message(msg: Dict) -> bool:
     shape-only 的 substring 命中不够——伪造/畸形 `_image_result` 的
     terminal/mcp 结果仍按普通文本处理（防绕过）。
     """
-    from app.services.tool_image_results import IMAGE_TOOL_ALLOWLIST, parse_image_envelope
+    from app.services.tool_image_results import (
+        IMAGE_TOOL_ALLOWLIST,
+        parse_image_envelope_for_message,
+    )
 
     name = str(msg.get("name") or "")
-    return name in IMAGE_TOOL_ALLOWLIST and parse_image_envelope(msg.get("content", "")) is not None
+    return name in IMAGE_TOOL_ALLOWLIST and parse_image_envelope_for_message(msg) is not None
 
 
 async def maybe_persist_tool_result(
@@ -50,16 +53,34 @@ async def maybe_persist_tool_result(
     config: BudgetConfig = DEFAULT_BUDGET,
     workspace_path: str = "",
     force: bool = False,
+    msg: Optional[Dict] = None,
 ) -> str:
     if not content:
         return content
     # P0.5：base64 图片信封不是"大文本"——外置成 .txt 会丢图且破坏 JSON。
     # 只豁免可解析的真信封；构造期已受 MAX_INLINE_BYTES 限制，请求侧旧帧
     # 由 expand_tool_images（wire 前）与 context_compressor 双重降级。
-    from app.services.tool_image_results import IMAGE_TOOL_ALLOWLIST, parse_image_envelope
+    # P0（2026-11-09）：调用方传了 msg 就走按消息身份的记忆化解析，避免同一
+    # 轮里对同一封反复 json.loads 全量 base64。
+    from app.services.tool_image_results import (
+        IMAGE_TOOL_ALLOWLIST,
+        parse_image_envelope_memoized,
+        parse_image_envelope_for_message,
+    )
 
-    if tool_name in IMAGE_TOOL_ALLOWLIST and parse_image_envelope(content) is not None:
-        return content
+    if tool_name in IMAGE_TOOL_ALLOWLIST:
+        # 没有 msg 也要走记忆化：`agent_loop._apply_tool_result_budget` 这个**每个
+        # 工具结果都要过**的调用点就不传 msg（A4.9 二轮评审 A·MISSED-CONSUMERS）。
+        # 键是载荷字符串本身的对象身份，而这里传进来的正是长期存活的那个 result
+        # 对象，命中率与按消息缓存等价。（对比：history_window 的多 part 分支是
+        # 现拼的临时串，记忆化只会往里塞垃圾条目，所以那里保持裸解析。）
+        payload = (
+            parse_image_envelope_for_message(msg)
+            if msg is not None
+            else parse_image_envelope_memoized(content)
+        )
+        if payload is not None:
+            return content
     if len(content) <= config.max_result_size_chars:
         return content
     if tool_name in _UNLIMITED_TOOLS and not force:
@@ -153,6 +174,7 @@ async def enforce_turn_budget(
             tool_use_id=msg.get("tool_call_id", _uuid.uuid4().hex[:12]),
             config=config,
             workspace_path=workspace_path,
+            msg=msg,
         )
         reduction = len(content) - len(persisted)
         current_total -= reduction
@@ -174,6 +196,7 @@ async def enforce_turn_budget(
                     config=config,
                     workspace_path=workspace_path,
                     force=True,
+                    msg=msg,
                 )
                 msg["content"] = persisted if persisted != content else (
                     content + "\n\n[...output 超预算且存档未成功；已保留全文...]")

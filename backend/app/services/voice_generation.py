@@ -15,6 +15,11 @@ from app.services.workspace_service import ensure_user_workspace
 
 logger = logging.getLogger(__name__)
 
+
+def _claim_guard_enabled() -> bool:
+    from app.core.config import get_config
+    return bool(get_config().memory.get("memory_claim_guard_enabled", True))
+
 # Tools that create/control/mutate delegated tasks. Synthetic notification
 # turns (user_turn=False) never expose or dispatch them (§5.1(5), §13.2).
 TASK_CONTROL_TOOL_NAMES = frozenset({
@@ -30,45 +35,6 @@ TASK_CONTROL_TOOL_NAMES = frozenset({
 })
 
 _voice_clarification_tasks: set = set()
-
-_DELEGATION_CLAIM_MARKERS = (
-    "已委派", "已经委派", "已交给", "已经交给", "已把任务交给",
-    "已提交给", "已经提交给", "任务已创建", "已创建任务",
-    "已创建独立会话", "已安排给", "已经安排给",
-    "转到后台", "已转到后台", "后台执行中", "已启动后台", "已放到后台",
-    "delegated", "has been delegated", "task has been created",
-    "task was created", "i've handed", "i have handed",
-)
-
-
-_DELEGATION_REQUEST_RE = re.compile(
-    r"(委派|交给|让[^。！？\n]{0,12}助手|后台(执行|跑|处理)|异步(执行|任务)|"
-    r"独立会话|delegate|hand[\s-]*(it[\s-]*)?off|background\s+task)",
-    re.IGNORECASE,
-)
-
-
-def user_turn_requests_delegation(text: str) -> bool:
-    """True when the real user turn explicitly asks for a delegation."""
-    value = text or ""
-    # Questions / definitions are not an instruction to delegate.
-    if re.search(
-        r"(委派|交给|delegate).{0,16}(是什么|什么意思|怎么|如何|吗|？|\?)",
-        value, re.IGNORECASE,
-    ):
-        return False
-    return bool(_DELEGATION_REQUEST_RE.search(value))
-
-
-def claims_delegation_success(text: str) -> bool:
-    """True when a TOOL-LESS prefetch claims a delegation already happened.
-
-    Such a claim can only be hallucinated (the prefetch had no tools and no DB
-    transaction); it must never be spoken as a receipt (§5.1 / §17.1).
-    """
-    value = (text or "").casefold()
-    return any(marker.casefold() in value for marker in _DELEGATION_CLAIM_MARKERS)
-
 
 def _split_segments(*a, **k):
     from app.services.voice_service import _split_segments as f
@@ -131,24 +97,18 @@ def strip_voice_tags(*a, **k):
 
 
 class VoiceGenerationMixin:
-    def _should_suppress_stale_low_value(self, text: str, user_turn: bool) -> bool:
-        """Suppress only a stale acknowledgement, never a substantive answer.
-
-        Output ownership is deliberately narrow: defer may still finish a real
-        answer, but a delayed "你说，我听着" after the user already asked a new
-        question has no conversational value and must not be finalized/spoken.
-        """
-        if not user_turn or self._generation_input_seq >= self._latest_input_seq:
-            return False
-        from app.services.voice_service import _is_low_value_ack_text
-        return _is_low_value_ack_text(text)
+    async def _should_suppress_stale_low_value(self, text: str, user_turn: bool) -> bool:
+        """Use the stale-only agentic judge; no text lexicon decides delivery."""
+        return await self._should_suppress_stale_reply(text, user_turn)
 
     def _generation_is_stale(self, user_turn: bool) -> bool:
         return user_turn and self._generation_input_seq < self._latest_input_seq
 
     def _has_pending_user_turn(self) -> bool:
         return any(
-            isinstance(item, dict) and not item.get("notice")
+            isinstance(item, dict)
+            and not item.get("notice")
+            and not item.get("notice_batch")
             for item in self._turn_queue._queue
         )
 
@@ -207,7 +167,7 @@ class VoiceGenerationMixin:
         self._paused_spoken_chars = 0
 
         # Fast path: prefetched text (no tools) -> speak directly.
-        if prefetched and user_turn and claims_delegation_success(prefetched):
+        if prefetched and user_turn and await self._claims_delegation_success(prefetched):
             # The tool-less prefetch cannot have committed a task. Discard the
             # fake "已委派" receipt and regenerate with the real tool loop.
             logger.warning(
@@ -216,23 +176,28 @@ class VoiceGenerationMixin:
             prefetched_summary_note = ""
         if prefetched:
             prefetch_note = prefetched_summary_note or getattr(self, "_prefetch_summary_note", "")
-            if self._should_suppress_stale_low_value(prefetched, user_turn):
+            if await self._should_suppress_stale_low_value(prefetched, user_turn):
                 self._turn_reply_text = ""
                 self._interrupt.set()
                 self._drain_tts_queue()
                 await self._mark_speaking_end()
                 await self._send_json({
                     "event": "generation_cancelled",
+                "turn_epoch": self._turn_epoch,
                     "reason": "superseded_by_newer_user_turn",
                     "input_seq": self._generation_input_seq,
                 })
                 return
-            self._clear_pending_filler()
-            self._answer_content_epoch = self._turn_epoch
             await self._set_state("speak")
             clean = strip_voice_tags(prefetched)
             await self._send_json({"event": "assistant_text", "text": clean, "done": False})
-            await self._speak_text(prefetched)
+            # The prefetched fast path owns the same final flush as a streamed
+            # answer; pause may need to restore this exact completion boundary.
+            self._final_flush_enqueued_epoch = self._turn_epoch
+            await self._speak_text(
+                prefetched,
+                stale_approved=self._generation_is_stale(user_turn),
+            )
             self._history.append({"role": "assistant", "content": prefetched})
             self._last_answer_text = prefetched
             self._vmem_answer_epoch = self._turn_epoch
@@ -242,15 +207,9 @@ class VoiceGenerationMixin:
             await self._send_json({"event": "assistant_text", "text": clean, "done": True})
             return
 
-        # TTFT-gated filler: schedule the watch BEFORE the first LLM call so
-        # its clock matches "query sent"; it consumes the EoT prefetch (or
-        # falls back to on-demand synthesis) and plays only if no content
-        # token arrives within the threshold (2026-09-13). Proactive notices
-        # pass allow_filler=False (no user question to cover).
-        if allow_filler:
-            self._schedule_filler_ttft_watch()
-        else:
-            self._clear_pending_filler()
+        # A substantive answer owns the floor from its first real token.
+        # W38 handoff T3 (2026-11-06): filler/backchannel clip generation is
+        # removed — nothing is scheduled or cleared here anymore.
         svc, _ = self._build_llm()
         if self._test_llm_stall > 0:
             # Test-only hook (mirrors the `_test_inject_asr` convention): the
@@ -289,8 +248,13 @@ class VoiceGenerationMixin:
                             not in TASK_CONTROL_TOOL_NAMES)
                     ] or None
             except Exception as exc:
-                logger.debug("voice tool defs unavailable: %s", exc)
+                # 事故教训（2026-11-07 conv 73875edd）：DEBUG 级吞错让 tools=None
+                # 整场不可见。工具面降级=用户可感知故障，必须 WARNING 可见。
+                logger.warning("voice tool defs unavailable (tools disabled this turn): %s", exc)
                 tools = None
+            if allow_tools and not tools:
+                logger.warning(
+                    "voice tool defs resolved EMPTY despite allow_tools — model cannot call tools")
 
         messages = self._generation_messages()
         full_reply = ""
@@ -417,9 +381,6 @@ class VoiceGenerationMixin:
                                 data = ev["data"]
                                 if not _first_content:
                                     _first_content = True
-                                    # TTFT gate: this turn's first content token
-                                    # arrived — the filler watch must suppress.
-                                    self._answer_content_epoch = self._turn_epoch
                                     _perf("llm_ttft", (_now() - _llm_start) * 1000,
                                           round_no=tool_rounds, turn_ms=(_now() - self._turn_started) * 1000)
                                 reply_text += data
@@ -440,12 +401,25 @@ class VoiceGenerationMixin:
                                     {"event": "assistant_text", "text": strip_voice_tags(reply_text), "done": False}
                                 )
                                 segs, seg_buffer = _split_segments(seg_buffer)
+                                from app.services.memory_claim_guard import (
+                                    has_memory_write_result, is_write_claim,
+                                )
                                 for s in segs:
                                     if s.strip():
+                                        if _claim_guard_enabled() and is_write_claim(s) and not has_memory_write_result(_all_tool_results, _all_tool_calls):
+                                            # A5：未落地的“已记住/已补录”不播报。
+                                            continue
                                         _perf("seg_to_tts", (_now() - _llm_start) * 1000,
                                               round_no=tool_rounds, seg_len=len(s))
                                         if self._generation_is_stale(user_turn):
                                             held_tts_segments.append(s)
+                                        elif "<｜｜DSML" in reply_text:
+                                            # DSML 起始后的分段一律不 enqueue
+                                            # （2026-11-07 第二形态）：块内参数
+                                            # 值含标点会被切成独立分段，逐段剥离
+                                            # 仍会漏读内容文本；本轮文字改由轮出口
+                                            # 解析成真实工具调用。
+                                            continue
                                         else:
                                             await self._tts_queue.put({
                                                 "text": s, "epoch": self._turn_epoch, "dedup": True,
@@ -480,14 +454,53 @@ class VoiceGenerationMixin:
                             await self._send_json({"event": "error", "error": f"生成失败: {exc}"})
                         break            # flush remaining buffer as a final segment
             if seg_buffer.strip():
-                if self._generation_is_stale(user_turn):
+                from app.services.memory_claim_guard import (
+                    has_memory_write_result, is_write_claim,
+                )
+                if _claim_guard_enabled() and is_write_claim(seg_buffer) and not has_memory_write_result(_all_tool_results, _all_tool_calls):
+                    pass  # A5: unsupported write claim never reaches TTS
+                elif self._generation_is_stale(user_turn):
                     held_tts_segments.append(seg_buffer)
+                elif "<｜｜DSML" in reply_text:
+                    pass  # DSML 轮尾段不朗读（同上）
                 else:
                     await self._tts_queue.put({
                         "text": seg_buffer, "epoch": self._turn_epoch, "dedup": True,
                         "notification_id": self._current_notice_id,
                                                 "input_seq": self._generation_input_seq,
                     })
+            # DSML 内联伪调用→真实调用（2026-11-07 第二形态：memory-add 轮
+            # 整段吐 <｜｜DSML｜｜ calls>…，不执行则用户"记住"被口头吞掉）。
+            # 对齐 chat 侧 agent_loop._extract_dsml_tool_calls，但容忍生产
+            # 实测的 `<｜｜DSML｜｜ invoke`（带空格）/`calls` 变体。必须在下方
+            # 伪标签剥离之前——剥离会把参数一起丢掉。
+            if tool_calls is None and "<｜｜DSML" in reply_text:
+                from app.services.voice_text import extract_dsml_pseudo_tool_calls
+
+                reply_text, _dsml_calls = extract_dsml_pseudo_tool_calls(reply_text)
+                if _dsml_calls:
+                    logger.warning(
+                        "voice DSML pseudo tool-calls converted to real calls: %s",
+                        [c["function"]["name"] for c in _dsml_calls],
+                    )
+                    tool_calls = _dsml_calls
+            # 伪工具标记轮出口剥离（2026-11-07 语音事故 conv 73875edd）：模型
+            # 不发原生调用、把 "<tool_call>name</tool_call>" 当正文吐出来。轮
+            # 出口统一剥离并 WARNING（历史面/落库面/TTS 面已有同款防御；这是
+            # 会话内累加 full_reply 与打断备注的最后一道），保证污染不落任何面。
+            if "<" in reply_text:
+                from app.services.voice_text import (
+                    PSEUDO_TOOL_TAGS_RE,
+                    strip_pseudo_tool_tags,
+                )
+
+                _pseudo_cleaned = strip_pseudo_tool_tags(reply_text)
+                if _pseudo_cleaned != reply_text:
+                    logger.warning(
+                        "voice pseudo tool-call tags stripped from round output: %r",
+                        PSEUDO_TOOL_TAGS_RE.findall(reply_text)[:3],
+                    )
+                    reply_text = _pseudo_cleaned
             if self._turn_reply_text != full_reply + reply_text:
                 self._turn_reply_text = full_reply + reply_text
 
@@ -502,15 +515,15 @@ class VoiceGenerationMixin:
                     names = _build_tool_notice_names(tool_calls, lang)
                     notice = f"(平静)好的，我来调用{names}工具帮你处理。这个任务可能需要较长时间，请耐心等待，我会持续为你工作。"
                     await self._send_json({"event": "tool_notice", "text": strip_voice_tags(notice)})
-                    await self._speak_text(notice)
+                    await self._speak_text(notice, turn_complete=False)
                 elif tool_rounds == 3:
                     progress_notice = "(平静)任务仍在进行中，请继续耐心等待。"
                     await self._send_json({"event": "tool_notice", "text": strip_voice_tags(progress_notice)})
-                    await self._speak_text(progress_notice)
+                    await self._speak_text(progress_notice, turn_complete=False)
                 elif tool_rounds == 5:
                     progress_notice = "(平静)这个任务比较复杂，还需要一些时间，感谢你的耐心等待。"
                     await self._send_json({"event": "tool_notice", "text": strip_voice_tags(progress_notice)})
-                    await self._speak_text(progress_notice)
+                    await self._speak_text(progress_notice, turn_complete=False)
                 # Clear TTS interrupt so tool execution proceeds even if the
                 # user barge-in interrupted the notice. Only an explicit stop
                 # command (_task_cancelled) prevents tool execution.
@@ -551,6 +564,28 @@ class VoiceGenerationMixin:
                             self.db, self.user.id, self.user.username
                         )
                         self._workspace_path = ws.root_path
+                        # 任务作用域（§10 voice）：voice session 从其 Conversation 读同一
+                        # binding/context；未放开该模式时明确拒绝，不自行 ensure_user_workspace 回用户根。
+                        try:
+                            from app.db.database import AsyncSessionLocal as _VLocal
+                            from app.services.workspace_scoping_runtime import (
+                                attach_execution_scope as _v_attach,
+                            )
+
+                            async with _VLocal() as _vdb:
+                                _vscoped = await _v_attach(
+                                    _vdb, user_id=str(getattr(self.user, "id", "") or ""),
+                                    workspace_root=str(ws.root_path),
+                                    conversation=getattr(self, "_conversation", None),
+                                    owner_kind="voice",
+                                    owner_id=str(getattr(self, "session_id", "") or
+                                                 getattr(getattr(self, "_conversation", None), "id", "") or ""),
+                                    mode_name="voice")
+                            self._workspace_ctx = _vscoped.ctx
+                        except Exception as _vscope_exc:
+                            self._workspace_ctx = None
+                            self._workspace_scope_block = _vscope_exc
+                            logger.warning("voice workspace scope refused: %s", _vscope_exc)
                     except Exception as exc:
                         logger.debug("voice workspace init failed: %s", exc)
                         self._workspace_path = ""
@@ -638,7 +673,7 @@ class VoiceGenerationMixin:
                                         from app.db.database import Message as _Message
 
                                         _src_msg = await self.db.get(_Message, _source_msg)
-                                        if _src_msg is None or not user_turn_requests_delegation(
+                                        if _src_msg is None or not await self._user_turn_requests_delegation(
                                                 _src_msg.content or ""):
                                             raise ValueError("user turn did not request delegation")
                                         from app.services import action_token_service as _tokens
@@ -720,10 +755,25 @@ class VoiceGenerationMixin:
                         json.dumps(_all_tool_calls, ensure_ascii=False),
                         _build_voice_tool_results(_all_tool_results) if _all_tool_results else None,
                     )
+                    _blocked = getattr(self, "_workspace_scope_block", None)
+                    if _blocked is not None:
+                        from app.services.workspace_scope import WorkspaceScopeError as _VE
+
+                        result = json.dumps({
+                            "error": f"任务作用域拒绝该链路：{_blocked}",
+                            "code": getattr(_blocked, "code", "workspace_scope_mode_unsupported"),
+                            "success": False,
+                        }, ensure_ascii=False)
+                        _all_tool_results.append({"id": call_id, "name": name, "content": result})
+                        continue
+                    # 语音链路同样剥离模型自造的内部参数（对齐 agent_loop 的 _ 前缀守卫）
+                    args = {k: val for k, val in args.items() if not str(k).startswith("_")} | {
+                        "_permission_granted": True}
                     result = await registry.dispatch(
                         name, args, db=self.db, user=self.user,
                         conversation=self._conversation, assistant=None,
                         workspace_path=self._workspace_path or "",
+                        workspace_ctx=getattr(self, "_workspace_ctx", None),
                         _source_message_id=self._last_persisted_user_message_id,
                         # Schema filtering alone is not a security boundary: a
                         # stale/hallucinated name must fail dispatch too.
@@ -818,12 +868,23 @@ class VoiceGenerationMixin:
             await self._mark_speaking_end()
             await self._send_json({
                 "event": "generation_cancelled",
+                "turn_epoch": self._turn_epoch,
                 "reason": "tool_summary_pending",
                 "input_seq": self._generation_input_seq,
             })
             return
 
-        if self._should_suppress_stale_low_value(full_reply, user_turn) and not _all_tool_results:
+        if _claim_guard_enabled():
+            from app.services.memory_claim_guard import sanitize_claim_text
+            _claim_backing = json.dumps(_all_tool_results, ensure_ascii=False) if _all_tool_results else ""
+            full_reply, _claim_issues = sanitize_claim_text(
+                full_reply, _claim_backing,
+                injected_context=getattr(self, "_memory_injected_context", "") or "",
+                tool_calls=_all_tool_calls)
+            if _claim_issues:
+                logger.warning("voice memory claim guard removed: %s", sorted(set(_claim_issues)))
+
+        if await self._should_suppress_stale_low_value(full_reply, user_turn) and not _all_tool_results:
             self._interrupt.set()
             logger.info(
                 "voice stale low-value reply suppressed: input_seq=%d latest=%d",
@@ -835,19 +896,38 @@ class VoiceGenerationMixin:
             await self._mark_speaking_end()
             await self._send_json({
                 "event": "generation_cancelled",
+                "turn_epoch": self._turn_epoch,
                 "reason": "superseded_by_newer_user_turn",
                 "input_seq": self._generation_input_seq,
             })
             return
 
+        if self._generation_is_stale(user_turn):
+            # The judge retained the whole answer, not only segments produced
+            # after supersession. Grandfather this generation's already-queued
+            # prefix with the same ownership approval as the held tail.
+            for queued in self._tts_queue._queue:
+                if (
+                    isinstance(queued, dict)
+                    and queued.get("epoch") == self._turn_epoch
+                    and int(queued.get("input_seq", 0) or 0) == self._generation_input_seq
+                ):
+                    queued["stale_approved"] = True
+
         for segment in held_tts_segments:
             if segment.strip():
+                from app.services.memory_claim_guard import (
+                    has_memory_write_result, is_write_claim,
+                )
+                if _claim_guard_enabled() and is_write_claim(segment) and not has_memory_write_result(_all_tool_results, _all_tool_calls):
+                    continue
                 await self._tts_queue.put({
                     "text": segment,
                     "epoch": self._turn_epoch,
                     "dedup": True,
                     "notification_id": self._current_notice_id,
-                                                "input_seq": self._generation_input_seq,
+                    "input_seq": self._generation_input_seq,
+                    "stale_approved": True,
                 })
 
         if (
@@ -865,8 +945,11 @@ class VoiceGenerationMixin:
         if full_reply.strip():
             loop = asyncio.get_running_loop()
             fut = loop.create_future()
+            self._final_flush_enqueued_epoch = self._turn_epoch
             await self._tts_queue.put({
                 "flush": fut,
+                "epoch": self._turn_epoch,
+                "turn_complete": True,
                 "notification_id": self._current_notice_id,
                                                 "input_seq": self._generation_input_seq,
                 "notification_complete": not generation_had_error,

@@ -199,6 +199,10 @@ def _sync_chat_globals() -> None:
 @dataclass
 class _ChatStreamState:
     _dm_terminal_status_saved: Any = None
+    # 任务作用域：本轮是否 enforce 装配成功（media 门只约束 scoped 回合）
+    ws_scoped_localize: bool = False
+    # 本轮 user 消息 id（装配/逐消息快照的精确锚点；stream_chat_response 写入）
+    ws_turn_message_id: str | None = None
     _injected_mem_ids: Any = None
     _stream_buf: Any = None
     client_disconnected: Any = None
@@ -231,6 +235,9 @@ class _AgentLoopRun:
     display_sequence: list = field(default_factory=list)
     interjection_items: list = field(default_factory=list)
     tool_results_accumulated: list = field(default_factory=list)
+    # 驻留口径（spec §4.7 / 评审 I7-A）：同一轮里图片信封不止活在消息列表一处，
+    # 累积数组与 stream buffer 各有一份。这里只数信封字符（形状检查，不解析）。
+    envelope_chars_accumulated: int = 0
     tool_call_events_accumulated: list = field(default_factory=list)
     search_queries_used: list = field(default_factory=list)
     search_queries_by_call: dict = field(default_factory=dict)
@@ -270,6 +277,41 @@ class _AgentLoopRun:
     sse_cancelled: Any = None
     generate_title_bg: Any = None
     persist_final_answer: Any = None
+
+
+def build_stream_meta(request_conversation_id: str, resolved_conversation_id: str) -> dict:
+    """流首个 `meta` 事件的载荷（P2 2026-11-09，spec §4.8 第 1 项）。
+
+    `reminted` 只在"前端确实带了 id、且服务端用的是另一个 id"时为真——这是前端
+    判断要不要切换会话的唯一依据（歧义情况一律 false，避免误切用户正在看的会话）。
+    """
+    client = str(request_conversation_id or "").strip()
+    server = str(resolved_conversation_id or "").strip()
+    return {
+        "conversation_id": server,
+        "requested_conversation_id": client,
+        "reminted": bool(client) and client != server,
+    }
+
+
+def _note_accumulated_envelope_chars(run, tr) -> None:
+    """驻留口径指标：本轮累积数组里图片信封的字符总量（spec §4.7 三载体之一）。
+
+    只做形状检查（头部 80 字符），不 json.loads —— 挂在每个 tool_result 事件上
+    也必须对请求路径零成本风险；任何异常一律吞掉，指标不得影响回答。
+    """
+    try:
+        from app.services import image_blob_metrics
+        from app.services.tool_image_results import envelope_chars_of_tool_result
+
+        delta = envelope_chars_of_tool_result(tr)
+        if delta:
+            run.envelope_chars_accumulated = int(run.envelope_chars_accumulated) + delta
+        image_blob_metrics.set_carrier(
+            "tool_results_accumulated", int(run.envelope_chars_accumulated)
+        )
+    except Exception:
+        logger.debug("image residency carrier update failed", exc_info=True)
 
 
 def _replace_deathmatch_plan_directive(messages: list[dict], directive: str) -> None:
@@ -619,6 +661,7 @@ async def _handle_dm_verdict_event(run, verdict):
             _turn_content, _turn_tr_json = await _localize_media_for_persist(
                 _turn_content, _turn_tr_json,
                 run.user_id_local, run.username_local,
+            scoped=bool(getattr(getattr(run, "state", None), "ws_scoped_localize", False)),
             )
             async with AsyncSessionLocal() as _turn_db:
                 _turn_msg = Message(
@@ -706,6 +749,13 @@ async def _handle_dm_verdict_event(run, verdict):
     run.content_segments = []
     run.display_sequence = []
     run.tool_results_accumulated = []
+    run.envelope_chars_accumulated = 0
+    try:
+        from app.services import image_blob_metrics as _ibm
+
+        _ibm.set_carrier("tool_results_accumulated", 0)
+    except Exception:
+        pass
     run.tool_call_events_accumulated = []
     run.search_queries_used = []
     run.search_queries_by_call = {}
@@ -981,6 +1031,7 @@ async def _drive_agent_events(run):
         elif "tool_result" in event:
             tr = event["tool_result"]
             run.tool_results_accumulated.append(tr)
+            _note_accumulated_envelope_chars(run, tr)
             run.pf.tick(run.assistant_content)
             await run.put({"tool_result": tr})
             # Live download-card set: recompute the
@@ -1406,6 +1457,7 @@ async def _handle_agent_loop_cancel(run):
                 _stop_content, _stop_tool_results = await _localize_media_for_persist(
                     _stop_content, _stop_tool_results,
                     run.user_id_local, run.username_local,
+            scoped=bool(getattr(getattr(run, "state", None), "ws_scoped_localize", False)),
                 )
                 # P1 复检（规格 §3.2-3）：sanitize/localize 在门槛之后执行，可能把
                 # 正文清空——「引用回声-only + reasoning」同样不得落 final，转空行清理。
@@ -1687,6 +1739,16 @@ async def _finalize_agent_run(run):
     # without any log line. Persistence must not depend on any
     # subscriber staying alive.
     _cap_content = _build_content_fallback(joined_content, tr_json)
+    if get_config().memory.get("memory_claim_guard_enabled", True):
+        from app.services.memory_claim_guard import sanitize_claim_text as _sanitize_memory_claims
+        _claim_backing = (json.dumps(run.tool_results_accumulated, ensure_ascii=False)
+                          if run.tool_results_accumulated else (tr_json or ""))
+        _cap_content, _claim_issues = _sanitize_memory_claims(
+            _cap_content, _claim_backing,
+            injected_context=getattr(run.agent_loop, "injected_memory_context", "") or "",
+            tool_calls=run.tool_call_events_accumulated)
+        if _claim_issues:
+            logger.warning("chat memory claim guard removed: %s", sorted(set(_claim_issues)))
     _cap_content, tr_json = await _sanitize_cited_content(
         _cap_content, tr_json,
     )
@@ -1804,6 +1866,16 @@ async def _finalize_agent_run(run):
             )
             return
         _cap_content = _build_content_fallback(joined_content, tr_json)
+        if get_config().memory.get("memory_claim_guard_enabled", True):
+            from app.services.memory_claim_guard import sanitize_claim_text as _sanitize_memory_claims
+            _claim_backing = (json.dumps(run.tool_results_accumulated, ensure_ascii=False)
+                              if run.tool_results_accumulated else (tr_json or ""))
+            _cap_content, _claim_issues = _sanitize_memory_claims(
+                _cap_content, _claim_backing,
+                injected_context=getattr(run.agent_loop, "injected_memory_context", "") or "",
+                tool_calls=run.tool_call_events_accumulated)
+            if _claim_issues:
+                logger.warning("chat memory claim guard removed: %s", sorted(set(_claim_issues)))
         _cap_content, tr_json = await _sanitize_cited_content(_cap_content, tr_json)
         _cap_content, tr_json = await _render_answer_citations(
             _cap_content, tr_json,
@@ -2069,9 +2141,12 @@ async def _chat_agent_loop_impl(_state, **kw):
                     _state._stream_buf.streaming_message_id = run.streaming_row_id
                 except Exception:
                     pass
-        except Exception:
-            logger.warning(
-                "streaming row creation failed (fail-open)", exc_info=True)
+        except Exception as _row_exc:
+            from app.services import persistence_metrics as _pmetrics
+
+            _pmetrics.note_failure(
+                "streaming_row_create", _row_exc, conversation_id=_cap_conversation_id,
+            )
 
     async def _pf_write(text: str) -> None:
         if not run.streaming_row_id:
@@ -2095,8 +2170,11 @@ async def _chat_agent_loop_impl(_state, **kw):
                     run.tool_results_accumulated, "工具结果")
             if (run.assistant_reasoning or "").strip():
                 payload["reasoning_content"] = run.assistant_reasoning
-        except Exception:
-            logger.debug("progressive evidence serialize failed (fail-open)", exc_info=True)
+        except Exception as _ser_exc:
+            from app.services import persistence_metrics as _pmetrics
+
+            _pmetrics.note_failure("progressive_serialize", _ser_exc,
+                                   row_id=run.streaming_row_id)
         try:
             async with AsyncSessionLocal() as _pf_db:
                 # Core 级 UPDATE：不触发 ORM/sync 事件（streaming
@@ -2108,8 +2186,13 @@ async def _chat_agent_loop_impl(_state, **kw):
                     .values(**payload)
                 )
                 await _pf_db.commit()
-        except Exception:
-            logger.debug("progressive flush failed (fail-open)", exc_info=True)
+        except Exception as _flush_exc:
+            from app.services import persistence_metrics as _pmetrics
+
+            # 以前是 logger.debug —— 生产级别 INFO，等于静默失败。渐进落库是
+            # "进程被杀后用户还能看到已完成轮次"的唯一保险，它坏了必须看得见。
+            _pmetrics.note_failure("progressive_flush", _flush_exc,
+                                   row_id=run.streaming_row_id)
 
     run.pf = ProgressiveFlusher(_pf_write)
 
@@ -2647,6 +2730,86 @@ def _qwen_sampling_for(assistant, wire_provider_type):
     return _thinking_sampling, _non_thinking_sampling, _preserve_thinking
 
 
+async def _attach_workspace_scope(*, conversation, conversation_id, current_user, workspace,
+                                  agent_loop, latest_user_query, current_message_id=None):
+    """任务作用域装配（§6.1/§10/§14）。返回 `(ScopedRunResult|None, error_event|None)`；
+    error_event 非空即由调用方 yield 后终止本轮——绝不静默回退用户根。"""
+    try:
+        from app.db.database import AsyncSessionLocal as _AsyncSessionLocal
+        from app.services.workspace_scope_service import scoping_mode as _ws_scope_mode
+
+        if _ws_scope_mode() == "off" or conversation is None or not getattr(conversation, "id", None):
+            return None, None
+        from app.services.workspace_scoping_runtime import attach_chat_scope as _ws_attach
+
+        async with _AsyncSessionLocal() as _sc_db:
+            _res = await _ws_attach(
+                _sc_db, current_user=current_user, conversation=conversation,
+                workspace=workspace, agent_loop=agent_loop,
+                continuation_hint=str(latest_user_query or "")[:500] or None,
+                current_message_id=current_message_id,
+                mode_name=("deathmatch" if getattr(conversation, "deathmatch_mode", None)
+                           else "chat"))
+        if _res.enforced:
+            agent_loop.workspace_ctx = _res.ctx
+            agent_loop.workspace_path = str(_res.ctx.write_root)
+    except Exception as _ws_exc:  # noqa: BLE001 - 作用域失败必须可见，不能静默降级
+        from app.services.workspace_scope import CODE_MODE_UNSUPPORTED as _WS_UNSUPPORTED
+        from app.services.workspace_scope import WorkspaceScopeError as _WSScopeErr
+
+        if isinstance(_ws_exc, _WSScopeErr) and _ws_exc.code == _WS_UNSUPPORTED:
+            logger.warning("workspace scope rejected run (conversation=%s): %s",
+                           conversation_id, _ws_exc)
+            return None, {"event": "error", "data": json.dumps({
+                "error": ("该运行模式尚未支持任务作用域（不会回退到共享工作区根）。"
+                          "请在设置中调整 [workspace.task_scoping] 或新建普通会话继续。"),
+                "code": _ws_exc.code, "success": False}, ensure_ascii=False)}
+        logger.exception("workspace scope attach failed (conversation=%s)", conversation_id)
+        return None, {"event": "error", "data": json.dumps({
+            "error": f"任务作用域初始化失败，本轮未执行：{_ws_exc}",
+            "code": "workspace_scope_setup_failed", "success": False}, ensure_ascii=False)}
+
+    if _res.action == "ambiguous":
+        return _res, {"event": "error", "data": json.dumps({
+            "error": _res.question or "你想继续哪个任务？", "code": "workspace_task_ambiguous",
+            "candidates": _res.candidates, "success": False}, ensure_ascii=False)}
+    return _res, None
+
+
+async def _record_scoped_user_message(scoped_run, *, conversation_id, current_user,
+                                      message_id=None) -> None:
+    """逐消息作用域快照（§8.5）：这条用户消息属于哪个 task/run/attempt、当时生效的
+    ingestion 策略——改绑与策略调整都不能追溯改写它。"""
+    if scoped_run is None or not scoped_run.enforced:
+        return
+    try:
+        from sqlalchemy import text as _ws_text
+
+        from app.db.database import AsyncSessionLocal as _AsyncSessionLocal
+        from app.services.workspace_scoping_runtime import (
+            record_user_message_scope as _ws_record,
+        )
+
+        async with _AsyncSessionLocal() as _mc_db:
+            _mid = message_id
+            if not _mid:
+                # 兜底只在调用方拿不到本轮 id 时使用（语音/后台链路）；
+                # 同秒批量数据下「最新 user 行」可能不是本轮消息。
+                _last_user = await _mc_db.execute(
+                    _ws_text("SELECT id FROM messages WHERE conversation_id = :c AND role = 'user' "
+                             "ORDER BY created_at DESC, id DESC LIMIT 1"),
+                    {"c": conversation_id},
+                )
+                _mid = _last_user.scalar()
+            if _mid:
+                await _ws_record(_mc_db, user_id=current_user.id, message_id=str(_mid),
+                                 result=scoped_run)
+                await _mc_db.commit()
+    except Exception:
+        logger.exception("workspace message-context record failed (conversation=%s)",
+                         conversation_id)
+
+
 async def _chat_run_tool_loop(_state, **kw):
     _sync_chat_globals()
     _finalize_and_emit_done = kw.get('_finalize_and_emit_done')
@@ -3059,6 +3222,23 @@ async def _chat_run_tool_loop(_state, **kw):
     logger.warning("[SETUP-TRACE] gather done")
     agent_loop.workspace_path = str(workspace.root_path)
 
+    # ---- 任务作用域（2026-11-10 · DESIGN_20261108 §6.1/§10/§14）----------------
+    # 解析 Conversation→Task 绑定；enforce 档开启 run/attempt 并把 frozen
+    # WorkspaceContext 交给 AgentLoop（工具根由它决定）。off 档零解析=现网零变化；
+    # shadow 档只记录「旧根 vs 提案 Task 根」。未支持的运行模式明确拒绝，
+    # 绝不以「兼容」为名静默回退用户根。
+    _scoped_run, _scoped_error = await _attach_workspace_scope(
+        conversation=conversation, conversation_id=conversation_id, current_user=current_user,
+        workspace=workspace, agent_loop=agent_loop, latest_user_query=latest_user_query,
+        current_message_id=kw.get('user_message_id'))
+    if _scoped_error is not None:
+        yield _scoped_error
+        return
+    await _record_scoped_user_message(_scoped_run, conversation_id=conversation_id,
+                                      current_user=current_user,
+                                      message_id=kw.get('user_message_id'))
+    _state.ws_scoped_localize = bool(_scoped_run is not None and _scoped_run.enforced)
+
     # W17 vibeweaver 轮次门控：force-inject 全文与 gate/audit 执法仅对
     # coding 任务或显式提及 vibeweaver 的轮次激活（生产 conv dd3b2408：
     # 非代码任务被无条件注入拖入工程仪式直至空回答）。coordinator 缺位
@@ -3109,7 +3289,10 @@ async def _chat_run_tool_loop(_state, **kw):
                 resolve_session_root as _vw_resolve_root,
             )
             _vw_ws = str(workspace.root_path)
-            _vw_root = _vw_resolve_root(_vw_ws, str(conversation_id))
+            # 双根协议（§5.1）：enforce 档的证据域是当前 attempt root，
+            # 不再用「用户根下最新 working note」服务所有 Conversation。
+            _vw_root = _vw_resolve_root(_vw_ws, str(conversation_id),
+                                        scope_ctx=getattr(agent_loop, "workspace_ctx", None))
             if _vw_root is None:
                 _vw_root = _vw_find_root([_vw_ws], bound=_vw_ws)
             if _vw_root is not None:
@@ -3162,6 +3345,8 @@ async def _chat_run_tool_loop(_state, **kw):
         shared_context=shared_context,
         workspace=workspace,
         user=current_user,
+        # §9：scoped 会话的系统提示要拿到任务上下文，否则注入的仍是「仅供参考的用户根」
+        workspace_ctx=getattr(agent_loop, "workspace_ctx", None),
         user_skill_content=skill_content,
         skills_system_prompt=skills_sys_prompt,
         skill_files=skill_files,
@@ -3451,6 +3636,7 @@ async def _chat_run_tool_loop(_state, **kw):
                 # (content-addressed into the user's workspace).
                 _cap_content, _cap_tool_results = await _localize_media_for_persist(
                     _cap_content, _cap_tool_results, _user_id_local, _username_local,
+                    scoped=bool(getattr(_state, "ws_scoped_localize", False)),
                 )
 
                 _state.full_response = _cap_content
@@ -4000,6 +4186,7 @@ async def _chat_event_generator(_state, **kw):
                 '_user_id_local': _user_id_local,
                 '_username_local': _username_local,
                 '_wire_provider_type': _wire_provider_type,
+                'user_message_id': getattr(_state, 'ws_turn_message_id', None),
                 'assistant': assistant,
                 'chat_session': chat_session,
                 'conversation': conversation,
@@ -4044,6 +4231,7 @@ async def _chat_event_generator(_state, **kw):
             '_user_id_local': _user_id_local,
             '_username_local': _username_local,
             '_wire_provider_type': _wire_provider_type,
+            'user_message_id': getattr(_state, 'ws_turn_message_id', None),
             'assistant': assistant,
             'chat_session': chat_session,
             'conversation': conversation,
@@ -4060,6 +4248,23 @@ async def _chat_event_generator(_state, **kw):
             'skill_content': skill_content,
             'skill_files': skill_files,
             'wire_provider_type': wire_provider_type,
+        }
+        # P2（2026-11-09，spec §4.8 第 1 项）：把服务端**权威** conversation_id 作为
+        # 首个业务事件回传。前端可能持有一个服务端从不认识的 id（跨设备删除、
+        # 库重置、旧客户端缓存），此时上面的解析会另铸新 id 并覆盖 —— 不回传的
+        # 后果是前端一直轮询一个不存在的会话（60 事故里 08:58/13:56 的
+        # `GET /api/conversations/<id>` 全 404），回答落在别的会话下而用户永远看不到。
+        _client_conv_id = str(getattr(request, "conversation_id", "") or "")
+        _meta_payload = build_stream_meta(_client_conv_id, conversation_id)
+        if _meta_payload["reminted"]:
+            from app.services import persistence_metrics as _pmetrics
+
+            _pmetrics.note_conversation_id_remint(_client_conv_id, _meta_payload["conversation_id"])
+        yield {
+            "event": "meta",
+            # 前端 dispatch 按**载荷形状**路由（SSE 的 event 名被忽略），所以这里
+            # 必须包一层 `{"meta": {...}}`，与 part_started / tool_result 等同构。
+            "data": json.dumps({"meta": _meta_payload}),
         }
         async for event in _chat_run_tool_loop(_state, **_tool_loop_kw):
             yield event
@@ -4259,6 +4464,9 @@ async def stream_chat_response(request, req, db, current_user):
         return EventSourceResponse(_busy_events())
 
     user_message = None  # 仅「新用户消息」轮（普通/编辑）绑定；regenerate 不产生新消息
+    # 任务作用域：本轮 user 消息 id（装配/逐消息快照的精确锚点，
+    # 不依赖 created_at/id 排序猜「最新一条」）。regenerate 无新消息 → None。
+    _ws_turn_message_id: str | None = None
     if request.regenerate_from_message_id:
         try:
             conversation_messages = await _trim_messages_for_regeneration(
@@ -4313,6 +4521,7 @@ async def stream_chat_response(request, req, db, current_user):
                 conversation.sort_order = 0
             db.add(user_message)
             await db.commit()
+            _ws_turn_message_id = user_message.id
             # reload 也在保护圈内：此前若失败（DB 抖动/取消），删+建已落库、
             # 槽位必须释放，否则 180s provisional TTL 内重试被 conversation_busy 挡。
             conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
@@ -4352,6 +4561,7 @@ async def stream_chat_response(request, req, db, current_user):
         conversation.sort_order = 0
         db.add(user_message)
         await db.commit()
+        _ws_turn_message_id = user_message.id
         conversation_messages = await _load_conversation_messages(db, conversation_id, limit=200)
 
     latest_user_query = next(
@@ -4766,6 +4976,7 @@ async def stream_chat_response(request, req, db, current_user):
     await db.close()
 
     _state = _ChatStreamState()
+    _state.ws_turn_message_id = _ws_turn_message_id
     _locals = locals()
     for _name in ('_dm_terminal_status_saved', '_injected_mem_ids', '_stream_buf', 'client_disconnected', 'detached_agent_task', 'full_reasoning', 'full_response', 'message_count', 'response_saved', 'sse_cancelled_flag', 'tool_results_json'):
         if _name in _locals:

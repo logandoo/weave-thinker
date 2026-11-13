@@ -199,8 +199,14 @@ export interface FileAttachment {
   name: string
   /** Legacy absolute path (old persisted messages); prefer rel_path. */
   path?: string
-  /** Workspace-relative path (2026-09-19) — the only path shown to users. */
+  /** 用户根相对（2026-11-10 统一）—— /api/files 下载解析用。 */
   rel_path?: string
+  /** Task 内展示路径（§3 不变量 9：展示与解析分离）。 */
+  display_path?: string
+  /** 跨域交付来源（经 grant 的 project/task 读取才出现，§7.5）。 */
+  source_scope?: string
+  source_label?: string
+  source_task_id?: string
   size: number
   type: string
 }

@@ -12,8 +12,8 @@ port = 8158
 [security]
 jwt_secret_key = "<YOUR-SECRET>"
 super_admin_bypass = false
-user_mcp_stdio_enabled = true
-user_mcp_allow_private_hosts = true
+user_mcp_stdio_enabled = false
+user_mcp_allow_private_hosts = false
 memory_provenance_strict = false
 memory_hmac_key = ""
 multi_tenant_experimental = false
@@ -24,7 +24,7 @@ tma_checkpoint_interval = 64
 tma_witness_dir = ""
 tma_action_token_ttl = 120
 verdict_reason_redaction = true
-injection_detector_mode = "shadow"
+injection_detector_mode = "off"
 injection_detector_target_fpr = 0.01
 injection_detector_threshold = 0.0
 injection_detector_external_url = ""
@@ -76,6 +76,17 @@ Markdown格式要求（严格遵守，否则渲染会出错）：
 [agent.vision]
 max_history_image_frames = 2
 max_current_turn_image_frames = 4
+
+[agent.image_blobs]
+offload = false
+root = ""
+cache_max_bytes = 33554432
+parse_memo_max_bytes = 33554432
+parse_memo_max_entries = 512
+resident_soft_limit_chars = 33554432
+wire_soft_limit_chars = 20971520
+user_quota_bytes = 0
+gc_min_age_hours = 72
 
 [agent.tools]
 mcp_progressive_enabled = true
@@ -151,7 +162,7 @@ cache_ttl_minutes = 5
 policy = "advisory"
 reject_budget = 2
 numeric_gate_enabled = true
-numeric_provenance_gate_mode = "enforce"
+numeric_provenance_gate_mode = "shadow"
 numeric_gate_tolerance = 0.01
 retry_reasoning_keep_chars = 6000
 revision_thinking_enabled = false
@@ -326,6 +337,14 @@ create_readme = true
 snapshots_enabled = true
 snapshots_max_file_mb = 10
 snapshots_retention = 50
+[workspace.task_scoping]
+mode = "off"
+supported_modes = ["chat"]
+inbox_project_name = "收件箱"
+recover_auto = false
+default_system_memory_ingest = "user_facts"
+staging_lease_seconds = 86400
+
 
 [client_exec]
 enabled = true
@@ -451,14 +470,6 @@ interjection_enabled = true
 interjection_cooldown_seconds = 3.0
 interjection_max_per_turn = 3
 emotion_enabled = true
-filler_enabled = true
-filler_ttft_threshold_seconds = 0.7
-filler_phrases = ["我来看看啊", "我来想想啊", "等下啊，我琢磨一下", "嗯，我想想", "让我捋一捋哈", "稍等，我查查看", "好，我这就看", "嗯，我看下哈"]
-backchannel_enabled = true
-backchannel_phrases = ["嗯", "嗯嗯", "哦", "对", "嗯哼", "对啊", "好", "明白"]
-backchannel_pause_seconds = 0.35
-backchannel_cooldown_seconds = 8.0
-backchannel_max_per_turn = 2
 memory_recall_enabled = true
 memory_interjection_enabled = true
 memory_correct_enabled = false
@@ -528,7 +539,22 @@ migration_enabled = false
 retrieval_enabled = true
 subconscious_enabled = true
 recurrence_trigger_enabled = true
-dreaming_enabled = true
+dream_verify_enabled = true
+dream_verify_max_concepts = 5
+dream_verify_min_importance = 0.7
+dream_verify_interval_days = 14
+dream_verify_timeout_seconds = 30
+dream_verify_total_budget_seconds = 240
+dream_verify_max_episodes = 2
+dream_verify_high_importance = 0.85
+weekly_report_enabled = false
+memory_search_enabled = true
+profile_concept_cap = 200
+page_index_enabled = false
+page_index_max_chars = 300
+memory_claim_guard_enabled = true
+retention_eviction_mode = "shadow"
+retention_capacity = 500
 cost_governance_enabled = true
 migration_max_concurrent = 2
 migration_batch_size = 5
@@ -562,6 +588,12 @@ recall_log_enabled = true
 recall_log_retention_days = 30
 recall_log_max_per_user = 20000
 recall_log_sample_rate = 1.0
+[memory.alerts]
+verify_fail_rate = 0.5
+zero_inject_days = 7
+false_contradiction_rate = 0.1
+daily_llm_cost_units = 50
+
 [memory.concept]
 weight_init = 0.5
 weight_recall_boost = 0.03

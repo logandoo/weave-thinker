@@ -41,10 +41,29 @@ async def process(args: Dict[str, Any], **kwargs) -> str:
         return _error(err)
     user_id = str(getattr(user, "id", ""))
 
-    if action in _GATED_ACTIONS and not args.get("_permission_granted"):
-        from app.services.agent_permissions import is_permission_allowed, permission_description
+    # 任务作用域收口（2026-11-10 §7.3）：start 的默认 cwd 是当前 attempt 的 scratch，
+    # 稳定 Task 文件的写入由 controlled_publish 完成；会话按 task/run/attempt 记账，
+    # scoped 调用不能 list/read/write/kill 其他任务的进程。
+    from app.services.workspace_scope_service import apply_scope_or_error
 
-        if not is_permission_allowed(user, "terminal_execution"):
+    ctx = kwargs.get("workspace_ctx")
+    scope_key = getattr(ctx, "task_id", None)
+    exec_cwd, cwd_err = await apply_scope_or_error(kwargs, default_root=workspace_root,
+                                                   args=args, access="write",
+                                                   default_scope="scratch")
+    if cwd_err:
+        return _error(str(cwd_err.get("error") or "任务作用域拒绝执行。"))
+    # cwd 可能在 attempt scratch（不在 workspace/ 里），containment 基准随之取
+    # attempt_root 与 write_root 的并集边界（任务根），但**显式拒绝**指向其他
+    # attempt/run 的证据域、staging 与 memory（§5.1：attempt 状态仅 harness 可写）。
+    _attempt_root = getattr(ctx, "attempt_root", None)
+    if _attempt_root is not None:
+        workspace_root = str(_attempt_root)
+
+    if action in _GATED_ACTIONS and not args.get("_permission_granted"):
+        from app.services.agent_permissions import permission_allowed_from, permission_description
+
+        if not permission_allowed_from(kwargs, user, "terminal_execution"):
             return json.dumps(
                 {
                     "success": False,
@@ -70,9 +89,17 @@ async def process(args: Dict[str, Any], **kwargs) -> str:
         result = await process_manager.start(
             user_id,
             command,
-            cwd=str(args.get("cwd") or workspace_root),
+            cwd=str(args.get("cwd") or exec_cwd),
             workspace_root=workspace_root,
             wait_ms=wait_ms,
+            scope={
+                "task_id": getattr(ctx, "task_id", ""), "run_id": getattr(ctx, "run_id", ""),
+                "attempt_id": getattr(ctx, "attempt_id", ""),
+                "lease_epoch": getattr(ctx, "lease_epoch", 0),
+            },
+            # 2026-11-12：真实用户批准（云端 kwargs 标记 / 设备单次 grant）后，
+            # 可批准类命令不得在持久会话层被二次拒绝。
+            user_approved=bool(kwargs.get("_user_approved")),
         )
     elif action == "write":
         session_id = str(args.get("session_id") or "").strip()
@@ -83,6 +110,7 @@ async def process(args: Dict[str, Any], **kwargs) -> str:
             session_id,
             str(args.get("data") or ""),
             newline=bool(args.get("newline", True)),
+            task_id=scope_key,
         )
     elif action == "read":
         session_id = str(args.get("session_id") or "").strip()
@@ -101,6 +129,7 @@ async def process(args: Dict[str, Any], **kwargs) -> str:
         result = await process_manager.read(
             user_id,
             session_id,
+            task_id=scope_key,
             wait_ms=wait_ms,
             max_chars=max_chars,
         )
@@ -108,9 +137,9 @@ async def process(args: Dict[str, Any], **kwargs) -> str:
         session_id = str(args.get("session_id") or "").strip()
         if not session_id:
             return _error("kill 需要 session_id。")
-        result = await process_manager.kill(user_id, session_id)
+        result = await process_manager.kill(user_id, session_id, task_id=scope_key)
     else:
-        result = process_manager.list(user_id)
+        result = process_manager.list(user_id, task_id=scope_key)
 
     if not result.get("ok"):
         extras = {k: v for k, v in result.items() if k not in ("ok", "error")}

@@ -226,7 +226,6 @@ class VoiceASRSessionMixin:
                     and self.config.voice_barge_in_onset_enabled
                     and self.config.voice_barge_in_enabled
                     and turn_text.strip()
-                    and not _ASR_NOISE_RE.match(turn_text)
                     and not _is_likely_echo(turn_text, self._spoken_text_recent)
                     and self._prox_is_near()
                 ):
@@ -344,34 +343,8 @@ class VoiceASRSessionMixin:
             # repeat identical text, so text-change time alone flushes turns
             # while the user is still talking.
             silence = _now() - max(self._last_text_change, self._last_asr_activity)
-            # Backchannel (应和): a short listening ack during a mid-utterance
-            # pause window — before the semantic-EoT probe can arm, so the
-            # turn-taking pipeline is never racing an in-flight aux phrase.
-            await self._maybe_backchannel(silence, text)
-            # Filler prefetch (填充词预取): the utterance MAY end at the
-            # earliest flush threshold — start the filler's TTS synthesis
-            # even earlier (half of min(semantic_probe, complete_grace),
-            # floored at 0.2s) so its first audio chunk is ready BEFORE the
-            # flush: the filler overlaps the flush+generation pipeline and
-            # starts playing right after ASR end (measured E2E: filler PCM
-            # ~0.5s after the filler event, 10s+ before the answer finishes).
-            # ARM ONCE PER LIVE FILLER — a mid-utterance pause never re-arms:
-            # the phrase is content-independent (picked from the previous
-            # PHRASE, not the user text), and a re-arm on every FunASR partial
-            # (0.3-1.1s cadence) would burn one canceled provider synthesis
-            # per partial of a long monologue (2026-08-25 review I1). The
-            # synthesis simply stays queued; a convert whose text no longer
-            # matches is re-gated (noise/stop-word) on the FLUSHED text.
-            arm_threshold = max(
-                0.2,
-                0.5
-                * min(
-                    self.config.voice_eot_semantic_probe_seconds,
-                    self.config.voice_eot_complete_grace_seconds,
-                ),
-            )
-            if silence >= arm_threshold and self._filler_prefetch.get("q") is None:
-                self._arm_filler_prefetch(text)
+            # Turn-taking remains agentic; no canned filler/backchannel is
+            # emitted from this acoustic timing loop.
             # Adaptive endpointing. A complete-looking utterance (ends with
             # sentence-final punctuation) flushes after a short grace of no ASR
             # activity — when the user continues into the next sentence FunASR
@@ -466,9 +439,8 @@ class VoiceASRSessionMixin:
             self._complete_since = 0.0
             self._eot_semantic_complete = False
             self._eot_semantic_checked_text = ""
-            # Per-turn backchannel budget + aux-echo guards reset at the turn
-            # boundary (the echo of the previous turn's filler is consumed).
-            self._backchannel_count_this_turn = 0
+            # Aux-echo guards reset at the turn boundary (the echo of the
+            # previous turn's aux speech is consumed).
             self._aux_echo_guard = []
             self._consumed_offset = len(self._latest_full)
             _perf("eot_flush", (_now() - max(self._last_text_change, self._last_asr_activity)) * 1000,
@@ -498,11 +470,4 @@ class VoiceASRSessionMixin:
                     # resumes the paused playback from its breakpoint.
                     asyncio.create_task(self._on_user_turn(text))
                 else:
-                    # Idle flush: convert the speculative filler synthesis
-                    # FIRST (before enqueueing the turn) — the phrase enters
-                    # the TTS queue as a pre-synthesized aux item here, so it
-                    # plays ~immediately after ASR end and covers the
-                    # generation+TTS window. `_handle_user_turn`'s fallback
-                    # stays cooldown-suppressed behind this (2026-08-25).
-                    await self._convert_filler_prefetch(text)
                     self._enqueue_turn(text, semantic_complete=semantic_complete_flush)

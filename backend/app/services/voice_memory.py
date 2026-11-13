@@ -34,6 +34,7 @@ class VoiceMemoryMixin:
         After the interjection audio finishes, the flag clears automatically.
         """
         _sync_voicememory_globals()
+        origin_epoch = self._prepare_direct_speech()
         self._interjecting = True
         old_emotion = self._emotion
         self._emotion = emotion
@@ -73,7 +74,7 @@ class VoiceMemoryMixin:
         # during the interjection, _on_user_turn will fire and the interjection
         # is cut off (the user's turn takes priority).
         try:
-            await self._speak_text(text, wait=True)
+            await self._speak_direct_text(text, wait=True, origin_epoch=origin_epoch)
         except Exception as exc:
             logger.debug("voice interjection TTS error: %s", exc)
         finally:
@@ -308,6 +309,7 @@ class VoiceMemoryMixin:
         if (budget.last_time
                 and _now() - budget.last_time < cfg.voice_memory_interjection_cooldown_seconds):
             return
+        origin_epoch = self._prepare_direct_speech()
         clean = strip_voice_tags(line)
         now = _now()
         self._aux_echo_guard.append((clean, now))
@@ -342,7 +344,7 @@ class VoiceMemoryMixin:
             else:
                 budget.correct += 1
             budget.last_time = _now()
-            await self._speak_text(line, wait=True)
+            await self._speak_direct_text(line, wait=True, origin_epoch=origin_epoch)
         finally:
             self._interjecting = False
     def _decay_emotion(self) -> None:

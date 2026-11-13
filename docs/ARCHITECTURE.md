@@ -23,7 +23,7 @@ Weave Thinker 是一个**具备长期记忆、工具调用、多模态语音交�
 核心能力一览：
 
 - **Agent 对话**：协调器语义路由 → ReAct 工具循环（≤50 轮）→ LLM 发送前审计 → 流式 SSE 渲染
-- **49 个内置工具函数**（§3.4 全表，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务、持久作业等
+- **65 个内置工具函数**（§3.4 摘要，MCP 可再动态扩展）：联网搜索、浏览器、代码执行沙箱、终端、笔记、记忆、文件、委派子代理、后台任务、定时任务、持久作业等
 - **三层记忆**：v1 DB 摘要记忆、文件记忆工具（AGENT.md/USER.md/changelog.md）、v2 概念/潜意识/情节子系统
 - **死磕模式**：盘问 → 目标循环（PEVR + judge/verifier 双 LLM 门 + 三级停滞升级）的自主长线任务模式
 - **双工语音**：一条 WebSocket 实现全双工对话（流式 ASR + 语义 EoT + barge-in 打断 + 流式 TTS）
@@ -43,23 +43,23 @@ flowchart TD
         AND["Android WebView 壳（webview-app/）<br/>JS 桥 window.WeaverNoteApp"]
     end
     subgraph G["FastAPI 网关（backend/main.py · JWT：app/core/deps.py）"]
-        GW["27 路由模块（app/api/）"]
+        GW["30 个挂载 router（app/api/ 35 模块）"]
         CHAT["chat.py — POST /api/chat/stream<br/>核心 SSE 流式对话 · 死磕接线"]
         VOICE["voice.py — /api/voice/ws<br/>全双工语音（barge-in / 断点续播）"]
         REST["conversation · notes · assistant · skills<br/>memory · asr · export · admin …"]
     end
-    subgraph S["服务层（app/services/，~120 模块）"]
+    subgraph S["服务层（app/services/，220 模块）"]
         LOOP["agent_loop.py（核心）<br/>协调器 _coordinate() 语义路由 → ReAct 工具循环 ≤50 迭代<br/>发送前审计（四态 + salvage + best-of）· 引用台账 · canary · 压缩"]
         DM["deathmatch_service.py<br/>盘问 → PEVR 目标循环（judge/verifier 双 LLM 门）"]
         VS["voice_service.py<br/>ASR FunASR · TTS MiMo · 语义判端 · 应声接话"]
         DEV["device_session_service.py + remote_dispatch_router.py<br/>客户端设备出站 WS 会话（配对/心跳/RPC/字节通道）· 远端工具路由缝"]
-        MEM["三层记忆<br/>v1 memory_service（摘要/dream）· 文件记忆 tools/memory.py（changelog.md 系统档）<br/>v2 memory_* ~24 模块（概念/潜意识/情节）"]
+        MEM["三层记忆<br/>v1 memory_service（摘要/dream）· 文件记忆 tools/memory.py（changelog.md 系统档）<br/>v2 memory_* 36 模块（概念/潜意识/情节）"]
         BK["后台循环（轮询 DB，独立于 HTTP）<br/>agent_worker（agent_tasks）· agent_scheduler（scheduled_tasks）<br/>memory_scheduler · export_worker"]
     end
     subgraph P["工具与持久化"]
-        TL["app/tools/ 52 工具函数 + MCP 动态扩展<br/>11 项系统技能（backend/skills/）· 浏览器套件驱动 Python 侧 playwright Chromium"]
+        TL["app/tools/ 65 工具函数 + MCP 动态扩展<br/>11 项系统技能（backend/skills/）· 浏览器套件驱动 Python 侧 playwright Chromium"]
         LLM["provider_router.py — LLM 供应商（config_model.toml [providers]）<br/>主模型/judge/verifier/子代理同一路由"]
-        DB[("PostgreSQL（45 表）<br/>database.py + STARTUP_MIGRATIONS 幂等迁移（无 Alembic）")]
+        DB[("PostgreSQL（77 表）<br/>database.py + STARTUP_MIGRATIONS 幂等迁移（无 Alembic）")]
         FS["agent_memories/（文件记忆 · changelog.md）<br/>user_workspaces/（沙箱 · 媒体本地化）· output_files/"]
     end
     AND --> WEB
@@ -88,9 +88,9 @@ weave-thinker/
 ├─ backend/
 │  ├─ main.py                          # 入口：app 装配 + 启动事件序列 + 静态/SPA 投递
 │  ├─ app/
-│  │  ├─ api/                          # 27 路由模块（§3.2 全表）
-│  │  ├─ services/                     # ~120 服务模块：AgentLoop/三层记忆/死磕/语音/设备执行/导出（§3.3）
-│  │  ├─ tools/                        # 52 个工具函数 + MCP 动态扩展（§3.4）
+│  │  ├─ api/                          # 35 个 API 模块 / 30 个挂载 router（§3.2 全表）
+│  │  ├─ services/                     # 220 服务模块：AgentLoop/三层记忆/死磕/语音/设备执行/导出（§3.3）
+│  │  ├─ tools/                        # 65 个工具函数 + MCP 动态扩展（§3.4）
 │  │  ├─ core/                         # config.py（双 TOML 合并）· deps.py（JWT）· provider_router.py
 │  │  ├─ db/                           # database.py（模型 + 启动幂等迁移，无 Alembic）
 │  │  ├─ schemas/                      # Pydantic 请求/响应模型
@@ -130,7 +130,7 @@ weave-thinker/
 
 ### 3.1 入口与启动（`backend/main.py`）
 
-- `app = FastAPI(title="Weave Thinker API")`，注册 27 个路由模块，SPA fallback 提供 `/app/frontend/*`（路径穿越防护）
+- `app = FastAPI(title="Weave Thinker API")`，注册 30 个路由模块，SPA fallback 提供 `/app/frontend/*`（路径穿越防护）
 - `__main__` 硬编码 `key.pem/cert.pem`（缺失静默回退 HTTP）；生产 `scripts/start.sh` 自动检测证书
 - **startup 事件**依次：JWT secret 校验 → 运行时目录创建（audio_files/output_files/Fonts）→ `init_db()`（先 pgvector 探测 → `create_all`（pgvector 缺失时排除 8 张 memory v2 表）→ `STARTUP_MIGRATIONS` 幂等 SQL；建表在前因迁移含 `ALTER TABLE`，全新空库必须先有表）→ worker_instances 注册 + 30s 心跳 → 启动 `agent_scheduler`/`agent_worker`/`export_worker`/`memory_scheduler` → `stream_buffer_manager`/`ActiveAgentRegistry` 清理循环 + 孤儿任务恢复
 
@@ -152,7 +152,7 @@ weave-thinker/
 | asr | `/api/asr` | 文件转写、热词管理、`WS /ws/transcribe/stream` 流式转写代理 |
 | files / file_upload / image_upload | `/api/files` `/api/images` | workspace 下载（路径校验）、多文件上传解析（docx/pptx/xlsx/pdf/csv）、图片与音视频上传 |
 | skills | `/api/skills` | 用户技能 CRUD + zip/文件夹上传（可执行文件安全扫描） |
-| sessions / admin / config / system | — | 登录会话与聊天会话统计；用户管理（**无角色网关**）；provider 脱敏列表；`/api/system/capabilities` 能力清单 |
+| sessions / admin / config / system | — | 登录会话与聊天会话统计；用户管理（`require_admin` 角色网关）；provider 脱敏列表；`/api/system/capabilities` 能力清单 |
 
 ### 3.3 关键服务（`backend/app/services/`）
 
@@ -172,7 +172,7 @@ weave-thinker/
 - **code_execution_service.py**：代码沙箱（子代理生成→执行→自动修复循环）
 - **interactive_browser_service.py / browser_service.py**：交互式浏览器会话（navigate/click/type/scroll/screenshot/execute_js）与一次性抓取
 
-### 3.4 工具系统（`backend/app/tools/`，52 个工具函数 + MCP）
+### 3.4 工具系统（`backend/app/tools/`，65 个工具函数 + MCP）
 
 注册机制：`registry.py` 单例 `ToolRegistry`，`register(name, toolset, schema, handler, check_fn, …)`，`dispatch()` 支持权限门、可见工具集 fail-closed、异步超时；启动时 `_discover_tools()` 自动导入 + `load_mcp_servers_from_config()` 注册 MCP 工具。
 
@@ -199,7 +199,7 @@ weave-thinker/
 | skill_view / skill_manage / skill_run_script | 技能系统（加载 SKILL.md 手册 / 创建用户技能 / 执行技能捆绑脚本） |
 | MCP 工具 | 按 `[mcp]` 配置动态注册 |
 
-**技能系统**：`backend/skills/` 11 个系统技能（browser/code_execution/docx_manipulation/echarts_chart/file_parsing/media_playback/pptx_manipulation/mcp-server-mcp/vibeweaver/web_search/xlsx_manipulation，各含 SKILL.md），`skill_tools.py` 双源解析（系统技能优先 → 用户 DB `user_skills`+`skill_files`）并注入系统提示词；`skill_evolution_service.py` 在工具高频使用后建议沉淀新技能。
+**技能系统**：`backend/skills/` 11 个系统技能（browser/code_execution/docx_manipulation/echarts_chart/file_parsing/media_playback/pptx_manipulation/comfyui/vibeweaver/web_search/xlsx_manipulation，各含 SKILL.md），`skill_tools.py` 双源解析（系统技能优先 → 用户 DB `user_skills`+`skill_files`）并注入系统提示词；`skill_evolution_service.py` 在工具高频使用后建议沉淀新技能。
 
 **设备执行路由**：会话执行环境为客户端设备时，白名单内的文件/进程类工具经 `remote_dispatch_router` 以 JSON-RPC over 出站 WS（`/api/device/ws`）转到已配对设备本机执行（`registry.dispatch` 单缝接入，agent loop / 语音 / 后台任务 / 定时任务 / 子代理全调用面自动继承）；服务端自有工具（搜索/记忆/笔记/定时等）保持云端语义，暂缓类（`browser_*` / `job_*`）fail-closed 拒绝，设备离线时明确报错、不静默改道云端。
 
@@ -296,7 +296,7 @@ sequenceDiagram
 
 1. **v1 DB 摘要记忆**（`memory_service.py`）：每用户每（服务器本地）日 `memory_summary` + `dream_summary`（`agent_memories` / `agent_dreams` 表），注入系统提示词（共享长期记忆 / 近期 dream / 可参考的记忆条目，`memory_max_items=12`）；调度器每 15 分钟 tick（**v2 runtime 启用时调度器跳过此每日生成**，改由 v2 提取管线 `memory_scheduler.py` 承担，见下）
 2. **文件记忆工具**（`tools/memory.py`）：`agent_memories/{user_id}/{AGENT,USER}.md`（`\n§\n` 分隔），target=system 映射到**只读的 `changelog.md`**（系统文档：能力自述 + 版本记录，2026-09-06 由 func.md 更名，注入扫描 + 不可见 Unicode 防护 + 异步锁）；读操作无磁盘副作用。**changelog.md 第 6 章为版本记录**：以产品视角描述各版本增量（不含 commit 号/内部工程细节），采用累积式记录（每次更新新增一节，2026-09-06 起不再整体替换）
-3. **v2 子系统**（~21 个 `memory_*` 模块，`config_model.toml [memory.*]`）：概念提取/衰减（weight+importance+stability+source_trust）、潜意识日志（复发检测 sim≥0.6 ×3 晋升）、情节记忆（merge_first_threshold 0.85）、多阶段检索（stage0-4：BM25+embedding → 关系扩展 → CE rerank → LLM 打分 → RRF 融合注入，预算 2000 token）、合并（20 概念/48h）、梦境、聚类、澄清（置信度≥0.8 自动应用）、多模态冷启动（Set-of-Mark OCR）、成本治理（计费 + 降级阶梯）、v1→v2 迁移管理
+3. **v2 子系统**（36 个 `memory_*` 模块，`config_model.toml [memory.*]`）：概念提取/衰减（weight+importance+stability+source_trust）、潜意识日志（复发检测 sim≥0.6 ×3 晋升）、情节记忆（merge_first_threshold 0.85）、多阶段检索（stage0-4：BM25+embedding → 关系扩展 → CE rerank → LLM 打分 → RRF 融合注入，预算 2000 token）、合并（20 概念/48h）、梦境、聚类、澄清（置信度≥0.8 自动应用）、多模态冷启动（Set-of-Mark OCR）、成本治理（计费 + 降级阶梯）、v1→v2 迁移管理
 
 ### 5.3 后台任务 / 定时任务
 
@@ -310,7 +310,7 @@ sequenceDiagram
 
 ### 5.5 权限与安全
 
-工具权限键（`terminal_execution`/`note_delete` 等）→ SSE `permission_request` → 用户前端审批 → `/permission/respond` 回填；死磕模式下带 permission_key 的工具自动放行（`registry.py` auto_allowed）；JWT + WebSocket token 认证；admin 用户管理（**当前无角色网关**：`/api/admin/*` 仅 `get_current_user`，任何登录用户可调用——已知待修项）。
+工具权限键（`terminal_execution`/`note_delete` 等）→ SSE `permission_request` → 用户前端审批 → `/permission/respond` 回填；死磕模式下带 permission_key 的工具自动放行（`registry.py` auto_allowed）；JWT + WebSocket token 认证；admin 用户管理（`/api/admin/users/*` 与 `/api/admin/memory/*` 统一依赖 `app/core/deps.py::require_admin`，fail-closed：仅 `users.role` ∈ `ADMIN_ROLES`（`admin`/`super_admin`，与 `app/api/mcp.py` 共用同一常量）放行、其余 403；管理员由 SQL 指定：`UPDATE users SET role='admin' WHERE username='<用户名>';`）；自助注册受 `[security] registration_open`（默认 `true`）与 `registration_invite_code`（默认空 = 不需要邀请码，非空则 `/api/auth/register` 须带匹配的 `invite_code`）控制；`/api/auth/register` 与 `/api/auth/login` 另有应用层速率限制（`app/services/auth_rate_limit_service.py`，`[security] auth_rate_limit_enabled` 默认开，超配额 429 + `Retry-After`；per-process 状态）：尝试窗按客户端 IP，登录失败窗按「IP + 账号」并叠加按来源上限（`login_ip`），注册失败窗按来源 IP。
 
 ### 5.6 导出
 
@@ -546,7 +546,7 @@ web_search 返回每轮 1 起编号的 formatted（tools/web_search.py:44）
 
 ## 11. 测试
 
-- **前端 E2E**：Playwright（`frontend/e2e/` 仅 2 个回归 specs（baseline_smoke、chat），其中 `chat.spec.ts` 为根基；默认配置 baseURL http://127.0.0.1:8159，需后端 8158 + `scripts/dev_frontend.sh` 起的 dev server；`playwright.prod8158.config.ts` 直接打 8158 生产构建；全局 setup 仅在存在种子脚本/venv 时运行，缺失自动跳过）
+- **前端 E2E**：Playwright。本开源发行只随发 1 条根基 spec（`frontend/e2e/chat.spec.ts`）；维护者仓另有 20 条门禁 spec / 67 tests（`scripts/e2e_gate.sh` 维护清单）与 266 条归档 spec（`frontend/e2e/_archive/`），均不随发。默认配置 baseURL http://127.0.0.1:8159，需后端 8158 + `scripts/dev_frontend.sh` 起的 dev server；`playwright.prod8158.config.ts` 直接打 8158 生产构建；全局 setup 仅在存在种子脚本/venv 时运行，缺失自动跳过
 - **后端**：本开源发行不含后端单元测试集（维护者仓内部保留）；后端改动验证走 CONTRIBUTING「测试要求」的可运行脚本 + 前端 E2E
 - **浏览器 chromium 单份**：服务端 agent 浏览器工具走 Python 侧 playwright（`python -m playwright install chromium`），前端 E2E 走 npm 侧（`npx playwright install chromium`）——两侧锁定同一版本（1.60.0）、chromium 构建 revision 一致、共用浏览器缓存，任一侧装一次即可双侧复用（见 requirements 各平台文档 §9）
 

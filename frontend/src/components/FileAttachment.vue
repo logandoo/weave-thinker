@@ -39,10 +39,16 @@
             <span class="file-size">{{ formatSize(file.size) }}</span>
           </span>
           <span
-            v-if="kindOf(file) === 'unknown' && displayPath(file)"
+            v-if="(kindOf(file) === 'unknown' || file.display_path) && displayPath(file)"
             class="file-workspace-path"
             :title="displayPath(file)"
           >工作区路径: {{ displayPath(file) }}</span>
+          <span
+            v-if="sourceBadge(file)"
+            class="file-source-badge"
+            :title="`跨任务读取需用户显式授权（grant）；来源任务 ${file.source_task_id || ''}`"
+            data-testid="file-source-badge"
+          >{{ sourceBadge(file) }}</span>
         </div>
         <button class="download-icon" title="下载" @click.stop="downloadFile(file)">⬇</button>
       </div>
@@ -78,6 +84,7 @@ import { buildDownloadUrl } from '@/api/workspaceFiles'
 import { classifyFile, fileIcon, fileTypeLabel, formatSize, type FileKind } from '@/composables/filePreview'
 import { downloadUrl } from '@/composables/useDownload'
 import { useToast } from '@/composables/useToast'
+import { sourceBadgeText } from '@/utils/workspaceScope'
 
 const props = defineProps<{
   attachments: Attachment[]
@@ -101,8 +108,13 @@ function attachmentKey(file: Attachment): string {
   return file.rel_path || file.path || `${file.type}:${file.name}`
 }
 
+function sourceBadge(file: FileAttachment): string {
+  return sourceBadgeText(file)
+}
+
 function displayPath(file: FileAttachment): string {
-  return file.rel_path || ''
+  // Task 内展示路径优先；旧消息没有 display_path 时回落 rel_path
+  return file.display_path || file.rel_path || ''
 }
 
 function targetUrl(file: FileAttachment): string {
@@ -330,6 +342,16 @@ async function downloadFile(file: FileAttachment) {
   color: var(--color-text-light);
 }
 
+.file-source-badge {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 0 6px;
+  border: 1px dashed var(--color-primary);
+  border-radius: 999px;
+  color: var(--color-primary);
+  font-size: 11px;
+  line-height: 1.6;
+}
 .file-workspace-path {
   font-size: 10px;
   color: var(--color-text-light);

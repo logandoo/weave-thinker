@@ -342,6 +342,7 @@ class AgentService:
         deathmatch_mode: bool = False,
         offered_tool_names: Optional[List[str]] = None,
         task: str = "",
+        workspace_ctx: Optional[Any] = None,
     ) -> str:
         """Build the agent system prompt (P1.2 move-only).
 
@@ -365,4 +366,5 @@ class AgentService:
             deathmatch_mode=deathmatch_mode,
             offered_tool_names=offered_tool_names,
             task=task,
+            workspace_ctx=workspace_ctx,
         )

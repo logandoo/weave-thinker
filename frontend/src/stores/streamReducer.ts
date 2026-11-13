@@ -445,3 +445,50 @@ export function forceFullBody(
   }
   return out
 }
+
+/** P2（2026-11-09，docs/DESIGN_20261109_image_envelope_zero_loss_memory.md §4.8 第 1 项）
+ *  服务端回传的权威会话标识（SSE 首个 `meta` 事件）。 */
+export interface StreamMetaLike {
+  conversation_id?: string | null
+  requested_conversation_id?: string | null
+  reminted?: boolean | null
+}
+
+/** 前端持有的 conversation id 是否需要切到服务端给的 id。
+ *
+ *  幽灵会话形态（60 事故取证）：前端持有一个服务端从不认识的 id（跨设备删除 /
+ *  库重置 / 陈旧缓存），服务端解析时**另铸新 id** 承载本轮工作；旧实现不回传，
+ *  于是前端一直轮询一个不存在的会话（`GET /api/conversations/<id>` 全 404），
+ *  回答落在别的会话下而用户永远看不到。
+ *
+ *  判定保守：只有服务端**明确说换了**（`reminted === true`）才动。id 不同但
+ *  reminted 缺失/为假时不动 —— 一次代理抖动或字段缺省都不该把用户正在看的
+ *  会话踢走（宁可保持现状，也不要误切）。 */
+export function planConversationRebind(
+  clientId: string | null | undefined,
+  meta: StreamMetaLike | null | undefined,
+): { rebind: boolean; serverId: string } {
+  const serverId = String(meta?.conversation_id || '').trim()
+  if (!serverId) return { rebind: false, serverId: '' }
+  const current = String(clientId || '').trim()
+  if (current && current === serverId) return { rebind: false, serverId }
+  if (meta?.reminted !== true) return { rebind: false, serverId }
+  return { rebind: true, serverId }
+}
+
+/** remint 后把一个"以 conversation id 为键"的状态桶搬到新 id 下（原地改）。
+ *
+ *  返回是否真的搬了（旧键不存在时返回 false，调用方无需分支）。目标键已存在时
+ *  **覆盖**它：remint 语义下旧桶是乐观气泡占位，新桶才是权威。
+ *
+ *  单独导出是为了能被 node 侧单测直接跑（store 里的桶是异构的，逐桶搬；能测的
+ *  只有"搬的动作"本身，所以把动作抽成纯函数，把"哪些桶必须搬"留给源码扫描测试）。 */
+export function moveConversationKey<T>(
+  bucket: Record<string, T> | null | undefined, from: string, to: string,
+): boolean {
+  if (!bucket || !from || !to || from === to) return false
+  if (!Object.prototype.hasOwnProperty.call(bucket, from)) return false
+  bucket[to] = bucket[from]
+  delete bucket[from]
+  return true
+}

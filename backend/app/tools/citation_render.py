@@ -79,6 +79,11 @@ async def citation_render(args: dict, **kwargs) -> str:
             try:
                 workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
                 workspace_root = str(Path(workspace.root_path).resolve())
+                from app.services.workspace_scope_service import apply_scope_or_error
+                workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
+                if _scope_err:
+                    return json.dumps(_scope_err, ensure_ascii=False)
+
                 try:
                     resolved = resolve_workspace_file(file_path, workspace_root)
                 except WorkspacePathError as exc:

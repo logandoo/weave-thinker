@@ -291,6 +291,30 @@ def _is_challenge_page(title: str, text: str) -> bool:
     return any(ind in combined for ind in _CF_CHALLENGE_INDICATORS)
 
 
+# 只读 browser 命中验证页时的升级提示（2026-11-12，Issue #1 可发现性修复）。
+# 事故 conv 2c4780d4：agent 撞滑块后宣称「没有鼠标事件通道」——交互浏览器一直
+# 存在且坐标操作对任何页面可用，缺的只是把升级路径递到模型眼前。
+_CHALLENGE_ESCALATION_HINT = (
+    "[提示] 该页面仍是人机验证/交互页，只读抓取到此为止。若任务必须继续："
+    "改用交互式浏览器 browser_navigate(url) 打开同一页面，browser_screenshot 定位控件，"
+    "再用 browser_mouse 做坐标级操作（滑块=在滑块上 down → 沿轨道分步 move → up）；"
+    "键盘输入用 browser_press 或 browser_type(ref=\"_focused\")。"
+    "注意滑块类验证有行为风控，可能无法通过；失败时如实告知用户，不得谎称已完成。"
+)
+
+
+def challenge_escalation_hint(title: str, text: str) -> str:
+    """只读 browser 结果仍是验证页 → 返回「升级交互浏览器」提示。
+
+    ``[browser.interaction]`` 未启用时返回空串（fail-closed：不宣传不可用能力）。
+    """
+    if not getattr(config, "browser_interaction_enabled", False):
+        return ""
+    if _is_challenge_page(title, text or ""):
+        return _CHALLENGE_ESCALATION_HINT
+    return ""
+
+
 def _is_wechat_url(url: str) -> bool:
     return "mp.weixin.qq.com" in (url or "").lower()
 

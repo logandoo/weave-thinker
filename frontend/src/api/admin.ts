@@ -20,15 +20,17 @@ export const adminApi = {
     return data
   },
 
+  // 2026-11-11 补救 #5b：口令走 body（此前是 query 参数 → 明文进 access log）
   async createUser(username: string, password: string): Promise<User> {
-    const { data } = await api.post('/admin/users', null, {
-      params: { username, password }
-    })
+    const { data } = await api.post('/admin/users', { username, password })
     return data
   },
 
-  async updateUser(userId: string, params: { username?: string; password?: string; is_active?: boolean }): Promise<void> {
-    await api.put(`/admin/users/${userId}`, null, { params })
+  async updateUser(
+    userId: string,
+    payload: { username?: string; password?: string; is_active?: boolean }
+  ): Promise<void> {
+    await api.put(`/admin/users/${userId}`, payload)
   },
 
   async deleteUser(userId: string): Promise<void> {

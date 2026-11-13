@@ -657,6 +657,11 @@ async def skill_run_script(args: dict, **kwargs) -> str:
 
     workspace_path = str(kwargs.get("workspace_path") or "")
     cwd_arg = str(args.get("cwd") or "").strip()
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='read')
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
 
     def _resolve_cwd(default: str) -> Optional[str]:
         base = Path(workspace_path).resolve() if workspace_path else Path(default).resolve()

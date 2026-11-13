@@ -27,6 +27,9 @@ function saveCollapsedGroups(groups: Set<string>) {
 export const useGroupStore = defineStore('groups', () => {
   // State
   const groups = ref<ConversationGroup[]>([])
+  // 全量分组（跨助手）：仅供「移动到分组」菜单使用，不参与主列表渲染，
+  // 主列表始终用按当前助手过滤后的 `groups`。
+  const allGroups = ref<ConversationGroup[]>([])
   const collapsedGroups = ref<Set<string>>(loadCollapsedGroups())
   const loading = ref(false)
 
@@ -44,6 +47,11 @@ export const useGroupStore = defineStore('groups', () => {
   function getGroupsForAssistant(assistantId: string | null): ConversationGroup[] {
     const key = assistantId || 'null'
     return groupsByAssistant.value[key] || []
+  }
+
+  function getAllGroupsForAssistant(assistantId: string | null): ConversationGroup[] {
+    const key = assistantId || 'null'
+    return allGroups.value.filter(g => (g.assistant_id || 'null') === key)
   }
 
   function isGroupCollapsed(groupId: string): boolean {
@@ -66,6 +74,21 @@ export const useGroupStore = defineStore('groups', () => {
       console.error('Failed to load groups:', e)
     } finally {
       if (seq === groupsLoadSeq) loading.value = false
+    }
+  }
+
+  // 加载全部助手的分组（无 assistant_id 过滤），供「移动到分组」菜单跨助手选择。
+  // 与 loadGroups 同样的 stale-response 守卫；菜单打开时调用即可保证新鲜。
+  let allGroupsLoadSeq = 0
+  async function loadAllGroups() {
+    const seq = ++allGroupsLoadSeq
+    try {
+      const res = await groupApi.getGroups()
+      if (seq !== allGroupsLoadSeq) return // superseded by a newer load
+      allGroups.value = res.data || []
+    } catch (e) {
+      if (seq !== allGroupsLoadSeq) return
+      console.error('Failed to load all groups:', e)
     }
   }
 
@@ -146,12 +169,15 @@ export const useGroupStore = defineStore('groups', () => {
 
   return {
     groups,
+    allGroups,
     collapsedGroups,
     loading,
     groupsByAssistant,
     getGroupsForAssistant,
+    getAllGroupsForAssistant,
     isGroupCollapsed,
     loadGroups,
+    loadAllGroups,
     createGroup,
     updateGroup,
     deleteGroup,

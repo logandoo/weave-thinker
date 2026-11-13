@@ -95,3 +95,17 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db)
 ) -> User:
     return await get_user_from_token(credentials.credentials, db)
+
+
+# 管理员角色词表（2026-11-11 补救 #5c）：单一事实源。
+# 此前 `require_admin` 只认 'admin'，而 `app/api/mcp.py` 认 ('admin','super_admin')——
+# 同一个 super_admin 用户在 /api/mcp 是管理员、在 /api/admin/users 却被 403。
+# 统一为「两者都是管理员」，两处共用本常量（fail-closed 方向不变：不在表内一律 403）。
+ADMIN_ROLES = frozenset({"admin", "super_admin"})
+
+
+async def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """§8.5.1：admin 端点鉴权（fail-closed）。`users.role` ∈ `ADMIN_ROLES` 才放行。"""
+    if getattr(current_user, "role", "user") not in ADMIN_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+    return current_user

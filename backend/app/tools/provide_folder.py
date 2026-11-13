@@ -82,6 +82,14 @@ async def provide_folder(args: Dict[str, Any], **kwargs) -> str:
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
     workspace_root = str(Path(workspace.root_path).resolve())
 
+    from app.services.workspace_scope_service import apply_scope_or_error, resolve_scope_meta
+    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root,
+                                                            args=args)
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+    # §7.5：跨域读取的交付卡片带来源 badge（本域不加噪声标签）
+    _src_meta = await resolve_scope_meta(kwargs, args=args, access="read")
+
     # Accept a single folder_path string and/or a folders list.
     raw_folders: List[str] = []
     single = args.get("folder_path") or args.get("path")
@@ -113,6 +121,15 @@ async def provide_folder(args: Dict[str, Any], **kwargs) -> str:
             continue
         try:
             rel_path = to_rel_path(resolved, workspace_root)
+            # §3 不变量 9：对外 rel_path 统一为**用户根**相对（/api/files 可解析），
+            # Task 内路径另用 display_path 展示，避免任务相对路径在解析器间漂移。
+            _ctx = kwargs.get("workspace_ctx")
+            if _ctx is not None:
+                try:
+                    rel_path = Path(resolved).resolve().relative_to(
+                        Path(_ctx.user_root).resolve()).as_posix()
+                except (ValueError, OSError, RuntimeError):
+                    pass
         except WorkspacePathError as exc:  # pragma: no cover - resolver guarantees inside
             not_found.append(target)
             logger.warning("provide_folder: rel path failed for %r (%s)", target, exc.code)
@@ -127,6 +144,9 @@ async def provide_folder(args: Dict[str, Any], **kwargs) -> str:
         generated.append({
             "name": resolved.name,
             "rel_path": rel_path,
+            "display_path": to_rel_path(resolved, str(workspace_root)),
+            **({"source_scope": _src_meta["scope"], "source_label": _src_meta["source"],
+                "source_task_id": _src_meta.get("task_id")} if _src_meta else {}),
             "size": size,
             "file_count": file_count,
             "type": "folder",

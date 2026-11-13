@@ -66,6 +66,11 @@ async def workspace_glob(args: Dict[str, Any], **kwargs) -> str:
             )
 
     pattern = str(args.get("pattern") or "*").strip()
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
     if not pattern:
         pattern = "*"
 
@@ -134,7 +139,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "pattern": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "pattern": {
                     "type": "string",
                     "description": "文件名匹配模式，支持通配符 * 和 ?。例如 '*.docx'、'chapter*.txt'。默认 '*'。",
                 },

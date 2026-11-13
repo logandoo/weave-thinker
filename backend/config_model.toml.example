@@ -178,6 +178,9 @@ coordinator = "main"
 "aux.classifier" = "main"
 "memory.concept_extraction" = "main"
 "memory.dream" = "main"
+# Dream Verify 可单独指定模型/成本；**缺省（不写本行）自动回落 memory.dream 的
+# 路由（B3/P0-02）**。仅在需要与 dream 不同端点时才取消注释：
+# "memory.dream_verify" = "main"
 "memory.clarification" = "main"
 "memory.query_expansion" = "main"
 "memory.migration" = "main"

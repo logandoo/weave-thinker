@@ -66,6 +66,23 @@ for f in config.toml config_model.toml; do
     fi
 done
 
+# ── 1.5 图片 blob 根（2026-11-09 零损失内存改造，docs/IMAGE_BLOBS.md）──────
+# 必须在 uvicorn 之前存在且 0700：写入点建目录、物化读要进目录。named volume
+# `image_blobs_data` 首次挂载时会继承镜像内 /app/data/image_blobs 的属主/权限，
+# 但卷被外部重建（或 SELinux 重打标签）时这里再兜一次。卷**必须可写**——
+# 只读挂载会让落盘失败并退回内联，等于把 OOM 向量原样请回来。
+BLOB_ROOT_DIR="/app/data/image_blobs"
+if ! mkdir -p "$BLOB_ROOT_DIR" 2>/dev/null; then
+    log "错误: 无法创建图片 blob 目录 $BLOB_ROOT_DIR（named volume 是否被挂成只读？SELinux 标签？）"
+    exit 1
+fi
+chmod 700 "$BLOB_ROOT_DIR" 2>/dev/null || log "WARN: $BLOB_ROOT_DIR chmod 700 失败（属主不是当前用户？），继续启动"
+if ! touch "$BLOB_ROOT_DIR/.write-probe" 2>/dev/null; then
+    log "WARN: $BLOB_ROOT_DIR 不可写——图片将退回内联 base64（内存上界回归），请检查卷挂载选项"
+else
+    rm -f "$BLOB_ROOT_DIR/.write-probe"
+fi
+
 # ── 2. 读 [server] host/port（env 优先） ───────────────────────────────
 read -r CFG_HOST CFG_PORT <<<"$(python - <<'PY'
 import tomllib
@@ -97,8 +114,34 @@ else
 fi
 
 # ── 4. 启动 ────────────────────────────────────────────────────────────
+# 反向代理信任面（2026-11-11 评审 B Critical）：`--forwarded-allow-ips=*` 让 uvicorn
+# 无条件采信客户端自填的 X-Forwarded-For，`request.client.host` 于是变成攻击者可控值
+# ——按 IP 的限流可被一个请求头绕过，也能被伪造成任意受害者 IP 做定向锁定。
+# 默认**不**启用 proxy headers；确有反代时用 WT_FORWARDED_ALLOW_IPS 显式列出代理地址
+# （逗号分隔），不要写 *。
+PROXY_OPTS=()
+if [ -n "${WT_FORWARDED_ALLOW_IPS:-}" ]; then
+    case "${WT_FORWARDED_ALLOW_IPS}" in
+        *\**)
+            # fail-closed：`*` 等于信任任意来源的伪造头（限流可被绕过、也能被伪造成
+            # 别人的 IP 做定向锁定）。与 registration_open 同口径——不安全的写法
+            # 落到安全方向，而不是只打一行日志然后照做。
+            log "ERROR: WT_FORWARDED_ALLOW_IPS 含 '*'，已忽略（不启用 proxy headers）。" \
+                "请填反向代理的实际地址；确需多值用逗号分隔，不要用 *"
+            ;;
+        *)
+            PROXY_OPTS=(--proxy-headers --forwarded-allow-ips "${WT_FORWARDED_ALLOW_IPS}")
+            log "代理信任面: --proxy-headers（forwarded-allow-ips=${WT_FORWARDED_ALLOW_IPS}）"
+            ;;
+    esac
+fi
+if [ ${#PROXY_OPTS[@]} -eq 0 ]; then
+    log "代理信任面: 未启用 --proxy-headers（客户端地址取 socket 对端；有反代时请设 WT_FORWARDED_ALLOW_IPS）"
+fi
+
 log "启动 uvicorn: ${HOST}:${PORT}"
+# `${arr[@]+"${arr[@]}"}`：bash 3.2（macOS 自带）在 set -u 下展开空数组会报 unbound
 exec python -m uvicorn main:app \
     --host "$HOST" --port "$PORT" \
-    --proxy-headers --forwarded-allow-ips "${WT_FORWARDED_ALLOW_IPS:-*}" \
-    "${SSL_OPTS[@]}"
+    ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} \
+    ${SSL_OPTS[@]+"${SSL_OPTS[@]}"}

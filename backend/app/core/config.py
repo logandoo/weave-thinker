@@ -20,6 +20,40 @@ def _parse_int(value) -> Optional[int]:
         return None
 
 
+# 安全门开关的严格布尔词表（2026-11-11 补救清单 #3 / AUDIT_20261111 §3 M-2）。
+# 惯用法 `bool(raw)` 对字符串恒为 True，于是 `registration_open = "false"`（带引号）
+# 会让运维以为关掉了注册，实际仍然开放——安全开关上这是不可接受的静默反向。
+_SECURITY_BOOL_TRUE = {"true", "1", "yes", "on", "y", "t"}
+_SECURITY_BOOL_FALSE = {"false", "0", "no", "off", "n", "f"}
+
+
+def _parse_security_bool(value, *, fail_closed: bool) -> tuple:
+    """严格解析安全门布尔值。
+
+    返回 ``(parsed_value, ok)``。``ok=False`` 表示 TOML 里的写法不是一个可识别的
+    布尔（拼错、带引号的怪值、空串、数字 2、数组……）。
+
+    ``fail_closed`` = 键**存在但解析不了**时的安全值。安全门的安全方向各不相同：
+    ``registration_open`` 的安全值是 ``False``（关闭注册），
+    ``auth_rate_limit_enabled`` 的安全值是 ``True``（限流开着）。
+    空串/纯空白按「存在但解析不了」处理——它是模板变量替换成空的典型产物，
+    回落到默认值就是 fail-OPEN（2026-11-11 评审 A 的 Important 项）。
+    键**缺失**的情形由调用方 ``dict.get(key, default)`` 处理，本函数不参与。
+    """
+    if isinstance(value, bool):
+        return value, True
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _SECURITY_BOOL_TRUE:
+            return True, True
+        if token in _SECURITY_BOOL_FALSE:
+            return False, True
+        return fail_closed, False
+    if isinstance(value, int) and value in (0, 1):  # bool 是 int 子类，上面已先判
+        return bool(value), True
+    return fail_closed, False
+
+
 class Config:
     def __init__(self, config_path: str = None):
         if config_path is None:
@@ -215,7 +249,95 @@ class Config:
 
     @property
     def super_admin_bypass(self) -> bool:
-        return bool(self.security.get("super_admin_bypass", False))
+        """安全门：严格布尔（2026-11-13 A4.9 评审 Important-1）。
+
+        ``bool("false") is True`` 会让运维「写了 false 却仍然放行」，因此与
+        ``registration_open`` 同口径解析；解析不了按安全方向取 False。"""
+        value, _ok = _parse_security_bool(
+            self.security.get("super_admin_bypass", False), fail_closed=False
+        )
+        return value
+
+    @property
+    def registration_open(self) -> bool:
+        """Whether POST /api/auth/register accepts new accounts. Default true
+        keeps the historical open-registration behaviour; set false on a
+        deployment reachable by untrusted users (admins can still create
+        accounts via /api/admin/users).
+
+        严格布尔（2026-11-11 补救清单 #3）：``"false"``/``"no"``/``"off"`` 这类
+        带引号写法按语义关闭；无法解析的值 fail-closed（= 关闭）并由
+        ``security_config_warnings()`` 启动告警。"""
+        value, _ok = _parse_security_bool(
+            self.security.get("registration_open", True), fail_closed=False
+        )
+        return value
+
+    @property
+    def registration_invite_code(self) -> str:
+        """Non-empty = /api/auth/register requires a matching invite_code
+        (constant-time compare). Empty (default) = no invite code needed."""
+        return str(self.security.get("registration_invite_code", "") or "").strip()
+
+    @property
+    def admin_reload_secret(self) -> str:
+        """`POST /api/admin/reload-config` 的独立管理密钥（2026-11-11 补救 #5a）。
+
+        此前该端点复用 `jwt_secret_key`（一密两用）且用非恒定时间比较。现在必须
+        单独配置：为空 = 端点 fail-closed（403），不再回落到 JWT 密钥。"""
+        return str(self.security.get("admin_reload_secret", "") or "").strip()
+
+    @property
+    def auth_rate_limit_enabled(self) -> bool:
+        """POST /api/auth/{register,login} 应用层速率限制总开关（默认开）。
+
+        逃生口：环境变量 ``WT_AUTH_RATE_LIMIT=off`` 优先级高于本项（与
+        ``WT_LOOP_GOVERNOR`` 等既有逃生口同口径），供排障与压测临时关闭。"""
+        override = os.environ.get("WT_AUTH_RATE_LIMIT", "").strip().lower()
+        if override in ("off", "false", "0", "no"):
+            return False
+        if override in ("on", "true", "1", "yes"):
+            return True
+        value, _ok = _parse_security_bool(
+            self.security.get("auth_rate_limit_enabled", True), fail_closed=True
+        )
+        return value
+
+    @property
+    def auth_rate_limit_rules(self) -> dict:
+        """``{bucket: (attempts_per_window, window_seconds, failures_per_window,
+        failure_window_seconds)}`` —— 每个桶的「尝试配额 + 失败配额」两道窗。
+
+        默认值取「人类不可能触顶、脚本也够不着」的宽松档：限流要治的是自动化高速
+        枚举（AUDIT_20261111 §3 I-1），不是正常用户。``[security.auth_rate_limit]``
+        下同名键可逐项覆盖（标量，非字符串）。"""
+        rules = {
+            # 尝试窗=防洪泛（宽松到人碰不到）；失败窗=真正的枚举刹车（邀请码/口令猜测一直 4xx）
+            "register": (60, 3600.0, 10, 900.0),
+            "login": (120, 60.0, 20, 900.0),
+            # 按来源的失败上限（attempts=0 → 不设尝试窗）：拦「同一来源换着账号喷洒」。
+            # 缺这道，攻击者换用户名就能把每账号配额乘成无限（评审 A/B 共同指出的回归）。
+            "login_ip": (0, 60.0, 60, 900.0),
+        }
+        raw = self.security.get("auth_rate_limit") or {}
+        if not isinstance(raw, dict):
+            return rules
+        for bucket, defaults in rules.items():
+            over = raw.get(bucket)
+            if not isinstance(over, dict):
+                continue
+            merged = list(defaults)
+            for idx, key in enumerate((
+                "attempts_per_window", "window_seconds",
+                "failures_per_window", "failure_window_seconds",
+            )):
+                if key in over:
+                    try:
+                        merged[idx] = float(over[key])
+                    except (TypeError, ValueError):
+                        continue
+            rules[bucket] = tuple(merged)
+        return rules
 
     @property
     def memory_provenance_strict(self) -> bool:
@@ -980,112 +1102,20 @@ class Config:
         more actively."""
         return bool(self.voice.get("emotion_enabled", True))
 
-    # ---- Auxiliary speech: filler prefix (填充词) + backchannel (应和) ----
+    # ---- Auxiliary speech knobs (W38 handoff T3, 2026-11-06): the filler /
+    # audible-backchannel chain was unreachable production code and was removed
+    # together with its `filler_*` / `backchannel_*` (except recall) knobs.
+    # `backchannel_recall_seconds` below stays — it gates the LIVE classifier
+    # memory chain (_record_backchannel → skip duplicated answer).
 
-    @property
-    def voice_filler_enabled(self) -> bool:
-        """Whether a random filler phrase ("我来想想啊"…) is spoken at the start
-        of an answer turn to cover LLM generation time. The phrase is an aux
-        TTS item: the consumer cuts it when the real answer's first audio
-        chunk is ready, so fast answers are not delayed."""
-        return bool(self.voice.get("filler_enabled", True))
 
-    @property
-    def voice_filler_phrases(self) -> list:
-        """Candidate filler phrases; one is picked at random per turn (never
-        the same as recent picks when alternatives exist — 2026-09-05 P5
-        recent-window exclusion). Defaults keep register variety: 全"我想想"
-        近义池会让用户听感恒为同一句。"""
-        default = [
-            "我来看看啊", "我来想想啊", "等下啊，我琢磨一下", "嗯，我想想",
-            "让我捋一捋哈", "稍等，我查查看", "好，我这就看", "嗯，我看下哈",
-        ]
-        val = self.voice.get("filler_phrases")
-        if isinstance(val, list) and any(isinstance(p, str) and p.strip() for p in val):
-            return [p for p in val if isinstance(p, str) and p.strip()] or default
-        return default
 
-    @property
-    def voice_filler_min_gap_seconds(self) -> float:
-        """Minimum gap (s) between two filler utterances. The filler now fires
-        at the EoT flush via a speculative prefetch (arm → convert); this gap
-        keeps a fragment cascade (watchdog chopping one utterance) from
-        speaking two fillers back-to-back, and keeps the `_handle_user_turn`
-        fallback from double-firing behind a flush-converted filler. 3.0s is
-        comfortably above the cascade window (fragment_merge_seconds probe +
-        typical chop gaps) without eating the filler of a fast natural
-        back-and-forth (short answer + quick follow-up)."""
-        try:
-            return float(self.voice.get("filler_min_gap_seconds", 3.0))
-        except (TypeError, ValueError):
-            return 3.0
 
-    @property
-    def voice_filler_ttft_threshold_seconds(self) -> float:
-        """Seconds after the main LLM call starts before the filler may play.
 
-        The filler is a latency cover, not a per-turn ritual: it plays ONLY
-        when the model has not produced its first content token within this
-        window (AND-gate: elapsed >= threshold AND no first content AND not
-        speaking/paused/interrupted AND cooldown passed). A fast turn never
-        hears a filler. 0.7s sits just above the ~600-700ms silent-gap
-        tolerance threshold (Roberts & Francis 2013) and inside the
-        500-1500ms industry band for fixed-time fillers (Agora). 0 = legacy
-        immediate play; negative values are clamped to 0. Config-level
-        rollback net: `[voice] filler_ttft_threshold_seconds = 0`."""
-        try:
-            return max(0.0, float(self.voice.get("filler_ttft_threshold_seconds", 0.7)))
-        except (TypeError, ValueError):
-            return 0.7
 
-    @property
-    def voice_backchannel_enabled(self) -> bool:
-        """Whether the agent utters short listening acks (嗯/哦…) during the
-        user's mid-utterance pauses. Kept intentionally short so the phrase
-        always finishes before the earliest EoT flush of the same utterance."""
-        return bool(self.voice.get("backchannel_enabled", True))
 
-    @property
-    def voice_backchannel_phrases(self) -> list:
-        """Candidate backchannel phrases (must stay ~1-2 chars: a long phrase
-        would stretch its audible window into the flush region and its
-        mic-echo could pass the short-noise gate; runtime enforces <=4 chars)."""
-        default = ["嗯", "嗯嗯", "哦", "对", "嗯哼", "对啊", "好", "明白"]
-        val = self.voice.get("backchannel_phrases")
-        if isinstance(val, list) and any(isinstance(p, str) and p.strip() for p in val):
-            return [p for p in val if isinstance(p, str) and p.strip()] or default
-        return default
 
-    @property
-    def voice_backchannel_pause_seconds(self) -> float:
-        """Minimum user-speech pause (s) before a backchannel may fire. Must be
-        below voice_eot_semantic_probe_seconds so the ack lands in the window
-        where the turn is neither flushing nor being semantically judged.
-        Clamped below the probe so a misconfigured value degrades to a
-        narrower window instead of silently disabling the feature (A4.9 M4)."""
-        try:
-            value = float(self.voice.get("backchannel_pause_seconds", 0.35))
-        except (TypeError, ValueError):
-            value = 0.35
-        probe = self.voice_eot_semantic_probe_seconds
-        return max(0.1, min(value, max(0.1, probe - 0.05)))
 
-    @property
-    def voice_backchannel_cooldown_seconds(self) -> float:
-        """Minimum seconds between backchannels. Human backchannels land every
-        ~5-15s; a shorter cooldown starts to sound mechanical."""
-        try:
-            return max(1.0, float(self.voice.get("backchannel_cooldown_seconds", 8.0)))
-        except (TypeError, ValueError):
-            return 8.0
-
-    @property
-    def voice_backchannel_max_per_turn(self) -> int:
-        """Maximum backchannels within a single user speech turn."""
-        try:
-            return max(0, int(self.voice.get("backchannel_max_per_turn", 2)))
-        except (TypeError, ValueError):
-            return 2
 
     # ---- 每轮异步记忆召回 + 记忆插话（memory recall & interjection）----
     @property
@@ -1572,13 +1602,24 @@ class Config:
 
     @property
     def user_mcp_stdio_enabled(self) -> bool:
-        """User-level stdio MCP = server-side process execution; opt-in only."""
-        return bool(self.security.get("user_mcp_stdio_enabled", False))
+        """User-level stdio MCP = server-side process execution; opt-in only.
+
+        安全门：严格布尔（2026-11-13 A4.9 评审 Important-1）。``"false"`` 这类
+        带引号写法按语义关闭；解析不了按安全方向取 False。"""
+        value, _ok = _parse_security_bool(
+            self.security.get("user_mcp_stdio_enabled", False), fail_closed=False
+        )
+        return value
 
     @property
     def user_mcp_allow_private_hosts(self) -> bool:
-        """Allow user HTTP MCP to reach loopback/private/link-local (SSRF)."""
-        return bool(self.security.get("user_mcp_allow_private_hosts", False))
+        """Allow user HTTP MCP to reach loopback/private/link-local (SSRF).
+
+        安全门：严格布尔，口径同 ``user_mcp_stdio_enabled``。"""
+        value, _ok = _parse_security_bool(
+            self.security.get("user_mcp_allow_private_hosts", False), fail_closed=False
+        )
+        return value
 
     @property
     def mcp_hot_reload_interval_seconds(self) -> float:
@@ -1656,6 +1697,65 @@ class Config:
     @property
     def workspace_create_readme(self) -> bool:
         return bool(self.workspace.get("create_readme", True))
+
+    # --- 任务作用域（2026-11-10 波 · DESIGN_20261108 §14 灰度开关）---------------
+    # `[workspace.task_scoping]` 只有行为开关，零 url/key/model。mode 默认 off =
+    # 现网零行为变化（旧会话与旧工具路径完全不变）；shadow 只比较记录不拦截；
+    # enforce 仅对 supported_modes 内的新会话生效。逃生口 WT_WORKSPACE_SCOPING=off。
+    _WORKSPACE_SCOPING_MODES = ("off", "shadow", "enforce")
+
+    @property
+    def workspace_task_scoping(self) -> dict:
+        raw = self.workspace.get("task_scoping", {})
+        return raw if isinstance(raw, dict) else {}
+
+    @property
+    def workspace_task_scoping_mode(self) -> str:
+        raw = str(self.workspace_task_scoping.get("mode", "off") or "off").strip().lower()
+        if raw not in self._WORKSPACE_SCOPING_MODES:
+            logger.warning("未知的 [workspace.task_scoping] mode=%r，按 off 处理", raw)
+            return "off"
+        if self._env_off("WT_WORKSPACE_SCOPING"):
+            return "off"
+        return raw
+
+    @property
+    def workspace_task_scoping_enabled(self) -> bool:
+        """shadow 与 enforce 都要解析/记录作用域；off 才完全走旧路径。"""
+        return self.workspace_task_scoping_mode in ("shadow", "enforce")
+
+    @property
+    def workspace_task_scoping_supported_modes(self) -> list[str]:
+        """已放开 enforce 的运行链路矩阵（设计 §14：逐模式 parity 后才加进来）。"""
+        raw = self.workspace_task_scoping.get("supported_modes", ["chat"])
+        if isinstance(raw, str):
+            raw = [p.strip() for p in raw.split(",") if p.strip()]
+        allowed = {"chat", "voice", "deathmatch", "background", "scheduler", "delegation",
+                   "separate_task", "device", "durable", "browser", "media"}
+        out = [str(m).strip() for m in (raw or []) if str(m).strip() in allowed]
+        return out or ["chat"]
+
+    @property
+    def workspace_inbox_project_name(self) -> str:
+        """未显式选择项目的新会话落入的 inbox Project 名（不自动读取 legacy 根）。"""
+        return str(self.workspace_task_scoping.get("inbox_project_name", "收件箱") or "收件箱")
+
+    @property
+    def workspace_task_recover_auto(self) -> bool:
+        """既有 Task 的自动恢复（设计 §6.2 门槛更高）：未校准前保持关闭。"""
+        return bool(self.workspace_task_scoping.get("recover_auto", False))
+
+    @property
+    def workspace_task_default_ingest(self) -> str:
+        """新 scoped 会话的默认 ingestion 策略（设计 §8.5：user_facts）。"""
+        raw = str(self.workspace_task_scoping.get("default_system_memory_ingest", "user_facts")
+                  or "user_facts").strip().lower()
+        return raw if raw in ("normal", "user_facts", "exclude") else "user_facts"
+
+    @property
+    def workspace_staging_lease_seconds(self) -> int:
+        """首条消息前上传的 pre-run staging lease 有效期（设计 §10 首条消息前附件）。"""
+        return max(60, int(self.workspace_task_scoping.get("staging_lease_seconds", 86400)))
 
     # 2026-09-19：Office 预览（/api/files/office-pdf，soffice 服务端转 PDF）。
     # enabled=false 或探测不到 soffice → 端点 501，前端自动回退客户端渲染器；
@@ -1957,6 +2057,73 @@ class Config:
     @property
     def agent_vision_max_current_turn_image_frames(self) -> int:
         return self._vision_frame_limit("max_current_turn_image_frames", 4)
+
+    # ------------------------------------------------------------------
+    # [agent.image_blobs] — 图片信封 blob 外置（2026-11-09 零损失内存改造，
+    # docs/DESIGN_20261109_image_envelope_zero_loss_memory.md）。全部是纯行为
+    # 参数：图片字节放在哪个目录、缓存多大、告警线在哪——没有 URL/Key/模型名。
+    # ------------------------------------------------------------------
+
+    @property
+    def agent_image_blobs(self) -> dict:
+        return self.agent.get("image_blobs", {}) or {}
+
+    def _image_blob_int(self, key: str, default: int) -> int:
+        raw = self.agent_image_blobs.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            if key in self.agent_image_blobs:
+                logger.warning(
+                    "invalid [agent.image_blobs].%s=%r; using default %d", key, raw, default
+                )
+            return default
+        return value if value >= 0 else default
+
+    @property
+    def agent_image_blob_offload(self) -> bool:
+        """写侧开关（P1b）：True 时新信封只写 `blob_ref`，不再把 base64 塞进消息。
+
+        默认 **false** —— 读取点（P1a）先上线、写入点后打开，任何时刻线上都不会
+        出现"有 ref 但读不出"。置 false 即回滚：新信封重新内联，已生成的 blob 变成
+        待 GC 的孤儿，不影响正确性。
+        """
+        return bool(self.agent_image_blobs.get("offload", False))
+
+    @property
+    def agent_image_blob_root(self) -> str:
+        """blob 根目录。默认 `{project_root}/data/image_blobs`——**必须**在
+        `backend/` 之外：`scripts/deploy_60.sh` 对 `backend/` 执行
+        `rsync -az --delete`，未登记的运行时目录会被部署删光（spec §4.9）。
+        """
+        import os
+
+        raw = str(self.agent_image_blobs.get("root", "") or "").strip()
+        if raw:
+            return os.path.abspath(os.path.expanduser(raw))
+        return os.path.join(str(self.project_root), "data", "image_blobs")
+
+    @property
+    def agent_image_blob_cache_max_bytes(self) -> int:
+        """物化 LRU 字节上限（缓存不是存放处：逐出永不丢数据）。0 = 直读不缓存。
+
+        默认 32 MiB（spec §4.3 从 64 下调；最终值待 P1a 实测后定）。
+        """
+        return self._image_blob_int("cache_max_bytes", 32 * 1024 * 1024)
+
+    @property
+    def agent_image_blob_parse_memo_max_bytes(self) -> int:
+        """P0 解析记忆化的字节上限（0 = 关闭记忆化）。"""
+        return self._image_blob_int("parse_memo_max_bytes", 32 * 1024 * 1024)
+
+    @property
+    def agent_image_blob_user_quota_bytes(self) -> int:
+        """按用户 blob 配额（0 = 不限）。超限**只告警**，不删不裁（spec §4.10 (a)）。"""
+        return self._image_blob_int("user_quota_bytes", 0)
+
+    @property
+    def agent_image_blob_gc_min_age_hours(self) -> int:
+        return int(self._image_blob_int("gc_min_age_hours", 72))
 
     @property
     def agent_background_tasks(self) -> dict:
@@ -3520,24 +3687,6 @@ class Config:
         return bool(raw)
 
     @property
-    def memory_dream_repair_enabled(self) -> bool:
-        """[memory] dream_repair_enabled —— W3-3/W3-4 A3 dream probe/repair
-        运行时触发门（2026-10-24，判据 #54/#57，**默认 false**，P3）。
-
-        true=consolidation clean-pass 尾部跑 probe→只修 miss→
-        dream_repair_reports 落库（hit@k before/after）+ check_stop_rule
-        （14 天无正收益落 stop 标记=回退方案 B 决策记录，此后短路——
-        面板只展示不注入）。false=零调用零落库。接线经本属性（单一真源），
-        字符串布尔 fail-safe（"false"→False）。
-        **翻 true 前置（D-20261024-a3b）**：hit@k_after 恒真 / repair 通胀
-        无上限 / memory_eval_runs 用户词逃逸擦除面——三项先清（见
-        docs/TODO_memory_v2_20261023.md D11-D13），否则修复面不可信。"""
-        raw = self.memory.get("dream_repair_enabled", False)
-        if isinstance(raw, str):
-            return raw.strip().lower() in ("true", "1", "yes", "on")
-        return bool(raw)
-
-    @property
     def memory_provider_routing_enabled(self) -> bool:
         """[memory] provider_routing_enabled —— W3 M1a 注入层路由开关（默认关）。
 
@@ -3682,6 +3831,135 @@ def production_security_errors(cfg: Config) -> List[str]:
             f"database.host={host!r} is loopback; production must use an explicit database host"
         )
     return errors
+
+
+_SECURITY_INVITE_CODE_MIN_LEN = 8
+
+# 失败窗的「按来源」伴生桶：`login` 的按账号窗之外，再留一道纯 IP 上限，
+# 否则攻击者换用户名即可把每账号配额乘成无限（评审 A/B 共同指出的回归）。
+# register 的按账号键本身就是纯 IP，无需伴生桶。
+# 事实源放在 config 侧（服务层从这里 import，避免 config→service 的循环依赖）。
+AUTH_RATE_LIMIT_IP_CEILING_BUCKETS = {"login": "login_ip"}
+
+_AUTH_RATE_LIMIT_NUMERIC_KEYS = (
+    "attempts_per_window", "window_seconds", "failures_per_window", "failure_window_seconds",
+)
+
+
+def _auth_rate_limit_numeric_warnings(cfg: Config) -> List[str]:
+    """`[security.auth_rate_limit.<bucket>]` 的数值陷阱。
+
+    `attempts_per_window = 0` 之类会让限流器**静默空转**（模块里 0 的语义是「关掉
+    那道窗」）——安全开关的静默失效正是本波要消灭的 M-2 同类，所以 0/负数/非数字
+    一律点名告警（不阻止启动：运维可能确实想临时关掉某道窗）。
+    """
+    raw = cfg.security.get("auth_rate_limit")
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return [f"[security.auth_rate_limit] 不是表（{type(raw).__name__}），已忽略；请写成子表"]
+    out: List[str] = []
+    companion_buckets = set(AUTH_RATE_LIMIT_IP_CEILING_BUCKETS.values())
+    known_buckets = set(cfg.auth_rate_limit_rules)
+    for bucket, over in raw.items():
+        if bucket not in known_buckets:
+            out.append(
+                f"[security.auth_rate_limit.{bucket}] 不是已知的限流桶（已知：{sorted(known_buckets)}）"
+                "——该段被静默忽略；请检查拼写"
+            )
+            continue
+        if not isinstance(over, dict):
+            out.append(f"[security.auth_rate_limit.{bucket}] 不是表，已忽略")
+            continue
+        for key in _AUTH_RATE_LIMIT_NUMERIC_KEYS:
+            if key not in over:
+                continue
+            try:
+                value = float(over[key])
+            except (TypeError, ValueError):
+                out.append(
+                    f"[security.auth_rate_limit.{bucket}].{key}={over[key]!r} 不是数字，该项已忽略"
+                )
+                continue
+            if value <= 0:
+                # 伴生桶的 attempts_per_window = 0 是**设计意图**（只做失败上限，不设尝试窗），
+                # 对它告警会把运维训练成忽略 SECURITY CONFIG 信道（评审 A/B 第 2 轮 Minor）。
+                if key == "attempts_per_window" and bucket in companion_buckets:
+                    continue
+                out.append(
+                    f"[security.auth_rate_limit.{bucket}].{key}={over[key]!r} <= 0："
+                    "0 会关掉这道窗（该窗口的限流失效）；若非有意关闭请改成正数"
+                )
+    return out
+
+
+def security_config_warnings(cfg: Config) -> List[str]:
+    """启动期「安全门配置写法」告警（2026-11-11 补救清单 #3 / AUDIT_20261111 §3 M-2）。
+
+    只报告「运维写了、但被严格解析纠正或拒绝」的配置：安全门的语义反转必须可见，
+    否则 ``registration_open = "false"`` 这类笔误会让站点静默保持开放注册。
+    告警文本**绝不包含邀请码本身**（它是秘密，只报长度/类型）。
+    """
+    warnings: List[str] = []
+
+    if "registration_open" in cfg.security:
+        raw = cfg.security.get("registration_open")
+        value, ok = _parse_security_bool(raw, fail_closed=False)
+        if not ok:
+            warnings.append(
+                f"registration_open={raw!r} 不是可识别的布尔写法，已按安全方向取 {value}"
+                "（关闭注册；请写 true/false，或 \"true\"/\"false\"）"
+            )
+
+    if "auth_rate_limit_enabled" in cfg.security:
+        raw = cfg.security.get("auth_rate_limit_enabled")
+        value, ok = _parse_security_bool(raw, fail_closed=True)
+        if not ok:
+            warnings.append(
+                f"auth_rate_limit_enabled={raw!r} 不是可识别的布尔写法，已按安全方向取 {value}"
+                "（限流保持开启；默认 true = 注册/登录接口启用速率限制）"
+            )
+
+    # 2026-11-13（A4.9 评审 Important-1）：其余安全门同样走严格布尔——
+    # 它们的安全方向都是 False（关）。被纠正/被拒绝的写法必须让运维看见，
+    # 否则「写了 false 却仍然放行」会静默发生在发行模板上。
+    for _key in (
+        "super_admin_bypass",
+        "user_mcp_stdio_enabled",
+        "user_mcp_allow_private_hosts",
+    ):
+        if _key in cfg.security:
+            _raw = cfg.security.get(_key)
+            _value, _ok = _parse_security_bool(_raw, fail_closed=False)
+            if not _ok:
+                warnings.append(
+                    f"{_key}={_raw!r} 不是可识别的布尔写法，已按安全方向取 {_value}"
+                    "（请写 true/false，或 \"true\"/\"false\"）"
+                )
+
+    warnings.extend(_auth_rate_limit_numeric_warnings(cfg))
+
+    if "registration_invite_code" in cfg.security:
+        raw = cfg.security.get("registration_invite_code")
+        if not isinstance(raw, str):
+            warnings.append(
+                "registration_invite_code 配置为 %s（非字符串），TOML 会丢掉前导零；"
+                "请写成带引号的字符串" % type(raw).__name__
+            )
+        code = str(raw or "").strip()
+        if raw and not code:
+            warnings.append(
+                "registration_invite_code 只含空白字符 → 等同未启用邀请码（注册仍无需邀请码）；"
+                "要停止自助注册请设 registration_open = false"
+            )
+        elif code and len(code) < _SECURITY_INVITE_CODE_MIN_LEN:
+            warnings.append(
+                "registration_invite_code 长度 %d < %d：邀请码是线上枚举目标"
+                "（AUDIT_20261111 §3 I-1），请使用更长的随机串"
+                % (len(code), _SECURITY_INVITE_CODE_MIN_LEN)
+            )
+
+    return warnings
 
 
 @lru_cache()

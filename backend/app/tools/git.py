@@ -148,17 +148,43 @@ async def git(args: Dict[str, Any], **kwargs) -> str:
         workspace_root = str(Path(workspace.root_path).resolve())
     else:
         workspace_root = str(Path(workspace_root).resolve())
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
+    # ---- 越界守卫（2026-11-10 §11.1）：-C / --git-dir / --work-tree 不许指向作用域外 ----
+    _root_resolved = Path(workspace_root).resolve()
+    _flag_opts = ("-C", "--git-dir", "--work-tree", "--namespace")
+    _flat = [str(a) for a in git_args]
+    for _i, _a in enumerate(_flat):
+        _val = None
+        for _flag in _flag_opts:
+            if _a == _flag and _i + 1 < len(_flat):
+                _val = _flat[_i + 1]
+            elif _a.startswith(_flag + "="):
+                _val = _a.split("=", 1)[1]
+        if _val is None:
+            continue
+        _candidate = Path(_val)
+        if not _candidate.is_absolute():
+            _candidate = _root_resolved / _candidate
+        try:
+            _candidate.resolve().relative_to(_root_resolved)
+        except ValueError:
+            return _payload_error(
+                f"git 参数 {_a!r} 指向任务作用域之外，已拒绝（越界路径不会被执行）")
 
     # ---- 分级权限（_permission_needed 协议；registry 级 key 不分粒度，
     # 故 mutating 子命令在此按 notes.py 模式逐动作放行/请求）----
     if subcommand not in _READ_ONLY_SUBCOMMANDS:
         if not args.get("_permission_granted"):
             from app.services.agent_permissions import (
-                is_permission_allowed,
+                permission_allowed_from,
                 permission_description,
             )
             perm_key = "workspace_restore" if subcommand == "restore" else "git_execution"
-            if not (user is not None and is_permission_allowed(user, perm_key)):
+            if not (user is not None and permission_allowed_from(kwargs, user, perm_key)):
                 return json.dumps(
                     {
                         "success": False,

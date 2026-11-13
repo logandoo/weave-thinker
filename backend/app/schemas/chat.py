@@ -183,6 +183,17 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RegisterRequest(LoginRequest):
+    # description 会进 /openapi.json → backend/API.md 输入表，避免文档只能手改
+    invite_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "`[security] registration_invite_code` 非空时必填且须匹配，否则 403 `邀请码无效`；"
+            "`registration_open = false` 时一律 403 `注册已关闭，请联系管理员`"
+        ),
+    )
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str

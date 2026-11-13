@@ -198,7 +198,7 @@ echo ""
 mkdir -p "$APK_DIR"
 
 APK_SOURCE="$WEBVIEW_DIR/app/build/outputs/apk/release/app-release.apk"
-APK_OUTPUT="$APK_DIR/weave-thinker.apk"
+APK_OUTPUT="$APK_DIR/Weave Thinker.apk"
 
 if [ -f "$APK_SOURCE" ]; then
     cp "$APK_SOURCE" "$APK_OUTPUT"
@@ -209,7 +209,7 @@ if [ -f "$APK_SOURCE" ]; then
     echo " 服务器: $SERVER_URL"
     echo "=========================================="
     echo ""
-    echo "  安装到设备: adb install $APK_OUTPUT"
+    echo "  安装到设备: adb install \"$APK_OUTPUT\""
 else
     echo ""
     echo "❌ APK 文件未找到，构建可能失败"

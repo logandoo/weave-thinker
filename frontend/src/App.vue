@@ -66,6 +66,14 @@ const unregisterBeforeEach = router.beforeEach((to, from) => {
   updateZenTransition(to.path, from.path)
 })
 
+// wave-2（透明边到边）：路由切换改变顶边实际绘制面（/voice /zen 是 ChatLayout 的
+// 兄弟路由，组件内 watch 覆盖不到）→ afterEach 防抖 350ms 重采样下发图标亮度依据。
+let surfaceNotifyTimer: number | undefined
+const unregisterAfterEach = router.afterEach(() => {
+  window.clearTimeout(surfaceNotifyTimer)
+  surfaceNotifyTimer = window.setTimeout(() => skinStore.notifyNativeBridge(), 350)
+})
+
 router.onError((error) => {
   console.error('Router error:', error)
   const message = '页面加载失败，请刷新重试'
@@ -91,6 +99,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.clearTimeout(surfaceNotifyTimer)
+  unregisterAfterEach()
   unregisterBeforeEach()
 })
 </script>

@@ -48,9 +48,9 @@ async def workspace_snapshot(args: Dict[str, Any], **kwargs) -> str:
     elif action == "list":
         result = await list_snapshots(user_id, workspace_root)
     else:
-        from app.services.agent_permissions import is_permission_allowed, permission_description
+        from app.services.agent_permissions import permission_allowed_from, permission_description
 
-        if not args.get("_permission_granted") and not is_permission_allowed(user, "workspace_restore"):
+        if not args.get("_permission_granted") and not permission_allowed_from(kwargs, user, "workspace_restore"):
             return json.dumps(
                 {
                     "success": False,
@@ -60,6 +60,16 @@ async def workspace_snapshot(args: Dict[str, Any], **kwargs) -> str:
                 },
                 ensure_ascii=False,
             )
+        # 任务作用域（§7.3）：scoped 会话的 restore 是一次多文件受控发布——
+        # 先校验当前 attempt/epoch 与绑定，旧 attempt / 改绑后整体拒绝，不做部分落盘。
+        _ctx = kwargs.get("workspace_ctx")
+        if _ctx is not None:
+            from app.services.workspace_run_service import assert_write_epoch as _assert_epoch
+
+            try:
+                await _assert_epoch(kwargs.get("db"), _ctx)
+            except Exception as _exc:  # WorkspaceScopeError
+                return _error(f"任务作用域拒绝快照恢复：{_exc}")
         snapshot_id = str(args.get("snapshot_id") or "").strip()
         if not snapshot_id:
             return _error("restore 需要 snapshot_id（可先用 action='list' 查看）。")

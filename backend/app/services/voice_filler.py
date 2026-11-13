@@ -9,18 +9,9 @@ monkeypatches of ``voice_service.<name>`` keep working.
 from __future__ import annotations
 
 _GLOBALS = (
-    '_ASR_NOISE_RE',
-    '_AUX_RECENT_CAP',
-    '_STOP_TASK_EXACT_RE',
-    '_STOP_TASK_RE',
-    '_is_likely_echo',
-    '_is_voice_noise',
     '_norm_barge_compare',
     '_now',
-    '_pick_aux_phrase',
     '_split_segments',
-    '_strip_lead_punct',
-    '_utterance_complete',
     'asyncio',
     'logger',
 )
@@ -61,96 +52,12 @@ def build_batch_notice_text(items: list[dict]) -> str:
 
 
 class VoiceFillerMixin:
-    def _record_filler_pick(self, phrase: str) -> None:
-        """填充词选取落账：last + 近期窗口（_pick_aux_phrase 的 recent 源）。"""
-        _sync_voicefillermixin_globals()
-        self._last_filler_phrase = phrase
-        self._recent_filler_phrases = (self._recent_filler_phrases + [phrase])[-_AUX_RECENT_CAP:]
-    def _record_backchannel_pick(self, phrase: str) -> None:
-        """应和选取落账：last + 近期窗口。"""
-        _sync_voicefillermixin_globals()
-        self._last_backchannel_phrase = phrase
-        self._recent_backchannel_phrases = (self._recent_backchannel_phrases + [phrase])[-_AUX_RECENT_CAP:]
-    async def _speak_filler(self) -> None:
-        """Filler prefix (填充词): speak a random "让我想想" phrase at the start
-        of an answer turn so the user is never met with dead silence while the
-        LLM generates. Gates: enabled, not already speaking, not paused, no
-        tool loop running, session open. The phrase rides _tts_queue as an aux
-        item — the consumer cuts it the moment the real answer's first audio
-        chunk is ready, so fast answers pay ~zero added latency.
-
-        This is the FALLBACK trigger (barge-in-deferred turns reach
-        `_handle_user_turn` without passing the idle flush block). The primary
-        trigger is `_convert_filler_prefetch` at the flush; the shared
-        `_last_filler_at` cooldown keeps the two from double-firing in one
-        turn and bounds fragment-cascade repeats."""
-        _sync_voicefillermixin_globals()
-        cfg = self.config
-        if not cfg.voice_filler_enabled:
-            return
-        if _now() - self._last_filler_at < cfg.voice_filler_min_gap_seconds:
-            return
-        if self._speaking or self._playback_paused or self._tools_running:
-            return
-        if self._closed:
-            return
-        phrase = _pick_aux_phrase(cfg.voice_filler_phrases, self._last_filler_phrase,
-                                  recent=self._recent_filler_phrases)
-        if not phrase:
-            return
-        if len(phrase) > 24:
-            # A pathological over-long configured phrase would play in full
-            # before the answer arrives — never (A4.9 M4).
-            return
-        self._record_filler_pick(phrase)
-        self._last_filler_at = _now()
-        await self._send_json({"event": "filler", "text": phrase})
-        await self._speak_text(phrase, wait=False, aux=True)
-    def _filler_idle_gates_ok(self) -> bool:
-        """Shared gates for the speculative filler arm/convert: only when the
-        session is fully idle (no playback, no paused answer, no active turn,
-        no tool loop) may a filler be synthesized/queued — the same conditions
-        under which the EoT flush routes to the plain `_enqueue_turn` path."""
-        _sync_voicefillermixin_globals()
-        cfg = self.config
-        if not cfg.voice_filler_enabled or self._closed:
-            return False
-        if self._speaking or self._playback_paused or self._turn_active or self._tools_running:
-            return False
-        return True
-    def _drop_filler_prefetch(self) -> None:
-        """Cancel and clear a live speculative filler synthesis (text changed,
-        gates flipped, session draining/shutting down), plus any pending
-        TTFT-gated phrase/watch from the previous turn."""
-        _sync_voicefillermixin_globals()
-        p = self._filler_prefetch
-        task = p.get("task")
-        if task is not None and not task.done():
-            task.cancel()
-        self._filler_prefetch = {"text": "", "phrase": "", "q": None, "task": None}
-        self._clear_pending_filler()
-    def _clear_pending_filler(self) -> None:
-        """Drop the converted-but-unplayed filler and cancel its TTFT watch
-        (drain / shutdown / generation end / skipped turn). The pre-synthesized
-        queue AND its still-running synth task are discarded — one-shot, like
-        the prefetch it came from (A4.9 review Minor #2)."""
-        _sync_voicefillermixin_globals()
-        pending = self._pending_filler
-        task = pending.get("task")
-        if task is not None and not task.done():
-            task.cancel()
-        self._pending_filler = {"phrase": "", "q": None, "task": None}
-        watch = self._filler_watch_task
-        if watch is not None and not watch.done():
-            watch.cancel()
-        self._filler_watch_task = None
     def _register_aux_echo(self, text: str) -> None:
         """Register an aux utterance (filler/backchannel) for mic-echo tail-
         stripping. Registers the SPLIT segments plus the joined phrase: the
-        consumer typically cuts a filler mid-phrase, so the ASR tail of an
-        interrupted aux word may only contain one segment. Shared by the
-        flush-convert path and the `_speak_text(aux=True)` fallback so the
-        two stay symmetric (2026-08-25 review I2)."""
+        consumer typically cuts an aux utterance mid-phrase, so the ASR tail
+        of an interrupted aux word may only contain one segment
+        (`_speak_text(aux=True)` path, 2026-08-25 review I2)."""
         _sync_voicefillermixin_globals()
         segments, rest = _split_segments(text)
         if rest.strip():
@@ -164,222 +71,6 @@ class VoiceFillerMixin:
         if joined not in [p for p, _ in self._aux_echo_guard]:
             self._aux_echo_guard.append((joined, now))
         del self._aux_echo_guard[:-4]
-    def _arm_filler_prefetch(self, text: str) -> None:
-        """Speculatively start the filler phrase's TTS synthesis while the EoT
-        watchdog is still deciding whether the utterance ended (silence has
-        reached arm threshold). ARM-ONCE per live prefetch — the caller only
-        invokes this when no prefetch is alive, so a long monologue's many
-        mid-utterance pauses produce at most ONE synthesis (not one per
-        FunASR partial, which 0.3-1.1s cadence would otherwise burn as
-        cancelled provider calls — review I1). At the flush the phrase
-        converts to a pre-synthesized aux item, so the filler's own TTS
-        round-trip overlaps the generation pipeline instead of trailing it.
-        Deterministic gates only (noise/stop-word/busy/cooldown): the LLM
-        intent classifier runs too late to gate this, and the reject path
-        already drains aux speech (A4.9 I2 pattern)."""
-        _sync_voicefillermixin_globals()
-        if not self._filler_idle_gates_ok():
-            return
-        cfg = self.config
-        if _now() - self._last_filler_at < cfg.voice_filler_min_gap_seconds:
-            return
-        t = (text or "").strip()
-        if not t or _is_voice_noise(t):
-            return
-        if _STOP_TASK_RE.search(t) or _STOP_TASK_EXACT_RE.match(t):
-            return
-        phrase = _pick_aux_phrase(cfg.voice_filler_phrases, self._last_filler_phrase,
-                                  recent=self._recent_filler_phrases)
-        if not phrase or len(phrase) > 24:
-            return
-        self._record_filler_pick(phrase)
-        # Defensive: the watchdog only arms when no prefetch is alive; drop
-        # anything stale so we never hold two candidate syntheses.
-        self._drop_filler_prefetch()
-        q: asyncio.Queue = asyncio.Queue()
-        task = self._spawn_synth(phrase, self._turn_epoch, q)
-        self._filler_prefetch = {"text": t, "phrase": phrase, "q": q, "task": task}
-    async def _convert_filler_prefetch(self, flushed: str) -> None:
-        """Convert the armed filler synthesis into a PENDING phrase at the EoT
-        flush (idle path only, BEFORE `_enqueue_turn`). Nothing plays yet: the
-        pre-synthesized queue is held until the TTFT watch scheduled at
-        generation start decides — the filler is audible only when the model
-        has not produced its first content token within
-        `voice_filler_ttft_threshold_seconds` (2026-09-13; fast turns stay
-        silent). The old immediate enqueue made every turn open with a filler.
-
-        NO strict text match against the arm-time text: the filler phrase is
-        content-independent, and the flushed text is normally LONGER than the
-        tail that armed it (partials kept growing) — matching on equality
-        would drop most converts (review I1). Security against the user text
-        is re-gated here on the FLUSHED text (noise / stop-word / idle gates);
-        a prefetch that fails them is dropped. The prefetch is ALWAYS cleared
-        (one-shot)."""
-        _sync_voicefillermixin_globals()
-        p = self._filler_prefetch
-        self._filler_prefetch = {"text": "", "phrase": "", "q": None, "task": None}
-        q = p.get("q")
-        synth_task = p.get("task")
-        phrase = p.get("phrase") or ""
-        if q is None or not phrase:
-            return
-        t = (flushed or "").strip()
-        if not (
-            bool(t)
-            and self._filler_idle_gates_ok()
-            and not _is_voice_noise(t)
-            and not (_STOP_TASK_RE.search(t) or _STOP_TASK_EXACT_RE.match(t))
-        ):
-            if synth_task is not None and not synth_task.done():
-                synth_task.cancel()
-            return
-        self._pending_filler = {"phrase": phrase, "q": q, "task": synth_task}
-    def _schedule_filler_ttft_watch(self) -> None:
-        """Start the TTFT-gated filler decision for THIS turn (called when the
-        main generation is about to issue its LLM call).
-
-        Consumes `_pending_filler` (EoT prefetch) if present; otherwise the
-        watch's fallback synthesizes on demand (`_speak_filler`) — covers the
-        barge-in/defer path that never went through the idle flush convert.
-        A previous watch is cancelled: only the newest generation owns the
-        decision."""
-        _sync_voicefillermixin_globals()
-        cfg = self.config
-        if not cfg.voice_filler_enabled or self._closed:
-            self._clear_pending_filler()
-            return
-        epoch = self._turn_epoch
-        pending = self._pending_filler
-        self._pending_filler = {"phrase": "", "q": None, "task": None}
-        prev = self._filler_watch_task
-        if prev is not None and not prev.done():
-            prev.cancel()
-        self._filler_watch_task = asyncio.create_task(
-            self._filler_ttft_watch(
-                epoch, pending.get("phrase") or "", pending.get("q"), pending.get("task")
-            )
-        )
-    async def _filler_ttft_watch(self, epoch: int, phrase: str, q,
-                                 synth_task: Optional[asyncio.Task] = None) -> None:
-        """AND-gated filler decision: play only when (elapsed >= threshold)
-        AND (no first content this turn) AND (not speaking/paused/interrupted)
-        AND (cooldown passed). OR semantics would degenerate to the old
-        per-turn behavior — elapsed always exceeds the threshold eventually.
-
-        With a pre-synthesized queue the phrase plays instantly (its TTS
-        round-trip already overlapped the EoT window); without one (barge-in
-        path) `_speak_filler` synthesizes on demand — the model is slow
-        anyway, so the extra TTS hop only lands on genuinely slow turns."""
-        _sync_voicefillermixin_globals()
-        played = False
-        try:
-            threshold = self.config.voice_filler_ttft_threshold_seconds
-            if threshold > 0:
-                await asyncio.sleep(threshold)
-            if self._closed or self._turn_epoch != epoch:
-                return
-            if self._answer_content_epoch >= epoch:
-                return  # model already produced its first content token
-            if self._speaking or self._playback_paused or self._interrupt.is_set():
-                return
-            if phrase and q is not None:
-                if _now() - self._last_filler_at < self.config.voice_filler_min_gap_seconds:
-                    return
-                self._last_filler_at = _now()
-                self._register_aux_echo(phrase)
-                await self._send_json({"event": "filler", "text": phrase})
-                self._tts_queue.put_nowait({
-                    "text": phrase, "epoch": epoch, "aux": True, "pre_q": q,
-                })
-                played = True
-            else:
-                await self._speak_filler()
-                played = True
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.debug("voice filler ttft watch failed: %s", exc)
-        finally:
-            if not played and synth_task is not None and not synth_task.done():
-                # Decision was "no filler": stop the speculative synthesis
-                # instead of letting it fill a queue nobody reads (A4.9
-                # review Minor #2).
-                synth_task.cancel()
-            if self._filler_watch_task is asyncio.current_task():
-                self._filler_watch_task = None
-    async def _maybe_backchannel(self, silence: float, text: str) -> None:
-        """Backchannel (应和): during the USER's speech, in a mid-utterance
-        pause window (silence >= pause_seconds and below the semantic-EoT
-        probe), the agent utters a short "嗯" to signal attentive listening —
-        the classic human listening behavior that keeps a speaker going.
-
-        Design constraints honored (no TTS conflict, no race, no overwrite):
-        - Speech rides the SAME _tts_queue as everything else: the single
-          consumer serializes it against answers/interjections/notices.
-        - Only fires while the agent is fully idle (not speaking, not
-          interjecting, no turn active, not paused, ASR ready) — it can never
-          talk over the user's turn-taking machinery.
-        - Only fires on INCOMPLETE utterances (no terminal punctuation) in a
-          silence window that ENDS BEFORE the semantic-EoT probe: a complete
-          utterance is about to flush and get answered, a probe-armed one is
-          being judged — both would race the turn pipeline.
-        - If a flush of the SAME utterance still lands while the ack plays
-          (probe 1.0s + judge ~0.8s, or the 1.6s hard threshold, vs TTS
-          round-trip ~0.7-1.3s + short phrase audio), the overlap is benign
-          BY CONSTRUCTION: the aux-cut truncates the ack the moment the
-          answer audio is ready, the barge-in no-interrupt window defers the
-          flushed turn (queued + prefetched, answered immediately after), and
-          the ack is excluded from the pause breakpoint pool so a resume
-          never replays it (A4.9 M3).
-        - Phrase length is bounded (~1-2 chars, ~0.3-0.6s audio) so the ack
-          is over quickly and its own mic-echo passes the short-noise gate.
-        - Cooldown + per-turn cap + same-text dedup + near-field gate + noise/
-          echo pre-filters bound frequency and false positives."""
-        _sync_voicefillermixin_globals()
-        cfg = self.config
-        if not cfg.voice_backchannel_enabled:
-            return
-        if not self._asr_ready or self._speaking or self._interjecting:
-            return
-        if self._turn_active or self._playback_paused or self._closed:
-            return
-        if silence < cfg.voice_backchannel_pause_seconds or silence >= cfg.voice_eot_semantic_probe_seconds:
-            return
-        t = (text or "").strip()
-        if not t or _utterance_complete(t):
-            return
-        if len(_strip_lead_punct(t)) < 2:
-            return
-        if _ASR_NOISE_RE.match(t) or _is_voice_noise(t):
-            return
-        if _is_likely_echo(t, self._spoken_text_recent):
-            return
-        if not self._prox_is_near():
-            return
-        now = _now()
-        if now - self._last_backchannel_time < cfg.voice_backchannel_cooldown_seconds:
-            return
-        if t == self._backchannel_acked_text:
-            return
-        if self._backchannel_count_this_turn >= cfg.voice_backchannel_max_per_turn:
-            return
-        phrase = _pick_aux_phrase(cfg.voice_backchannel_phrases, self._last_backchannel_phrase,
-                                  recent=self._recent_backchannel_phrases)
-        if not phrase:
-            return
-        if len(phrase) > 4:
-            # Backchannel phrases MUST stay ~1-2 chars: a long one would (a)
-            # stretch its audible window into the flush region and (b) its
-            # mic-echo could pass the short-noise gate and become a phantom
-            # turn (A4.9 M4).
-            return
-        self._last_backchannel_time = now
-        self._record_backchannel_pick(phrase)
-        self._backchannel_acked_text = t
-        self._backchannel_count_this_turn += 1
-        await self._send_json({"event": "agent_backchannel", "text": phrase})
-        await self._speak_text(phrase, wait=False, aux=True)
-        logger.info("voice backchannel: %r (pause %.2fs, text %r)", phrase, silence, t[-40:])
     def _record_backchannel(self, text: str) -> None:
         """Remember a recent backchannel verdict for *text* so the responder
         can skip a queued copy of the same utterance (a backchannel-classified
@@ -495,7 +186,7 @@ class VoiceFillerMixin:
                     "retry_at": _now() + 0.25,
                 })
                 return
-        self._interrupt.clear()
+        origin_epoch = self._prepare_direct_speech()
         self._turn_active = True
         await self._set_state("think")
         status = str(info.get("task_status") or info.get("status") or "")
@@ -532,17 +223,30 @@ class VoiceFillerMixin:
             text = f"{assistant}委派的任务《{title}》执行失败。你可以打开结果会话查看原因。"
         previous_notice_id = self._current_notice_id
         self._current_notice_id = notification_id
+        # Deterministic content success is known before TTS. The direct-speech
+        # queue carries its full text and claims resume ownership at first PCM;
+        # audio/completion bits still gate the eventual ACK.
         if notification_id:
             self._notification_states[notification_id] = {
                 "audio_sent": False,
                 "generation_complete": False,
+                "llm_succeeded": True,
                 "tts_failed": False,
                 "delivered": False,
                 "delivery_attempt_id": info.get("delivery_attempt_id"),
             }
         try:
-            await self._speak_text(
-                text, wait=True, notification_id=notification_id)
+            played = await self._speak_direct_text(
+                text, wait=True, notification_id=notification_id,
+                origin_epoch=origin_epoch)
+            if not played:
+                self._queued_notice_ids.discard(notification_id)
+                return
+            if notification_id and not self._notice_state(notification_id).get("audio_sent"):
+                # A pause before the first PCM is not delivery. Release the
+                # replay latch without marking the unspoken notice complete.
+                self._queued_notice_ids.discard(notification_id)
+                return
             if notification_id:
                 self._notice_state(notification_id)["generation_complete"] = True
                 if self._active_notification_id == notification_id:
@@ -576,7 +280,7 @@ class VoiceFillerMixin:
                     "retry_at": _now() + 0.25,
                 })
                 return
-        self._interrupt.clear()
+        origin_epoch = self._prepare_direct_speech()
         self._turn_active = True
         await self._set_state("think")
         members = [{
@@ -586,6 +290,7 @@ class VoiceFillerMixin:
         self._notification_states[batch_id] = {
             "audio_sent": False,
             "generation_complete": False,
+            "llm_succeeded": True,
             "tts_failed": False,
             "delivered": False,
             "members": members,
@@ -613,7 +318,19 @@ class VoiceFillerMixin:
         previous_notice_id = self._current_notice_id
         self._current_notice_id = batch_id
         try:
-            await self._speak_text(text, wait=True, notification_id=batch_id)
+            played = await self._speak_direct_text(
+                text, wait=True, notification_id=batch_id,
+                origin_epoch=origin_epoch)
+            if not played:
+                self._queued_notice_ids.discard(batch_id)
+                for item in items:
+                    self._queued_notice_ids.discard(str(item.get("notification_id") or ""))
+                return
+            if not self._notice_state(batch_id).get("audio_sent"):
+                self._queued_notice_ids.discard(batch_id)
+                for item in items:
+                    self._queued_notice_ids.discard(str(item.get("notification_id") or ""))
+                return
             self._notice_state(batch_id)["generation_complete"] = True
             if self._active_notification_id == batch_id:
                 self._active_notification_generation_complete = True

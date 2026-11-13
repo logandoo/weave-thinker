@@ -15,6 +15,25 @@ import { openTaskResult } from '@/utils/openTaskResult'
 import { RNNoiseNode, rnnoise_loadAssets } from 'simple-rnnoise-wasm'
 import { spillChunk, drainSpilledChunks, clearSpilledChunks, getSpilledCount } from './voiceAudioSpill'
 import { TOKEN_KEY } from '@/api/client'
+import { VoicePlaybackGate } from './voicePlaybackGate'
+import { planVoiceResume } from './voiceResumePolicy'
+
+/**
+ * Android 壳保活桥（2026-11-12，Issue #3）：语音会话期间原生侧启动
+ * microphone|mediaPlayback 前台服务 + WakeLock，否则 Android 9+ 会在退后台后
+ * 掐掉麦克风并把进程冻结，播放/收音双双中断。非 WebView 环境（浏览器/桌面）
+ * 桥不存在，静默跳过。
+ */
+export function setNativeVoiceKeepAlive(active: boolean) {
+  try {
+    const bridge = (window as unknown as {
+      WeaverNoteApp?: { setVoiceKeepAlive?: (on: boolean) => void }
+    }).WeaverNoteApp
+    if (bridge && typeof bridge.setVoiceKeepAlive === 'function') {
+      bridge.setVoiceKeepAlive(active)
+    }
+  } catch { /* 桥异常绝不影响语音会话本身 */ }
+}
 
 export interface VoiceMessage {
   id: number
@@ -159,10 +178,7 @@ export function useVoiceDuplex() {
   let playCtx: AudioContext | null = null
   let nextStartTime = 0
   let activeSources: AudioBufferSourceNode[] = []
-  // When true, incoming PCM audio is dropped (after a barge-in interrupt the
-  // TTS consumer may still send a stray chunk before it checks the interrupt
-  // flag — those must not be scheduled or the audio "resumes" briefly).
-  let droppingAudio = false
+  const playbackGate = new VoicePlaybackGate()
   // Playback-progress tracking. In 语音助理 mode the user only ever RECEIVES audio,
   // so we tie playback progress to the answer text: the client reports how far
   // the current audible burst has actually played (played_sec / total_sec) and
@@ -176,7 +192,7 @@ export function useVoiceDuplex() {
   let activeNoticeBurstSeq = 0
   // A notice→answer transition starts a new burst without cancelling the old
   // audible tail. Keep independent drain clocks until each notice has ACKed.
-  let pendingNoticeDrains = new Map<string, { seq: number; endTime: number }>()
+  let pendingNoticeDrains = new Map<string, { seq: number; endTime: number; turnEpoch: number | null }>()
   let progressTimer: ReturnType<typeof setInterval> | null = null
   const playbackProgress = ref(0) // 0..1 — drives the orb progress ring
 
@@ -223,7 +239,7 @@ export function useVoiceDuplex() {
     }
   }
 
-  function retainActiveNoticeDrain(nextNotificationId: string | null) {
+  function retainActiveNoticeDrain(nextNotificationId: string | null, previousTurnEpoch: number | null) {
     if (
       activeNotificationId
       && activeNotificationId !== nextNotificationId
@@ -233,6 +249,7 @@ export function useVoiceDuplex() {
       pendingNoticeDrains.set(activeNotificationId, {
         seq: activeNoticeBurstSeq,
         endTime: burstEndTime,
+        turnEpoch: previousTurnEpoch,
       })
     }
   }
@@ -244,6 +261,7 @@ export function useVoiceDuplex() {
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({
           event: 'playback_drained',
+          turn_epoch: pending.turnEpoch,
           notification_id: notificationId,
           notice_burst_seq: pending.seq,
         }))
@@ -264,7 +282,12 @@ export function useVoiceDuplex() {
       const played = Math.max(0, Math.min(playCtx.currentTime - burstStartTime, total))
       playbackProgress.value = total > 0 ? Math.min(1, played / total) : 0
       if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ event: 'playback_progress', played_sec: played, total_sec: total }))
+        socket.send(JSON.stringify({
+          event: 'playback_progress',
+          turn_epoch: playbackGate.currentEpoch,
+          played_sec: played,
+          total_sec: total,
+        }))
       }
       if (total > 0 && playCtx.currentTime >= burstEndTime - 0.05 && !drainedSent) {
         drainedSent = true
@@ -272,6 +295,7 @@ export function useVoiceDuplex() {
         if (socket && socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({
             event: 'playback_drained',
+            turn_epoch: playbackGate.currentEpoch,
             notification_id: activeNotificationId,
             notice_burst_seq: activeNoticeBurstSeq,
           }))
@@ -281,10 +305,18 @@ export function useVoiceDuplex() {
     }, 250)
   }
 
+  function decodePcm16(base64: string): ArrayBuffer | null {
+    try {
+      const binary = atob(base64)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+      return bytes.buffer
+    } catch {
+      return null
+    }
+  }
+
   function schedulePcm16(pcm16: ArrayBuffer) {
-    // Drop stray audio chunks that arrive after an interrupt — the backend
-    // TTS consumer may still be mid-stream when the interrupt flag is set.
-    if (droppingAudio) return
     const ctx = ensurePlayCtx()
     const int16 = new Int16Array(pcm16)
     const float = new Float32Array(int16.length)
@@ -688,6 +720,9 @@ export function useVoiceDuplex() {
     if (reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
       errorMsg.value = '语音连接已断开，自动重连失败'
       state.value = 'error'
+      // 会话已死：释放原生保活（前台服务/WakeLock），否则通知常驻且耗电。
+      // 手动「重试」走 start() 会重新挂上。
+      setNativeVoiceKeepAlive(false)
       // Drop every buffered medium of the dead session — it must never be
       // replayed into a later session as ghost speech.
       pendingChunks = []
@@ -734,6 +769,7 @@ export function useVoiceDuplex() {
       clearSpillState()
       errorMsg.value = closeEvent.reason || '语音服务鉴权失败，请重新登录'
       state.value = 'error'
+      setNativeVoiceKeepAlive(false)
       return
     }
     if (closeEvent.code === 1006 || closeEvent.code === 1005) {
@@ -752,6 +788,7 @@ export function useVoiceDuplex() {
         clearSpillState()
         errorMsg.value = '语音服务鉴权失败，请重新登录'
         state.value = 'error'
+        setNativeVoiceKeepAlive(false)
       })
     }
     if (sawErrorEvent) {
@@ -762,6 +799,9 @@ export function useVoiceDuplex() {
         errorMsg.value = errorMsg.value || closeEvent.reason || '语音服务连接已断开'
         state.value = 'error'
       }
+      // 终态即释放原生保活（与重连耗尽/1008 分支同口径）——否则用户退后台后
+      // FGS 通知 + WakeLock 一直挂到 6h 兜底。手动「重试」走 start() 会重新挂上。
+      setNativeVoiceKeepAlive(false)
       return
     }
     // Initial connect failures, abnormal closes AND clean server-side closes
@@ -823,6 +863,7 @@ export function useVoiceDuplex() {
     }
     switch (ev.event) {
       case 'ready':
+        playbackGate.reset()
         connected.value = true
         ttsAvailable.value = ev.tts !== false
         state.value = 'listen'
@@ -863,8 +904,6 @@ export function useVoiceDuplex() {
         break
       case 'state':
         if (ev.state) state.value = ev.state
-        // A new think phase means a fresh turn — allow audio again.
-        if (ev.state === 'think') droppingAudio = false
         break
       case 'asr_partial':
         partialText.value = ev.text || ''
@@ -894,11 +933,19 @@ export function useVoiceDuplex() {
         }
         break
       }
+      case 'audio_chunk': {
+        const pcm = ev.audio ? decodePcm16(ev.audio) : null
+        if (pcm && playbackGate.acceptAudio(ev.turn_epoch ?? null, ev.sequence ?? null)) {
+          schedulePcm16(pcm)
+        }
+        break
+      }
       case 'speaking_start': {
-        droppingAudio = false
+        const previousTurnEpoch = playbackGate.currentEpoch
+        if (!playbackGate.start(ev.turn_epoch ?? null)) break
         speaking.value = true
         const nextNotificationId = ev.notification_id || null
-        retainActiveNoticeDrain(nextNotificationId)
+        retainActiveNoticeDrain(nextNotificationId, previousTurnEpoch)
         activeNotificationId = nextNotificationId
         activeNoticeBurstSeq = typeof ev.notice_burst_seq === 'number' && Number.isInteger(ev.notice_burst_seq) ? ev.notice_burst_seq : 0
         resetBurstTiming()
@@ -906,6 +953,7 @@ export function useVoiceDuplex() {
         break
       }
       case 'speaking_end':
+        if (playbackGate.isStale(ev.turn_epoch ?? null)) break
         speaking.value = false
         activeNotificationId = null
         activeNoticeBurstSeq = 0
@@ -954,18 +1002,19 @@ export function useVoiceDuplex() {
         pushMessage({ role: 'system', text: ev.text || '', kind: 'ignored', reason: ev.reason })
         break
       case 'interrupted':
-        droppingAudio = true
+        if (!playbackGate.cancel(ev.turn_epoch ?? null)) break
         clearPlayback()
         speaking.value = false
         break
       case 'playback_paused':
-        // Acoustic onset barge-in: user speech stopped the assistant's audio
-        // immediately; the backend decides resume-from-breakpoint or switch.
-        droppingAudio = true
+        // Stop the current epoch immediately; only an explicit resume of this
+        // same epoch can reopen it, while a newer answer remains independent.
+        if (!playbackGate.pause(ev.turn_epoch ?? null)) break
         clearPlayback()
         speaking.value = false
         break
       case 'notification_ack_pending':
+        if (playbackGate.isStale(ev.turn_epoch ?? null)) break
         // A drain arrived before the full notice was ready. Rearm instead of
         // leaving the client unable to ACK the final segment of the same notice.
         if (activeNotificationId === ev.notification_id) {
@@ -974,17 +1023,16 @@ export function useVoiceDuplex() {
         }
         break
       case 'playback_resumed':
-        // The backend emits this before any resumed PCM. Restore both parts of
-        // the notice ACK identity so a pre-pause drain cannot settle this burst.
+        if (!playbackGate.resume(ev.turn_epoch ?? null)) break
         activeNotificationId = ev.notification_id || null
         activeNoticeBurstSeq = typeof ev.notice_burst_seq === 'number' && Number.isInteger(ev.notice_burst_seq) ? ev.notice_burst_seq : 0
         resetBurstTiming()
         startProgressTimer()
         break
       case 'generation_cancelled':
-        // Noise gate cancelled the in-flight generation — remove any partial
-        // assistant message that was streamed before the cancellation.
-        droppingAudio = true
+        // Remove only the cancelled generation; a stale cancellation must not
+        // clear a newer assistant message or reopen/mute its audio.
+        if (!playbackGate.cancel(ev.turn_epoch ?? null)) break
         clearPlayback()
         speaking.value = false
         if (currentAssistantId !== null) {
@@ -993,7 +1041,7 @@ export function useVoiceDuplex() {
         }
         break
       case 'task_cancelled':
-        droppingAudio = true
+        if (!playbackGate.cancel(ev.turn_epoch ?? null)) break
         clearPlayback()
         speaking.value = false
         pushMessage({ role: 'system', text: '任务已取消', kind: 'notice' })
@@ -1067,7 +1115,7 @@ export function useVoiceDuplex() {
       try {
         handleEvent(JSON.parse(event.data) as VoiceEvent)
       } catch { /* ignore */ }
-    } else if (event.data instanceof ArrayBuffer) {
+    } else if (event.data instanceof ArrayBuffer && playbackGate.acceptLegacyAudio()) {
       schedulePcm16(event.data)
     }
   }
@@ -1181,6 +1229,9 @@ export function useVoiceDuplex() {
       surfaceCaptureError(err)
       throw err
     }
+    // 会话建立=用户在页面前台点开的时刻 → 立刻挂原生保活（Android 壳外为 no-op）。
+    // 放在 capture 之后：桥 start 的语义是「这个会话真的活了」。
+    setNativeVoiceKeepAlive(true)
   }
 
   function sendText(text: string) {
@@ -1203,7 +1254,7 @@ export function useVoiceDuplex() {
   function interrupt() {
     // Local teardown is unconditional: the user's tap must stop audio/UI even
     // while the socket is down (previously a silent no-op in that window).
-    droppingAudio = true
+    playbackGate.cancel(playbackGate.currentEpoch)
     clearPlayback()
     speaking.value = false
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -1238,6 +1289,7 @@ export function useVoiceDuplex() {
     // invalidates any in-flight attempt), its timer, and every buffer of this
     // generation (memory + spilled audio + queued text events).
     userClosed = true
+    setNativeVoiceKeepAlive(false)
     sessionEpoch += 1
     stopReconnectTimer()
     stopFlushTimer()
@@ -1270,8 +1322,49 @@ export function useVoiceDuplex() {
     state.value = 'idle'
   }
 
+  // ---- 回前台修复（2026-11-12，Issue #3）----
+  // Android 后台会挂起两个 AudioContext、结束 mic 音轨、静默回收 WebSocket，
+  // 且后台冻结的退避计时器可能一次都没跑过。回到前台按决策表逐项修复：
+  // resume 挂起 ctx → 音轨已死重启采集 → socket 已死立即重连（重置退避，
+  // 后台的失败尝试不吃掉前台的重连预算）。终态/用户挂断不复活。
+  function handleVisibilityResume() {
+    if (document.visibilityState !== 'visible') return
+    const plan = planVoiceResume({
+      userClosed,
+      state: state.value,
+      socketReady: socket ? socket.readyState : null,
+      reconnectPending: reconnecting || reconnectTimer !== null,
+      terminal: terminalClose || sawErrorEvent,
+      captureCtxState: captureCtx ? captureCtx.state : null,
+      playCtxState: playCtx ? playCtx.state : null,
+      micOn: micOn.value,
+      micTrackLive: !!mediaStream && mediaStream.getAudioTracks().length > 0
+        && mediaStream.getAudioTracks().every(t => t.readyState === 'live'),
+    })
+    if (plan.resumeCaptureCtx && captureCtx) void captureCtx.resume().catch(() => {})
+    if (plan.resumePlayCtx && playCtx) void playCtx.resume().catch(() => {})
+    if (plan.restartCapture) {
+      stopCapture()
+      void ensureCapture().catch(surfaceCaptureError)
+    }
+    if (plan.reconnectNow) {
+      // 重连在途的会话仍是活会话：退过后台期间保活可能已随挂断/终态释放，
+      // 复活后必须重新挂上，否则下一次退后台又被系统掐死。
+      setNativeVoiceKeepAlive(true)
+      reconnectAttempt = 0
+      errorMsg.value = null
+      scheduleReconnect()
+    }
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleVisibilityResume)
+  }
+
   onUnmounted(() => {
     disconnect()
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', handleVisibilityResume)
+    }
   })
 
   // ---- session management ----

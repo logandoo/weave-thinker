@@ -100,4 +100,6 @@ bash scripts/smoke.sh http://127.0.0.1:8158 --chat    # 加注册→登录→真
 
 - 不动目标机上既有的其他服务；端口冲突改 `APP_PORT`，不要停别人的进程。
 - 密钥（`config*.toml` / `.env`）不写入镜像、不提交仓库；生产建议由反向代理终结 TLS。
+- **反向代理与客户端地址**：容器默认**不**启用 `--proxy-headers`（客户端地址取 socket 对端）。若前面确有 nginx/traefik 等反代，必须在 `.env` 里设 `WT_FORWARDED_ALLOW_IPS=<反代地址>`（可逗号分隔），并让反代覆写 `X-Forwarded-For`；否则登录/注册限流会把整个反代当成一个来源（整站共享 120 次/分钟）。**绝不要写 `*`**——那会信任任意来源的伪造头，限流可被绕过、也能被伪造成别人的 IP 做定向锁定（入口脚本检测到 `*` 会告警并忽略）。
+- **配置热重载**：`POST /api/admin/reload-config` 需请求头 `x-admin-secret` = `[security] admin_reload_secret`（独立密钥，恒定时间比较；**未配置即 403**，不再复用 JWT 密钥）。该值在启动时读取，**改完需重启**；调用成功会清配置缓存并重载模型注册表（改 `config_model.toml` 后免重启生效）。
 - 升级或重建前先备份数据库与运行时目录。

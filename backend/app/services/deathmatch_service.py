@@ -1756,6 +1756,47 @@ class DeathmatchManager(DeathmatchPlanCoreMixin, DeathmatchGrillingFlowMixin, De
         lines.append("（自动记录，供后续任务参考）")
         return "\n".join(lines)
 
+    async def _persist_completion_candidate(self, content: str) -> bool:
+        """scoped 会话：completion 摘要写进 run candidate（任务层），返回是否已处理。"""
+        from pathlib import Path as _P
+
+        from app.db.database import AsyncSessionLocal, WorkspaceTask
+        from app.services import task_binding_service as tbs
+        from app.services import workspace_memory_service as wmem
+        from app.services import workspace_run_service as yrs
+        from app.services import workspace_service as wsvc
+
+        if not AsyncSessionLocal:
+            return False
+        from app.services.workspace_scope_service import scoping_mode as _scope_mode
+
+        if _scope_mode() != "enforce":
+            return False   # off/shadow 不改写系统记忆行为（§14：shadow 只记录不拦截）
+        async with AsyncSessionLocal() as db:
+            binding = await tbs.get_binding(db, user_id=self._conv.user_id,
+                                            conversation_id=self._conv.id)
+            if binding is None:
+                return False
+            run = await yrs.active_run_for(db, conversation_id=self._conv.id)
+            workspace = await wsvc.ensure_user_workspace(db, self._conv.user_id)
+            if workspace is None:
+                return True
+            task = await db.get(WorkspaceTask, binding.task_id)
+            if task is None:
+                return True
+            task_root = _P(workspace.root_path).resolve() / _P(*str(task.root_rel).split("/"))
+            if run is not None and run.current_attempt_id:
+                attempt_root = task_root / "runs" / f"r_{run.id}" / "attempts" / f"a_{run.current_attempt_id}"
+                run_id, attempt_id = run.id, run.current_attempt_id
+            else:
+                attempt_root = task_root / "memory"
+                run_id, attempt_id = "", ""
+            wmem.write_candidate(
+                task_id=binding.task_id, run_id=run_id, attempt_id=attempt_id,
+                topic="死磕收束摘要", content=content,
+                evidence=(), attempt_memory_dir=attempt_root)
+            return True
+
     async def _persist_completion_memory(self) -> None:
         """写回用户记忆（file memory + subconscious 钩子）。失败 fail-open，
         绝不阻断收束。"""
@@ -1767,6 +1808,11 @@ class DeathmatchManager(DeathmatchPlanCoreMixin, DeathmatchGrillingFlowMixin, De
             return
         try:
             content = self._completion_memory_entry()
+            # 任务作用域（2026-11-10 §8.4 / §10）：scoped 会话的 completion **不得**写系统
+            # AGENT 记忆、不得触发 v2 subconscious hook；改投 run candidate，由 task
+            # curator 去重核对后再晋升。未绑定任务的 legacy 会话保持原行为。
+            if await self._persist_completion_candidate(content):
+                return
             from app.tools.memory import memory as memory_tool
             await memory_tool(
                 {"action": "add", "target": "agent", "content": content},

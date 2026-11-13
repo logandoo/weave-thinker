@@ -5,6 +5,8 @@ declare global {
   interface Window {
     WeaverNoteApp?: {
       onThemeChanged: (isDark: boolean) => void
+      /** 新桥（2026-11-07）：下发页面真实背景色，小写 #rrggbb；旧 APK 无此方法。 */
+      onThemeColors?: (statusHex: string, navHex: string) => void
       saveFile: (base64Data: string, filename: string, mimeType: string) => boolean
       isDownloadSupported: () => boolean
       downloadFile?: (url: string, filename: string) => boolean

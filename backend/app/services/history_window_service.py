@@ -27,7 +27,10 @@ from app.services.tool_image_results import (
     IMAGE_TOOL_ALLOWLIST,
     image_envelope_token_count,
     inline_images_enabled,
+    memoized_json_for_message,
     parse_image_envelope,
+    parse_image_envelope_for_message,
+    parse_tool_results_for_message,
 )
 
 
@@ -84,7 +87,14 @@ def _content_cost(msg: Any) -> int:
     """P0.5：allowlist 图片信封按尺寸计 token；其余内容按文本计。"""
     content = _content_text(_field(msg, "content"))
     if _is_inline_image_message(msg):
-        payload = parse_image_envelope(content)
+        # 字符串 content 走按消息身份的记忆化解析（P0 2026-11-09）；多 part
+        # content 仍按今天的路径解析拼接文本，估算结果与改造前逐位一致。
+        raw = _field(msg, "content")
+        payload = (
+            parse_image_envelope_for_message(msg)
+            if isinstance(raw, str)
+            else parse_image_envelope(content)
+        )
         if payload is not None:
             text_tokens = _estimate_text(str(payload.get("text") or ""))
             if not inline_images_enabled():
@@ -135,15 +145,11 @@ def _tool_results_cost(msg: Any, results: Any) -> int:
     """
     if results in (None, "", [], {}):
         return 0
-    if isinstance(results, str):
-        try:
-            data = json.loads(results)
-        except (json.JSONDecodeError, TypeError):
-            return _estimate_text(results)
-    elif isinstance(results, (dict, list)):
-        data = results
-    else:
-        return _estimate_text(str(results))
+    # P0（2026-11-09）：多 MB 的 tool_results blob 按消息身份记忆化解析——
+    # 一次窗口选择里同一条消息会被估多次（2d 模式反向遍历 + used_tokens 复算）。
+    data = parse_tool_results_for_message(msg, results)
+    if data is None:
+        return _estimate_text(results if isinstance(results, str) else str(results))
 
     steps = data.get("agent_steps") if isinstance(data, dict) else data
     if not isinstance(steps, list):
@@ -164,7 +170,7 @@ def _tool_results_cost(msg: Any, results: Any) -> int:
             title = str(step.get("title") or "")
             tool_name = next((n for n in IMAGE_TOOL_ALLOWLIST if n in title), "")
         if tool_name in IMAGE_TOOL_ALLOWLIST:
-            payload = parse_image_envelope(raw)
+            payload = memoized_json_for_message(step, raw, parse_image_envelope)
             if payload is not None:
                 text_tokens = _estimate_text(str(payload.get("text") or ""))
                 if inline_images_enabled():
@@ -233,9 +239,7 @@ def cap_tool_results(
     capped = 0
     for msg in messages:
         if isinstance(msg, dict) and _is_inline_image_message(msg):
-            from app.services.tool_image_results import parse_image_envelope
-
-            if parse_image_envelope(msg.get("content")) is not None:
+            if parse_image_envelope_for_message(msg) is not None:
                 # P0.5：截断 base64 会破坏 JSON 并丢图；图片帧由 compressor
                 # 的旧帧占位机制处理，这里原样保留。
                 out.append(msg)

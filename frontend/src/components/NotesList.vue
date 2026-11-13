@@ -1516,11 +1516,11 @@ function formatDate(dateStr: string): string {
 
   .notes-list {
     padding: 8px;
-    padding-bottom: calc(8px + var(--mobile-tab-bar-offset, 72px) + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(8px + var(--mobile-tab-bar-offset, 72px) + var(--safe-bottom));
   }
 
   .pagination-bar {
-    margin-bottom: calc(var(--mobile-tab-bar-offset, 72px) + env(safe-area-inset-bottom, 0px));
+    margin-bottom: calc(var(--mobile-tab-bar-offset, 72px) + var(--safe-bottom));
   }
 
   .note-item {

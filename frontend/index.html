@@ -7,7 +7,9 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/icon.svg" />
     <link rel="alternate icon" type="image/png" href="/logo.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- interactive-widget=resizes-content：键盘弹出时压缩布局视口（Chrome/Edge ≥108；
+         鸿蒙 ArkWeb 等不支持的引擎忽略本指令，由 ChatLayout 的 --keyboard-inset JS 通道兜底） -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Weave Thinker</title>
     <!-- UI 字体全量自托管（frontend/public/fonts/，SIL OFL 1.1，见 FONTS_LICENSE.md）：
          变量字体按 unicode-range 分片，离线/内网无第三方 CDN 请求 -->

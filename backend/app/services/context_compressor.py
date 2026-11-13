@@ -16,7 +16,8 @@ from app.services.tool_image_results import (
     image_envelope_placeholder,
     image_envelope_token_count,
     inline_images_enabled,
-    parse_image_envelope,
+    parse_image_envelope_memoized,
+    parse_image_envelope_for_message,
     select_kept_image_frames,
 )
 
@@ -109,7 +110,7 @@ def _is_inline_image_message(msg: Dict[str, Any]) -> bool:
         return False
     if str(msg.get("name") or "") not in IMAGE_TOOL_ALLOWLIST:
         return False
-    return parse_image_envelope(msg.get("content")) is not None
+    return parse_image_envelope_for_message(msg) is not None
 
 
 def _image_content_tokens(msg: Dict[str, Any]) -> Optional[int]:
@@ -122,7 +123,7 @@ def _image_content_tokens(msg: Dict[str, Any]) -> Optional[int]:
         return None
     if str(msg.get("name") or "") not in IMAGE_TOOL_ALLOWLIST:
         return None
-    payload = parse_image_envelope(msg.get("content"))
+    payload = parse_image_envelope_for_message(msg)
     if payload is None:
         return None
     text_tokens = estimate_text_tokens_rough(str(payload.get("text") or ""))
@@ -306,7 +307,7 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
     raw_content = str(tool_content or "")
     if raw_content.startswith(IMAGE_PLACEHOLDER_PREFIX):
         return raw_content
-    if tool_name in IMAGE_TOOL_ALLOWLIST and parse_image_envelope(raw_content) is not None:
+    if tool_name in IMAGE_TOOL_ALLOWLIST and parse_image_envelope_memoized(raw_content) is not None:
         return image_envelope_placeholder(raw_content)
     content_len = len(raw_content)
     if tool_name == "web_search":
@@ -1024,7 +1025,7 @@ class ContextCompressor:
                 raw = str(msg.get("content") or "")
                 # P0.5：图片信封走路径占位——force=True 现在豁免图片，若继续
                 # 走 char 截断会把 base64 JSON 切成不可解析的 2k 垃圾（丢图）。
-                if name in IMAGE_TOOL_ALLOWLIST and parse_image_envelope(raw) is not None:
+                if name in IMAGE_TOOL_ALLOWLIST and parse_image_envelope_for_message(msg) is not None:
                     logger.info("degraded pointerize: image frame %s -> placeholder", name)
                     content = image_envelope_placeholder(raw)
                 else:
@@ -1094,7 +1095,7 @@ class ContextCompressor:
                 msg.get("role") == "tool"
                 and str(msg.get("name") or "") in IMAGE_TOOL_ALLOWLIST
             ):
-                payload = parse_image_envelope(msg.get("content"))
+                payload = parse_image_envelope_for_message(msg)
                 if payload is not None:
                     parsed[i] = payload
         keep = select_kept_image_frames(messages, parsed)

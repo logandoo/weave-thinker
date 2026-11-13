@@ -401,7 +401,9 @@ async def register_device(
 
 _COMPRESS_DROP = {("create", "delete")}
 # 排除清单唯一事实源 = sync_apply.EXCLUDE_PAYLOAD_COLS（D-16 后仅含嵌入本地态
-# 与记忆动态列；api_key 类列随同步——用户原则「同账户所有数据一致」）。
+# 与记忆动态列 + SERVER_READONLY_PULL_COLS 服务端只读列）；另有 deathmatch_*
+# 前缀列在 sanitize_payload 内排除。api_key 类列随同步——用户原则「同账户所有
+# 数据一致」（D-16，见 sync_capture.py 注记）。
 
 
 def _ev_dict(ev) -> dict:

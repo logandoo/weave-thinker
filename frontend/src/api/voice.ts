@@ -32,6 +32,9 @@ export interface VoiceEvent {
   title?: string
   status?: string
   speech_kind?: 'answer' | 'aux' | 'notice'
+  turn_epoch?: number
+  sequence?: number
+  audio?: string
   notification_id?: string
   notice_burst_seq?: number
   execution_conversation_id?: string | null
@@ -63,6 +66,7 @@ export function getVoiceWebSocketUrl(
   if (conversationId) {
     url.searchParams.set('conversation_id', conversationId)
   }
+  url.searchParams.set('audio_protocol', 'epoch_v1')
   return url.toString()
 }
 

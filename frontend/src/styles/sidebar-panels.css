@@ -409,6 +409,32 @@
 
 .move-group-menu {
   min-width: 160px;
+  /* 助手/分组很多时：纵向内部滚动 + 横向按视口收窄，长名省略号，绝不溢出视口。 */
+  max-height: 60vh;
+  max-width: min(340px, calc(100vw - 16px));
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* 分组/助手名过长时省略，避免菜单被撑宽溢出屏幕。 */
+.move-group-menu .menu-item > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 助手分区标题（agent / 工作台共用同一份样式，保证两模式完全一致）。 */
+.menu-section-label {
+  padding: 6px 12px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  opacity: 0.75;
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .move-group-menu .menu-item {
@@ -422,11 +448,81 @@
   color: var(--color-primary);
 }
 
+/* 搜索框：助手/分组很多（如 7-8 助手 × 100 分组）时靠搜索定位，粘顶不随滚动消失。 */
+.move-group-search {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 6px 8px;
+  background-color: var(--surface-panel-strong);
+}
+.move-group-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--color-text);
+  background-color: var(--color-hover);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+.move-group-search input:focus {
+  border-color: var(--color-primary);
+}
+
+/* 助手分区折叠头（点击展开/收起该助手的分组）。 */
+.move-group-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 32px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.move-group-section-toggle:hover {
+  opacity: 1;
+}
+.move-group-section-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.move-group-section-count {
+  flex-shrink: 0;
+  font-size: 10px;
+  opacity: 0.8;
+}
+.move-group-chevron {
+  flex-shrink: 0;
+  transition: transform var(--transition-fast);
+}
+.move-group-chevron.expanded {
+  transform: rotate(180deg);
+}
+
+.move-group-empty {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--color-text-light);
+  text-align: center;
+}
+
 
 /* ── 移动端触屏目标（双宿主一致） ── */
 @media (max-width: 767px) {
   .action-buttons {
     padding: 12px 8px 8px;
+  }
+
+  /* 移动端折叠头触屏目标 ≥44px（展开分区是核心交互）。 */
+  .move-group-section-toggle {
+    min-height: 44px;
   }
 
   .new-group-btn {

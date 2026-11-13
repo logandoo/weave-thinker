@@ -11,7 +11,7 @@ from sqlalchemy import desc, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_config
-from app.db.database import AgentDream, AgentMemory, Conversation, Message, Note, Notebook, UserAgentState
+from app.db.database import AgentMemory, Conversation, Message, Note, Notebook, UserAgentState
 from app.services.memory_llm_factory import _memory_llm
 
 config = get_config()
@@ -109,7 +109,21 @@ async def _load_note_context(db: AsyncSession, user_id: str, limit: int) -> List
         .order_by(desc(Note.updated_at))
         .limit(limit)
     )
-    return result.scalars().all()
+    rows = list(result.scalars().all())
+    # 任务作用域（2026-11-10 §8.5）：任务关联笔记按当时策略过滤；
+    # 未关联任何 Task 的用户笔记仍是独立的用户级来源。
+    try:
+        from app.services.workspace_ingest_filter import note_policies
+
+        policies = await note_policies(db, user_id, [r.id for r in rows])
+        if policies:
+            from app.services.workspace_ingest_filter import policy_allows_note
+
+            rows = [r for r in rows
+                    if policy_allows_note(*(policies.get(r.id) or (None, None)))]
+    except Exception:
+        logger.exception("memory ingestion note-policy filter failed (fail open to legacy)")
+    return rows
 
 
 async def _load_user_message_context(db: AsyncSession, user_id: str, limit: int) -> List[Message]:
@@ -120,7 +134,16 @@ async def _load_user_message_context(db: AsyncSession, user_id: str, limit: int)
         .order_by(desc(Message.created_at))
         .limit(limit)
     )
-    return result.scalars().all()
+    rows = list(result.scalars().all())
+    # 任务作用域（2026-11-10 §8.5）：exclude 的 Task 消息不进系统记忆；
+    # user_facts 只保留结构清理后的 user-authored 文本（不带助手回答/工具卡片）。
+    try:
+        from app.services.workspace_ingest_filter import filter_user_messages
+
+        rows = await filter_user_messages(db, rows)
+    except Exception:
+        logger.exception("memory ingestion message filter failed (fail open to legacy)")
+    return rows
 
 
 async def _generate_summary(prompt_messages: list, fallback: str) -> str:
@@ -230,44 +253,9 @@ async def generate_user_agent_memory(db: AsyncSession, user_id: str, *, force: b
     state.last_memory_generated_at = now
     state.last_dream_generated_at = now
 
-    # 2026-08-09 修复 B：v2 运行时跳过 v1 nightly dream 写入 agent_dreams——
-    # v2 的 consolidation dream（_generate_dream）每日生成且注入路径
-    # （_get_latest_dream）限定 dream_type='consolidation'；v1 nightly 再写
-    # 会造成双写混淆（实测 528 行 v1 风格 dream 混入 consolidation 标签、
-    # metadata 为空，注入读到旧内容）。memory_summary 列仍保留（双轨兼容）。
-    from app.services.memory_runtime_state import memory_runtime_enabled
-    if not memory_runtime_enabled(config):
-        dream_result = await db.execute(
-            select(AgentDream).where(
-                AgentDream.agent_state_id == state.id,
-                AgentDream.generated_for_date == today_key,
-                # A4.9 复审 Minor：只更新 v1 nightly 行——防 runtime 中途
-                # active→disabled（SIGHUP 重探测失败）把当日 consolidation 行
-                # 改写为 nightly + v1 metadata
-                AgentDream.dream_type == "nightly",
-            )
-        )
-        dream = dream_result.scalar_one_or_none()
-        if dream is None:
-            dream = AgentDream(
-                agent_state_id=state.id,
-                generated_for_date=today_key,
-                summary=state.dream_summary,
-                source_note_count=len(notes),
-                source_message_count=len(user_messages),
-                # 2026-08-09 修复 A：显式标记 nightly 类型 + metadata——
-                # ORM 默认 dream_type='consolidation' 使 v1/v2 dream 无法区分
-                # （实测 134 行 metadata 为 NULL 的"consolidation"实为 v1 写入）
-                dream_type="nightly",
-                metadata_json='{"source": "v1_nightly"}',
-            )
-            db.add(dream)
-        else:
-            dream.summary = state.dream_summary
-            dream.source_note_count = len(notes)
-            dream.source_message_count = len(user_messages)
-            dream.dream_type = "nightly"
-            dream.metadata_json = '{"source": "v1_nightly"}'
+    # 2026-11-08（dreaming 收敛）：v1 nightly dream 写入已删除。
+    # v2 的 consolidation dream 是唯一的 agent_dreams writer；历史 nightly/legacy
+    # 行保留但不再新增，API/UI 默认不展示。
 
     memory_result = await db.execute(
         select(AgentMemory).where(

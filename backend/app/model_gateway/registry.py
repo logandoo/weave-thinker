@@ -80,6 +80,7 @@ _INTERNAL_PURPOSE_ALIASES = frozenset({"vlm"})
 _MEMORY_PURPOSE_KEYS = {
     "memory.concept_extraction": "concept_extraction_model",
     "memory.dream": "dream_model",
+    "memory.dream_verify": "dream_verify_model",
     "memory.clarification": "clarification_model",
     "memory.query_expansion": "query_expansion_model",
     "memory.migration": "concept_extraction_model",
@@ -373,6 +374,13 @@ def synthesize(conf: dict) -> Tuple[Dict[str, ModelEndpoint], Dict[str, Any]]:
         value = str(memory.get(key, "") or "")
         routing[purpose] = value if value and value in endpoints else DEFAULT_LLM_ALIAS
 
+    # B3：未单独配置 dream_verify_model 时显式回落到 dream 的路由（而不是
+    # DEFAULT_LLM_ALIAS），这样“只配 dream”的部署行为不变。
+    verify_target = str(memory.get("dream_verify_model", "") or "")
+    if not (verify_target and verify_target in endpoints):
+        routing["memory.dream_verify"] = routing.get(
+            "memory.dream", DEFAULT_LLM_ALIAS)
+
     mm_provider = str((memory.get("multimodal", {}) or {}).get("provider", "") or "")
     routing["multimodal"] = mm_provider if mm_provider and mm_provider in endpoints else DEFAULT_LLM_ALIAS
 
@@ -458,6 +466,14 @@ class ModelRegistry:
                 endpoints[str(alias)] = _endpoint_from_toml(str(alias), ep_data)
         for purpose, target in ((conf.get("routing") or {}).items()):
             routing[str(purpose)] = target
+        # P0-02（2026-11-08）：dream_verify 的缺省回落必须基于 **最终** 的
+        # memory.dream 路由（synthesize 阶段的回落早于显式 [routing] 合并，
+        # 显式只配 dream 的部署会错指 main）。显式配置 = [routing] 键存在，
+        # 或 legacy [memory].dream_verify_model 指向有效端点——两者都没有才回落。
+        _dv_legacy = str(((conf.get("memory") or {}).get("dream_verify_model")) or "")
+        if ("memory.dream_verify" not in (conf.get("routing") or {})
+                and not (_dv_legacy and _dv_legacy in endpoints)):
+            routing["memory.dream_verify"] = routing.get("memory.dream", DEFAULT_LLM_ALIAS)
         reg = cls(conf, endpoints, routing)
         # 显式路由键 = [routing] 段 ∪ legacy [voice] 子模型覆盖升格（空值不发
         # = 继承语义；非空 = 用户显式设置 → 语音子分类走池成员而非继承助手）。
@@ -721,10 +737,19 @@ def _warn_if_no_usable_llm(registry: "ModelRegistry") -> None:
 
 
 def reload_model_registry() -> "ModelRegistry":
-    """改 config_model.toml 后免重启重载（管理用途）。端点/路由现由合并配置
-    承载，必须先清配置缓存再重建注册表。"""
+    """改 config_model.toml 后免重启重载（管理用途）。
+
+    2026-11-11 评审 C Important：**先建后换**。旧实现先 `_registry = None` 再重建，
+    一旦新配置解析失败（config_model.toml 打错一个键），进程就永久处于
+    「registry=None」——此后每次 `get_model_registry()` 都抛异常，模型调用全断，
+    直到有人修好文件。现在只有新注册表构建成功才换入；失败时旧注册表原样保留。
+    """
     global _registry
-    from app.core.config import clear_config_cache
+    from app.core.config import clear_config_cache, get_config
     clear_config_cache()
-    _registry = None
-    return get_model_registry()
+    cfg = get_config()
+    conf = getattr(cfg, "_config", {}) or {}
+    new_registry = ModelRegistry.from_sources(conf)  # 可能抛：调用方负责报错，旧表不动
+    _warn_if_no_usable_llm(new_registry)
+    _registry = new_registry
+    return new_registry

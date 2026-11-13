@@ -127,7 +127,10 @@ async def voice_duplex_ws(
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="server is draining")
         return
     conversation_id = websocket.query_params.get("conversation_id") or None
-    session = VoiceDuplexSession(websocket, current_user, db, conversation_id=conversation_id)
+    session = VoiceDuplexSession(
+        websocket, current_user, db, conversation_id=conversation_id,
+        audio_protocol=websocket.query_params.get("audio_protocol"),
+    )
     from app.services import voice_service as _vs
     _vs.begin_session()
     try:

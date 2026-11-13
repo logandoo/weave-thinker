@@ -58,6 +58,11 @@ def _next_consolidation_action(now_local: datetime, done_date: str | None) -> st
     return "run"
 
 
+def _weekly_report_enabled() -> bool:
+    """B10：周报调度开关（默认 false——仅手动 `python -m scripts.memory_weekly_report`）。"""
+    return bool(config.memory.get("weekly_report_enabled", False))
+
+
 def _task_done_callback(scheduler, name: str):
     """后台任务异常兜底：asyncio fire-and-forget 任务死亡不再静默（2026-08-10 事故根因之一）。
     正常停机（stop() 先置 _running=False 再 cancel）时循环自然退出不算异常。"""
@@ -79,6 +84,8 @@ class MemoryScheduler:
         self._subconscious_task: asyncio.Task | None = None
         self._consolidation_task: asyncio.Task | None = None
         self._recall_cleanup_task: asyncio.Task | None = None
+        self._weekly_report_task: asyncio.Task | None = None
+        self._weekly_report_last: str | None = None
         self._running = False
         # A4.9 Minor：恢复探测节流（默认 5 分钟一次，防 60s 循环 × 15s 探测）
         self._last_recovery_attempt: float = 0.0
@@ -99,6 +106,10 @@ class MemoryScheduler:
         self._running = True
         self._recall_cleanup_task = asyncio.create_task(self._run_recall_log_cleanup_loop())
         self._recall_cleanup_task.add_done_callback(_task_done_callback(self, "recall_cleanup"))
+        # B10（2026-11-08）：dream verify 周报调度（[memory] weekly_report_enabled
+        # 默认 false=仅手动脚本；开启后每周一本地时区跑一次）。
+        self._weekly_report_task = asyncio.create_task(self._run_weekly_report_loop())
+        self._weekly_report_task.add_done_callback(_task_done_callback(self, "weekly_report"))
         if not self.enabled:
             logger.info("MemoryScheduler: memory loops disabled via config; recall-log cleanup still active")
             return
@@ -135,12 +146,32 @@ class MemoryScheduler:
     async def stop(self) -> None:
         self._running = False
         for task in (self._subconscious_task, self._consolidation_task,
-                     self._recall_cleanup_task):
+                     self._recall_cleanup_task, self._weekly_report_task):
             if task:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
         logger.info("MemoryScheduler: stopped")
+
+    async def _run_weekly_report_loop(self) -> None:
+        """B10/P1-10：每 6h 检查，周一（本地时区）且当日未跑则生成周报。失败静默。"""
+        while self._running:
+            await asyncio.sleep(6 * 3600)
+            try:
+                if not _weekly_report_enabled():
+                    continue
+                today = _local_today()
+                if today.weekday() != 0:
+                    continue
+                stamp = today.strftime("%Y-%m-%d")
+                if self._weekly_report_last == stamp:
+                    continue
+                from scripts.memory_weekly_report import run_default
+                await run_default()
+                self._weekly_report_last = stamp
+                logger.info("memory weekly report generated")
+            except Exception:
+                logger.warning("memory weekly report run failed", exc_info=True)
 
     async def _run_recall_log_cleanup_loop(self) -> None:
         """C1：召回台账保留策略（30 天 + per-user 上限），只作用本表。

@@ -162,7 +162,15 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                     {"error": "任务工作区路径超出用户工作区，禁止导出"},
                     ensure_ascii=False,
                 )
+        # 作用域收口必须在算导出目录**之前**，否则 enforce 下 PDF 仍落旧用户根
+        from app.services.workspace_scope_service import apply_scope_or_error
+
+        workspace_root, _scope_err = await apply_scope_or_error(
+            kwargs, default_root=workspace_root, args=args, access="write")
+        if _scope_err:
+            return json.dumps(_scope_err, ensure_ascii=False)
         export_dir = await _ensure_export_dir(workspace_root)
+
 
         if action == "export_note":
             note_id = args.get("note_id")

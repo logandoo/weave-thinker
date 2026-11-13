@@ -707,6 +707,8 @@ async def _stage1_bm25_search(
             elif cold_start:
                 if detail.get("status") not in ("active", "silent"):
                     continue
+                if detail.get("verification_state") == "contradicted":
+                    continue
             elif not _concept_status_ok(detail, False):
                 continue
             regex_boost = _regex_match_boost(stage0.keywords, detail.get("canonical_name", ""), detail.get("aliases", ""))
@@ -719,6 +721,12 @@ async def _stage1_bm25_search(
                           "weight": detail.get("weight", 0.5),
                           "importance": detail.get("importance", 0.5),
                           "source_trust": detail.get("source_trust", ""),
+                          "verification_state": detail.get("verification_state"),
+                          "last_verified_at": detail.get("last_verified_at"),
+                          "valid_to": detail.get("valid_to"),
+                          "superseded_by": detail.get("superseded_by"),
+                          "needs_review": detail.get("needs_review"),
+                          "invalid_reason": detail.get("invalid_reason"),
                           "memory_type": detail.get("memory_type", ""),
                           "aliases": detail.get("aliases", ""),
                           "last_recalled_at": detail.get("last_recalled_at"),
@@ -930,6 +938,8 @@ async def _temporal_list_shortcut(
     epi_r = await db.execute(
         text("""SELECT id, narrative, valid_from FROM memory_episodes
                 WHERE user_id = :uid AND valid_to IS NULL
+                  AND superseded_by IS NULL
+                  AND (verification_state IS NULL OR verification_state != 'contradicted')
                   AND (valid_from IS NULL OR valid_from < :cutoff)
                 ORDER BY valid_from DESC NULLS LAST LIMIT 10"""),
         {"uid": user_id, "cutoff": cutoff},
@@ -947,6 +957,7 @@ async def _temporal_list_shortcut(
             text("""SELECT id, canonical_name, description_short, aliases, weight, source_trust, created_at
                     FROM memory_concepts
                     WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL
+                      AND (verification_state IS NULL OR verification_state != 'contradicted')
                       AND (created_at IS NULL OR created_at < :cutoff)
                     ORDER BY last_recalled_at DESC NULLS LAST LIMIT 8"""),
             {"uid": user_id, "cutoff": cutoff},
@@ -987,9 +998,15 @@ async def _temporal_list_shortcut(
 
 def _concept_status_ok(detail: dict, include_expired: bool) -> bool:
     """§5.2：常规查询仅 active + activation_strength > 0.05；
-    as-of 历史查询不限制 status / activation_strength（含 silent + cold_forgotten）。"""
+    as-of 历史查询不限制 status / activation_strength（含 silent + cold_forgotten）。
+
+    2026-11-08 dream verify：contradicted 的笔记不进常规注入（避免把与原始
+    transcript 冲突的内容当事实）；历史/as-of 查询仍可查。
+    """
     if include_expired:
         return True
+    if detail.get("verification_state") == "contradicted":
+        return False
     return detail.get("status") == "active" and (detail.get("activation_strength") or 0) > 0.05
 
 
@@ -1129,7 +1146,7 @@ async def _get_concept_detail(
     db: AsyncSession, concept_id: str, user_id: str, include_expired: bool = False,
 ) -> dict | None:    # §5.2 as-of 历史查询：include_expired 时不过滤 valid_to（失效概念可查，注入时标注）
     validity = "valid_from <= NOW()" if include_expired else "valid_to IS NULL"
-    result = await db.execute(text(f"SELECT canonical_name, description_short, description_full, weight, source_trust, memory_type, aliases, activation_strength, status, last_recalled_at, stability, created_at, valid_to, importance FROM memory_concepts WHERE id = :id AND user_id = :uid AND {validity}"), {"id": concept_id, "uid": user_id})
+    result = await db.execute(text(f"SELECT canonical_name, description_short, description_full, weight, source_trust, memory_type, aliases, activation_strength, status, last_recalled_at, stability, created_at, valid_to, importance, verification_state, last_verified_at, superseded_by, needs_review, invalid_reason, (SELECT s.canonical_name FROM memory_concepts s WHERE s.id = memory_concepts.superseded_by AND s.user_id = :uid) FROM memory_concepts WHERE id = :id AND user_id = :uid AND {validity}"), {"id": concept_id, "uid": user_id})
     row = result.fetchone()
     if not row:
         return None
@@ -1139,17 +1156,27 @@ async def _get_concept_detail(
         "aliases": row[6], "activation_strength": row[7], "status": row[8],
         "last_recalled_at": row[9], "stability": row[10], "created_at": row[11],
         "valid_to": row[12], "importance": row[13],
+        "verification_state": row[14], "last_verified_at": row[15],
+        "superseded_by": row[16], "needs_review": row[17],
+        "invalid_reason": row[18], "superseded_by_name": row[19],
     }
 
 
 async def _get_episode_detail(db: AsyncSession, episode_id: str, include_expired: bool = False) -> dict | None:
-    # §5.2 as-of：include_expired 时不过滤 valid_to/superseded_by
-    validity = "valid_from <= NOW()" if include_expired else "(valid_to IS NULL OR superseded_by IS NULL)"
-    result = await db.execute(text(f"SELECT narrative, valid_from, source_concept_ids FROM memory_episodes WHERE id = :id AND {validity}"), {"id": episode_id})
+    # §5.2 as-of：include_expired 时不过滤 valid_to/superseded_by；
+    # 现行查询必须 valid_to 与 superseded_by 同时为空（旧 OR 会放行半失效行）。
+    validity = "valid_from <= NOW()" if include_expired else "(valid_to IS NULL AND superseded_by IS NULL)"
+    result = await db.execute(text(f"SELECT narrative, valid_from, source_concept_ids, verification_state, last_verified_at, invalid_reason, superseded_by FROM memory_episodes WHERE id = :id AND {validity}"), {"id": episode_id})
     row = result.fetchone()
     if not row:
         return None
-    return {"narrative": row[0], "valid_from": row[1], "source_concept_ids": row[2]}
+    if not include_expired and row[3] == "contradicted":
+        return None
+    return {
+        "narrative": row[0], "valid_from": row[1], "source_concept_ids": row[2],
+        "verification_state": row[3], "last_verified_at": row[4],
+        "invalid_reason": row[5], "superseded_by": row[6],
+    }
 
 
 async def _get_subconscious_detail(db: AsyncSession, unit_id: str) -> dict | None:
@@ -1189,6 +1216,13 @@ async def _stage2_description_expansion(
                                   "weight": detail.get("weight", 0.5),
                           "importance": detail.get("importance", 0.5),
                                   "source_trust": detail.get("source_trust", ""),
+                                  "verification_state": detail.get("verification_state"),
+                                  "last_verified_at": detail.get("last_verified_at"),
+                                  "valid_to": detail.get("valid_to"),
+                                  "superseded_by": detail.get("superseded_by"),
+                              "superseded_by_name": detail.get("superseded_by_name"),
+                                  "needs_review": detail.get("needs_review"),
+                                  "invalid_reason": detail.get("invalid_reason"),
                                   "memory_type": detail.get("memory_type", ""),
                                   "aliases": detail.get("aliases", ""),
                                   "last_recalled_at": detail.get("last_recalled_at"),
@@ -1219,6 +1253,13 @@ async def _stage2_description_expansion(
                                       "weight": detail.get("weight", 0.5),
                           "importance": detail.get("importance", 0.5),
                                       "source_trust": detail.get("source_trust", ""),
+                                  "verification_state": detail.get("verification_state"),
+                                  "last_verified_at": detail.get("last_verified_at"),
+                                  "valid_to": detail.get("valid_to"),
+                                  "superseded_by": detail.get("superseded_by"),
+                              "superseded_by_name": detail.get("superseded_by_name"),
+                                  "needs_review": detail.get("needs_review"),
+                                  "invalid_reason": detail.get("invalid_reason"),
                                       "memory_type": detail.get("memory_type", ""),
                                       "aliases": detail.get("aliases", ""),
                                       "last_recalled_at": detail.get("last_recalled_at"),
@@ -1272,6 +1313,13 @@ async def _stage2_description_expansion(
                                   "weight": detail.get("weight", 0.5),
                           "importance": detail.get("importance", 0.5),
                                   "source_trust": detail.get("source_trust", ""),
+                                  "verification_state": detail.get("verification_state"),
+                                  "last_verified_at": detail.get("last_verified_at"),
+                                  "valid_to": detail.get("valid_to"),
+                                  "superseded_by": detail.get("superseded_by"),
+                              "superseded_by_name": detail.get("superseded_by_name"),
+                                  "needs_review": detail.get("needs_review"),
+                                  "invalid_reason": detail.get("invalid_reason"),
                                   "memory_type": detail.get("memory_type", ""),
                                   "aliases": detail.get("aliases", ""),
                                   "last_recalled_at": detail.get("last_recalled_at"),
@@ -1310,6 +1358,13 @@ async def _stage2_description_expansion(
                                       "weight": detail.get("weight", 0.5),
                                       "importance": detail.get("importance", 0.5),
                                       "source_trust": detail.get("source_trust", ""),
+                                  "verification_state": detail.get("verification_state"),
+                                  "last_verified_at": detail.get("last_verified_at"),
+                                  "valid_to": detail.get("valid_to"),
+                                  "superseded_by": detail.get("superseded_by"),
+                              "superseded_by_name": detail.get("superseded_by_name"),
+                                  "needs_review": detail.get("needs_review"),
+                                  "invalid_reason": detail.get("invalid_reason"),
                                       "memory_type": detail.get("memory_type", ""),
                                       "aliases": detail.get("aliases", ""),
                                       "last_recalled_at": detail.get("last_recalled_at"),
@@ -1444,6 +1499,7 @@ async def _stage2b_link_expansion(
                      "FROM memory_concepts WHERE user_id = :u "
                      "AND status IN ('active', 'silent') "
                      "AND valid_to IS NULL "
+                     "AND (verification_state IS NULL OR verification_state != 'contradicted') "
                      "AND source_unit_ids LIKE :pat "
                      "ORDER BY weight DESC LIMIT 5"),
                 {"u": user_id, "pat": f'%"{seed.id}"%'},
@@ -1541,7 +1597,7 @@ async def _stage3_embedding_rerank(
             existing[0].metadata["calibrated_score"] = concept_final
         else:
             detail = await _get_concept_detail(db, cr["id"], user_id, include_expired=stage0.include_expired)
-            if detail:
+            if detail and _concept_status_ok(detail, stage0.include_expired):
                 concept_candidates.append(RetrievalCandidate(
                     id=cr["id"], tier="concept", score=cr["similarity"],
                     content=detail.get("description_short", ""),
@@ -1550,6 +1606,13 @@ async def _stage3_embedding_rerank(
                               "weight": detail.get("weight", 0.5),
                           "importance": detail.get("importance", 0.5),
                               "source_trust": detail.get("source_trust", ""),
+                              "verification_state": detail.get("verification_state"),
+                              "last_verified_at": detail.get("last_verified_at"),
+                              "valid_to": detail.get("valid_to"),
+                              "superseded_by": detail.get("superseded_by"),
+                              "superseded_by_name": detail.get("superseded_by_name"),
+                              "needs_review": detail.get("needs_review"),
+                              "invalid_reason": detail.get("invalid_reason"),
                               "memory_type": detail.get("memory_type", ""),
                               "aliases": detail.get("aliases", ""),
                               "last_recalled_at": detail.get("last_recalled_at"),
@@ -2443,6 +2506,36 @@ async def _apply_recall_boosts_bg(
         logger.debug("window boost failed for user=%s", user_id, exc_info=True)
 
 
+async def _build_memory_index(db: AsyncSession, user_id: str,
+                               max_chars: int = 300) -> str:
+    """C6：实体索引（标题 + 摘要指针），严格字符预算；无页则空。
+
+    页面正文不在这里展开——需要细节时 agent 用 memory_search/页面读工具。
+    """
+    try:
+        from app.services.memory_page_service import get_index_pages
+        pages = await get_index_pages(db, user_id, limit=8)
+    except Exception:
+        return ""
+    if not pages:
+        return ""
+    lines = ["[记忆索引]"]
+    used = len(lines[0])
+    for p in pages:
+        title = str(p.get("title") or "")
+        if not title:
+            continue
+        aliases = [a for a in (p.get("aliases") or []) if a and a != title]
+        alias_part = f"（{'/'.join(aliases[:2])}）" if aliases else ""
+        summary = str(p.get("summary") or "").strip()
+        line = f"- {title}{alias_part}" + (f": {summary[:60]}" if summary else "")
+        if used + len(line) + 1 > max_chars:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 async def _build_memory_overview(
     db: AsyncSession, user_id: str, max_chars: int | None = None,
     exclude_recent_minutes: float = 0,
@@ -2505,6 +2598,7 @@ async def _build_memory_overview(
                     "FROM memory_concepts "
                     "WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 "
                     "AND valid_to IS NULL AND (valid_from IS NULL OR valid_from <= NOW()) "
+                    "AND (verification_state IS NULL OR verification_state != 'contradicted') "
                     "AND created_at IS NOT NULL AND created_at < :cutoff "
                     "AND memory_type != 'profile' AND weight > 0.05 "
                     "ORDER BY " + eff_expr + " DESC, created_at DESC LIMIT :limit"
@@ -2824,6 +2918,18 @@ async def _build_injection_context_ex(
     except Exception:
         logger.exception("memory overview build failed")
 
+    # C6：实体索引 + 指针（低优先级；强命中时让位给检索段）。
+    # P0-03（2026-11-08）：默认 **false**（回滚安全）——A/B（next P1-08）量化 token/
+    # 召回前不改变注入形态；开关关闭时注入与旧版逐字等价（test_page_index_default_off）。
+    if bool(config.memory.get("page_index_enabled", False)) and not strong_hit:
+        try:
+            page_index = await _build_memory_index(
+                db, user_id, max_chars=int(config.memory.get("page_index_max_chars", 300)))
+            if page_index:
+                sections.append((0.15, page_index))
+        except Exception:
+            logger.debug("memory page index failed (fail-open)", exc_info=True)
+
     injected = _select_injected(candidates)
 
     # 去重前置到切片前：overview 已显示的概念/事件不再重复注入，
@@ -2920,10 +3026,30 @@ async def _build_injection_context_ex(
             weight = c.metadata.get("weight", 0)
             trust = c.metadata.get("source_trust", "")
             tag = " （推断，未经用户确认）" if trust == "agent_inferred" else ""
+            vstate = c.metadata.get("verification_state")
+            verify_tag = {
+                "confirmed": " （已验证）",
+                "contradicted": " （与原始对话不一致，待核实）",
+                "insufficient": " （证据不足）",
+            }.get(str(vstate or ""), "")
             valid_to = _to_dt(c.metadata.get("valid_to"))
-            expired_tag = f" （已于 {valid_to.strftime('%Y-%m-%d')} 失效）" if valid_to else ""
+            from app.services.memory_validity_service import (
+                derive_invalid_reason, validity_label,
+            )
+            reason = c.metadata.get("invalid_reason") or (
+                derive_invalid_reason(
+                    superseded_by=c.metadata.get("superseded_by"),
+                    status=c.metadata.get("status"),
+                    needs_review=bool(c.metadata.get("needs_review")),
+                ) if valid_to else None
+            )
+            validity_tag = (
+                validity_label(reason, superseded_name=c.metadata.get("superseded_by_name"),
+                               valid_to=valid_to, status=c.metadata.get("status"))
+                if reason else ""
+            )
             alias_part = f"（{aliases}）" if aliases else ""
-            line = f"- {name}{alias_part}: {c.content}{tag}{expired_tag} [权重: {weight:.2f}]"
+            line = f"- {name}{alias_part}: {c.content}{tag}{verify_tag}{validity_tag} [权重: {weight:.2f}]"
             lines.append(_concept_line_with_link(line, linked_excerpts.get(c.id, "")))
         sections.append((_section_score("concept"), "\n".join(lines)))
 
@@ -3116,22 +3242,11 @@ def dream_section_text(text: str) -> str:
 
 async def _get_latest_dream(db: AsyncSession, user_id: str) -> str | None:
     # 2026-08-09 修复：① 限定 consolidation 类型（passive dream 每天由 consolidation
-    # 管线写入，不受 dreaming_enabled 门控；该开关只门控主动 dream 第 6 步）；
-    # ② `ORDER BY created_at DESC` 必须显式 NULLS LAST——PostgreSQL 降序默认
-    # NULLS FIRST，而 agent_dreams 有 134 条历史行 created_at 为 NULL（约 5%），
-    # 旧代码总是选中 NULL 行 → [近期 Dream] 注入过时内容（实测低活跃用户返回
-    # 08-02 的 workspace_read 而非 08-09 的新 dream）。
-    # A4.9 复审 Minor：runtime 禁用（v1 模式）时 consolidation 调度停止、v1 行被
-    # nightly 过滤 → 本函数返回空——退回任意类型最新行（v1 模式无注入歧义）。
+    # 2026-11-08（dreaming 收敛）：只读 consolidation dream；legacy/nightly
+    # 已停止写入且不再回退注入。`ORDER BY created_at DESC` 必须显式 NULLS LAST
+    # ——PostgreSQL 降序默认 NULLS FIRST，历史行 created_at 为 NULL 会选中旧行。
     result = await db.execute(
         text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) AND dream_type = 'consolidation' AND scanned = TRUE AND COALESCE(provenance_taint, '') <> 'untrusted' ORDER BY created_at DESC NULLS LAST, generated_for_date DESC LIMIT 1"),
-        {"uid": user_id},
-    )
-    row = result.fetchone()
-    if row:
-        return row[0]
-    result = await db.execute(
-        text("SELECT summary FROM agent_dreams WHERE agent_state_id = (SELECT id FROM user_agent_states WHERE user_id = :uid) AND scanned = TRUE AND COALESCE(provenance_taint, '') <> 'untrusted' ORDER BY created_at DESC NULLS LAST, generated_for_date DESC LIMIT 1"),
         {"uid": user_id},
     )
     row = result.fetchone()

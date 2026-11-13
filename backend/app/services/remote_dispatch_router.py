@@ -335,6 +335,30 @@ async def _try_remote_dispatch_inner(
     if not target or not target.startswith("device:"):
         return None
     device_id = target.split(":", 1)[1]
+    # 任务作用域（§11.2 设备执行）：enforce 下没有 frozen context 就不派发——
+    # 旧客户端/未支持链路不得降级成旧签名继续执行；同时要求 execution_target
+    # 与 Task 的 storage_authority 一致（云端写一份、设备读另一份是不可接受的）。
+    from app.services import workspace_scope_service as _wss
+
+    if _wss.scoping_mode() == "enforce":
+        _ctx = kwargs.get("workspace_ctx")
+        if _ctx is not None:
+            # scoped 执行：链路必须过能力门（未放开 → 明确拒绝，不降级旧签名），
+            # 且 execution_target 必须与 Task 的 storage_authority 一致。
+            from app.services.workspace_scope import WorkspaceScopeError as _DErr
+            from app.services.workspace_scoping_runtime import entry_guard as _entry_guard
+
+            try:
+                _entry_guard("device")
+            except _DErr as _dexc:
+                return json.dumps({"error": str(_dexc), "code": _dexc.code,
+                                   "success": False}, ensure_ascii=False)
+            _authority = str(getattr(_ctx, "storage_authority", "cloud") or "cloud")
+            if _authority != str(target):
+                return json.dumps({
+                    "error": f"任务存储权威为 {_authority}，与会话 execution_target={target} 不兼容；"
+                             "跨权威只能走显式迁移。",
+                    "code": "workspace_relation_invalid", "success": False}, ensure_ascii=False)
     # C1 属主栅栏（评审 r3/r4 Critical）：派发按 device_id 盲路由——在线会话属主必须
     # 与会话用户一致。硬删释放的 device_id 被他人抢占=劫持不可变会话执行通道（波前
     # 软删占槽不可达）；栅栏后抢占者会话无法收到受害会话的派发。
@@ -427,11 +451,21 @@ async def _try_remote_dispatch_inner(
                 "拒绝派发，不回退云端执行。请重新登录后重试，或改用云端执行环境（新建会话）。"
             )
         timeout = _tool_timeout(tool_name)
+        # 2026-11-12：随每次 RPC 下发**新鲜**权限快照（设备侧作为 permission_key
+        # 闸的权威值）——用户在设置里改开关后，下一次工具调用立即生效，不等 30s
+        # sync 周期。调用点已算好（kwargs["permission_snapshot"]）则直接复用，
+        # 避免同一调用两次 SELECT；否则现读；读失败回落请求期快照。
+        _fresh_perms = kwargs.get("permission_snapshot")
+        if not isinstance(_fresh_perms, dict):
+            from app.services.agent_permissions import fresh_permissions
+
+            _fresh_perms = await fresh_permissions(kwargs.get("db"), kwargs.get("user"))
         params = {
             "tool": tool_name,
             "args": strip_internal_args(args),
             "workspace_ctx": ws_ctx,
             "timeout_seconds": timeout,
+            "permissions": _fresh_perms,
         }
         grant = kwargs.get("_device_grant")
         if grant is not None:

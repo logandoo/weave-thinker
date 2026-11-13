@@ -6,6 +6,7 @@
 容量 + 用户可见预览；默认 **shadow 只记录不删**。淘汰 = 归档降级
 （fidelity_state: full → archived，P2 降级 > 删除），可一键恢复（撤销）。
 """
+import json
 import logging
 from datetime import datetime
 from math import exp
@@ -32,7 +33,8 @@ def retention_score_for(weight, stability, recurrence_count,
 
 async def preview_evictions(db: Any, user_id: str,
                             capacity: int = CAP_DEFAULT) -> List[Dict[str, Any]]:
-    """超容量淘汰候选（按 retention_score 升序）——只预览不删（shadow）。"""
+    """超容量淘汰候选——只预览不删（shadow）。排序：retention_score 降序
+    （NULLS FIRST 保护未回填行）取尾部 = 最低分先淘汰。"""
     from sqlalchemy import select
 
     from app.db.database import MemoryConcept
@@ -41,7 +43,14 @@ async def preview_evictions(db: Any, user_id: str,
         select(MemoryConcept).where(
             MemoryConcept.user_id == user_id,
             MemoryConcept.status == "active",
-        ).order_by(MemoryConcept.retention_score.desc(), MemoryConcept.weight.desc()))
+            # J2/B9（2026-11-08）：contradicted 不参与保留排序/淘汰候选。
+            (MemoryConcept.verification_state.is_(None))
+            | (MemoryConcept.verification_state != "contradicted"),
+        ).order_by(
+            # 评审修复：显式 NULLS FIRST——未回填 retention_score 的 legacy 行
+            # 不得因 NULL 排序方言差异被当成最低分先淘汰（保护方向必须写死）。
+            MemoryConcept.retention_score.desc().nulls_first(),
+            MemoryConcept.weight.desc().nulls_first()))
     rows = list(res.scalars().all())
     # 评审 A C3：按分数降序取尾部 = 最低分先淘汰（原升序取尾部=反向误删高价值）
     over = rows[int(capacity):] if len(rows) > int(capacity) else []
@@ -62,9 +71,10 @@ async def apply_eviction(db: Any, user_id: str, capacity: int = CAP_DEFAULT,
 
     candidates = await preview_evictions(db, user_id, capacity)
     db.add(MemoryEvalRun(
-        run_id=f"retention-{datetime.utcnow().strftime('%Y%m%d')}",
+        run_id=f"retention-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
         suite="retention_shadow",
         arm=str(mode or "shadow"),
+        user_id=user_id,
         metrics_json={"would_evict": len(candidates), "user_id": user_id},
     ))
     if str(mode).strip().lower() != "enforce":
@@ -74,7 +84,31 @@ async def apply_eviction(db: Any, user_id: str, capacity: int = CAP_DEFAULT,
     for c in candidates:
         row = await db.get(MemoryConcept, c["id"])
         if row is not None and row.user_id == user_id:
+            # 评审修复：J1 要求归档态不得显示验证态，但 undo 必须可恢复——
+            # 抹除前把验证四字段快照进 metadata_json，undo_eviction 还原。
+            snap = {
+                "verification_state": row.verification_state,
+                "last_verified_at": (row.last_verified_at.isoformat()
+                                     if row.last_verified_at else None),
+                "verification_evidence": row.verification_evidence,
+                "verification_correction": getattr(row, "verification_correction", None),
+            }
+            if any(v is not None for v in snap.values()):
+                try:
+                    meta = json.loads(row.metadata_json) if row.metadata_json else {}
+                except (TypeError, ValueError):
+                    meta = {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["retention_undo_snapshot"] = snap
+                row.metadata_json = json.dumps(meta, ensure_ascii=False)
             row.fidelity_state = "archived"
+            # J1：归档/淘汰后不得同时显示“已归档 + 已验证/待核实”。
+            row.verification_state = None
+            row.last_verified_at = None
+            row.verification_evidence = None
+            if hasattr(row, "verification_correction"):
+                row.verification_correction = None
     await db.flush()
     return {"applied": True, "mode": "enforce", "candidates": len(candidates)}
 
@@ -88,14 +122,22 @@ async def retention_preview_report(db: Any, user_id: str,
     active = int(await db.scalar(
         select(func.count()).select_from(MemoryConcept).where(
             MemoryConcept.user_id == user_id,
-            MemoryConcept.status == "active")) or 0)
+            MemoryConcept.status == "active",
+            (MemoryConcept.verification_state.is_(None))
+            | (MemoryConcept.verification_state != "contradicted"))) or 0)
+    contradicted = int(await db.scalar(
+        select(func.count()).select_from(MemoryConcept).where(
+            MemoryConcept.user_id == user_id,
+            MemoryConcept.status == "active",
+            MemoryConcept.verification_state == "contradicted")) or 0)
     candidates = await preview_evictions(db, user_id, capacity)
     return {"capacity": int(capacity), "active": active,
+            "contradicted_excluded": contradicted,
             "mode": "shadow", "candidates": candidates}
 
 
 async def undo_eviction(db: Any, user_id: str, concept_ids: List[str]) -> int:
-    """撤销淘汰：fidelity_state 恢复 full（P2 可逆优先）。"""
+    """撤销淘汰：fidelity_state 恢复 full（P2 可逆优先）+ 还原归档时快照的验证态。"""
     from sqlalchemy import select
 
     from app.db.database import MemoryConcept
@@ -105,6 +147,31 @@ async def undo_eviction(db: Any, user_id: str, concept_ids: List[str]) -> int:
         row = await db.get(MemoryConcept, str(cid))
         if row is not None and row.user_id == user_id and row.fidelity_state != "full":
             row.fidelity_state = "full"
+            # 评审修复：enforce 归档抹掉的验证四字段（J1 显示约束）从快照恢复。
+            try:
+                meta = json.loads(row.metadata_json) if row.metadata_json else {}
+            except (TypeError, ValueError):
+                meta = {}
+            snap = meta.pop("retention_undo_snapshot", None) if isinstance(meta, dict) else None
+            if isinstance(snap, dict) and row.verification_state is not None:
+                # 评审复审钉：守卫跳过还原时必须把快照放回——否则快照被弹出
+                # 却不生效，元数据里既没了句柄也丢了可恢复性。
+                meta["retention_undo_snapshot"] = snap
+                row.metadata_json = json.dumps(meta, ensure_ascii=False)
+                snap = None
+            if isinstance(snap, dict):
+                # 评审修复：仅当归档期间验证态未被新写入（仍为空）才还原——
+                # 若归档后又有新的 verify 结果，不得用陈旧快照覆盖新态。
+                row.verification_state = snap.get("verification_state")
+                lva = snap.get("last_verified_at")
+                try:
+                    row.last_verified_at = datetime.fromisoformat(lva) if lva else None
+                except (TypeError, ValueError):
+                    row.last_verified_at = None
+                row.verification_evidence = snap.get("verification_evidence")
+                if hasattr(row, "verification_correction"):
+                    row.verification_correction = snap.get("verification_correction")
+                row.metadata_json = json.dumps(meta, ensure_ascii=False)
             n += 1
     await db.flush()
     return n

@@ -6,8 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.db.database import get_db, User, UserSession
-from app.schemas.chat import UserCreate, UserResponse, LoginRequest, TokenResponse
+from app.schemas.chat import UserCreate, UserResponse, LoginRequest, RegisterRequest, TokenResponse
+from app.core.config import get_config
 from app.services.auth_service import hash_password, verify_password, create_access_token
+from app.services.auth_rate_limit_service import AuthHeadroom, rate_limited
 from app.services.assistant_service import create_default_assistant_if_needed
 from app.services.memory_service import ensure_user_agent_state
 from app.services.workspace_service import ensure_user_workspace
@@ -18,6 +20,7 @@ from app.services.agent_permissions import (
 )
 from datetime import datetime
 import json
+import secrets
 from typing import Dict, Any
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -35,7 +38,34 @@ def _user_response(user) -> UserResponse:
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(request: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def register(
+    request: RegisterRequest,
+    db: AsyncSession = Depends(get_db),
+    headroom: AuthHeadroom = Depends(rate_limited("register")),
+):
+    # 注册开关 / 邀请码（[security] registration_open / registration_invite_code）。
+    # 默认开放且无邀请码，与历史行为一致；网关先于字段校验，关闭时不泄露任何校验细节。
+    # 失败窗（按来源 IP）在入口先判：邀请码枚举的特征就是「一直 403」，撞顶即 429。
+    headroom.guard_failure()
+    cfg = get_config()
+    if not cfg.registration_open:
+        headroom.note_failure()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="注册已关闭，请联系管理员"
+        )
+    expected_code = cfg.registration_invite_code
+    if expected_code:
+        supplied = (request.invite_code or "").strip()
+        if not supplied or not secrets.compare_digest(
+            supplied.encode("utf-8"), expected_code.encode("utf-8")
+        ):
+            headroom.note_failure()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="邀请码无效"
+            )
+
     if not request.username or not request.password:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -75,11 +105,20 @@ async def register(request: LoginRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(request: Request, login_req: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(
+    request: Request,
+    login_req: LoginRequest,
+    db: AsyncSession = Depends(get_db),
+    headroom: AuthHeadroom = Depends(rate_limited("login")),
+):
+    # 失败窗按「来源 IP + 账号」判定：同事在共享出口上输错自己的口令不会连累别人，
+    # 攻击者从自己的 IP 反复试某账号只会锁住这一对（评审 B Important：避免整出口连带锁定）。
+    headroom.guard_failure(login_req.username)
     result = await db.execute(select(User).where(User.username == login_req.username))
     user = result.scalar_one_or_none()
 
     if not user or not await verify_password(login_req.password, user.password_hash):
+        headroom.note_failure(login_req.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password"

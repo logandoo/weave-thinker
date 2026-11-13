@@ -9,7 +9,9 @@
  * 由 main.ts 导入。
  */
 import { useChatStore } from './chat'
+import { useAssistantStore } from './assistant'
 import { chatApi } from '@/api/chat'
+import { planResumeRefresh } from './resumeRefreshPolicy'
 
 // P1（2026-09-05）：连接静默判死阈值。后端 setup 期每 10s 一次 ping、agent
 // 循环 keepalive 同为 10s——超过 25s（2.5 个心跳周期）无任何事件的连接在
@@ -113,6 +115,25 @@ if (typeof window !== 'undefined' && !_visibilityChangeHandler) {
 
     for (const convId of Object.keys(store.streamStates)) {
       handleReconnect(convId).catch(() => {})
+    }
+
+    // P0（2026-11-12 手机 App 后台同步失效）：上面的循环只覆盖「本机发起过流」
+    // 的会话——他端（网页/其他客户端）发来的 query 不会创建 streamStates 条目，
+    // 回前台等于零动作，只能重启 App 才见新内容。无主会话按决策表整表刷新：
+    // 侧栏列表总是重载（他端新建会话也要出现），当前会话仅在本机无活跃流时刷新
+    // （活跃流的消息归 reducer 所有）。refreshConversation 自带 last-request-wins
+    // 守卫，重复触发安全。
+    const plan = planResumeRefresh({
+      currentConversationId: store.currentConversationId,
+      currentStreaming: !!store.streamStates[store.currentConversationId ?? '']?.streaming,
+    })
+    if (plan.reloadConversationList) {
+      // 必须带当前助手 id：不带 = 后端返回跨助手并集，侧栏会被其他助手的
+      // 会话污染（chat.ts 乐观置顶注释记录的同类泄漏面；ChatLayout/Sidebar 均带 id）。
+      void store.loadConversations(useAssistantStore().currentAssistantId).catch(() => {})
+    }
+    if (plan.refreshConversationId) {
+      void store.refreshConversation(plan.refreshConversationId).catch(() => {})
     }
   }
   document.addEventListener('visibilitychange', _visibilityChangeHandler)

@@ -22,7 +22,15 @@ Design rules (blind-spot dispositions):
 Usage:
   python3 scripts/evidence_seal.py            # seal (run from the project root)
   python3 scripts/evidence_seal.py --check    # verify an existing seal (no write)
+  python3 scripts/evidence_seal.py --run-context PATH [--sha-map PATH]
 Exit 0 = sealed/verified. Exit 1 = refused (a test change lacks its reason).
+
+W25 multi-agent (PLAN Task 6, §MA6): the manifest carries the Consistency
+Hub Evidence Manifest field set (missing values default to null — old
+manifests still verify/read cleanly). With `--run-context PATH` (RunContext
+JSON, schema vibeweaver-run-context/1) the identity/SHA fields and verifier
+versions are populated; `--sha-map PATH` ({queue_id, candidate_sha,
+final_commit_sha, final_tree_sha}) adds the integration SHA mapping.
 """
 import argparse
 import hashlib
@@ -41,6 +49,22 @@ TRACE_RE = re.compile(r"tests/(workflows/\S+?\.trace\.log)")
 # (SLSA/in-toto: a subject digest binds ANY artifact type).
 EVIDENCE_RE = re.compile(r"tests/(\S+\.(?:log|json|md))")
 TEST_CHANGE_RE = re.compile(r"(\S+\.(?:py|js|mjs|ts|tsx|jsx|go|rs))")
+# W25 Consistency Hub — Evidence Manifest field names (character-for-character;
+# missing values default to null; old manifests without them still verify)
+HUB_MANIFEST_FIELDS = (
+    "repo_id", "task_id", "run_id", "attempt_id", "wave_id",
+    "integration_run_id", "spec_hash", "acceptance_hash", "base_sha",
+    "original_head_sha", "resolved_head_sha", "candidate_sha",
+    "final_commit_sha", "tree_sha", "final_tree_sha", "dep_lock_digest",
+    "env_digest", "skill_digest", "plugin_digest", "checker_digest",
+    "config_digest", "hook_digest", "test_commands", "results",
+    "review_records", "artifact_hashes", "archive_locations", "outbox_status",
+)
+RUN_CONTEXT_SCHEMA = "vibeweaver-run-context/1"
+# Hub id grammar (shared with run_control.py): a forged/garbage id is refused
+RUN_ID_RE = re.compile(r"^run-[0-9a-f]{32}$")
+ATTEMPT_ID_RE = re.compile(r"^attempt-[0-9a-f]{32}$")
+WAVE_ID_RE = re.compile(r"^wave-[0-9a-f]{32}$")
 # code fingerprint inputs — SHARED CONTRACT with scripts/assert_artifacts.py
 # (identical ext set AND identical file-set derivation; review R-I2 found the
 # divergence red-locked group 15b after a clean seal).
@@ -148,11 +172,74 @@ def test_files(root):
     return out
 
 
+def _load_run_context(path):
+    """RunContext JSON (schema vibeweaver-run-context/1) -> identity dict.
+    Raises ValueError on a missing/unparseable/forged context (fail-closed:
+    a manifest must never record identity the context cannot prove)."""
+    try:
+        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"run context {path} missing/unparseable ({e})")
+    if not isinstance(data, dict) or data.get("schema") != RUN_CONTEXT_SCHEMA:
+        raise ValueError(f"run context {path}: schema must be {RUN_CONTEXT_SCHEMA!r} "
+                         f"(forged/legacy context rejected, §MA1)")
+    for key in ("repo_id", "task_id", "run_id", "attempt_id", "wave_id",
+                "base_sha", "spec_hash", "skill_version", "checker_digest"):
+        if not str(data.get(key, "")):
+            raise ValueError(f"run context {path}: field `{key}` missing")
+    # Fail closed on garbage identity: the Hub id grammar and lease_epoch >= 1
+    # must hold before any identity lands in a manifest.
+    for key, rx in (("run_id", RUN_ID_RE), ("attempt_id", ATTEMPT_ID_RE),
+                    ("wave_id", WAVE_ID_RE)):
+        if rx.match(str(data.get(key, ""))) is None:
+            raise ValueError(f"run context {path}: field `{key}` has bad id "
+                             f"format: {data.get(key)!r}")
+    epoch = data.get("lease_epoch")
+    if type(epoch) is not int or epoch < 1:
+        raise ValueError(f"run context {path}: field `lease_epoch` must be an "
+                         f"int >= 1 (got {epoch!r})")
+    return data
+
+
+def _load_sha_map(path):
+    """integration SHA map ({queue_id, candidate_sha, final_commit_sha,
+    final_tree_sha} — integrate.py record_sha_map shape)."""
+    try:
+        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"sha map {path} missing/unparseable ({e})")
+    if not isinstance(data, dict):
+        raise ValueError(f"sha map {path}: must be a JSON object")
+    for key in ("queue_id", "candidate_sha", "final_commit_sha", "final_tree_sha"):
+        if not isinstance(data.get(key), str) or not data.get(key):
+            raise ValueError(f"sha map {path}: field `{key}` missing")
+    return data
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="verify the existing seal without writing")
+    ap.add_argument("--run-context", default="",
+                    help="W25: RunContext JSON (schema vibeweaver-run-context/1) — "
+                         "populate the manifest identity/SHA + verifier-version fields")
+    ap.add_argument("--sha-map", default="",
+                    help="W25: integration SHA map JSON {queue_id, candidate_sha, "
+                         "final_commit_sha, final_tree_sha} (integrate.py record_sha_map)")
     args = ap.parse_args()
     root = pathlib.Path(".").resolve()
+    run = None
+    sha_map = None
+    try:
+        if args.run_context:
+            run = _load_run_context(args.run_context)
+        if args.sha_map:
+            sha_map = _load_sha_map(args.sha_map)
+        if sha_map and run is None:
+            raise ValueError("--sha-map requires --run-context (the SHA map is "
+                             "bound to a run's identity, §MA6)")
+    except ValueError as e:
+        print(f"evidence_seal.py: REFUSED — {e}")
+        return 1
     tests = root / "tests"
     log = (tests / "verification_log.md").read_text(errors="replace") if (tests / "verification_log.md").exists() else ""
     acc = (tests / "acceptance.md").read_text(errors="replace") if (tests / "acceptance.md").exists() else ""
@@ -187,6 +274,36 @@ def main():
             files[rel] = {"sha256": sha256_file(p), "size": p.stat().st_size}
 
     manifest = {"version": 1, "files": files, "code_fingerprint": code_fingerprint(root)}
+    # W25 Hub Evidence Manifest: every field present, missing values default
+    # to null (old manifests without them still verify — --check below only
+    # compares files/code_fingerprint). `skill_version` is ADDITIVE: the
+    # 28-field Hub list keeps its names.
+    for _f in HUB_MANIFEST_FIELDS:
+        manifest[_f] = None
+    manifest["skill_version"] = None
+    if run:
+        manifest["repo_id"] = run.get("repo_id")
+        manifest["task_id"] = run.get("task_id")
+        manifest["run_id"] = run.get("run_id")
+        manifest["attempt_id"] = run.get("attempt_id")
+        manifest["wave_id"] = run.get("wave_id")
+        manifest["spec_hash"] = run.get("spec_hash")
+        manifest["base_sha"] = run.get("base_sha")
+        # verifier versions pinned at evidence time (§MA6 immutability):
+        # skill_digest is a REAL digest of the version string ('sha256:'
+        # prefix), and the raw value lives in the additive `skill_version`
+        # field — it never silently carries the raw string.
+        manifest["skill_version"] = run.get("skill_version")
+        manifest["skill_digest"] = "sha256:" + hashlib.sha256(
+            str(run.get("skill_version")).encode("utf-8")).hexdigest()
+        manifest["checker_digest"] = run.get("checker_digest")
+        manifest["archive_locations"] = [str(run.get("artifact_root") or ""),
+                                         str(run.get("state_root") or "")]
+    if sha_map:
+        manifest["integration_run_id"] = sha_map.get("queue_id")
+        manifest["candidate_sha"] = sha_map.get("candidate_sha")
+        manifest["final_commit_sha"] = sha_map.get("final_commit_sha")
+        manifest["final_tree_sha"] = sha_map.get("final_tree_sha")
     baseline_new = test_files(root)
     baseline_p = tests / "test_baseline.json"
     baseline_old = {}
@@ -252,7 +369,19 @@ def main():
         except Exception:
             print("evidence_seal.py: manifest unreadable")
             return 1
-        ok = man.get("code_fingerprint") == manifest["code_fingerprint"] and man.get("files") == files
+        binding_fields = []
+        if run:
+            binding_fields.extend((
+                "repo_id", "task_id", "run_id", "attempt_id", "wave_id",
+                "spec_hash", "base_sha", "skill_digest", "checker_digest",
+            ))
+        if sha_map:
+            binding_fields.extend((
+                "integration_run_id", "candidate_sha", "final_commit_sha", "final_tree_sha",
+            ))
+        bindings_ok = all(man.get(field) == manifest.get(field) for field in binding_fields)
+        ok = (man.get("code_fingerprint") == manifest["code_fingerprint"]
+              and man.get("files") == files and bindings_ok)
         print("evidence_seal.py: " + ("seal VERIFIED" if ok else "seal STALE or TAMPERED — re-run tests + re-seal"))
         return 0 if ok else 1
 

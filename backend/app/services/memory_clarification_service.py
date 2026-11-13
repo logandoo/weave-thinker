@@ -32,7 +32,7 @@ async def process_clarification(
     from app.services.memory_llm_factory import _memory_llm
 
     result = await db.execute(
-        text("SELECT id, canonical_name, description_short, aliases FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL ORDER BY weight DESC LIMIT 5"),
+        text("SELECT id, canonical_name, description_short, aliases FROM memory_concepts WHERE user_id = :uid AND status = 'active' AND activation_strength > 0.05 AND valid_to IS NULL AND (verification_state IS NULL OR verification_state != 'contradicted') ORDER BY weight DESC LIMIT 5"),
         {"uid": user_id},
     )
     concepts = [{"id": r[0], "name": r[1], "short": r[2], "aliases": r[3]} for r in result.fetchall()]
@@ -155,6 +155,9 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
             if not concept or concept.user_id != user_id:
                 continue
             # 同步发射侧契约：ORM 变更触发捕获（text() UPDATE 零事件为已修缺口）。
+            from app.services.memory_validity_service import apply_invalidation
+            apply_invalidation(concept, "retracted")
+            # 发射侧契约（同步域）：显式 ORM 写点 + ts bump。
             concept.valid_to = datetime.utcnow()
             concept.weight = 0
             concept.updated_at = datetime.utcnow()
@@ -166,12 +169,23 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
             if not concept or concept.user_id != user_id:
                 continue
             old_full = concept.description_full
-            concept.metadata_json = json.dumps({
+            # 评审修复：合并写 metadata_json——整体覆盖会销毁 undo_eviction
+            # 依赖的 retention_undo_snapshot（归档概念的验证态将无法还原）。
+            try:
+                _meta = json.loads(concept.metadata_json) if concept.metadata_json else {}
+            except (TypeError, ValueError):
+                _meta = {}
+            if not isinstance(_meta, dict):
+                _meta = {}
+            _meta.update({
                 "audit_old_description": old_full,
                 "audit_old_description_short": concept.description_short,
-            }, ensure_ascii=False)
+            })
+            concept.metadata_json = json.dumps(_meta, ensure_ascii=False)
             concept.description_short = new_desc[:80]
             concept.description_full = new_desc[:5000]
+            from app.services.memory_concept_service import _reset_verification
+            _reset_verification(concept)
             if concept.status == "silent" and concept.source_trust == "agent_inferred":
                 concept.activation_strength = 1.0
                 concept.status = "active"
@@ -185,10 +199,17 @@ async def _apply_clarification(db: AsyncSession, parsed: dict, user_id: str) -> 
             if not concept or concept.user_id != user_id:
                 continue
             if concept.description_full and parsed.get("new_description"):
-                concept.metadata_json = json.dumps({
-                    "audit_old_description": concept.description_full,
-                }, ensure_ascii=False)
+                try:
+                    _meta = json.loads(concept.metadata_json) if concept.metadata_json else {}
+                except (TypeError, ValueError):
+                    _meta = {}
+                if not isinstance(_meta, dict):
+                    _meta = {}
+                _meta["audit_old_description"] = concept.description_full
+                concept.metadata_json = json.dumps(_meta, ensure_ascii=False)
                 concept.description_full = (concept.description_full + "\n\n约束: " + parsed["new_description"])[:5000]
+                from app.services.memory_concept_service import _reset_verification
+                _reset_verification(concept)
             concept.updated_at = datetime.utcnow()
 
     elif ctype == "forget":
@@ -237,6 +258,9 @@ async def revert_clarification(db: AsyncSession, user_id: str, clarification_id:
             continue
         if clar.correction_type == "negate":
             concept.valid_to = None
+            concept.invalid_reason = None
+            concept.validity_updated_at = datetime.utcnow()
+            concept.status = "active"
             if (concept.weight or 0) <= 0:
                 concept.weight = float(config.memory_concept.get("weight_init", 0.5))
             concept.updated_at = datetime.utcnow()

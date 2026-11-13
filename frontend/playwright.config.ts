@@ -5,8 +5,9 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './e2e',
-  // 2026-11-04 E2E 清债波：269 条历史 ad-hoc spec 归档到 e2e/_archive/（保留 git
-  // 历史）。默认只收集 13 条门禁套件（scripts/e2e_gate.sh）；
+  // 2026-11-04 E2E 清债波：266 条历史 ad-hoc spec 归档到 e2e/_archive/（保留 git
+  // 历史）。默认只收集门禁套件（scripts/e2e_gate.sh，20 条 spec / 67 tests）；
+  // 开源发行树只随发 chat.spec.ts，_archive/ 与门禁脚本不随发。
   // E2E_INCLUDE_ARCHIVE=1 时放开，可单跑归档 spec：
   //   E2E_INCLUDE_ARCHIVE=1 npx playwright test e2e/_archive/xxx.spec.ts
   testIgnore: process.env.E2E_INCLUDE_ARCHIVE ? [] : ['**/_archive/**'],

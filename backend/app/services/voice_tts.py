@@ -15,7 +15,6 @@ _GLOBALS = (   'Optional',
     '_split_segments',
     'asyncio',
     'clean_for_tts',
-    '_is_low_value_ack_text',
     'logger')
 
 
@@ -38,7 +37,10 @@ class VoiceTTSMixin:
         if self._speaking:
             self._speaking = False
             self._speaking_deadline = 0.0
-            await self._send_json({"event": "speaking_end"})
+            await self._send_json({
+                "event": "speaking_end",
+                "turn_epoch": int(self._speaking_epoch or self._turn_epoch or 0),
+            })
     def _reset_turn_playback(self) -> None:
         """Reset per-turn playback-progress tracking at the start of a turn."""
         _sync_voicetts_globals()
@@ -222,6 +224,12 @@ class VoiceTTSMixin:
                 await self._mark_speaking_end()
                 return
             if "flush" in item:
+                flush_epoch = int(item.get("epoch", self._turn_epoch) or 0)
+                if flush_epoch > 0 and (
+                    item.get("turn_complete") is True
+                    or item.get("notification_complete") is True
+                ):
+                    self._completed_speaking_epoch = flush_epoch
                 if (
                     item.get("notification_id")
                     and item.get("notification_id") == self._active_notification_id
@@ -250,9 +258,17 @@ class VoiceTTSMixin:
             if (
                 item_input_seq
                 and item_input_seq < self._latest_input_seq
-                and _is_low_value_ack_text(text)
+                and not item.get("stale_approved")
+                and not (self._speaking and self._speaking_epoch == epoch)
+                and not (self._turn_active and self._turn_epoch == epoch)
             ):
-                logger.info("voice stale ack PCM dropped: input_seq=%d latest=%d", item_input_seq, self._latest_input_seq)
+                # Ownership, not text: inactive stale items may be dropped, but
+                # a live generation must retain its prefix until the final
+                # stale verdict; rejection still cancels/drains that generation.
+                logger.info(
+                    "voice stale unapproved PCM dropped: input_seq=%d latest=%d",
+                    item_input_seq, self._latest_input_seq,
+                )
                 continue
             if not text or self._interrupt.is_set() or self._playback_paused:
                 self._tts_prefetch_q = None
@@ -312,6 +328,7 @@ class VoiceTTSMixin:
             # Per-item epoch: each queued segment carries the turn that
             # ENQUEUED it — re-tags the onset-pause hook for a new answer's
             # audio streaming into a still-draining previous burst.
+            previous_speaking_epoch = self._speaking_epoch
             self._speaking_epoch = epoch
             _perf("tts_play", (_now() - self._turn_enqueued_at) * 1000,
                   seg_len=len(text), epoch=epoch)
@@ -339,18 +356,7 @@ class VoiceTTSMixin:
             aux_prefetch_spawned = False
             aux_prefetch_task = None
             self._playing_aux = aux_item
-            previous_notification_id = self._active_notification_id
-            if notification_id:
-                notice_state = self._notice_state(notification_id)
-                self._active_notification_id = notification_id
-                self._active_notification_audio_sent = notice_state["audio_sent"]
-                self._active_notification_generation_complete = notice_state["generation_complete"]
-            else:
-                # Ordinary speech is not notification playback. Clear only the
-                # active slot; per-notification state remains independently intact.
-                self._active_notification_id = None
-                self._active_notification_audio_sent = False
-                self._active_notification_generation_complete = False
+            notice_state = self._notice_state(notification_id) if notification_id else None
             while True:
                 if first_wait:
                     # Safety net: a hung TTS provider stream must not stall
@@ -377,6 +383,8 @@ class VoiceTTSMixin:
                 if self._interrupt.is_set() or self._closed or self._playback_paused:
                     truncated = True
                     break
+                if not pcm:
+                    continue
                 # Auxiliary speech (filler/backchannel) is cut as soon as a real
                 # answer segment's audio is ready: spawn its synthesis the
                 # moment it appears in the queue (during aux playback) and
@@ -431,17 +439,38 @@ class VoiceTTSMixin:
                         self._tts_prefetch_q.put_nowait(nxt_pcm)
                         truncated = True
                         break
+                previous_notification_id = self._active_notification_id
+                if notification_id:
+                    notice_state["turn_epoch"] = epoch
+                    self._active_notification_id = notification_id
+                    self._active_notification_audio_sent = notice_state["audio_sent"]
+                    self._active_notification_generation_complete = notice_state["generation_complete"]
+                else:
+                    # Ordinary PCM takes over only when it actually exists; an
+                    # older notice keeps its independent outbox state.
+                    self._active_notification_id = None
+                    self._active_notification_audio_sent = False
+                    self._active_notification_generation_complete = False
                 was_speaking = self._speaking
                 if not self._speaking:
                     self._speaking = True
                     self._speaking_started_at = _now()
-                if (not was_speaking) or (notification_id != previous_notification_id):
+                if (
+                    (not was_speaking)
+                    or (notification_id != previous_notification_id)
+                    or (epoch != previous_speaking_epoch)
+                ):
                     await self._send_json({
                         "event": "speaking_start",
+                        "turn_epoch": epoch,
                         "speech_kind": "notice" if notification_id else ("aux" if aux_item else "answer"),
                         "notification_id": notification_id,
                         "notice_burst_seq": notice_state.get("burst_seq", 0) if notification_id else 0,
                     })
+                if item.get("reply_text"):
+                    # Preparation/queueing must not overwrite an older audible
+                    # tail. A direct utterance owns resume text from its first PCM.
+                    self._turn_reply_text = item["reply_text"]
                 sec = len(pcm) / 48000.0  # PCM16, 24kHz, mono
                 self._current_seg_audio_sec += sec
                 self._turn_audio_sec_total += sec
@@ -497,8 +526,46 @@ class VoiceTTSMixin:
                     self._dup_window.record(text, epoch)
             self._consumer_playing = False
             self._playing_aux = False
+    def _prepare_direct_speech(self) -> int:
+        """Bind a direct utterance to a valid epoch BEFORE its first await."""
+        _sync_voicetts_globals()
+        if (
+            self._turn_epoch <= 0
+            or self._interrupt.is_set()
+            or (not self._speaking and self._completed_speaking_epoch >= self._turn_epoch)
+        ):
+            self._turn_epoch += 1
+            self._interrupt.clear()
+        return self._turn_epoch
+
+    async def _speak_direct_text(self, text: str, wait: bool = True,
+                                 notification_id: Optional[str] = None,
+                                 turn_complete: bool = True,
+                                 origin_epoch: Optional[int] = None) -> bool:
+        """Start direct speech only if its prepared origin is still current."""
+        _sync_voicetts_globals()
+        if origin_epoch is not None and (
+            origin_epoch != self._turn_epoch or self._interrupt.is_set()
+        ):
+            return False
+        self._prepare_direct_speech()
+        if wait and turn_complete:
+            # Pause drains an unconsumed final flush. Remember that this direct
+            # utterance owned one so resume can restore the completion boundary.
+            self._final_flush_enqueued_epoch = self._turn_epoch
+        await self._speak_text(
+            text, wait=wait, notification_id=notification_id,
+            turn_complete=turn_complete, reply_text=text,
+            inherit_current_notice=False,
+        )
+        return True
+
     async def _speak_text(self, text: str, wait: bool = True, aux: bool = False,
-                          notification_id: Optional[str] = None) -> None:
+                          notification_id: Optional[str] = None,
+                          turn_complete: bool = True,
+                          stale_approved: bool = False,
+                          reply_text: Optional[str] = None,
+                          inherit_current_notice: bool = True) -> None:
         """Speak an arbitrary string (notices/suggestions) via the TTS pipeline.
 
         ``aux=True`` marks filler-prefix / backchannel utterances: the consumer
@@ -507,6 +574,11 @@ class VoiceTTSMixin:
         spoken phrases are also recorded in ``_aux_echo_guard`` so their own
         mic-echo is stripped from the ASR pending text."""
         _sync_voicetts_globals()
+        # Direct notices may bypass generation. Allocate a real epoch before
+        # enqueueing so the client never has to treat notification PCM as an
+        # anonymous/legacy stream; every segment in this utterance shares it.
+        if self._turn_epoch <= 0:
+            self._turn_epoch = 1
         segments, rest = _split_segments(text)
         if rest.strip():
             segments.append(rest)
@@ -515,8 +587,10 @@ class VoiceTTSMixin:
             if seg.strip():
                 await self._tts_queue.put({
                     "text": seg, "epoch": self._turn_epoch, "aux": aux,
-                    "notification_id": notification_id or self._current_notice_id,
+                    "notification_id": (notification_id or self._current_notice_id) if inherit_current_notice else notification_id,
                     "input_seq": self._generation_input_seq,
+                    "stale_approved": stale_approved,
+                    "reply_text": reply_text,
                 })
         if aux:
             self._register_aux_echo(text)
@@ -524,7 +598,9 @@ class VoiceTTSMixin:
             fut = loop.create_future()
             await self._tts_queue.put({
                 "flush": fut,
-                "notification_id": notification_id or self._current_notice_id,
+                "epoch": self._turn_epoch,
+                "turn_complete": turn_complete,
+                "notification_id": (notification_id or self._current_notice_id) if inherit_current_notice else notification_id,
             })
             try:
                 await asyncio.wait_for(fut, timeout=60.0)
@@ -539,10 +615,6 @@ class VoiceTTSMixin:
         self._tts_prefetch_text = ""
         self._tts_prefetch_epoch = 0
         self._tts_prefetch_valid = False
-        # The speculative filler prefetch dies with the drain too: the
-        # pipeline is being reset (interrupt/pause), so its partial audio
-        # must not convert at a later flush (2026-08-25).
-        self._drop_filler_prefetch()
         # The pause's resume pre-synthesis is dropped too: a drain means the
         # answer is being abandoned/restarted, so its partial audio must not
         # be replayed by a later resume. (The synth task itself exits via the

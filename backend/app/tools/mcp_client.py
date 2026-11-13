@@ -867,6 +867,28 @@ class _MCPToolHandler:
         self.owner = owner
 
     async def __call__(self, args: dict, **kwargs) -> str:
+        # 任务作用域（§7.5/§10 MCP）：外部 MCP 不是本地文件沙箱。scoped 会话默认全部
+        # 拒绝，只有用户签发的 kind=mcp grant 指明 server/tool/action 才放行；
+        # 放行后危险操作仍照旧过 act gate。
+        from app.services import workspace_scope_service as _svs
+
+        if _svs.scoping_mode() == "enforce" and kwargs.get("workspace_ctx") is not None:
+            import json as _json
+
+            from app.services.cross_scope_grant_service import verify_grant as _verify_grant
+
+            grant_id = _svs.grant_id_from(kwargs) or str((args or {}).get("grant_id") or "").strip()
+            if not grant_id:
+                return _json.dumps({
+                    "error": "scoped 会话默认不开放外部 MCP；请让用户在界面上显式授权该 server/tool/action。",
+                    "code": "workspace_cross_scope_denied", "success": False}, ensure_ascii=False)
+            db = kwargs.get("db")
+            check = await _verify_grant(db, grant_id, ctx=kwargs["workspace_ctx"], kind="mcp",
+                                        mode="read", tool=self.server_name or self.server_url,
+                                        action=self.tool_name)
+            if not check.ok:
+                return _json.dumps({"error": check.message, "code": check.code,
+                                    "success": False}, ensure_ascii=False)
         if self.transport == "stdio":
             return await _call_stdio_tool(self.server_name, self.tool_name, args)
         return await _mcp_call_tool(

@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _CONFIG_KEY_MAP = {
     "concept_extraction": "concept_extraction_model",
     "dream": "dream_model",
+    "dream_verify": "dream_verify_model",
     "clarification": "clarification_model",
     "query_expansion": "query_expansion_model",
     "migration": "concept_extraction_model",

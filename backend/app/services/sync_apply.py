@@ -25,15 +25,19 @@ from app.db.database import (
     User,
     UserModelProvider,
 )
-from app.services.sync_capture import MEMORY_DYNAMICS_COLS, MEMORY_SYNC_ENTITIES, SYNC_ENTITIES
+from app.services.sync_capture import (
+    MEMORY_DYNAMICS_COLS, MEMORY_SYNC_ENTITIES, SERVER_READONLY_PULL_COLS,
+    SYNC_ENTITIES)
 
 DIRECT_USER_TYPES = {"conversations", "conversation_groups", "notebooks", "assistants",
                      "memory_episodes", "memory_concepts",
                      "user_asr_hotwords", "user_skills", "user_model_providers"}
 APPEND_ONLY_TYPES = {"messages"}
-# 服务端权威/敏感列——同步载荷一律不携带（入端丢弃）
+# 服务端权威/敏感列——同步载荷一律不携带（入端丢弃）。
+# P1-14：SERVER_READONLY_PULL_COLS（source_*）在 push 入端丢弃（服务端权威），
+# 但不在 capture 侧排除（pull 下发给客户端只读展示）。
 EXCLUDE_PAYLOAD_COLS = {"embedding", "embedding_model", "embedding_updated_at",
-                        *MEMORY_DYNAMICS_COLS}
+                        *MEMORY_DYNAMICS_COLS, *SERVER_READONLY_PULL_COLS}
 # 记忆域 create 必填守卫（评审 M3：防手造缺字段事件 flush 失败成噪音）
 REQUIRED_ON_CREATE = {
     "memory_episodes": ("narrative", "source_unit_ids"),
@@ -294,6 +298,16 @@ async def apply_change(
         return APPLIED
 
     data = sanitize_payload(entity_type, model, payload or {})
+    # A6（2026-11-08）：validity 是服务端权威。旧设备快照（validity_updated_at
+    # 更旧/缺失）不得把 valid_to/status 镜像回写，修复/遗忘可被客户端覆盖。
+    if entity_type == "memory_concepts" and row is not None:
+        from app.services.memory_validity_service import filter_validity_payload
+        current_validity = {
+            key: getattr(row, key, None)
+            for key in ("valid_to", "superseded_by", "invalid_reason",
+                        "needs_review", "status", "validity_updated_at")
+        }
+        data = filter_validity_payload(current_validity, data)
     # 缺父拒绝（Minor 收口）：notes/messages 无父键不可归属（owner 无法解析）——
     # 与 S1 重构前语义对齐，防孤儿行/IntegrityError 毒事件
     if entity_type == "notes" and not data.get("notebook_id") and row is None:

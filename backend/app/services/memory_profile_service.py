@@ -13,6 +13,7 @@
 """
 import json
 import logging
+import re
 from typing import Optional
 
 from sqlalchemy import text
@@ -53,6 +54,12 @@ def _parse_json_array_lenient(text: str):
 
 _PROFILE_SOURCE = "profile_sync"
 _PROFILE_KEY_PREFIX = "profile_fact:"
+
+
+def _profile_key(name: str) -> str:
+    """C5：稳定键（归一化名称），不再依赖每日变体名。"""
+    from app.services.memory_validity_service import normalize_entity_key
+    return _PROFILE_KEY_PREFIX + (normalize_entity_key(name) or name.strip()[:60])
 # 每日门控（A4.9 复审 Important #1）：调度器 15 分钟一轮，无门控则每轮触发
 # 800-token LLM 提炼（~96× 文档化成本）。last_profile_sync_at 存于
 # user_agent_states.metadata_json，距上次同步 < _SYNC_INTERVAL_HOURS 跳过。
@@ -116,6 +123,7 @@ async def _load_recent_summaries(db: AsyncSession, user_id: str, limit: int = 10
             SELECT description_full FROM memory_concepts
             WHERE user_id = :uid AND source_type = 'extracted' AND valid_to IS NULL
               AND status = 'active' AND description_full IS NOT NULL
+              AND (verification_state IS NULL OR verification_state != 'contradicted')
               AND created_at >= now() - interval '14 days'
             ORDER BY importance DESC LIMIT :lim
         """),
@@ -136,11 +144,120 @@ async def _load_existing_profile_keys(db: AsyncSession, user_id: str) -> set[str
         if not raw:
             continue
         try:
-            keys.update(json.loads(raw))
+            vals = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            if isinstance(raw, str) and raw:
-                keys.add(raw)
+            vals = [raw] if isinstance(raw, str) and raw else []
+        for val in vals if isinstance(vals, list) else []:
+            if not isinstance(val, str) or not val:
+                continue
+            if val.startswith(_PROFILE_KEY_PREFIX):
+                keys.add(_profile_key(val[len(_PROFILE_KEY_PREFIX):]))
+            else:
+                keys.add(val)
     return keys
+
+
+async def _load_profile_rows(db: AsyncSession, user_id: str) -> list[dict]:
+    rows = (await db.execute(
+        text("""SELECT id, source_raw_ids, canonical_name, description_short,
+                       status, valid_to, source_unit_ids, superseded_by, invalid_reason
+                FROM memory_concepts
+                WHERE user_id = :uid AND source_type = :st"""),
+        {"uid": user_id, "st": _PROFILE_SOURCE},
+    )).fetchall()
+    return [{
+        "id": r[0], "raw_keys": r[1],
+        "name": r[2] if len(r) > 2 else "",
+        "desc": r[3] if len(r) > 3 else "",
+        "status": r[4] if len(r) > 4 else "active",
+        "valid_to": r[5] if len(r) > 5 else None,
+        "source_unit_ids": r[6] if len(r) > 6 else None,
+        "superseded_by": r[7] if len(r) > 7 else None,
+        "invalid_reason": r[8] if len(r) > 8 else None,
+    } for r in rows]
+
+
+async def _find_profile_row_by_name(db: AsyncSession, user_id: str,
+                                    name: str) -> dict | None:
+    """Legacy fallback: match by exact canonical name when no stable key exists."""
+    row = (await db.execute(
+        text("""SELECT id, source_raw_ids, canonical_name, description_short,
+                       status, valid_to, source_unit_ids, superseded_by, invalid_reason
+                FROM memory_concepts
+                WHERE user_id = :uid AND source_type = :st
+                  AND canonical_name = :nm AND status = 'active'
+                LIMIT 1"""),
+        {"uid": user_id, "st": _PROFILE_SOURCE, "nm": name},
+    )).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "raw_keys": row[1] if len(row) > 1 else None,
+        "name": row[2] if len(row) > 2 else name,
+        "desc": row[3] if len(row) > 3 else "",
+        "status": row[4] if len(row) > 4 else "active",
+        "valid_to": row[5] if len(row) > 5 else None,
+        "source_unit_ids": row[6] if len(row) > 6 else None,
+        "superseded_by": row[7] if len(row) > 7 else None,
+        "invalid_reason": row[8] if len(row) > 8 else None,
+    }
+
+
+async def _recent_evidence_unit_ids(db: AsyncSession, user_id: str,
+                                    limit: int = 10) -> list[str]:
+    """B4：给 profile 事实挂最近情景记忆的来源单元，便于 transcript verify。"""
+    rows = (await db.execute(
+        text("""SELECT source_unit_ids FROM memory_episodes
+                WHERE user_id = :uid AND source_unit_ids IS NOT NULL
+                  AND valid_to IS NULL
+                ORDER BY created_at DESC NULLS LAST LIMIT :lim"""),
+        {"uid": user_id, "lim": max(1, int(limit))},
+    )).fetchall()
+    out: list[str] = []
+    for (raw,) in rows:
+        try:
+            vals = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            vals = []
+        for v in vals if isinstance(vals, list) else []:
+            if isinstance(v, str) and v and v not in out:
+                out.append(v)
+    return out[:30]
+
+
+async def _evidence_units_for_fact(db: AsyncSession, user_id: str,
+                                   name: str, desc: str) -> list[str]:
+    """I5：只挂与这条画像事实有词面交集的 episode 来源，避免拿无关对话
+    给 judge 当 ground truth（否则 confirmed/contradicted 都是偶然）。"""
+    tokens = [t for t in re.split(r"[^\w\u4e00-\u9fff]+", f"{name} {desc}")
+              if len(t) >= 2][:10]
+    if not tokens:
+        return []
+    rows = (await db.execute(
+        text("""SELECT narrative, source_unit_ids FROM memory_episodes
+                WHERE user_id = :uid AND source_unit_ids IS NOT NULL
+                  AND valid_to IS NULL
+                  AND (verification_state IS NULL OR verification_state != 'contradicted')
+                ORDER BY created_at DESC NULLS LAST LIMIT 50"""),
+        {"uid": user_id},
+    )).fetchall()
+    out: list[str] = []
+    for row in rows:
+        narrative = row[0] if row else ""
+        raw = row[1] if len(row) > 1 else None
+        text_val = str(narrative or "")
+        if not any(tok in text_val for tok in tokens):
+            continue
+        try:
+            vals = json.loads(raw) if raw else []
+        except (json.JSONDecodeError, TypeError):
+            vals = []
+        for v in vals if isinstance(vals, list) else []:
+            if isinstance(v, str) and v and v not in out:
+                out.append(v)
+        if len(out) >= 20:
+            break
+    return out[:20]
 
 
 async def _extract_profile_facts(llm, summaries: list[str]) -> list[dict]:
@@ -215,7 +332,30 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
         await _mark_synced(db, user_id)
         return {"skipped": "no_summaries"}
 
-    existing_keys = await _load_existing_profile_keys(db, user_id)
+    profile_rows = await _load_profile_rows(db, user_id)
+    existing_by_key: dict[str, dict] = {}
+    for row in profile_rows:
+        keys: list[str] = []
+        try:
+            raw = json.loads(row["raw_keys"]) if row["raw_keys"] else []
+            keys = [str(k) for k in raw] if isinstance(raw, list) else []
+        except (json.JSONDecodeError, TypeError):
+            keys = []
+        keys.append(_profile_key(row["name"]))
+        for key in keys:
+            current = existing_by_key.get(key)
+            row_is_live = not (row.get("superseded_by") or row.get("status") == "forgotten")
+            current_is_live = current is not None and not (
+                current.get("superseded_by") or current.get("status") == "forgotten")
+            if current is None or (row_is_live and not current_is_live):
+                existing_by_key[key] = row
+    cap = max(1, int(config.memory.get("profile_concept_cap", 200)))
+    profile_count = sum(
+        1 for r in profile_rows
+        if r.get("valid_to") is None and (r.get("status") or "active") == "active"
+        and not r.get("superseded_by")
+    )
+    processed_keys: set[str] = set()
 
     llm = _memory_llm("concept_extraction")
     try:
@@ -232,52 +372,70 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
         logger.exception("profile fact extraction failed for user=%s", user_id)
         return {"error": "extraction_failed"}
 
-    created, updated, skipped = 0, 0, 0
+    created, updated, skipped, capped = 0, 0, 0, 0
     for fact in facts:
-        key = _PROFILE_KEY_PREFIX + fact["name"]
-        if not force and key in existing_keys:
+        key = _profile_key(fact["name"])
+        if key in processed_keys:
             skipped += 1
             continue
-        # 已有同名 profile 概念则更新描述；否则新建。
-        # status='active' 限定（W12 Dx-1）：merged 行不参与复活，避免与合并目标重复入读路径。
-        existing = await db.execute(
-            text("SELECT id, source_raw_ids FROM memory_concepts WHERE user_id = :uid AND source_type = :st AND canonical_name = :nm AND status = 'active'"),
-            {"uid": user_id, "st": _PROFILE_SOURCE, "nm": fact["name"]},
-        )
-        row = existing.fetchone()
+        processed_keys.add(key)
+        row = existing_by_key.get(key)
+        if row is None:
+            row = await _find_profile_row_by_name(db, user_id, fact["name"])
+        # I2：merged/forgotten/retracted 历史行不得被复活成新的现行版本。
+        if row and (row.get("superseded_by") or row.get("status") == "forgotten"
+                    or row.get("invalid_reason") == "retracted"):
+            skipped += 1
+            continue
+        fact_units = await _evidence_units_for_fact(
+            db, user_id, fact["name"], fact["desc"])
         if row:
-            # W12 Dx-1（08-24 根因 6）：命中已被置 valid_to 的同名行时复活——
-            # 事实仍被近期记忆支持，旧实现只 UPDATE 描述不清 valid_to，
-            # 画像行永久僵尸（读路径 valid_to IS NULL 恒过滤）。
+            old_desc = row["desc"] or ""
+            changed = old_desc != fact["desc"]
+            units = []
+            try:
+                units = json.loads(row["source_unit_ids"]) if row["source_unit_ids"] else []
+            except (json.JSONDecodeError, TypeError):
+                units = []
+            units = list(dict.fromkeys([str(u) for u in units if u] + fact_units))[:30]
             await db.execute(
                 text("""
                     UPDATE memory_concepts
-                    SET description_short = :d, updated_at = NOW(),
-                        valid_to = NULL, needs_review = FALSE
+                    SET valid_to = NULL, invalid_reason = NULL, needs_review = FALSE,
+                        superseded_by = NULL, status = 'active', source_kind = 'profile',
+                        validity_updated_at = NOW(),
+                        source_unit_ids = :units, updated_at = NOW()
                     WHERE id = :cid
                 """),
-                {"d": fact["desc"], "cid": row[0]},
+                {"units": json.dumps(units, ensure_ascii=False), "cid": row["id"]},
             )
-            # 描述变化后需重生成 embedding 与 BM25 索引
-            from app.services.memory_concept_service import update_concept_description
-            await update_concept_description(db, row[0], fact["desc"], fact["desc"])
-            # A-M4（W12 复审）：profile_fact 键 append 合并——仅空补写会让携带
-            # 迁移期死 raw_ids 的行每晚 reconcile 误标 → rebalance 误杀 → sync 复活
-            # 循环 flap。
+            if changed:
+                from app.services.memory_concept_service import update_concept_description
+                await update_concept_description(db, row["id"], fact["desc"], fact["desc"])
+            # A-M4（W12 复审）：profile_fact 键 append 合并。
             try:
-                _keys = json.loads(row[1]) if row[1] else []
+                _keys = json.loads(row["raw_keys"]) if row["raw_keys"] else []
                 if not isinstance(_keys, list):
-                    _keys = [row[1]] if row[1] else []
+                    _keys = [row["raw_keys"]] if row["raw_keys"] else []
             except (json.JSONDecodeError, TypeError):
-                _keys = [row[1]] if row[1] else []
+                _keys = [row["raw_keys"]] if row["raw_keys"] else []
             if key not in _keys:
                 _keys.append(key)
             await db.execute(
                 text("UPDATE memory_concepts SET source_raw_ids = :keys WHERE id = :cid"),
-                {"keys": json.dumps(_keys, ensure_ascii=False), "cid": row[0]},
+                {"keys": json.dumps(_keys, ensure_ascii=False), "cid": row["id"]},
             )
             updated += 1
         else:
+            if profile_count >= cap:
+                # P1-22（2026-11-08）：cap 触顶不再静默 skip——逐条 WARNING +
+                # 汇总落 memory_eval_runs(suite="profile_cap")，边界可解释。
+                capped += 1
+                logger.warning(
+                    "profile cap reached user=%s key=%s profile_count=%s cap=%s "
+                    "(new fact skipped; existing facts still update)",
+                    user_id, key, profile_count, cap)
+                continue
             cid = await create_concept(
                 db, user_id, fact["name"], fact["desc"], fact["desc"],
                 source_trust="user_stated",
@@ -286,13 +444,32 @@ async def sync_profile_concepts(db: AsyncSession, user_id: str, force: bool = Fa
             )
             if cid:
                 await db.execute(
-                    text("UPDATE memory_concepts SET source_raw_ids = :keys WHERE id = :cid"),
-                    {"keys": json.dumps([key], ensure_ascii=False), "cid": cid},
+                    text("""UPDATE memory_concepts
+                            SET source_raw_ids = :keys, source_kind = 'profile',
+                                source_unit_ids = :units
+                            WHERE id = :cid"""),
+                    {"keys": json.dumps([key], ensure_ascii=False),
+                     "units": json.dumps(fact_units, ensure_ascii=False),
+                     "cid": cid},
                 )
                 created += 1
-        existing_keys.add(key)
+                profile_count += 1
     await _mark_synced(db, user_id)
-    return {"created": created, "updated": updated, "skipped": skipped}
+    if capped:
+        # P1-22：触顶指标（health/周报可查；只记计数不记事实内容）。
+        try:
+            from datetime import datetime as _dt
+
+            from app.db.database import MemoryEvalRun
+            db.add(MemoryEvalRun(
+                run_id=f"profilecap-{_dt.utcnow().strftime('%Y%m%d%H%M%S')}",
+                suite="profile_cap", arm="info", user_id=user_id,
+                metrics_json={"capped": capped, "cap": cap,
+                              "profile_count": profile_count},
+            ))
+        except Exception:
+            logger.debug("profile cap metrics record failed", exc_info=True)
+    return {"created": created, "updated": updated, "skipped": skipped, "capped": capped}
 
 
 async def get_profile_concepts(db: AsyncSession, user_id: str, limit: int = 6) -> list[dict]:
@@ -302,6 +479,7 @@ async def get_profile_concepts(db: AsyncSession, user_id: str, limit: int = 6) -
             SELECT canonical_name, description_short FROM memory_concepts
             WHERE user_id = :uid AND memory_type = 'profile'
               AND status = 'active' AND valid_to IS NULL
+              AND (verification_state IS NULL OR verification_state != 'contradicted')
             ORDER BY weight DESC, created_at DESC LIMIT :lim
         """),
         {"uid": user_id, "lim": limit},

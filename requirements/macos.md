@@ -135,7 +135,7 @@ pg_dump -U postgres -h 127.0.0.1 -Fc weavethinker > backup_$(date +%F).dump
 # 需要 Android SDK + JDK 11+
 ANDROID_HOME=~/Library/Android/sdk ./scripts/apk_generate.sh \
   "https://<你的局域网 IP 或域名>:8158"
-# 产物 apk/weave-thinker.apk（自签证书在壳内全局信任）
+# 产物 apk/Weave Thinker.apk（自签证书在壳内全局信任）
 ```
 
 ## 9. 可选：E2E 自验

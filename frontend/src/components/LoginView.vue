@@ -363,6 +363,18 @@
           </div>
         </div>
 
+        <div v-if="isRegisterMode" class="form-group">
+          <label for="inviteCode">邀请码（如管理员要求）</label>
+          <input
+            id="inviteCode"
+            v-model="inviteCode"
+            type="password"
+            placeholder="没有邀请码可留空"
+            autocomplete="off"
+            :disabled="loading"
+          />
+        </div>
+
         <div v-if="errorMessage" class="error-message">
           {{ errorMessage }}
         </div>
@@ -405,6 +417,7 @@ const skinStore = useSkinStore()
 
 const username = ref('')
 const password = ref('')
+const inviteCode = ref('')
 const confirmPassword = ref('')
 const loading = ref(false)
 const errorMessage = ref('')
@@ -450,6 +463,7 @@ function toggleMode() {
   errorMessage.value = ''
   successMessage.value = ''
   confirmPassword.value = ''
+  inviteCode.value = ''
   showPassword.value = false
   showConfirmPassword.value = false
 }
@@ -501,10 +515,18 @@ async function handleRegister() {
   successMessage.value = ''
 
   try {
-    await api.post('/auth/register', { username: username.value, password: password.value })
+    const pw = password.value
+    const payload: Record<string, string> = {
+      username: username.value,
+      password: pw,
+    }
+    // 邀请码可选：服务端 [security] registration_invite_code 非空时才需要
+    if (inviteCode.value.trim()) payload.invite_code = inviteCode.value.trim()
+    await api.post('/auth/register', payload)
     successMessage.value = '注册成功，请登录'
     isRegisterMode.value = false
     confirmPassword.value = ''
+    inviteCode.value = ''
     showPassword.value = false
     showConfirmPassword.value = false
   } catch (e: any) {

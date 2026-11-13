@@ -194,6 +194,12 @@ html[data-skin="mono-brutal"] { --mobile-tab-bar-offset: 60px; }
   --shell-workbench-radius: 28px;
   --shell-card-gap: 18px;
   --mobile-tab-bar-height: 44px;
+  /* 系统栏安全区（wave-2 透明边到边）：Android 壳经桥注入 --wt-safe-top/--wt-safe-bottom
+     （WebView 内 env(safe-area-inset-top) 可能为 0，注入为准；单位 CSS px）。
+     min(...,64px) 为纵深防御：任何注入异常（如误传物理像素）最多让顶栏偏移 64px，
+     不会把界面挤扁（2026-11-07 真机事故）。 */
+  --safe-top: min(var(--wt-safe-top, env(safe-area-inset-top, 0px)), 64px);
+  --safe-bottom: min(var(--wt-safe-bottom, env(safe-area-inset-bottom, 0px)), 64px);
   --mobile-tab-bar-offset: 72px; /* 基座默认（无 data-skin 时=verdant 基线）；三皮肤精确值见下方 html[data-skin] 覆写 */
 
   --transition-fast: 150ms ease;
@@ -204,6 +210,14 @@ html[data-skin="mono-brutal"] { --mobile-tab-bar-offset: 60px; }
     linear-gradient(180deg, #ffffff 0%, #fafafa 100%);
 
   color-scheme: light;
+}
+
+/* 抽屉 logo 避让状态栏（2026-11-07 真机反馈）：三皮肤均用
+   `html[data-skin=x] .sidebar { padding: … }` (0,2,1) 简写覆写吞掉基座 padding-top，
+   且 mono 还钉了 `.sidebar-header { margin: 0 }`——改挂 header margin-top，
+   特异性 (0,2,2) 压过全部皮肤覆写；safe=0（桌面/浏览器）时零影响。 */
+html[data-skin] body .sidebar-header {
+  margin-top: var(--safe-top, 0px);
 }
 
 [data-theme="dark"] {

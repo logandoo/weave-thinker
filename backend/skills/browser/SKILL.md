@@ -69,3 +69,12 @@ category: builtin
    需要时显式新建/打开目标文档；不要把启动默认文档的节点/元素 id 当成目标文档的 id。
 5. 若目标应用是 ComfyUI（节点工作流、Qwen-Image/MiniMax 等），另见 `comfyui` 技能。
 
+
+### 只读 browser 命中验证页 / 需要操作页面（2026-11-12）
+
+`browser` 是只读抓取，**无法**完成滑块验证、点按钮、填表提交。结果带「人机验证」
+提示或任务本身要求操作页面时，改用交互浏览器：`browser_navigate(url)` 打开同一页面
+→ `browser_screenshot` 定位控件 → `browser_mouse` 坐标级操作（滑块=在滑块上 down →
+沿轨道分步 move → up）；键盘输入用 `browser_press` / `browser_type(ref="_focused")`。
+坐标操作对**任何网页**可用，不限于 canvas 应用。滑块类验证有行为风控，可能无法通过——
+失败时如实告知用户，不得谎称已完成。

@@ -29,6 +29,26 @@ def _runner():
 
 
 async def job_submit(args: Dict[str, Any], **kwargs) -> str:
+    # 任务作用域（§7.2 durable job workdir）：enforce 且 scoped 执行未放开该模式 →
+    # 提交前明确拒绝（legacy 无 ctx 不受影响）。放开该模式前需补：workdir 持久化
+    # Task 相对身份 + 执行期 ctx/epoch 复核（当前仅提交期收口，评审 r2 #14）。
+    from app.services.workspace_scope import WorkspaceScopeError as _JErr
+    from app.services.workspace_scoping_runtime import entry_guard as _entry_guard
+    from app.services.workspace_scope_service import apply_scope_or_error as _apply_scope
+
+    if kwargs.get("workspace_ctx") is not None:
+        # 门只约束 scoped 执行（legacy 保持旧行为，acceptance #31）
+        try:
+            _entry_guard("durable")
+        except _JErr as _exc:
+            return json.dumps({"error": str(_exc), "code": _exc.code, "success": False},
+                              ensure_ascii=False)
+    _scoped_root, _scope_err = await _apply_scope(kwargs, default_root=str(
+        kwargs.get("workspace_path") or config.workspace_root), args=args, access="write",
+        default_scope="scratch")
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+    kwargs = {**kwargs, "workspace_path": _scoped_root}
     user = kwargs.get("user")
     user_id = str(getattr(user, "id", "") or "")
     if not user_id:

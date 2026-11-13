@@ -30,6 +30,8 @@ _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
 # tools/call/字节通道 + client_devices fs-proxy HTTP 面）。
 WIRE_ERROR_HINTS = {
     "identity_unbound": "设备未绑定执行身份，请在客户端重新配对设备后重试。",
+    # 2026-11-12：设备侧 grant 校验失败（签名/过期/重放）——批准后仍拒绝时给可操作提示。
+    "grant_invalid": "设备授权校验失败（签名/过期/重放）：请重新批准该操作；若持续失败请升级客户端。",
 }
 
 

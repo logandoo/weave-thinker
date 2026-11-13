@@ -37,8 +37,24 @@ def tool_args_sha256(args: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_tool_args(args).encode("utf-8")).hexdigest()
 
 
-def _message(device_id: str, tool: str, args_digest: str, nonce: str, exp: int) -> bytes:
-    return f"{device_id}|{tool}|{args_digest}|{nonce}|{exp}".encode("utf-8")
+def _scope_segment(scope: Mapping[str, Any] | None) -> str:
+    """作用域段（2026-11-10 §11.2）。缺省空串 = 旧客户端/legacy 会话的签名形状。
+
+    用 canonical JSON（固定键序）而不是 "|" 拼接：storage_authority 后缀用户可控，
+    裸拼接允许 `a|b` 与 `a`+`b` 撞同一签名域（评审 r2 #9）。
+    """
+    if not scope:
+        return ""
+    keys = ("storage_authority", "task_id", "run_id", "attempt_id", "binding_version",
+            "lease_epoch", "scope")
+    canonical = {k: ("" if scope.get(k) is None else str(scope.get(k))) for k in keys}
+    return "|" + json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"))
+
+
+def _message(device_id: str, tool: str, args_digest: str, nonce: str, exp: int,
+             scope: Mapping[str, Any] | None = None) -> bytes:
+    return f"{device_id}|{tool}|{args_digest}|{nonce}|{exp}{_scope_segment(scope)}".encode("utf-8")
 
 
 def issue_device_grant(
@@ -50,6 +66,7 @@ def issue_device_grant(
     now: int | None = None,
     ttl_seconds: int = DEFAULT_GRANT_TTL_SECONDS,
     nonce: str | None = None,
+    scope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not pairing_secret or not device_id or not tool:
         raise ValueError("pairing_secret, device_id and tool are required")
@@ -63,15 +80,19 @@ def issue_device_grant(
     args_digest = tool_args_sha256(args)
     signature = hmac.new(
         pairing_secret.encode("utf-8"),
-        _message(device_id, tool, args_digest, grant_nonce, exp),
+        _message(device_id, tool, args_digest, grant_nonce, exp, scope),
         hashlib.sha256,
     ).hexdigest()
-    return {
+    payload = {
         "version": GRANT_VERSION,
         "nonce": grant_nonce,
         "exp": exp,
         "signature": signature,
     }
+    if scope:
+        # 作用域字段随 grant 一起下发，设备侧可校验自己拿到的就是签的那份
+        payload["scope"] = dict(scope)
+    return payload
 
 
 def verify_device_grant(
@@ -102,9 +123,11 @@ def verify_device_grant(
         if current >= exp or nonce in consumed_nonces:
             return False
         args_digest = tool_args_sha256(args)
+        # 带作用域的 grant 必须连作用域一起验（缺字段/被改写的旧版签名一律不过）
+        scope = grant.get("scope") if isinstance(grant.get("scope"), Mapping) else None
         expected = hmac.new(
             pairing_secret.encode("utf-8"),
-            _message(device_id, tool, args_digest, nonce, exp),
+            _message(device_id, tool, args_digest, nonce, exp, scope),
             hashlib.sha256,
         ).hexdigest()
         return hmac.compare_digest(expected, signature)

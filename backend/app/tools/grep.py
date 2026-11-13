@@ -235,6 +235,11 @@ async def grep(args: Dict[str, Any], **kwargs) -> str:
     from app.services.workspace_service import ensure_user_workspace
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
     workspace_root = str(Path(workspace.root_path).resolve())
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
+    if _scope_err:
+        return _format_output("", _scope_err)
+
 
     pattern_str = str(args.get("pattern") or "").strip()
     if not pattern_str:
@@ -307,7 +312,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "pattern": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "pattern": {
                     "type": "string",
                     "description": "The regex pattern to search for in file contents.",
                 },

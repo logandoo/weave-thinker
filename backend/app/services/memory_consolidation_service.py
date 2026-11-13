@@ -245,13 +245,17 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
             result.update(_initial)
             had_failure = True
     if not had_failure:
-        # 任一步骤失败即不在部分回滚状态上跑主动 Dreaming（§9.3 隔离原则）
-        await _try_active_dreaming(db, user_id)
         await _clear_consolidation_failure(db, user_id)
-        # W3 续波 A3（2026-10-24，判据 #54-#56）：dream probe/repair 运行时
-        # 触发——只在 clean-pass 尾部跑（savepoint 隔离，fail-open，
-        # 不影响水位推进；默认关 [memory] dream_repair_enabled=false）。
-        await _try_dream_probe_repair(db, user_id)
+        await _try_dream_verify(db, user_id)
+        try:
+            from app.services.memory_page_service import build_pages
+            await _isolated_merge_item(
+                db, "memory_pages", lambda: build_pages(db, user_id))
+        except Exception:
+            logger.warning("memory page build failed for user=%s", user_id, exc_info=True)
+        # P0-06（2026-11-08）：capacity 淘汰调度接线（默认 shadow 只记账；
+        # enforce 必须 [memory] retention_eviction_mode='enforce' 显式开启）。
+        await _try_retention_eviction(db, user_id)
     else:
         failures = await _bump_consolidation_failure(db, user_id)
         if _consolidation_failure_action(failures) == "hold":
@@ -273,35 +277,6 @@ async def run_consolidation(db: AsyncSession, user_id: str) -> dict:
     )
     await db.commit()
     return result
-
-
-async def _try_dream_probe_repair(db: AsyncSession, user_id: str):
-    """W3 续波 A3（2026-10-24，判据 #54-#57）：dream probe/repair 运行时触发。
-
-    只在 consolidation clean-pass 尾部调用（部分回滚状态不跑附加写入——
-    §9.3 隔离原则同 _try_active_dreaming）。默认关（[memory]
-    dream_repair_enabled=false，P3）；probe→只修 miss→dream_repair_reports
-    落库后跑 check_stop_rule（14 天无正收益落 stop 标记=回退方案 B 决策记录，
-    此后 _stopped 短路、面板只展示不注入）。整体 savepoint 隔离
-    （_isolated_merge_item 同款）：异常不毒化 consolidation 事务、不影响
-    run_consolidation 返回值与水位推进。接线经 Config 属性（单一真源）。"""
-    if not config.memory_dream_repair_enabled:
-        return None
-    from app.services import memory_dream_repair_service as drs
-
-    # 评审修批（A#1/A#4）：① check_stop_rule 只在本轮真产出报告后跑——
-    # probe 短路/无探测词时不拿陈旧报告重复重判（防 stop 行重复 + 恢复陷阱
-    # 加剧）；② probe 与 stop 规则各自独立 savepoint——stop 侧失败不丢弃
-    # 已成功的修复写入。
-    report = await _isolated_merge_item(
-        db, "dream_probe_repair",
-        lambda: drs.run_probe_repair(db, user_id, enabled=True))
-    if not report:
-        return bool(report)
-    await _isolated_merge_item(
-        db, "dream_repair_stop_rule",
-        lambda: drs.check_stop_rule(db, user_id, min_reports=3))
-    return True
 
 
 async def _get_agent_state(db: AsyncSession, user_id: str) -> dict | None:
@@ -567,7 +542,11 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
                     except Exception:
                         logger.debug("episode bm25 index update failed", exc_info=True)
                 await db.execute(
-                    text("UPDATE memory_episodes SET valid_to = NOW(), superseded_by = :kept, updated_at = NOW() WHERE id = :merged"),
+                    text("""UPDATE memory_episodes SET valid_to = NOW(), superseded_by = :kept,
+                            invalid_reason = 'merged', validity_updated_at = NOW(),
+                            verification_state = NULL, last_verified_at = NULL,
+                            verification_evidence = NULL, verification_correction = NULL,
+                            updated_at = NOW() WHERE id = :merged"""),
                     {"kept": _kept, "merged": _merged},
                 )
                 await db.execute(
@@ -583,6 +562,11 @@ async def _dedup_concepts_and_episodes(db: AsyncSession, user_id: str, result: d
 
 
 async def _rebalance_clusters(db: AsyncSession, user_id: str, result: dict) -> None:
+    try:
+        from app.services.memory_validity_service import expire_due_concepts
+        await expire_due_concepts(db, user_id)
+    except Exception:
+        logger.debug("expire_due_concepts failed (fail-open)", exc_info=True)
     await db.execute(
         text("DELETE FROM memory_clusters WHERE user_id = :uid AND member_count = 0"),
         {"uid": user_id},
@@ -590,7 +574,7 @@ async def _rebalance_clusters(db: AsyncSession, user_id: str, result: dict) -> N
 
     # 待复核概念（needs_review，§5.5 Step 2）：无来源证据则置 valid_to 失效，有证据则清除标记
     review_r = await db.execute(
-        text("SELECT id, source_raw_ids, source_unit_ids FROM memory_concepts WHERE user_id = :uid AND needs_review = TRUE AND valid_to IS NULL"),
+        text("SELECT id, source_raw_ids, source_unit_ids FROM memory_concepts WHERE user_id = :uid AND needs_review = TRUE AND valid_to IS NULL AND (verification_state IS NULL OR verification_state != 'contradicted')"),
         {"uid": user_id},
     )
     from app.services.memory_concept_service import _parse_json_array
@@ -615,10 +599,25 @@ async def _rebalance_clusters(db: AsyncSession, user_id: str, result: dict) -> N
                 # 误杀（valid_to 置位），60 生产 2026-10-08 仍在发生（08-24 根因 4）。
                 raw_alive += 1
         if unit_alive == 0 and raw_alive == 0:
-            await db.execute(
-                text("UPDATE memory_concepts SET valid_to = NOW(), updated_at = NOW() WHERE id = :id"),
-                {"id": cid},
-            )
+            from app.db.database import MemoryConcept
+            from app.services.memory_validity_service import apply_invalidation
+            if hasattr(db, "get"):
+                concept = await db.get(MemoryConcept, cid)
+                if concept is not None and concept.user_id == user_id:
+                    apply_invalidation(concept, "source_lost")
+            else:
+                # Fake/limited sessions (tests) without identity map: keep the
+                # same observable write contract, including verification reset.
+                await db.execute(
+                    text("""UPDATE memory_concepts SET valid_to = NOW(),
+                            invalid_reason = 'source_lost',
+                            validity_updated_at = NOW(),
+                            verification_state = NULL,
+                            last_verified_at = NULL,
+                            verification_evidence = NULL,
+                            updated_at = NOW() WHERE id = :id"""),
+                    {"id": cid},
+                )
         else:
             await db.execute(
                 text("UPDATE memory_concepts SET needs_review = FALSE, updated_at = NOW() WHERE id = :id"),
@@ -775,7 +774,7 @@ def dream_write_verdict(narrative: str, source_trusts=()):
 
     返回 (clean, provenance_taint, scanned, stripped)：
     - sanitize_untrusted_text 剥离注入/自我传播句（B2 投毒放大器写入边界）；
-    - taint 继承来源最严（B3）：stripped 或来源含非 {user_stated, agent_inferred}
+    - taint 继承来源最严（B3）：stripped 或来源含非 {user_stated, user_authored, agent_inferred}
       → untrusted；否则 agent（dream 叙事是 agent 推测，永非 trusted）；
     - scanned=True 表示已过扫描（读取侧只注入 scanned 且非 untrusted 的行）。
     """
@@ -783,7 +782,7 @@ def dream_write_verdict(narrative: str, source_trusts=()):
 
     clean, filtered = sanitize_untrusted_text(str(narrative or ""))
     stripped = bool(filtered)
-    strict_sources = {"user_stated", "agent_inferred"}
+    strict_sources = {"user_stated", "user_authored", "agent_inferred"}
     src_untrusted = any(
         str(s or "").strip() not in strict_sources for s in (source_trusts or ()))
     taint = "untrusted" if (stripped or src_untrusted) else "agent"
@@ -798,7 +797,7 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     day_ago = datetime.utcnow() - timedelta(days=1)
 
     new_r = await db.execute(
-        text("SELECT canonical_name FROM memory_concepts WHERE user_id = :uid AND created_at >= :since AND valid_to IS NULL LIMIT 30"),
+        text("SELECT canonical_name FROM memory_concepts WHERE user_id = :uid AND created_at >= :since AND valid_to IS NULL AND (verification_state IS NULL OR verification_state != 'contradicted') LIMIT 30"),
         {"uid": user_id, "since": day_ago},
     )
     new_concepts = [r[0] for r in new_r.fetchall()]
@@ -826,7 +825,8 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     window_days = int(config.memory.get("dream_concept_window_days", 14))
     window_since = datetime.utcnow() - timedelta(days=window_days)
     base_filter = ("status = 'active' AND activation_strength > 0.05 "
-                   "AND valid_to IS NULL AND memory_type != 'profile'")
+                   "AND valid_to IS NULL AND memory_type != 'profile' "
+                   "AND (verification_state IS NULL OR verification_state != 'contradicted')")
     recent_filter = f"({base_filter} AND (last_recalled_at >= :since OR created_at >= :since))"
 
     # A4.9 wave2/3 审查 M4：与 overview 同构补 profile 排除（profile 概念经
@@ -857,7 +857,20 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     forget_candidates = [{"name": r[0], "weight": float(r[1] or 0)} for r in forget_r.fetchall()]
 
     cluster_r = await db.execute(
-        text("SELECT name, member_count FROM memory_clusters WHERE user_id = :uid ORDER BY member_count DESC LIMIT 10"),
+        text("""
+            SELECT mc.name, mc.member_count
+            FROM memory_clusters mc
+            WHERE mc.user_id = :uid
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM concept_cluster_members ccm
+                  JOIN memory_concepts c ON c.id = ccm.concept_id
+                  WHERE ccm.cluster_id = mc.id
+                    AND c.valid_to IS NULL
+                    AND c.source_trust NOT IN ('user_stated', 'user_authored', 'agent_inferred')
+              )
+            ORDER BY mc.member_count DESC LIMIT 10
+        """),
         {"uid": user_id},
     )
     clusters = [{"name": r[0], "members": r[1]} for r in cluster_r.fetchall()]
@@ -869,6 +882,38 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     concept_count = cc_r.scalar() or 0
     cluster_count = len(clusters)
 
+    # 2026-11-08（dreaming 收敛）：taint 只统计**实际进入 payload** 的概念，
+    # 且把 untrusted 概念从 payload 排除——旧实现取全用户 DISTINCT source_trust，
+    # 任一 untrusted 概念都会把整条 dream 判 untrusted，导致生产环境低活跃用户
+    # 连续 2 周 0 条可注入（27 unscanned + 6 untrusted，LATEST_INJECTABLE=None）。
+    candidate_names = set(new_concepts)
+    candidate_names.update(c["name"] for c in top_concepts + bottom_concepts + forget_candidates)
+    trust_map: dict[str, set[str]] = {}
+    if candidate_names:
+        trust_r = await db.execute(
+            text("""SELECT canonical_name, source_trust FROM memory_concepts
+                    WHERE user_id = :uid AND valid_to IS NULL
+                      AND canonical_name = ANY(:names)"""),
+            {"uid": user_id, "names": sorted(candidate_names)},
+        )
+        for r in trust_r.fetchall():
+            trust_map.setdefault(str(r[0]), set()).add(str(r[1] or ""))
+    # 同名多行时取最严：只要任一行不是 user_stated/agent_inferred，就整名排除。
+    trusted = {n for n, ts in trust_map.items()
+               if ts and ts <= {"user_stated", "user_authored", "agent_inferred"}}
+    if not trusted:
+        # 无可信概念时不再写一条“N 个概念”的空 dream——避免注入零信息叙事。
+        logger.info("dream skipped: no trusted concepts for user=%s", user_id)
+        return
+    new_concepts = [n for n in new_concepts if n in trusted]
+    top_concepts = [c for c in top_concepts if c["name"] in trusted]
+    bottom_concepts = [c for c in bottom_concepts if c["name"] in trusted]
+    forget_candidates = [c for c in forget_candidates if c["name"] in trusted]
+    source_trusts = sorted({t for n in trusted for t in trust_map[n]})
+    focus = [c["name"] for c in top_concepts[:3]]
+    changed = new_concepts[:3]
+    needs_confirmation = [c["text"] for c in clarifications[:3]]
+
     input_payload = {
         "今日新增概念": new_concepts,
         "今日合并概念对数": result["dedup_merged"],
@@ -878,6 +923,9 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
         f"待遗忘候选_近{window_days}天未再出现": forget_candidates,
         "概念集合": clusters,
         "冷遗忘数": result["cold_forgotten"],
+        "focus": focus,
+        "changed": changed,
+        "needs_confirmation": needs_confirmation,
     }
 
     fallback_meta = {
@@ -887,7 +935,14 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
         "clarifications_applied": len(clarifications),
         "patterns_observed": "",
         "attention_needed": [],
-        "narrative": f"今日记忆整理：活跃概念 {concept_count} 个，集合 {cluster_count} 个。",
+        "focus": focus,
+        "changed": changed,
+        "needs_confirmation": needs_confirmation,
+        "narrative": (
+            f"焦点：{'；'.join(focus) if focus else '无'}"
+            f"。变化：{'；'.join(changed) if changed else '无'}"
+            f"。待确认：{'；'.join(needs_confirmation) if needs_confirmation else '无'}。"
+        )[:400],
     }
     narrative = fallback_meta["narrative"]
     metadata = fallback_meta
@@ -900,7 +955,7 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
                     "生成今日记忆整理 dream。输出 JSON：{\"date\": \"...\", \"new_concepts\": [...], "
                     "\"merged_concepts\": [{\"kept\": \"...\", \"merged\": \"...\"}], "
                     "\"clarifications_applied\": 0, \"patterns_observed\": \"...\", "
-                    "\"attention_needed\": [...], \"narrative\": \"3-5句中文摘要\"}。"
+                    "\"attention_needed\": [...], \"narrative\": \"索引式短句：焦点：…。变化：…。待确认：…（≤200字，不得写成长叙事）\"}。"
                     f"语义约束：{window_days}天高频概念是当前工作焦点，narrative 以此为中心；"
                     f"{window_days}天低频概念是近期内出现过但热度较低的主题；"
                     f"待遗忘候选是超过 {window_days} 天未再出现的旧主题——narrative 至多用一句话说明它们正在渐淡，"
@@ -928,7 +983,14 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
         parsed = _extract_json_object(resp)
         if isinstance(parsed, dict):
             # 2026-08-10：LLM 曾返回幻觉日期 "2023-10-27" 并被直接落库 -> 强制校验回退
-            metadata = {**fallback_meta, **parsed, "date": _sanitize_dream_date(parsed.get("date"), today)}
+            # 2026-11-08：focus/changed/needs_confirmation 由确定性列表生成，
+            # 不允许 LLM 覆盖（只允许它写 narrative/patterns/attention）。
+            metadata = {
+                **fallback_meta, **parsed,
+                "date": _sanitize_dream_date(parsed.get("date"), today),
+                "focus": focus, "changed": changed,
+                "needs_confirmation": needs_confirmation,
+            }
             narrative = parsed.get("narrative") or narrative
     except Exception:
         logger.warning("dream LLM failed, using fallback", exc_info=True)
@@ -953,11 +1015,8 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
     # W3-2/W1-3（记忆/长程 v2，2026-10-23）：入库前扫描 + 派生 taint + scanned
     # 标记（B2 dream 是投毒放大器——写入边界必须扫描；读取侧只注入 scanned
     # 且非 untrusted 的行）。
-    trust_r = await db.execute(
-        text("SELECT DISTINCT source_trust FROM memory_concepts WHERE user_id = :uid AND valid_to IS NULL"),
-        {"uid": user_id},
-    )
-    source_trusts = [r[0] for r in trust_r.fetchall()]
+    # W3-2/W1-3：source_trusts 已在 payload 过滤阶段按“实际进入 dream 的概念”
+    # 计算，避免任一 untrusted 概念把整条 dream 一票否决。
     narrative, dream_taint, _scanned, stripped = dream_write_verdict(
         narrative, source_trusts)
     if stripped:
@@ -982,16 +1041,61 @@ async def _generate_dream(db: AsyncSession, user_id: str, result: dict) -> None:
         {"did": dream_id, "sid": state_row[0]},
     )
     result["dream_generated"] = True
-
-
-async def _try_active_dreaming(db: AsyncSession, user_id: str) -> None:
-    if not config.memory.get("dreaming_enabled"):
-        return
-    from app.services.memory_cost_governance_service import is_step_enabled
-    if not await is_step_enabled(user_id, "dreaming_step6_off", db):
-        return
-    from app.services.memory_dreaming_service import run_active_dreaming
+    # D7：记录可注入率（scanned/taint/dream_type），供健康度面板/周报。
+    # P0-08/D5（2026-11-08）：injectable 判定复用 dream_injectable 纯函数
+    # （单一真源；旧自算表达式漏 scanned 维度且与读取门漂移）。
     try:
-        await run_active_dreaming(db, user_id)
+        from app.db.database import MemoryEvalRun
+        from app.services.memory_retrieval_service import dream_injectable
+        db.add(MemoryEvalRun(
+            run_id=f"dreaminject-{today}",
+            suite="dream_injection",
+            arm="consolidation",
+            user_id=user_id,
+            metrics_json={
+                "scanned": True,
+                "taint": dream_taint,
+                "dream_type": "consolidation",
+                "injectable": 1 if dream_injectable(True, dream_taint) else 0,
+                "narrative_chars": len(narrative or ""),
+            },
+        ))
     except Exception:
-        logger.exception("Active dreaming failed for user=%s", user_id)
+        logger.debug("dream injection metric failed (fail-open)", exc_info=True)
+
+
+async def _try_retention_eviction(db: AsyncSession, user_id: str) -> None:
+    """P0-06（2026-11-08）：capacity 淘汰调度（consolidation clean-pass 尾部）。
+
+    `[memory] retention_eviction_mode` = shadow（默认，只记 memory_eval_runs 不删）
+    | enforce（显式开启才降级归档，可 undo）| off（完全跳过）。savepoint 隔离。
+    """
+    mode = str(config.memory.get("retention_eviction_mode", "shadow") or "shadow").strip().lower()
+    if mode == "off":
+        return None
+    from app.services.memory_retention_service import CAP_DEFAULT, apply_eviction
+    capacity = int(config.memory.get("retention_capacity", CAP_DEFAULT) or CAP_DEFAULT)
+    try:
+        await _isolated_merge_item(
+            db, "retention_eviction",
+            lambda: apply_eviction(db, user_id, capacity, mode=mode))
+    except Exception:
+        logger.warning("retention eviction failed for user=%s", user_id, exc_info=True)
+    return None
+
+
+async def _try_dream_verify(db: AsyncSession, user_id: str) -> None:
+    """2026-11-08：transcript-grounded verify（Anthropic dreaming 适配）。
+
+    只在 consolidation clean-pass 尾部、有界（默认 5 个/夜）跑；savepoint 隔离，
+    失败不影响水位。contradicted 只写 verification_state，不写 valid_to。
+    """
+    if not bool(config.memory.get("dream_verify_enabled", True)):
+        return None
+    from app.services.memory_dream_verify_service import run_verify
+    try:
+        await _isolated_merge_item(
+            db, "dream_verify", lambda: run_verify(db, user_id))
+    except Exception:
+        logger.warning("dream verify failed for user=%s", user_id, exc_info=True)
+    return None

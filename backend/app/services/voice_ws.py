@@ -8,6 +8,8 @@ monkeypatches of ``voice_service.<name>`` keep working.
 """
 from __future__ import annotations
 
+import base64
+
 _GLOBALS = (
     'ASRService',
     '_ACTIVE_VOICE_SESSIONS',
@@ -149,6 +151,15 @@ class VoiceWSMixin:
             if content:
                 await self._on_user_turn(content)
         elif event == "playback_progress":
+            # A delayed progress report from an abandoned turn must not move
+            # the current turn's breakpoint. Missing epoch is legacy-only.
+            report_epoch = msg.get("turn_epoch")
+            if (
+                isinstance(report_epoch, int)
+                and not isinstance(report_epoch, bool)
+                and report_epoch != self._turn_epoch
+            ):
+                return
             # Client-authoritative playback position. Ties the spoken audio to
             # the answer text so truncation is attributed to playback, not text.
             try:
@@ -159,7 +170,32 @@ class VoiceWSMixin:
             except (TypeError, ValueError):
                 pass
         elif event == "playback_drained":
+            ack_epoch = msg.get("turn_epoch")
             ack_notification_id = msg.get("notification_id")
+            if (
+                not ack_notification_id
+                and isinstance(ack_epoch, int)
+                and not isinstance(ack_epoch, bool)
+                and ack_epoch != self._turn_epoch
+            ):
+                logger.debug(
+                    "voice playback_drained ignored (turn mismatch): ack=%s current=%s",
+                    ack_epoch, self._turn_epoch,
+                )
+                return
+            if (
+                not ack_notification_id
+                and self._speaking
+                and self._completed_speaking_epoch != self._speaking_epoch
+            ):
+                # A temporary buffer underrun is not turn completion. Keep the
+                # epoch alive and ask the client to re-arm its drain clock.
+                await self._send_json({
+                    "event": "notification_ack_pending",
+                    "notification_id": None,
+                    "turn_epoch": self._speaking_epoch,
+                })
+                return
             notice_state = self._notification_states.get(ack_notification_id)
             if notice_state is None and ack_notification_id == self._active_notification_id:
                 notice_state = {
@@ -171,6 +207,22 @@ class VoiceWSMixin:
                 self._notification_states[ack_notification_id] = notice_state
             if not ack_notification_id:
                 notice_state = {}
+            if (
+                ack_notification_id
+                and isinstance(ack_epoch, int)
+                and not isinstance(ack_epoch, bool)
+                and ack_epoch != self._turn_epoch
+                and ack_notification_id in {self._active_notification_id, self._current_notice_id}
+                and notice_state.get("turn_epoch") != ack_epoch
+            ):
+                # Same-ID retry is a different attempt. Its old-epoch ACK must
+                # not settle the active/current retry; older inactive IDs keep
+                # their independent late-ACK path below.
+                logger.debug(
+                    "voice notification ACK ignored (retry epoch mismatch): %s ack=%s current=%s",
+                    ack_notification_id, ack_epoch, self._turn_epoch,
+                )
+                return
             if ack_notification_id and notice_state and notice_state.get("delivered"):
                 return
             if ack_notification_id and notice_state:
@@ -369,7 +421,6 @@ class VoiceWSMixin:
         if _ACTIVE_VOICE_SESSIONS.get(self.user.id) is self:
             _ACTIVE_VOICE_SESSIONS.pop(self.user.id, None)
         self._interrupt.set()
-        self._drop_filler_prefetch()
         # stop queues
         try:
             self._turn_queue.put_nowait(None)
@@ -407,11 +458,25 @@ class VoiceWSMixin:
         except Exception as exc:
             logger.debug("voice send_json failed: %s", exc)
     async def _send_bytes(self, data: bytes) -> None:
+        """Send PCM with explicit ownership; anonymous binary frames are not
+        safe across cancellation because a late chunk is indistinguishable from
+        the next answer. The historical method name remains the single audio
+        egress used by the TTS consumer."""
         _sync_voicewsmixin_globals()
-        if self._closed:
+        if self._audio_protocol != "epoch_v1":
+            if self._closed:
+                return
+            try:
+                async with self._send_lock:
+                    await self.websocket.send_bytes(data)
+            except Exception as exc:
+                logger.debug("voice legacy send_bytes failed: %s", exc)
             return
-        try:
-            async with self._send_lock:
-                await self.websocket.send_bytes(data)
-        except Exception as exc:
-            logger.debug("voice send_bytes failed: %s", exc)
+        self._audio_sequence += 1
+        epoch = int(self._speaking_epoch or self._turn_epoch or 0)
+        await self._send_json({
+            "event": "audio_chunk",
+            "turn_epoch": epoch,
+            "sequence": self._audio_sequence,
+            "audio": base64.b64encode(data).decode("ascii"),
+        })

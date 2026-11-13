@@ -247,9 +247,25 @@ async def _process_single_concept(
             logger.warning("match_existing_id rejected (cross-user): %s", match_existing_id)
             existing = None
         if existing:
-            existing.description_full = _merge_description_full(existing.description_full or "", desc_full_safe)
-            existing.description_short = desc_safe or existing.description_short
-            existing.aliases = _merge_aliases(existing.aliases, aliases_json)
+            old_full = existing.description_full or ""
+            old_short = existing.description_short or ""
+            old_aliases = existing.aliases or "[]"
+            old_sources = _parse_json_array(existing.source_unit_ids)
+            new_full = _merge_description_full(old_full, desc_full_safe)
+            new_short = desc_safe or existing.description_short
+            new_aliases = _merge_aliases(old_aliases, aliases_json)
+            new_sources = list(dict.fromkeys(old_sources + list(source_unit_ids)))
+            content_changed = (
+                new_full != old_full or new_short != old_short
+                or new_aliases != old_aliases or new_sources != old_sources
+            )
+            existing.description_full = new_full
+            existing.description_short = new_short
+            existing.aliases = new_aliases
+            # J11：纯 recurrence（描述/别名/来源均未变）保留已验证状态，
+            # 只有内容或来源真实变化才重验。
+            if content_changed:
+                _reset_verification(existing)
             existing.weight = min(existing.weight + weight_evidence, trust_cap)
             # importance 取 max：合并提升不下降（一次性话题证据不得稀释用户偏好）
             new_importance = _sanitize_importance(cdata)
@@ -261,6 +277,13 @@ async def _process_single_concept(
                 existing.importance_evaluated = True
             existing.recurrence_count = (existing.recurrence_count or 0) + 1
             existing.last_recurrence_at = now
+            # P0-06（2026-11-08）：复现即刷新 retention_score（旧：仅 backfill 快照，
+            # 运行时恒 0/陈旧 → 淘汰排序对新数据失效）。
+            from app.services.memory_retention_service import retention_score_for
+            existing.retention_score = retention_score_for(
+                existing.weight, existing.stability,
+                existing.recurrence_count, existing.last_recurrence_at,
+                existing.created_at, now)
             if source_trust in ("user_stated", "user_authored") and existing.source_trust == "agent_inferred":
                 existing.source_trust = source_trust
                 existing.activation_strength = 1.0
@@ -280,9 +303,13 @@ async def _process_single_concept(
                 existing.embedding_model = _get_embedding_model()
             existing.updated_at = now
 
-            existing_source_ids = _parse_json_array(existing.source_unit_ids)
-            existing_source_ids.extend(source_unit_ids)
+            existing_source_ids = new_sources
             existing.source_unit_ids = json.dumps(existing_source_ids, ensure_ascii=False)
+            msg_ids, source_kind = await _derive_source_evidence(db, user_id, existing_source_ids)
+            if msg_ids:
+                existing.source_message_ids = json.dumps(msg_ids, ensure_ascii=False)
+            if source_kind:
+                existing.source_kind = source_kind
 
             if cluster_suggestion:
                 await _ensure_cluster_membership(db, user_id, existing.id, cluster_suggestion)
@@ -301,6 +328,10 @@ async def _process_single_concept(
         stability = float(attr.get("semantic_stability_init_days", 14))
 
     emb = await _generate_embedding(canonical_name, aliases, desc_safe)
+    msg_ids, source_kind = await _derive_source_evidence(db, user_id, source_unit_ids)
+    # P0-06（2026-11-08）：创建即维护 retention_score（与 backfill/复现同一公式），
+    # 新概念不再恒 0 —— 否则 capacity 淘汰排序对全部新数据失真。
+    from app.services.memory_retention_service import retention_score_for
 
     concept = MemoryConcept(
         id=concept_id,
@@ -319,8 +350,11 @@ async def _process_single_concept(
         status=status,
         source_type="extracted",
         source_unit_ids=source_unit_json,
+        source_message_ids=json.dumps(msg_ids, ensure_ascii=False) if msg_ids else None,
+        source_kind=source_kind,
         recurrence_count=1,
         last_recurrence_at=now,
+        retention_score=retention_score_for(weight_init, stability, 1, now, now),
         embedding=emb,
         embedding_updated_at=now if emb else None,
         embedding_model=_get_embedding_model() if emb else None,
@@ -350,6 +384,13 @@ def _merge_aliases(existing_raw: Optional[str], new_json: str) -> str:
     return json.dumps(merged, ensure_ascii=False)
 
 
+def _reset_verification(concept) -> None:
+    """2026-11-08：内容/来源变化后，旧的 transcript 验证失效，等下一轮重验。"""
+    concept.verification_state = None
+    concept.last_verified_at = None
+    concept.verification_evidence = None
+
+
 def _parse_json_array(raw: Optional[str]) -> list:
     if not raw:
         return []
@@ -360,6 +401,41 @@ def _parse_json_array(raw: Optional[str]) -> list:
         return []
     except (json.JSONDecodeError, TypeError):
         return []
+
+
+async def _derive_source_evidence(
+    db: AsyncSession, user_id: str, unit_ids: list[str],
+) -> tuple[list[str], Optional[str]]:
+    """C3/B4：subconscious unit → 原始 message/note ids + 证据类型。"""
+    ids = [str(x) for x in (unit_ids or []) if isinstance(x, str) and x][:20]
+    if not ids:
+        return [], None
+    try:
+        rows = (await db.execute(
+            text("""SELECT source_ids, unit_kind FROM subconscious_log
+                    WHERE user_id = :uid AND id = ANY(:ids)"""),
+            {"uid": user_id, "ids": ids},
+        )).fetchall()
+    except Exception:
+        logger.debug("derive source evidence failed", exc_info=True)
+        return [], None
+    msg_ids: list[str] = []
+    kinds: set[str] = set()
+    for raw, kind in rows:
+        if kind:
+            kinds.add(str(kind))
+        for mid in _parse_json_array(raw):
+            if isinstance(mid, str) and mid and mid not in msg_ids:
+                msg_ids.append(mid)
+    if not kinds:
+        return msg_ids, None
+    if kinds <= {"message"}:
+        source_kind = "message"
+    elif kinds <= {"note"}:
+        source_kind = "note"
+    else:
+        source_kind = "mixed"
+    return msg_ids[:30], source_kind
 
 
 async def _generate_embedding(name: str, aliases: list, short_desc: str) -> Optional[list]:
@@ -455,6 +531,13 @@ def _update_bm25_on_concept_change(concept_id: str, user_id: str, name: str, ali
                 idx.update_doc(concept_id, txt)
     except Exception:
         pass
+    # 评审修复（P1-17）：名称/别名变化会改变拼音匹配集——本 hub 覆盖全部
+    # 概念写入点（create×2 / recurrence / update_description / merge）。
+    try:
+        from app.services.memory_validity_service import phonetic_cache_invalidate
+        phonetic_cache_invalidate(user_id)
+    except Exception:
+        pass
 
 
 async def promote_silent_to_active(db: AsyncSession, concept_id: str, trigger: str = "maturation") -> bool:
@@ -485,6 +568,12 @@ async def create_concept(
     stability = float(attr.get("semantic_stability_init_days", 14))
     emb = await _generate_embedding(canonical_name, [], desc_short)
 
+    # P0-06 补齐（评审修复 2026-11-08）：这个第二创建点（manual/profile 路径）同样
+    # 要维护 retention 三字段——否则该路径新概念的 capacity 淘汰排序恒失真。
+    from app.services.memory_retention_service import retention_score_for
+
+    now = datetime.utcnow()
+    weight_init = float(config.memory_concept.get("weight_init", 0.5))
     cid = str(uuid.uuid4())
     concept = MemoryConcept(
         id=cid,
@@ -493,7 +582,7 @@ async def create_concept(
         description_short=desc_short,
         description_full=desc_full,
         aliases=aliases_json,
-        weight=float(config.memory_concept.get("weight_init", 0.5)),
+        weight=weight_init,
         stability=stability,
         source_trust=source_trust,
         memory_type=memory_type,
@@ -503,8 +592,11 @@ async def create_concept(
         # 精选路径（profile/dreaming）：按来源分派——用户画像事实 0.9；推断类 0.6
         importance=(0.9 if source_trust in ("user_stated", "user_authored") else 0.6),
         importance_evaluated=True,
+        recurrence_count=1,
+        last_recurrence_at=now,
+        retention_score=retention_score_for(weight_init, stability, 1, now, now),
         embedding=emb,
-        embedding_updated_at=datetime.utcnow() if emb else None,
+        embedding_updated_at=now if emb else None,
         embedding_model=_get_embedding_model() if emb else None,
     )
     db.add(concept)
@@ -521,6 +613,7 @@ async def update_concept_description(
         return False
     concept.description_short = description_short[:80]
     concept.description_full = description_full[:5000]
+    _reset_verification(concept)
     emb = await _generate_embedding(concept.canonical_name, _parse_json_array(concept.aliases), concept.description_short)
     if emb:
         concept.embedding = emb
@@ -545,6 +638,7 @@ async def merge_concepts(db: AsyncSession, kept_id: str, merged_id: str) -> bool
     kept.aliases = json.dumps(all_aliases, ensure_ascii=False)
 
     kept.description_full = _merge_description_full(kept.description_full or "", merged.description_full or "")
+    _reset_verification(kept)
     kept.weight = max(kept.weight, merged.weight)
     kept.source_trust = kept.source_trust if kept.source_trust in ("user_stated", "user_authored") else merged.source_trust
     kept.stability = max(kept.stability, merged.stability)
@@ -554,9 +648,9 @@ async def merge_concepts(db: AsyncSession, kept_id: str, merged_id: str) -> bool
         kept.embedding_updated_at = datetime.utcnow()
         kept.embedding_model = _get_embedding_model()
 
-    merged.valid_to = datetime.utcnow()
-    merged.superseded_by = kept_id
     merged.updated_at = datetime.utcnow()
+    from app.services.memory_validity_service import apply_invalidation
+    apply_invalidation(merged, "merged", superseded_by=kept_id, now=merged.updated_at)
 
     kept.updated_at = datetime.utcnow()
     await db.flush()

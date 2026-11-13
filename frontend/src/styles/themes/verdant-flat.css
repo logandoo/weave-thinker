@@ -821,7 +821,7 @@ html[data-skin="verdant-flat"] .tool-pending .tool-card-icon { color: var(--tool
     flex: none;
   }
   html[data-skin="verdant-flat"] .chat-input-wrapper {
-    padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0));
+    padding: 8px 12px calc(8px + var(--safe-bottom));
   }
   html[data-skin="verdant-flat"] .input-bottom-toolbar .toolbar-btn {
     height: 29px; /* wave-10：基线 28px +1px */

@@ -566,6 +566,21 @@ def _transform_tool_loop_results(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _note_pf_failure(where: str, exc: BaseException) -> None:
+    """渐进落库的失败必须**可计数 + ERROR 级**（P2 2026-11-09，spec §4.8 第 2 项）。
+
+    这些点以前全是 `logger.debug(... fail-open)`：生产日志级别是 INFO，等于
+    静默失败。fail-open 语义保留（落库失败不该打死用户的流式回答），
+    但"保险丝断了"这件事必须看得见。
+    """
+    try:
+        from app.services import persistence_metrics as _pm
+
+        _pm.note_failure(where, exc)
+    except Exception:
+        logger.exception("persistence metric failed")
+
+
 class ProgressiveFlusher:
     """在途 assistant 行的周期刷写器（2026-10-06，conv ae9aa092 渐进落库）。
 
@@ -603,8 +618,8 @@ class ProgressiveFlusher:
         snapshot = text
         try:
             self._pending = asyncio.get_running_loop().create_task(self._writer(snapshot))
-        except Exception:
-            logger.debug("progressive flush schedule failed (fail-open)", exc_info=True)
+        except Exception as _exc:
+            _note_pf_failure("progressive_schedule", _exc)
 
     def tick(self, text: str) -> None:
         """证据刷新（2026-11-01，conv 861cb5af）：纯工具型长任务正文长期为空，
@@ -622,8 +637,8 @@ class ProgressiveFlusher:
         snapshot = text
         try:
             self._pending = asyncio.get_running_loop().create_task(self._writer(snapshot))
-        except Exception:
-            logger.debug("progressive evidence tick failed (fail-open)", exc_info=True)
+        except Exception as _exc:
+            _note_pf_failure("progressive_schedule", _exc)
 
     def reset(self) -> None:
         """打回边界（audit_reset）：被拒草稿不进在途行（它已入 message_attempts
@@ -643,8 +658,8 @@ class ProgressiveFlusher:
                 pass
         try:
             await self._writer(text)
-        except Exception:
-            logger.debug("progressive revert failed (fail-open)", exc_info=True)
+        except Exception as _exc:
+            _note_pf_failure("progressive_revert", _exc)
 
 
 
@@ -778,6 +793,8 @@ async def _localize_media_for_persist(
     tool_results_json: str | None,
     user_id: str,
     username: str | None,
+    *,
+    scoped: bool = False,
 ) -> tuple[str | None, str | None]:
     """Download remote media the agent decided to display into the user's
     workspace (content-addressed sha256) and rewrite to workspace-relative
@@ -788,6 +805,18 @@ async def _localize_media_for_persist(
     readable, but a fresh session keeps transactions isolated)."""
     try:
         from app.services.media_localizer import localize_message_payload
+        # 任务作用域（§10 媒体本地化）：enforce 未放开 media 模式时**不做本地化**
+        # ——既不写用户根也不写 Task 根，保持原 URL（宁可不解耦，不错放位置）。
+        from app.services.workspace_scope import WorkspaceScopeError as _MErr
+        from app.services.workspace_scoping_runtime import entry_guard as _media_guard
+
+        if scoped:
+            # 门只约束 scoped 回合（enforce 装配成功）；legacy 回合保持本地化。
+            try:
+                _media_guard("media")
+            except _MErr as _mexc:
+                logger.info("media localization skipped by workspace scope gate: %s", _mexc.code)
+                return content, tool_results_json
         async with AsyncSessionLocal() as ml_db:
             ws = await ensure_user_workspace(ml_db, user_id, username)
             return await localize_message_payload(content, tool_results_json, ws.root_path)

@@ -921,10 +921,29 @@ class AgentWorker:
             max_iterations = task.iterations_max or config.agent_tool_loop_max_iterations
 
             from app.model_gateway.factory import wire_provider_type as _wire_pt
+            # 任务作用域（§10 legacy background）：enforce 且该模式未放开 → 启动前明确拒绝；
+            # 放开则按 execution binding 恢复同一 run，不再自行回用户根。
+            from app.services.workspace_scoping_runtime import attach_execution_scope as _ws_attach_exec
+
+            _scoped_run_id = None
+            try:
+                async with AsyncSessionLocal() as _sc_db:
+                    _scoped = await _ws_attach_exec(
+                        _sc_db, user_id=user.id,
+                        workspace_root=str(workspace.root_path), agent_loop=None,
+                        owner_kind="agent_task", owner_id=str(task_id), conversation=conversation,
+                        mode_name="background")
+            except Exception as _scope_exc:
+                # 明确拒绝而不是回退用户根：任务终态可见 workspace_scope_* 错误码
+                await self._mark_failed(task_id, f"workspace_scope_refused: {_scope_exc}")
+                return
+            _scoped_run_id = _scoped.run_id
+
             agent_loop = AgentLoop(
                 llm=llm,
                 max_iterations=max_iterations,
                 workspace_path=str(workspace.root_path),
+                workspace_ctx=_scoped.ctx,
                 provider_type=_wire_pt(llm, getattr(assistant, "provider_type", "deepseek") or "deepseek"),
                 enable_reasoning=False,
                 enable_compression=config.agent_compression_enabled,
@@ -1199,12 +1218,17 @@ class AgentWorker:
                     return
 
                 if task.status == "cancelled":
+                    from app.services.workspace_scoping_runtime import finish_execution_scope
+                    await finish_execution_scope(_scoped_run_id, status="cancelled")
                     return
 
                 if _timed_out:
                     task.status = "timed_out"
                 else:
                     task.status = "completed"
+                from app.services.workspace_scoping_runtime import finish_execution_scope
+                await finish_execution_scope(_scoped_run_id,
+                                             status="completed" if not _timed_out else "failed")
                 raw_result = accumulated_response.strip() or "任务已完成,但未生成文本输出。"
                 task.result = sanitize_markdown(raw_result)
                 # Citation ledger verify step (grounded-citations port): strip
@@ -1390,6 +1414,8 @@ class AgentWorker:
                 with suppress(asyncio.CancelledError):
                     await _pending_poller
             logger.exception("Background task %s failed", task_id)
+            from app.services.workspace_scoping_runtime import finish_execution_scope
+            await finish_execution_scope(locals().get("_scoped_run_id"), status="failed")
             await self._mark_failed(task_id, str(exc))
 
     @staticmethod
@@ -1978,8 +2004,19 @@ class AgentWorker:
             pending_poller = asyncio.create_task(
                 _poll_steers(), name=f"agent-task-steer-{task_id[:8]}")
 
+            # 任务作用域（§10 separate_v1）：委派任务链接既有 WorkspaceTask 或新建 child Task；
+            # 未放开该模式时启动前拒绝（不回落用户根）。
+            from app.services.workspace_scoping_runtime import attach_execution_scope as _ws_attach_sep
+
+            async with AsyncSessionLocal() as _sep_sc_db:
+                _scoped_sep = await _ws_attach_sep(
+                    _sep_sc_db, user_id=user.id, workspace_root=str(workspace.root_path),
+                    owner_kind="agent_task", owner_id=str(task_id), conversation=conversation,
+                    mode_name="separate_task")
+
             agent_loop = AgentLoop(
                 llm=llm,
+                workspace_ctx=_scoped_sep.ctx,
                 max_iterations=min(
                     int(task.iterations_max or config.agent_tool_loop_max_iterations),
                     config.voice_delegation_iterations_cap,

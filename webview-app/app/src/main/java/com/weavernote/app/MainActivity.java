@@ -11,6 +11,9 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -19,6 +22,8 @@ import android.provider.MediaStore;
 import android.util.Base64;
 import android.util.Log;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
 import android.view.Window;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
@@ -28,10 +33,13 @@ import android.webkit.SslErrorHandler;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.net.http.SslError;
+import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.Toast;
 
@@ -40,7 +48,10 @@ import androidx.activity.result.ActivityResultCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
 import java.io.File;
@@ -57,7 +68,27 @@ public class MainActivity extends AppCompatActivity {
     private WebView webView;
     private ProgressBar progressBar;
     private View splashOverlay;
+    /** 离线重试遮罩（Issue #2）：主文档加载失败时可见，成功后隐藏。 */
+    private View offlineOverlay;
+    /** 自动 reload 去抖：网络抖动（onAvailable 连发）不得把 WebView 打进重载循环。 */
+    private long lastReloadAt = 0L;
+    private ConnectivityManager.NetworkCallback networkCallback;
     private WindowInsetsControllerCompat insetsController;
+    /** 前端已下发过一次真实系统栏颜色（新桥 onThemeColors）→ 旧布尔桥的硬编码色不再覆盖。 */
+    private volatile boolean webColorsApplied = false;
+    /** 最近一次 WindowInsets 系统栏 inset（px），页面加载完成后重注入。 */
+    private int lastSafeTop = 0;
+    private int lastSafeBottom = 0;
+    private int lastImeBottom = -1;
+
+    /** 把安全区写成 CSS 变量注入当前文档（页面切换/重载后由 onPageFinished 重放）。 */
+    private void injectSafeAreas() {
+        if (webView == null) return;
+        String js = "(function(){var s=document.documentElement.style;"
+                + "s.setProperty('--wt-safe-top','" + lastSafeTop + "px');"
+                + "s.setProperty('--wt-safe-bottom','" + lastSafeBottom + "px');})()";
+        webView.evaluateJavascript(js, null);
+    }
 
     private ValueCallback<Uri[]> fileUploadCallback;
     private ActivityResultLauncher<Intent> fileChooserLauncher;
@@ -74,18 +105,34 @@ public class MainActivity extends AppCompatActivity {
 
         @JavascriptInterface
         public void onThemeChanged(boolean isDark) {
+            // 兼容路径（旧前端/注入 observer）：透明边到边后只控制图标深浅。
+            // 前端已下发过表面色时不再覆盖其亮度判定。
+            if (webColorsApplied) return;
             runOnUiThread(() -> {
-                Window w = getWindow();
-                if (isDark) {
-                    w.setStatusBarColor(0xFF202020);
-                    w.setNavigationBarColor(0xFF191919);
-                    insetsController.setAppearanceLightStatusBars(false);
-                    insetsController.setAppearanceLightNavigationBars(false);
-                } else {
-                    w.setStatusBarColor(0xFFFFFFFF);
-                    w.setNavigationBarColor(0xFFF4F6F9);
-                    insetsController.setAppearanceLightStatusBars(true);
-                    insetsController.setAppearanceLightNavigationBars(true);
+                if (webColorsApplied) return;
+                insetsController.setAppearanceLightStatusBars(!isDark);
+                insetsController.setAppearanceLightNavigationBars(!isDark);
+            });
+        }
+
+        /**
+         * 新桥（wave-2 语义）：前端下发屏幕顶边/底边实际绘制色。系统栏透明，
+         * 颜色本身不再设置到窗口，仅按亮度决定各栏图标深浅（luminance>0.5 → 深色图标）。
+         * 非法颜色串忽略并保持现状，不崩溃。
+         */
+        @JavascriptInterface
+        public void onThemeColors(String statusHex, String navHex) {
+            runOnUiThread(() -> {
+                try {
+                    int status = Color.parseColor(statusHex);
+                    int nav = Color.parseColor(navHex);
+                    webColorsApplied = true;
+                    insetsController.setAppearanceLightStatusBars(Color.luminance(status) > 0.5f);
+                    insetsController.setAppearanceLightNavigationBars(Color.luminance(nav) > 0.5f);
+                } catch (IllegalArgumentException | NullPointerException e) {
+                    Log.w(TAG, "onThemeColors ignored (invalid color): "
+                            + (statusHex == null ? "null" : statusHex.length()) + "/"
+                            + (navHex == null ? "null" : navHex.length()));
                 }
             });
         }
@@ -232,6 +279,35 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> finishAffinity());
         }
 
+        /**
+         * 语音会话保活桥（2026-11-12，Issue #3）：前端在语音会话建立/终态时调用。
+         * active=true → 启动 microphone|mediaPlayback 前台服务 + WakeLock（后台
+         * 续命麦克风与播放）；false → 释放。O+ 一律走 startForegroundService：
+         * STOP 路径若用 startService 会在后台被 BackgroundServiceStartNotAllowed
+         * 拒掉，前台服务化后「启动即停」是合法路径。
+         */
+        @JavascriptInterface
+        public void setVoiceKeepAlive(boolean active) {
+            try {
+                Intent i = new Intent(context, VoiceKeepAliveService.class);
+                if (!active) {
+                    // STOP 直接 stopService()：对已运行服务后台调用合法；
+                    // 若走 startForegroundService(ACTION_STOP)，退后台终态时平台可能
+                    // 拒绝后台 FGS 启动（catch 吞掉）→ 通知+WakeLock 挂到 6h 兜底。
+                    context.stopService(i);
+                    return;
+                }
+                i.setAction(VoiceKeepAliveService.ACTION_START);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(i);
+                } else {
+                    context.startService(i);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "setVoiceKeepAlive(" + active + ") failed", e);
+            }
+        }
+
         /** Open an http(s) URL in the system browser instead of navigating the SPA WebView. */
         @JavascriptInterface
         public boolean openUrl(String url) {
@@ -267,11 +343,20 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Edge-to-edge: 系统栏颜色匹配 web 主题
-        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+        // wave-2 透明边到边：系统栏透明，内容铺满；安全区经 --wt-safe-* 注入由页面消费；
+        // 图标深浅由前端下发的表面亮度决定（onThemeColors/onThemeChanged）。
         Window window = getWindow();
-        window.setStatusBarColor(0xFFFFFFFF);
-        window.setNavigationBarColor(0xFFF4F6F9);
+        WindowCompat.setDecorFitsSystemWindows(window, false);
+        // AppCompat 的 ActionBarOverlayLayout 会自行消费 inset（真机实证：仅
+        // setDecorFitsSystemWindows(false) 时内容仍被系统带压住一条黑边），
+        // 需显式关掉 decor 的 fitsSystemWindows 并允许绘制到刘海/挖孔带。
+        window.getDecorView().setFitsSystemWindows(false);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.getAttributes().layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
         insetsController = WindowCompat.getInsetsController(window, window.getDecorView());
         insetsController.setAppearanceLightStatusBars(true);
         insetsController.setAppearanceLightNavigationBars(true);
@@ -299,10 +384,107 @@ public class MainActivity extends AppCompatActivity {
         progressBar = findViewById(R.id.progressbar);
         splashOverlay = findViewById(R.id.splash_overlay);
 
+        // 离线重试遮罩（Issue #2）：加载失败→可见；手动重试立即 reload。
+        offlineOverlay = findViewById(R.id.offline_overlay);
+        Button retryButton = findViewById(R.id.offline_retry_button);
+        if (retryButton != null) {
+            retryButton.setOnClickListener(v -> reloadNow());
+        }
+
+        // 安全区注入：Android WebView 内 env(safe-area-inset-top) 可能为 0（业界同坑，
+        // 壳侧通行做法=原生读 WindowInsets 注入 CSS 变量）。
+        // ⚠ WindowInsets 是物理像素，CSS 变量必须是 CSS px（=dp）——除以 density，
+        // 否则安全区被放大 density 倍（真机实证：36dp 状态栏变 75dp 空白）。
+        View contentRoot = findViewById(android.R.id.content);
+        final float density = getResources().getDisplayMetrics().density;
+        ViewCompat.setOnApplyWindowInsetsListener(contentRoot, (v, insets) -> {
+            Insets bars = insets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            int cssTop = Math.round(bars.top / density);
+            int cssBottom = Math.round(bars.bottom / density);
+            if (cssTop != lastSafeTop || cssBottom != lastSafeBottom) {
+                lastSafeTop = cssTop;
+                lastSafeBottom = cssBottom;
+                injectSafeAreas();
+            }
+            // 键盘避让（2026-11-10 真机回归修复）：边到边（decorFitsSystemWindows=false）
+            // 下 adjustResize 不再收缩 WebView——IME 改以 WindowInsets 下发，必须自行消费，
+            // 否则键盘静默覆盖页面（WebView <M139 时 innerHeight/vv.height 均无变化，JS 无信号）。
+            // 用 bottomMargin 收缩 WebView = 恢复「布局视口压缩」：innerHeight/100dvh 随键盘
+            // 缩小，前端外壳自然顶起，且 vv 同步缩小 → 前端 --keyboard-inset=0 不双重顶起。
+            Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
+            if (ime.bottom != lastImeBottom) {
+                lastImeBottom = ime.bottom;
+                ViewGroup.MarginLayoutParams lp =
+                        (ViewGroup.MarginLayoutParams) webView.getLayoutParams();
+                if (lp.bottomMargin != ime.bottom) {
+                    lp.bottomMargin = ime.bottom;
+                    webView.setLayoutParams(lp);
+                }
+            }
+            return insets;
+        });
+        contentRoot.requestApplyInsets();
+
         setupWebView();
         requestPermissions();
+        registerNetworkMonitor();
 
         webView.loadUrl(BuildConfig.SERVER_URL);
+    }
+
+    /** 手动/自动重试：去抖 2s，防网络抖动连发把 WebView 打进重载循环。 */
+    private void reloadNow() {
+        long now = System.currentTimeMillis();
+        if (now - lastReloadAt < 2000L) return;
+        lastReloadAt = now;
+        if (offlineOverlay != null) offlineOverlay.setVisibility(View.GONE);
+        if (webView != null) webView.reload();
+    }
+
+    /** 网络恢复监听（Issue #2）：仅在离线遮罩可见（=上次加载失败）时自动 reload。 */
+    private void registerNetworkMonitor() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+            networkCallback = new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    runOnUiThread(() -> {
+                        if (offlineOverlay != null && offlineOverlay.getVisibility() == View.VISIBLE) {
+                            reloadNow();
+                        }
+                    });
+                }
+            };
+            cm.registerDefaultNetworkCallback(networkCallback);
+        } catch (Exception e) {
+            Log.w(TAG, "network monitor unavailable", e);
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 与 WebView 默认行为对齐（我们从不 onPause 页面，这里只做防御性恢复；
+        // 语音/流媒体的后台存活由 VoiceKeepAliveService 负责，不靠暂停语义）。
+        if (webView != null) webView.onResume();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (networkCallback != null) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) cm.unregisterNetworkCallback(networkCallback);
+            } catch (Exception ignored) { }
+            networkCallback = null;
+        }
+        // Activity 消亡=WebView 会话同亡：兜底停掉保活服务，防通知/唤醒锁残留
+        try {
+            stopService(new Intent(this, VoiceKeepAliveService.class));
+        } catch (Exception ignored) { }
+        super.onDestroy();
     }
 
     private void setupWebView() {
@@ -322,8 +504,30 @@ public class MainActivity extends AppCompatActivity {
                 handler.proceed();
             }
 
+            /**
+             * 主文档加载失败（服务器不可达/断网/DNS）→ 显示离线遮罩（Issue #2）。
+             * 旧实现没有任何恢复路径：系统错误页盖在 WebView 上，用户只能杀进程
+             * 重启。现在网络恢复由 NetworkCallback 自动 reload，也可手动点重试。
+             */
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                if (request != null && request.isForMainFrame()) {
+                    Log.w(TAG, "Main frame load failed: " + error.getErrorCode()
+                            + " " + error.getDescription() + " url=" + request.getUrl());
+                    runOnUiThread(() -> {
+                        if (offlineOverlay != null) offlineOverlay.setVisibility(View.VISIBLE);
+                    });
+                }
+            }
+
             @Override
             public void onPageFinished(WebView view, String url) {
+                // 文档加载成功 → 收起离线遮罩
+                if (offlineOverlay != null && offlineOverlay.getVisibility() == View.VISIBLE) {
+                    offlineOverlay.setVisibility(View.GONE);
+                }
+                // 新文档重放安全区注入（inset 值进程内缓存）
+                injectSafeAreas();
                 // Hide splash with fade-out animation
                 if (splashOverlay != null && splashOverlay.getVisibility() == View.VISIBLE) {
                     splashOverlay.animate()
@@ -478,6 +682,10 @@ public class MainActivity extends AppCompatActivity {
                 }
                 if (checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                     needed.add(Manifest.permission.READ_MEDIA_AUDIO);
+                }
+                // 语音保活前台服务的通知（被拒仅影响通知可见性，不影响服务运行）
+                if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    needed.add(Manifest.permission.POST_NOTIFICATIONS);
                 }
             }
             if (!needed.isEmpty()) {

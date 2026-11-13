@@ -211,6 +211,11 @@ async def find_similar_concepts(
                  ELSE valid_to IS NULL
             END
           )
+          AND (
+            CASE WHEN :incl_expired THEN TRUE
+                 ELSE (verification_state IS NULL OR verification_state != 'contradicted')
+            END
+          )
         ORDER BY CAST(:emb AS vector({dim})) <=> embedding
         LIMIT :lim
     """)
@@ -250,7 +255,8 @@ async def find_similar_episodes(
           AND 1 - (CAST(:emb AS vector({dim})) <=> embedding) >= :thr
           AND (
             CASE WHEN :incl_expired THEN valid_from <= now()
-                 ELSE valid_to IS NULL
+                 ELSE valid_to IS NULL AND superseded_by IS NULL
+                      AND (verification_state IS NULL OR verification_state != 'contradicted')
             END
           )
           AND (CAST(:ts AS TIMESTAMP) IS NULL OR valid_from >= CAST(:ts AS TIMESTAMP))

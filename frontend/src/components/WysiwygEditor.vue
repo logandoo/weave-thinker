@@ -4080,8 +4080,13 @@ function tryAutoNumberedList(): boolean {
 // Handle keydown events for formatting shortcuts
 function onKeydown(e: KeyboardEvent) {
   if (!editorRef.value) return
-  // 陈旧组合标志自愈（判据 #2）：可打印键且浏览器报非组合 ⇒ 组合早已不在
-  if (isComposing && shouldHealComposingFromKey(e.key, e.isComposing)) healStaleComposing()
+  // 陈旧组合标志自愈（判据 #2）：可打印键，或 Backspace/Delete 且浏览器权威报非组合
+  // （组合早已结束、compositionend 丢失）⇒ 复位。否则陈旧标志会吞掉这一次合法的结构性
+  // 退格（评审 A3/B5：shouldHealComposingFromKey 只认 length===1 键，Backspace 永不自愈）。
+  if (isComposing && (shouldHealComposingFromKey(e.key, e.isComposing)
+    || ((e.key === 'Backspace' || e.key === 'Delete') && e.isComposing === false))) {
+    healStaleComposing()
+  }
 
   // Escape to clear table selection / 虚拟多 range（判据 #3）
   if (e.key === 'Escape') {
@@ -4097,7 +4102,8 @@ function onKeydown(e: KeyboardEvent) {
     }
   }
 
-  if ((e.key === 'Delete' || e.key === 'Backspace') && tableSelection.value.table && tableSelection.value.indices.size > 0) {
+  if ((e.key === 'Delete' || e.key === 'Backspace') && !isComposing && !e.isComposing
+    && tableSelection.value.table && tableSelection.value.indices.size > 0) {
     e.preventDefault()
     deleteSelectedTableRowsOrCols()
     return
@@ -4111,14 +4117,21 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key !== 'Enter' && e.key !== 'Backspace' && e.key !== 'Delete') {
     pendingHeadingNormalize = false
   }
-  if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !isComposing && !e.isComposing) {
     pendingHeadingNormalize = true
   } else if (e.key === 'Backspace' || e.key === 'Delete') {
-    const sel = window.getSelection()
-    if (sel && sel.rangeCount > 0) {
-      const collapsed = sel.isCollapsed
-      pendingHeadingNormalize = !collapsed ||
-        isCaretAtBlockEdge(e.key === 'Backspace' ? 'start' : 'end')
+    // IME 组合期不判定合块：isCaretAtBlockEdge → getCurrentBlockElement 会把裸文本
+    // 节点包进 <p> 并改选区，组合中触发即打断输入法（2026-11-11「backspace/del 错乱」
+    // 诊断：与列表/标题分支同源，统一收口——组合期一律不跑结构性 keydown 逻辑）。
+    if (isComposing || e.isComposing) {
+      pendingHeadingNormalize = false
+    } else {
+      const sel = window.getSelection()
+      if (sel && sel.rangeCount > 0) {
+        const collapsed = sel.isCollapsed
+        pendingHeadingNormalize = !collapsed ||
+          isCaretAtBlockEdge(e.key === 'Backspace' ? 'start' : 'end')
+      }
     }
   }
 
@@ -4141,7 +4154,7 @@ function onKeydown(e: KeyboardEvent) {
   // heading's computed style on the merged text (a <span style="font-size:…">
   // artifact) and can move the caret to the wrong side; this keeps the
   // merged text plain and the caret at the merge point.
-  if (e.key === 'Backspace' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && !isComposing) {
+  if (e.key === 'Backspace' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && !isComposing && !e.isComposing) {
     const sel = window.getSelection()
     if (sel && sel.rangeCount === 1 && sel.isCollapsed && !tableSelection.value.table) {
       const block = getCurrentBlockElement()
@@ -4187,7 +4200,10 @@ function onKeydown(e: KeyboardEvent) {
   // item → outdent one level; margin-indented item → reduce margin;
   // top-level item → unwrap to a paragraph (list marker removed, content
   // fully preserved).
-  if (e.key === 'Backspace' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+  // IME 组合期绝不接管：组合中按 Backspace 是在删输入法候选，必须交回浏览器原生
+  // 组合处理。标题分支（上方）本就有 `!isComposing` 守卫，列表分支曾遗漏（2026-11-11
+  // 报障「backspace/del 错乱」根因之一：中文输入时误触发 unwrap/outdent/删项并吞组合）。
+  if (e.key === 'Backspace' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && !isComposing && !e.isComposing) {
     const sel = window.getSelection()
     if (sel && sel.rangeCount === 1 && sel.isCollapsed && !tableSelection.value.table) {
       const li = findCurrentListItem()
@@ -5674,7 +5690,7 @@ defineExpose({
 
 @media (max-width: 767px) {
   .wysiwyg-editor {
-    padding-bottom: calc(var(--mobile-tab-bar-offset, 72px) + 80px + env(safe-area-inset-bottom, 0px)) !important;
+    padding-bottom: calc(var(--mobile-tab-bar-offset, 72px) + 80px + var(--safe-bottom)) !important;
   }
 }
 

@@ -12,7 +12,7 @@
 
 <p align="center"><strong>记得住你 · 做得完事 · 句句有据</strong><br/>FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用台账 · 三层仿生记忆</p>
 
-<p align="center"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /> <img alt="Version" src="https://img.shields.io/badge/version-v0.0.1-4c9f70.svg" /> <a href="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml/badge.svg" /></a></p>
+<p align="center"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /> <img alt="Version" src="https://img.shields.io/badge/version-6.73-4c9f70.svg" /> <a href="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml/badge.svg" /></a></p>
 
 </div>
 
@@ -156,7 +156,7 @@ cd ..
 
 **防幻觉体系**：发送前四态审计（accept / reject / unverifiable / needs_evidence）+ 拒绝预算与 salvage 重生成 + 遵循词 canary（长上下文防走神）+ 数值溯源闸门 NPG（关键数值须逐字溯源，默认记录、可配置强制拦截）。审计链路不静默截断：工具输出全量保留、超长自动存档并可回读核对；被审草稿始终逐字全文送审（超长分块全覆盖审计，零省略），绝不「看不到就当编造」。最新一条用户消息在意图判断、审计与守卫中逐字全文，长粘贴消息不会被截断误读；学术 / 研究类任务按研究语域组织（问题 → 假说 → 证据 → 结论），不混入工程流程话术。
 
-**三层记忆**：每日摘要与 dream、文件记忆（AGENT.md / USER.md）、v2 概念/情节/潜意识管线并存。五段混合召回（BM25 + embedding → 关系扩展 → rerank → LLM 打分 → RRF 融合），支持复现晋升、休眠淡忘、梦境整理与成本治理降级，pgvector 可选。记忆面板可见来源与权重，支持修正、遗忘与一键擦除。
+**三层记忆**：每日摘要与 dream、文件记忆（AGENT.md / USER.md）、v2 概念/情节/潜意识管线并存。五段混合召回（BM25 + embedding → 关系扩展 → rerank → LLM 打分 → RRF 融合），支持复现晋升、休眠淡忘、梦境整理与成本治理降级，pgvector 可选。记忆条目可被「梦境核验」用原始对话片段校对（已验证 / 待核实 / 证据不足），冲突条目不注入但不删除；失效原因分门别类（合并 / 来源丢失 / 撤回 / 遗忘 / 过期）并给出后继；实体页汇总别名与关联；`memory_search` 可按需只读检索。记忆面板可见来源与权重，支持修正、遗忘与一键擦除。
 
 **死磕模式**：先盘问再动手（最多 3 轮递进追问），随后进入 PEVR 目标循环；验证器要求工作区里有真实文件产出，幻影完成会被拦下；「待执行 / 待填写」的占位交付物无法通过完成判定，用说明、设计或计划代替真实结果同样会被拦下；你对结果的批评与返工要求会重新开启执行；停滞按重规划、部分交付、人工介入三级升级；状态全部落库，断网或隔夜可以续跑。
 
@@ -165,6 +165,8 @@ cd ..
 **联网同步**：多台设备登录同一账号即可同步会话与分组、笔记、助手配置（含模型供应商）、语音热词、技能、用户资料与记忆——超长的工具结果与思考过程也随同步携带全文，其他设备打开即可见完整内容；只传增量，大文件走独立文件通道；设备可绑定 / 撤销 / 手动全量重同步，换绑不回灌旧改动；记忆默认纳入同步（可配置关闭）；自签证书的内网服务器可按设备绑定跳过证书校验。
 
 **远程设备执行**：在电脑上装好配套客户端并完成配对后，会话的「执行环境」可切到这台设备——Agent 的文件读写、搜索、终端、Git、代码执行等本地类操作都在设备本机运行，用手机或网页即可远程指挥自己的电脑干活；设备工作区的文件预览、下载、整包与 Office 预览由设备侧提供，图片解读与语音转写的文件字节也从设备取回（模型调用仍在云端）。设备离线时明确报错、绝不静默改在云端执行；设备可随时解绑，远端执行留有审计记录；执行环境随会话固定（切换 = 新建会话）。
+
+**任务工作区（实验特性，默认关闭）**：会话可绑定「项目 / 任务」，助手的文件读写、终端与交付卡片只落在当前任务目录，看不到用户根或其他任务的文件；标题栏 `项目 · 任务` 徽标可查看绑定与改绑历史（改绑只影响后续消息归属，不移动已有文件）；会话内上传的附件进入任务 `inputs/`，首条消息前的附件先进暂存区、任务激活时按内容哈希交接；跨任务读取需用户签发一次性授权，交付卡片带「来自…」来源标记。三档灰度 `off`（默认，行为不变）/ `shadow`（只记录）/ `enforce`（仅白名单链路强制，当前为 chat）。
 
 **全双工语音**：单条 WebSocket 上做流式识别与流式合成，播报中持续拾音，插话即时暂停并从断点续播；语义判端、近场声学门控、情绪应声、热词纠音；输出停滞自动回到聆听、语音识别掉线自动重连；语音里可以调用搜索、代码、笔记、记忆等工具，随口提的事自动转笔记，长内容的分块写入不再因单轮预算不足而失败。当前针对 DashScope FunASR 识别 + MiMo 合成组合调优，其他 ASR/TTS 供应商未经完整测试。
 
@@ -184,16 +186,18 @@ cd ..
 
 **中断保护**：回答生成途中服务重启/崩溃，已生成部分按中断时点保留并带「已中断」标记；被审计打回重写的草稿全文留痕可查；服务停止/升级前自动排空在途回答（默认最长 120 秒）。
 
+**账号与安全**：用户管理与记忆迁移管理接口只允许 `admin` / `super_admin` 调用，其他登录用户 403；自助注册默认开放，可关闭（`registration_open = false`）或要求邀请码（`registration_invite_code`），开关走严格布尔——无法解析的写法按关闭处理并在启动日志告警；注册 / 登录有应用层速率限制（尝试窗按来源 IP、登录失败窗按「来源 IP + 账号」、另有按来源失败上限，超限 429 + `Retry-After`），只信 socket 对端地址、不读可伪造的 `X-Forwarded-For`（反代部署需显式声明可信代理，且不允许 `*`）；配置热重载使用独立的 `admin_reload_secret`（未配置时端点一律 403），并同时重载模型注册表。
+
 **皮肤与技能**：3 套内置皮肤 × 明暗双模式（设计令牌体系，支持上传自定义皮肤，规范见 [docs/SKINS.md](docs/SKINS.md)）；11 项系统技能 + 用户技能，SKILL.md 即操作手册，捆绑脚本执行前做安全扫描。
 
 **字体自托管**：Inter 与 Noto Sans SC（SIL OFL 1.1）全量存放在 `frontend/public/fonts/`，运行时零第三方 CDN 请求，离线与内网可用（许可与再分发义务见 [docs/license-compliance.md](docs/license-compliance.md) 第五节）。
 
 ## 内置工具与技能
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 62 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 11 项系统技能。
+后端 `app/tools/` 经 `registry.register()` 静态注册 65 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 11 项系统技能。
 
 <details>
-<summary>完整工具清单（62 个）</summary>
+<summary>完整工具清单（65 个）</summary>
 
 | 类别 | 工具函数 | 说明 |
 | --- | --- | --- |
@@ -209,6 +213,8 @@ cd ..
 | 文档查询 | `context7_resolve_library_id` / `context7_query_docs` | Context7 库 ID 解析与官方文档查询 |
 | 笔记 | `notes` | 笔记本与笔记的列表、读取、创建、修改、追加、删除 |
 | 记忆 | `memory` | 跨会话长期记忆（agent/user 双目标 + system 只读系统文档） |
+| | `memory_search` | 长期记忆只读检索（概念 / 情节 / 实体页；返回有效性、核验状态与来源消息 id；`history=true` 查历史） |
+| 任务检索 | `task_catalog_search` / `task_memory_search` | 任务目录与任务级工程记忆的只读检索（不读文件正文、不改绑定；跨任务需用户授权） |
 | 任务编排 | `delegate_task` / `background_task` / `schedule` / `session_search` / `mixture_of_agents` | 子代理并行委派、后台长线任务、定时任务、跨会话搜索、混合专家 |
 | 语音任务委派 | `delegate_agent_task` / `list_agent_tasks` / `get_agent_task` / `cancel_agent_task` / `steer_agent_task` / `summarize_agent_task` / `open_agent_task_result` | 语音/聊天长任务交给独立后台 Agent；任务面板可查、补充、取消、摘要与打开结果 |
 | 交互 | `request_user_input` | 后台任务缺信息时向用户发起一次性提问（等待态），回复后续跑 |
@@ -239,9 +245,9 @@ cd ..
 frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI · 3 皮肤令牌体系）
                      │  /api/*（JWT）
 backend/    FastAPI + async SQLAlchemy 2.0
-  ├─ app/api/        34 个 API 模块（29 个挂载 router：auth/chat/conversations/notes/assistants/skills/voice/asr/sync/devices/server-drain/…）
+  ├─ app/api/        35 个 API 模块（30 个挂载 router：auth/chat/conversations/notes/assistants/skills/voice/asr/sync/devices/server-drain/…）
   ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出 · 联网同步
-  ├─ app/tools/      工具体系（62 个工具函数 + MCP 动态扩展）
+  ├─ app/tools/      工具体系（65 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）
   └─ skills/         系统技能（SKILL.md 目录，Agent 可加载执行）
 webview-app/ Android WebView 壳（可选，JS 桥 window.WeaverNoteApp）

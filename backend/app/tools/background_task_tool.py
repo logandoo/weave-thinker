@@ -56,6 +56,15 @@ async def background_task(args: dict, **kwargs) -> str:
             iterations_max=iterations_max,
         )
         task_db.add(bt)
+        # 任务作用域（§10 legacy background）：把 WorkspaceTask 身份随执行记录持久化，
+        # worker 重启/恢复时据此解析同一 Task，而不是自行回退用户根。
+        _ctx = kwargs.get("workspace_ctx")
+        if _ctx is not None:
+            from app.services.workspace_run_service import bind_execution as _bind_exec
+
+            await _bind_exec(task_db, owner_kind="agent_task", owner_id=task_id,
+                             user_id=user.id, task_id=_ctx.task_id, run_id=None,
+                             binding_version=_ctx.binding_version)
         await task_db.commit()
 
     logger.info(

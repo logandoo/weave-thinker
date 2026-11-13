@@ -721,7 +721,8 @@ async def _audit_stop_hook(ctx: hook_service.StopContext) -> Optional[hook_servi
         return None  # W17 轮次门控：非激活轮不做 claim 校验（不产新 latch）
     from app.services.vibeweaver_gate_service import resolve_session_root, recent_project_root
     key = ctx.conversation_id or ctx.session_id
-    root = resolve_session_root(ctx.workspace_path, key)
+    root = resolve_session_root(ctx.workspace_path, key,
+                                scope_ctx=getattr(ctx, "workspace_ctx", None))
     if root is None:
         return None
     # W12 P1#7：C17 观察——vibeweaver-active 项目被写（注册表有记录）但技能未激活。

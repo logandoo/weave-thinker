@@ -805,7 +805,7 @@ html[data-skin="ink-paper"] .tool-pending .tool-card-icon { color: var(--tool-ic
     flex: none;
   }
   html[data-skin="ink-paper"] .chat-input-wrapper {
-    padding: 8px 16px calc(8px + env(safe-area-inset-bottom, 0));
+    padding: 8px 16px calc(8px + var(--safe-bottom));
   }
 }
 

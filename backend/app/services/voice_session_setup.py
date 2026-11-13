@@ -20,6 +20,12 @@ def _sync_voicesessionsetup_globals() -> None:
             g[_name] = getattr(_svc, _name)
 
 
+# 语音回放的历史 tool 内容上限（HC-1 豁免面①，spec §4.4 语音行 / §5 豁免清单）。
+# 具名是为了让这条豁免可测：legacy 大信封今天会被截成**不可解析的 base64 残串**
+# 进模型上下文，ref 信封短到不会触发截断 ⇒ 语音路径的 wire 字节会变，且变好。
+VOICE_REPLAY_TOOL_CONTENT_MAX_CHARS = 1500
+
+
 class VoiceSessionSetupMixin:
     def _build_llm(self, purpose: str = "voice") -> tuple[LLMService, str]:
         _sync_voicesessionsetup_globals()
@@ -60,9 +66,11 @@ class VoiceSessionSetupMixin:
         return svc, (ep.model_name or "")
     def _system_prompt(self) -> str:
         _sync_voicesessionsetup_globals()
+        from app.prompts.fragments import MEMORY_EVIDENCE_RULE
         if self._identity_loaded and self._identity_prompt:
-            return self._identity_prompt
-        return self.config.voice_system_prompt or "你是一个全双工语音对话助手，用自然口语化的中文简洁回答。"
+            return MEMORY_EVIDENCE_RULE + "\n" + self._identity_prompt
+        base = self.config.voice_system_prompt or "你是一个全双工语音对话助手，用自然口语化的中文简洁回答。"
+        return MEMORY_EVIDENCE_RULE + "\n" + base
     async def _load_identity(self) -> None:
         """Load identity/shared memory on a DEDICATED DB session.
 
@@ -256,7 +264,10 @@ class VoiceSessionSetupMixin:
             "严禁编造数据（最高优先级）：工具返回的真实结果会保留在对话上下文中，后续回答必须"
             "以上下文中的工具结果为准。笔记本 id/名称、笔记标题、搜索结果等只能使用工具实际返回的值；"
             "如果工具返回错误或空结果，如实告知用户真实结果（例如把可用的笔记本列表读给用户），"
-            "并按错误提示重试，绝对不要编造不存在的笔记本名称、笔记内容或搜索结论。"
+            "并按错误提示重试，绝对不要编造不存在的笔记本名称、笔记内容或搜索结论。\n"
+            "绝对禁止在回答正文中输出 `<tool_call>`、`<｜｜DSML｜｜>` 等任何工具调用标记文本，"
+            "也禁止用文字描述一次「假装的工具调用」代替真实调用——需要调用工具时必须发起"
+            "原生工具调用，正文只写要说的话。"
         )
 
         # Skills catalog — Agent mode injects the unified skills list so the agent
@@ -275,6 +286,7 @@ class VoiceSessionSetupMixin:
             logger.debug("voice identity: skills catalog load failed: %s", exc)
 
         self._identity_prompt = "\n\n".join(s for s in sections if s and s.strip())
+        self._memory_injected_context = self._identity_prompt
         self._identity_loaded = True
         # 基线捕获：会话启动记忆（哨兵区块）——空召回时 _apply_vmem_block(None)
         # 还原到此内容，避免跨话题残留上一主题的召回区块。
@@ -404,7 +416,7 @@ class VoiceSessionSetupMixin:
                         "tool_call_id": cid,
                         "content": _denumber_search_formatted(
                             steps_by_id[cid].get("content") or ""
-                        )[:1500],
+                        )[:VOICE_REPLAY_TOOL_CONTENT_MAX_CHARS],
                     })
                 self._history.append({
                     "role": "assistant",
@@ -508,6 +520,14 @@ class VoiceSessionSetupMixin:
         _sync_voicesessionsetup_globals()
         if not self.conversation_id or not content.strip():
             return
+        if role == "assistant":
+            # 伪工具标记不落库（2026-11-07 语音事故）：DB 历史是跨会话污染
+            # 的唯一载体，落库面剥离保证事故不再随历史回放复发。
+            from app.services.voice_text import strip_pseudo_tool_tags
+
+            content = strip_pseudo_tool_tags(content)
+            if not content.strip():
+                return
         from app.db.database import Conversation, Message
 
         try:
@@ -661,6 +681,20 @@ class VoiceSessionSetupMixin:
         window = msgs[start:]
         while window and window[0].get("role") == "tool":
             window = window[1:]
+        # 污染环切断（2026-11-07 语音事故 conv 73875edd）：历史里一旦出现伪
+        # 工具标记文本，模型会在后续轮模仿自己的伪格式并谎称已完成（带 tools
+        # 也会，probe_no_tools_fingerprint 实证）。请求侧统一剥离，已污染的
+        # 既有会话下一轮即恢复原生工具调用。
+        if any(m.get("role") == "assistant" and "<" in (m.get("content") or "")
+               for m in window):
+            from app.services.voice_text import strip_pseudo_tool_tags
+
+            window = [
+                {**m, "content": strip_pseudo_tool_tags(m["content"]) or "（无内容）"}
+                if m.get("role") == "assistant" and "<" in (m.get("content") or "")
+                else m
+                for m in window
+            ]
         return window
     def _system_messages(self) -> list[dict]:
         """System message for the next generation. Folds a one-shot interruption

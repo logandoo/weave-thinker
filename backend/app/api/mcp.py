@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_config
-from app.core.deps import get_current_user
+from app.core.deps import ADMIN_ROLES, get_current_user
 from app.db.database import User, get_db
 from app.tools import mcp_client
 from app.services import user_mcp_service
@@ -95,7 +95,7 @@ async def reload_global_mcp(
     current_user: User = Depends(get_current_user),
 ):
     cfg = get_config()
-    if not (cfg.super_admin_bypass or (current_user.role or "") in ("admin", "super_admin")):
+    if not (cfg.super_admin_bypass or (current_user.role or "") in ADMIN_ROLES):
         raise HTTPException(status_code=403, detail="global MCP reload is operator-only")
     result = await mcp_client.reload_mcp_servers_from_config()
     return result
@@ -107,7 +107,7 @@ async def mcp_status(
     db: AsyncSession = Depends(get_db),
 ):
     cfg = get_config()
-    is_operator = bool(cfg.super_admin_bypass or (current_user.role or "") in ("admin", "super_admin"))
+    is_operator = bool(cfg.super_admin_bypass or (current_user.role or "") in ADMIN_ROLES)
     user_servers = await user_mcp_service.list_servers(db, current_user.id)
     return {
         "global": [

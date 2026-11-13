@@ -124,10 +124,9 @@ async def invalidate_episode(db: AsyncSession, episode_id: str, superseded_by: s
     episode = await db.get(MemoryEpisode, episode_id)
     if not episode:
         return False
-    episode.valid_to = datetime.utcnow()
-    if superseded_by:
-        episode.superseded_by = superseded_by
-    episode.updated_at = datetime.utcnow()
+    from app.services.memory_validity_service import apply_invalidation
+    apply_invalidation(episode, "merged" if superseded_by else "expired",
+                       superseded_by=superseded_by)
     await db.flush()
     return True
 

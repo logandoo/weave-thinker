@@ -1072,6 +1072,176 @@ $$"""),
         created_at TIMESTAMP DEFAULT NOW(),
         CONSTRAINT uq_agent_task_summary_hash UNIQUE (logical_task_id, result_hash, part_index)
     )"""),
+    # ------------------------------------------------------------------
+    # 任务作用域身份层（2026-11-10 波 · DESIGN_20261108 §4.2）：Project/Task/Run/Attempt
+    # + 绑定/事件/执行绑定/消息上下文/产物来源/跨域 grant。全部 additive：新表新列，
+    # 无行即 legacy；**不进入** memory sync 与 v2 记忆表。
+    # ------------------------------------------------------------------
+    ("workspace_projects", """CREATE TABLE IF NOT EXISTS workspace_projects (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name VARCHAR(200),
+        root_rel VARCHAR(500) NOT NULL,
+        status VARCHAR(16),
+        storage_authority VARCHAR(64),
+        system_memory_ingest VARCHAR(16),
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
+        last_active_at TIMESTAMP,
+        CONSTRAINT uq_workspace_projects_user_root UNIQUE (user_id, root_rel)
+    )"""),
+    ("workspace_tasks", """CREATE TABLE IF NOT EXISTS workspace_tasks (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        project_id VARCHAR(36) REFERENCES workspace_projects(id) ON DELETE CASCADE,
+        title VARCHAR(300),
+        goal TEXT,
+        root_rel VARCHAR(500) NOT NULL,
+        status VARCHAR(16),
+        summary TEXT,
+        tags_json TEXT,
+        artifact_manifest_json TEXT,
+        storage_authority VARCHAR(64),
+        system_memory_ingest VARCHAR(16),
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
+        last_active_at TIMESTAMP,
+        CONSTRAINT uq_workspace_tasks_user_root UNIQUE (user_id, root_rel)
+    )"""),
+    ("workspace_bindings", """CREATE TABLE IF NOT EXISTS workspace_bindings (
+        id VARCHAR(36) PRIMARY KEY,
+        conversation_id VARCHAR(36) NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id VARCHAR(36) NOT NULL REFERENCES workspace_tasks(id) ON DELETE CASCADE,
+        project_id VARCHAR(36),
+        binding_version INTEGER NOT NULL DEFAULT 1,
+        system_memory_ingest VARCHAR(16),
+        bound_by VARCHAR(32),
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
+    )"""),
+    ("workspace_binding_events", """CREATE TABLE IF NOT EXISTS workspace_binding_events (
+        id VARCHAR(36) PRIMARY KEY,
+        conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        from_task_id VARCHAR(36),
+        to_task_id VARCHAR(36),
+        from_version INTEGER,
+        to_version INTEGER,
+        run_id VARCHAR(36),
+        actor VARCHAR(32),
+        reason TEXT,
+        system_memory_ingest VARCHAR(16),
+        created_at TIMESTAMP
+    )"""),
+    ("workspace_execution_bindings", """CREATE TABLE IF NOT EXISTS workspace_execution_bindings (
+        id VARCHAR(36) PRIMARY KEY,
+        owner_kind VARCHAR(32) NOT NULL,
+        owner_id VARCHAR(64) NOT NULL,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id VARCHAR(36) NOT NULL REFERENCES workspace_tasks(id) ON DELETE CASCADE,
+        run_id VARCHAR(36),
+        binding_version INTEGER,
+        bound_at TIMESTAMP,
+        CONSTRAINT uq_workspace_exec_binding UNIQUE (owner_kind, owner_id, run_id)
+    )"""),
+    ("workspace_runs", """CREATE TABLE IF NOT EXISTS workspace_runs (
+        id VARCHAR(36) PRIMARY KEY,
+        task_id VARCHAR(36) NOT NULL REFERENCES workspace_tasks(id) ON DELETE CASCADE,
+        project_id VARCHAR(36),
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id VARCHAR(36),
+        binding_version INTEGER NOT NULL DEFAULT 1,
+        run_spec_json TEXT,
+        status VARCHAR(24),
+        current_attempt_id VARCHAR(36),
+        lease_epoch INTEGER DEFAULT 0,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP
+    )"""),
+    ("workspace_attempts", """CREATE TABLE IF NOT EXISTS workspace_attempts (
+        id VARCHAR(36) PRIMARY KEY,
+        run_id VARCHAR(36) NOT NULL REFERENCES workspace_runs(id) ON DELETE CASCADE,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        lease_epoch INTEGER NOT NULL DEFAULT 1,
+        status VARCHAR(24),
+        frozen_context_json TEXT,
+        attempt_root VARCHAR(500),
+        artifact_root VARCHAR(500),
+        state_root VARCHAR(500),
+        started_at TIMESTAMP,
+        ended_at TIMESTAMP
+    )"""),
+    ("workspace_message_contexts", """CREATE TABLE IF NOT EXISTS workspace_message_contexts (
+        id VARCHAR(36) PRIMARY KEY,
+        message_id VARCHAR(36) NOT NULL UNIQUE,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id VARCHAR(36) NOT NULL,
+        run_id VARCHAR(36),
+        attempt_id VARCHAR(36),
+        binding_version INTEGER NOT NULL,
+        system_memory_ingest VARCHAR(16),
+        created_at TIMESTAMP
+    )"""),
+    ("workspace_artifact_refs", """CREATE TABLE IF NOT EXISTS workspace_artifact_refs (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        artifact_type VARCHAR(16),
+        artifact_id VARCHAR(64),
+        rel_path VARCHAR(500),
+        owner_task_id VARCHAR(36),
+        owner_run_id VARCHAR(36),
+        owner_attempt_id VARCHAR(36),
+        source_task_id VARCHAR(36),
+        source_run_id VARCHAR(36),
+        source_attempt_id VARCHAR(36),
+        content_hash VARCHAR(64),
+        origin VARCHAR(32),
+        taint VARCHAR(16),
+        system_memory_ingest VARCHAR(16),
+        created_at TIMESTAMP
+    )"""),
+    ("workspace_cross_scope_grants", """CREATE TABLE IF NOT EXISTS workspace_cross_scope_grants (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        current_task_id VARCHAR(36) NOT NULL,
+        source_project_id VARCHAR(36),
+        source_task_id VARCHAR(36),
+        kind VARCHAR(16),
+        "mode" VARCHAR(8),
+        claims_json TEXT NOT NULL,
+        claims_hash VARCHAR(64) NOT NULL,
+        issuer VARCHAR(32),
+        status VARCHAR(16),
+        run_id VARCHAR(36),
+        attempt_id VARCHAR(36),
+        lease_epoch INTEGER,
+        binding_version INTEGER,
+        not_after TIMESTAMP,
+        audit_count INTEGER DEFAULT 0,
+        last_audit_json TEXT,
+        created_at TIMESTAMP,
+        revoked_at TIMESTAMP
+    )"""),
+    ("idx_workspace_tasks_user_project_active", "CREATE INDEX IF NOT EXISTS idx_workspace_tasks_user_project_active ON workspace_tasks(user_id, project_id, last_active_at)"),
+    ("workspace_staging_leases", """CREATE TABLE IF NOT EXISTS workspace_staging_leases (
+        id VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id VARCHAR(36) NOT NULL,
+        binding_version INTEGER,
+        path VARCHAR(500),
+        status VARCHAR(16),
+        expires_at TIMESTAMP,
+        created_at TIMESTAMP
+    )"""),
+    # 2026-11-11 遗留清偿（D-49）：users.created_at 的历史 NULL 行会让
+    # `GET /api/admin/users` 与登录响应在 `created_at.isoformat()` 上直接 500
+    # （本地开发库实测 17 行，全部是既往测试波直接 SQL 插入的 fixture 用户）。
+    # 根因是列可空、且默认只在 ORM 侧生效——直接 SQL 插入的行留 NULL。
+    # 顺序：先回填历史行，再补 DB 默认（挡住未来直接插入），最后收紧 NOT NULL。
+    ("users_created_at_backfill", "UPDATE users SET created_at = (NOW() AT TIME ZONE 'UTC') WHERE created_at IS NULL"),
+    ("users_created_at_default", "ALTER TABLE users ALTER COLUMN created_at SET DEFAULT (now() AT TIME ZONE 'UTC')"),
+    ("users_created_at_not_null", "ALTER TABLE users ALTER COLUMN created_at SET NOT NULL"),
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (
@@ -1094,6 +1264,9 @@ $$"""),
         source_raw_ids TEXT,
         source_unit_ids TEXT,
         needs_review BOOLEAN NOT NULL DEFAULT FALSE,
+        verification_state VARCHAR(16),
+        last_verified_at TIMESTAMP,
+        verification_evidence TEXT,
         metadata_json TEXT,
         last_recalled_at TIMESTAMP,
         valid_from TIMESTAMP DEFAULT NOW(),
@@ -1274,11 +1447,81 @@ $$"""),
     # （默认 dry-run；WHERE ... IS NULL 幂等）；fidelity_state 默认 full 不回溯降级。
     ("mc_retention_score", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS retention_score DOUBLE PRECISION DEFAULT 0"),
     ("mc_fidelity_state", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS fidelity_state VARCHAR(16) DEFAULT 'full'"),
+    ("mc_verification_state", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS verification_state VARCHAR(16)"),
+    ("mc_last_verified_at", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMP"),
+    ("mc_verification_evidence", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS verification_evidence TEXT"),
+    # 2026-11-08 memory TODO（A1/A6/B4/B6）：失效原因、消息证据链、修正草案、
+    # validity 同步权威时间戳；全部 nullable/幂等 ALTER。
+    ("mc_invalid_reason", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS invalid_reason VARCHAR(20)"),
+    ("mc_source_message_ids", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS source_message_ids TEXT"),
+    ("mc_source_kind", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS source_kind VARCHAR(20)"),
+    ("mc_verification_correction", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS verification_correction TEXT"),
+    ("mc_validity_updated_at", "ALTER TABLE memory_concepts ADD COLUMN IF NOT EXISTS validity_updated_at TIMESTAMP"),
+    ("me_verification_state", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS verification_state VARCHAR(16)"),
+    ("me_last_verified_at", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMP"),
+    ("me_verification_evidence", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS verification_evidence TEXT"),
+    ("me_verification_correction", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS verification_correction TEXT"),
+    ("me_invalid_reason", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS invalid_reason VARCHAR(20)"),
+    ("me_validity_updated_at", "ALTER TABLE memory_episodes ADD COLUMN IF NOT EXISTS validity_updated_at TIMESTAMP"),
+    # B11：dream verify 选择池索引（避免夜间全表扫）。
+    ("idx_concepts_dream_verify", "CREATE INDEX IF NOT EXISTS idx_concepts_dream_verify ON memory_concepts(user_id, importance DESC, last_verified_at) WHERE valid_to IS NULL AND status = 'active'"),
+    # A1：旧数据按 superseded_by/status/needs_review 推导一次（只填空值，幂等）。
+    ("backfill_invalid_reason", """UPDATE memory_concepts SET
+            invalid_reason = CASE
+                WHEN superseded_by IS NOT NULL THEN 'merged'
+                WHEN status = 'forgotten' THEN 'forgotten'
+                WHEN needs_review THEN 'source_lost'
+                WHEN valid_to <= NOW() THEN 'expired'
+                ELSE NULL END,
+            validity_updated_at = CASE WHEN valid_to IS NOT NULL THEN NOW() ELSE validity_updated_at END
+        WHERE valid_to IS NOT NULL AND invalid_reason IS NULL"""),
+    ("backfill_validity_updated_at", "UPDATE memory_concepts SET validity_updated_at = NOW() WHERE valid_to IS NOT NULL AND validity_updated_at IS NULL"),
+    # C4/C8：实体页 + 页关系（夜间维护；注入只放索引）。
+    ("create_memory_pages", """CREATE TABLE IF NOT EXISTS memory_pages (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        entity_key VARCHAR(120) NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        aliases TEXT,
+        summary TEXT,
+        concept_ids TEXT,
+        importance DOUBLE PRECISION NOT NULL DEFAULT 0,
+        last_built_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("idx_memory_pages_user_key", "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_pages_user_key ON memory_pages(user_id, entity_key)"),
+    ("create_memory_page_links", """CREATE TABLE IF NOT EXISTS memory_page_links (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        source_page_id VARCHAR(36) NOT NULL,
+        target_page_id VARCHAR(36) NOT NULL,
+        relation_type VARCHAR(50) NOT NULL DEFAULT 'related',
+        weight DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+        created_at TIMESTAMP DEFAULT NOW()
+    )"""),
+    ("idx_memory_page_links_user", "CREATE INDEX IF NOT EXISTS idx_memory_page_links_user ON memory_page_links(user_id, source_page_id)"),
+    ("memory_eval_runs_user", "ALTER TABLE memory_eval_runs ADD COLUMN IF NOT EXISTS user_id VARCHAR(36)"),
     ("idx_concepts_user_retention", "CREATE INDEX IF NOT EXISTS idx_concepts_user_retention ON memory_concepts(user_id, retention_score DESC)"),
     ("ad_provenance_taint", "ALTER TABLE agent_dreams ADD COLUMN IF NOT EXISTS provenance_taint VARCHAR(16)"),
     ("ad_scanned", "ALTER TABLE agent_dreams ADD COLUMN IF NOT EXISTS scanned BOOLEAN DEFAULT FALSE"),
     # W2-3（2026-10-23）：读时门槛拒绝面 shadow 落档（误杀审计）
     ("mrl_rejects_json", "ALTER TABLE memory_recall_log ADD COLUMN IF NOT EXISTS rejects_json TEXT"),
+    # P1-15（2026-11-08）：memory_eval_runs 旧 NULL user_id 行——metrics 可推断者回填，
+    # 其余标记 legacy_user（保留不删，跨用户不可见但不静默丢语义）。
+    ("backfill_eval_runs_user_id", """UPDATE memory_eval_runs SET user_id = metrics_json->>'user_id'
+        WHERE user_id IS NULL AND jsonb_typeof(metrics_json) = 'object'
+          AND COALESCE(metrics_json->>'user_id', '') <> ''"""),
+    ("mark_eval_runs_legacy_user", """UPDATE memory_eval_runs
+        SET metrics_json = CASE WHEN jsonb_typeof(metrics_json) = 'object'
+            THEN metrics_json || '{"user_id_unknown": true}'::jsonb ELSE metrics_json END
+        WHERE user_id IS NULL AND jsonb_typeof(metrics_json) = 'object'
+          AND NOT (metrics_json ? 'user_id_unknown')"""),
+    # P1-18（2026-11-08/J1 遗留）：legacy 失效行同时带 needs_review+contradicted 会永久
+    # 留在 needs_review 语义面（contradicted 已不再驱动 needs_review）——一次性清旗，幂等。
+    ("clear_legacy_needs_review_on_invalid", """UPDATE memory_concepts SET needs_review = FALSE
+        WHERE valid_to IS NOT NULL AND verification_state = 'contradicted' AND needs_review"""),
+
 ]
 
 

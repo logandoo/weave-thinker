@@ -26,6 +26,7 @@
         >
           本轮 {{ formatContextTokens(chatStore.currentContextInfo!.tokens) }}
         </span>
+        <WorkspaceScopeChip />
         <button
           v-if="showMobileSaveNote"
           class="mobile-save-note-btn"
@@ -80,19 +81,33 @@ import Sidebar from './Sidebar.vue'
 import DrawerOverlay from './DrawerOverlay.vue'
 import Toast from './Toast.vue'
 import PermissionDialog from './PermissionDialog.vue'
+import WorkspaceScopeChip from './WorkspaceScopeChip.vue'
 import { useAuth } from '@/composables/useAuth'
 import { navigateWithMobileHistory } from '@/composables/useMobileNavigation'
 import { useChatStore } from '@/stores/chat'
 import { useNotesStore } from '@/stores/notes'
 import { useAssistantStore } from '@/stores/assistant'
+import { useSkinStore } from '@/stores/skin'
 import { formatContextTokens, contextTokenTooltipText } from '@/composables/useContextTokens'
+import { computeKeyboardInset } from '@/composables/keyboardInset'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuth()
 const chatStore = useChatStore()
 const notesStore = useNotesStore()
 const assistantStore = useAssistantStore()
+const skinStore = useSkinStore()
 const sidebarOpen = ref(false)
+
+// wave-2（透明边到边）：抽屉开合改变顶边实际绘制面（侧栏滑入覆盖）→ 350ms 防抖
+// 重采样下发。路由级重发在 App.vue afterEach 统一处理（/voice /zen 是本组件兄弟路由）。
+let surfaceNotifyTimer: number | undefined
+function scheduleSurfaceNotify() {
+  window.clearTimeout(surfaceNotifyTimer)
+  surfaceNotifyTimer = window.setTimeout(() => skinStore.notifyNativeBridge(), 350)
+}
+watch(sidebarOpen, scheduleSurfaceNotify)
+onBeforeUnmount(() => window.clearTimeout(surfaceNotifyTimer))
 
 const isOnNotesPage = computed(() => route.path.startsWith('/notes'))
 const isOnZenPage = computed(() => route.path === '/zen')
@@ -110,7 +125,10 @@ let lastWidth = 0
 function updateKeyboardState() {
   const vv = window.visualViewport
   if (vv && vv.scale > 1) {
+    // 已知盲区（评审 Minor-5）：键盘开着时捏合缩放会把 inset 归零（输入框暂落回
+    // 键盘下），与 keyboardOpen 同语义——缩放期间无法区分键盘高度，取安全侧。
     keyboardOpen.value = false
+    applyKeyboardInset(0)
     return
   }
   const visibleHeight = vv ? vv.height : window.innerHeight
@@ -120,6 +138,16 @@ function updateKeyboardState() {
     lastWidth = width
   }
   keyboardOpen.value = layoutBaseline - visibleHeight > 150
+  // 鸿蒙 5.x / ArkWeb / iOS Safari / Chrome ≥108（resizes-visual）：键盘只缩视觉
+  // 视口，100dvh 外壳不缩 → 输入框被盖。inset = innerHeight − vv.height；
+  // Android adjustResize 两者同缩 → 0，不会双重顶起（2026-11-10）。
+  // 阈值口径（评审 Minor-3）：inset 地板 60px（顶壳宁早勿晚，60 以下视为瞬时 UI
+  // 噪声）；keyboardOpen 保持 150px（NoteEditor 隐藏 tab bar 的既有契约不变）。
+  applyKeyboardInset(computeKeyboardInset(window.innerHeight, visibleHeight, vv ? vv.scale : 1))
+}
+
+function applyKeyboardInset(px: number) {
+  document.documentElement.style.setProperty('--keyboard-inset', px > 0 ? `${px}px` : '0px')
 }
 
 const hideTabBarForKeyboard = computed(() => keyboardOpen.value && isOnNoteEditorPage.value)
@@ -251,6 +279,7 @@ watch(() => chatStore.currentConversationId, (id) => {
 onBeforeUnmount(() => {
   window.visualViewport?.removeEventListener('resize', updateKeyboardState)
   window.removeEventListener('resize', updateKeyboardState)
+  document.documentElement.style.removeProperty('--keyboard-inset')
 })
 </script>
 
@@ -277,8 +306,8 @@ onBeforeUnmount(() => {
   display: none;
   align-items: center;
   gap: 12px;
-  height: var(--header-height);
-  padding: 0 16px;
+  height: calc(var(--header-height) + var(--safe-top, 0px));
+  padding: var(--safe-top, 0px) 16px 0;
   background-color: var(--surface-panel-strong);
   border-bottom: 1px solid var(--panel-border);
 }
@@ -288,6 +317,11 @@ onBeforeUnmount(() => {
     background-color: var(--surface-workbench);
     touch-action: pan-y pinch-zoom;
     overscroll-behavior-x: none;
+    /* 键盘只缩视觉视口的机型（鸿蒙 5.x/ArkWeb、iOS、Chrome≥108）：JS 按
+       innerHeight−vv.height 写 --keyboard-inset，外壳等高收缩把输入框顶到键盘
+       上方；adjustResize 机型 inset=0 与本行无感（2026-11-10） */
+    height: calc(100vh - var(--keyboard-inset, 0px));
+    height: calc(100dvh - var(--keyboard-inset, 0px));
   }
 
   .chat-main {
@@ -296,13 +330,13 @@ onBeforeUnmount(() => {
   }
 
   .chat-main :deep(.chat-input-wrapper) {
-    margin-bottom: calc(var(--mobile-tab-bar-offset) + env(safe-area-inset-bottom, 0px));
+    margin-bottom: calc(var(--mobile-tab-bar-offset) + var(--safe-bottom));
   }
 
   /* 语音态：wrapper 悬垂量 offset+4px，让语音条落在底 tab 上方（任务块 14 重定标：
      verdant offset 76 时 gap=19<20 留余量；三皮肤实测 19/9/9；mobile_voice_bar_position 契约 0~20） */
   body.voice-mode-active .chat-main :deep(.chat-input-wrapper) {
-    margin-bottom: calc(var(--mobile-tab-bar-offset) + 4px + env(safe-area-inset-bottom, 0px));
+    margin-bottom: calc(var(--mobile-tab-bar-offset) + 4px + var(--safe-bottom));
   }
 
   .mobile-header {
@@ -393,7 +427,7 @@ onBeforeUnmount(() => {
     transform: translateX(-50%);
     width: max-content;
     max-width: calc(100vw - 24px);
-    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(12px + var(--safe-bottom) + var(--keyboard-inset, 0px));
     z-index: 100;
     gap: 4px;
     padding: 5px;

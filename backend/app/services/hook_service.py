@@ -39,6 +39,9 @@ class ToolHookContext:
     conversation_id: str = ""
     user_id: str = ""
     workspace_path: str = ""
+    # 任务作用域（2026-11-10）：frozen WorkspaceContext；gate/delivery 用它定位
+    # write_root（任务文件域）与 vibeweaver_root（attempt 证据域）两个根。
+    workspace_ctx: Any = None
     # W17 轮次门控：False=本轮非 vibeweaver 激活轮（非代码任务），
     # gate/audit 钩子对本事件 stand-down（loop-guard 观察不受影响）。
     vibeweaver_active: bool = True
@@ -64,6 +67,7 @@ class StopContext:
     conversation_id: str = ""
     user_id: str = ""
     workspace_path: str = ""
+    workspace_ctx: Any = None
     assistant_content: str = ""
     # W17 轮次门控（同 ToolHookContext.vibeweaver_active）
     vibeweaver_active: bool = True

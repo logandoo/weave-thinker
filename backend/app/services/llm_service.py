@@ -74,6 +74,39 @@ from app.model_gateway.profiles import preserve_thinking_provider_types as _pt_t
 PRESERVE_THINKING_PROVIDERS = _pt_types()
 
 
+def _messages_carry_blob_refs(messages: list) -> bool:
+    """消息里是否还有**未物化的图片 blob 指针**（只查产图工具的 tool 消息）。
+
+    只用于 fail-closed 判定：图片展开炸了但字节仍是 ref 形态时，绝不能把指针当
+    内容发给模型（spec §4.3）。
+
+    判定必须窄（A4.9 二轮评审 A·I6）：早先是对**所有**消息做 `"blob_ref"` 子串
+    匹配，于是 `grep -rn blob_ref` 的 terminal 输出、或用户笔记里出现这个字面量，
+    就会把一次本该透传的普通失败变成硬错误，而且这段文本会粘在历史里让整条会话
+    永久易炸——正好违反本函数上方写着的"绝不让图片机制把非图片请求打死"。
+    现在要求：`role=tool` + 工具名在产图白名单 + 形状像信封 + 真能解析出
+    `images[].blob_ref`。
+    """
+    from app.services.image_blob_store import envelope_has_blob_ref
+    from app.services.tool_image_results import (
+        IMAGE_TOOL_ALLOWLIST,
+        is_image_envelope,
+        parse_image_envelope_memoized,
+    )
+
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        if str(msg.get("name") or "") not in IMAGE_TOOL_ALLOWLIST:
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or not is_image_envelope(content):
+            continue
+        if envelope_has_blob_ref(parse_image_envelope_memoized(content)):
+            return True
+    return False
+
+
 class LLMService:
     def __init__(self, custom_api_url: str = None, custom_api_key: str = None, custom_model_name: str = None, preserve_reasoning: bool = False, endpoint=None):
         self.config = get_config()
@@ -96,13 +129,41 @@ class LLMService:
         logger.info("LLMService created: base_url=%s, model=%s, is_custom=%s",
                      base_url, custom_model_name or self.config.model_name, self.is_custom_provider)
 
-    def _build_params(self, messages: list, **kwargs) -> dict:
+    async def _build_params(self, messages: list, **kwargs) -> dict:
         # P3/B4：工具结果图片信封 → 多模态 content parts（单点展开）。
+        # P1a（2026-11-09，spec §4.3 必修项）：异常必须分级。
+        #   · blob 物化失败 → 冒泡。这里以前是 `except Exception: pass`，一旦
+        #     吞掉，请求照发，模型收到的是含 `blob://sha256/…` 的裸 JSON 文本
+        #     （连 base64 都没有）⇒ 对着指针幻觉"我看过了"。比占位符更糟。
+        #   · 其余（信封形状不可解析 / 展开内部意外）→ 沿用今天语义：原样透传，
+        #     绝不让图片机制把非图片请求打死。
+        from app.services.image_blob_store import ImageBlobMaterializeError
+        from app.services.tool_image_results import expand_tool_images
+
+        _owner_uid8 = kwargs.pop("image_owner_uid8", None)
+        if _owner_uid8 is None:
+            from app.services.image_blob_context import current_owner_uid8
+
+            _owner_uid8 = current_owner_uid8()
         try:
-            from app.services.tool_image_results import expand_tool_images
-            messages = expand_tool_images(messages)
+            messages = await expand_tool_images(messages, owner_uid8=_owner_uid8)
+        except ImageBlobMaterializeError as exc:
+            logger.error(
+                "image blob materialize failed — request aborted (fail-closed, HC-3): %s",
+                exc,
+            )
+            raise
         except Exception:
-            pass
+            # 兜底透传只保护"非图片机制引起的意外"。一旦消息里还留着 `blob_ref`，
+            # 透传就等于把指针当内容交给模型——模型会对着一个 sha 幻觉"我看过了"
+            # （比占位更糟，spec §4.3 点名要消灭的形态）。此时必须冒泡。
+            if _messages_carry_blob_refs(messages):
+                logger.error(
+                    "expand_tool_images failed on a blob-ref session — request aborted "
+                    "(fail-closed, HC-3): %s", exc_info=True,
+                )
+                raise
+            logger.debug("expand_tool_images failed (passthrough)", exc_info=True)
         model = kwargs.get("model") or self.custom_model_name or self.config.model_name or "gpt-3.5-turbo"
         # 模型网关：custom 端点的 toml params 作为每端点默认采样（kwargs 优先；
         # 非 custom 端点走下方 [defaults] 全局默认，行为与 legacy 一致）。
@@ -377,7 +438,7 @@ class LLMService:
         return content
 
     async def complete_chat_parts(self, messages: list, **kwargs) -> tuple[str, str]:
-        params = self._build_params(messages, **kwargs)
+        params = await self._build_params(messages, **kwargs)
         logger.info("complete_chat called: model=%s, base_url=%s, is_custom=%s",
                      params.get("model"), self.client.base_url, self.is_custom_provider)
         response = await self.client.chat.completions.create(**params)
@@ -432,7 +493,7 @@ class LLMService:
         )
         try:
             retry_response = await self.client.chat.completions.create(
-                **self._build_params(messages, **retry_kwargs)
+                **(await self._build_params(messages, **retry_kwargs))
             )
         except Exception as e:
             logger.warning("Retry-with-thinking-off failed: %s", e)
@@ -486,7 +547,7 @@ class LLMService:
     async def stream_chat_structured(
         self, messages: list, **kwargs
     ) -> AsyncIterator[Dict[str, Any]]:
-        params = self._build_params(messages, **kwargs)
+        params = await self._build_params(messages, **kwargs)
         params["stream"] = True
         # P4 徽章真值（2026-09-02）：请求 usage 回传（OpenAI 兼容 stream_options），
         # 供应商不识别时在下方 create 处自动降级重试。flag=[llm] stream_include_usage。

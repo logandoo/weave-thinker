@@ -83,8 +83,10 @@ class VoiceTurnMixin:
             self._last_barge_in_time = _now()
             self._drain_tts_queue()
             await self._mark_speaking_end()
-            await self._send_json({"event": "interrupted"})
-            await self._send_json({"event": "task_cancelled", "text": text})
+            await self._send_json({"event": "interrupted", "turn_epoch": self._turn_epoch})
+            await self._send_json({
+                "event": "task_cancelled", "text": text, "turn_epoch": self._turn_epoch,
+            })
             logger.info("voice task cancelled by user: %r", text)
             return
 
@@ -92,17 +94,6 @@ class VoiceTurnMixin:
         # (_playback_paused — speech already stopped the audio; the classifier
         # now decides resume-from-breakpoint vs switch to the new turn).
         if (self._speaking or self._playback_paused) and self.config.voice_barge_in_enabled:
-            # Pre-filter: obvious ASR noise never interrupts TTS playback. In
-            # the paused state the noise/echo verdict means "not a real turn"
-            # → resume the paused answer from its breakpoint.
-            if _ASR_NOISE_RE.match(text):
-                logger.info("voice barge-in skipped (ASR noise): %r", text)
-                if self._playback_paused:
-                    await self._resume_playback()
-                else:
-                    await self._send_json({"event": "backchannel", "text": text})
-                await self._set_state("speak")
-                return
             # Deterministic echo guard: the agent's OWN TTS voice echoing back
             # through the mic is the #1 cause of mid-playback truncation. If the
             # interjection overlaps what is currently being spoken, it is echo,
@@ -247,8 +238,10 @@ class VoiceTurnMixin:
                 and _now() - self._last_queue_ack > 15.0
             ):
                 self._last_queue_ack = _now()
-                asyncio.create_task(self._speak_text(
-                    "(平静)收到，你先等我把手头这步做完，马上就来回答你。"
+                asyncio.create_task(self._speak_direct_text(
+                    "(平静)收到，你先等我把手头这步做完，马上就来回答你。",
+                    turn_complete=False,
+                    origin_epoch=self._prepare_direct_speech(),
                 ))
     def _start_prefetch(self, text: str) -> None:
         """Pre-generate reply text for a deferred turn while speech continues."""
@@ -359,7 +352,7 @@ class VoiceTurnMixin:
                 len(full),
             )
         await self._mark_speaking_end()
-        await self._send_json({"event": "interrupted"})
+        await self._send_json({"event": "interrupted", "turn_epoch": self._turn_epoch})
     async def _pause_playback(self) -> None:
         """Acoustic onset barge-in: speech detected during playback — stop TTS
         IMMEDIATELY (before EoT + LLM classification would decide, ~2s). The
@@ -492,7 +485,9 @@ class VoiceTurnMixin:
             self._resume_q = asyncio.Queue()
             self._resume_text = remaining
             resume_kwargs = {"ignore_paused": True}
-            resume_notification_id = self._active_notification_id or self._current_notice_id
+            # A preparing notice is not the owner of the older audible answer.
+            # Only first non-empty PCM creates active notification ownership.
+            resume_notification_id = self._active_notification_id
             if resume_notification_id:
                 resume_kwargs["notification_id"] = resume_notification_id
             self._spawn_synth(
@@ -504,6 +499,7 @@ class VoiceTurnMixin:
         await self._mark_speaking_end()
         await self._send_json({
             "event": "playback_paused",
+            "turn_epoch": self._turn_epoch,
             "paused_at_chars": self._paused_spoken_chars,
         })
         logger.info(
@@ -555,13 +551,28 @@ class VoiceTurnMixin:
         # giant segment) and a leading "。(风格)…" input hung the MiMo
         # provider, stalling the consumer forever (observed live).
         remaining = _strip_lead_punct(full[self._paused_spoken_chars:]).strip() if full else ""
-        resumed_notification_id = self._active_notification_id or self._current_notice_id
+        if remaining and self._completed_speaking_epoch == self._turn_epoch:
+            # The old burst's final flush proves nothing about this resumed tail.
+            # Only the restored final flush may make a later ordinary drain final.
+            self._completed_speaking_epoch = 0
+        # `_current_notice_id` is preparation state and may precede any PCM.
+        # Resume belongs only to the notice that actually owned audible playback.
+        resumed_notification_id = self._active_notification_id
         notice_state = self._notification_states.get(resumed_notification_id, {}) if resumed_notification_id else {}
         notice_burst_seq = int(notice_state.get("burst_seq", 0) or 0) + 1
         if resumed_notification_id:
             notice_state["burst_seq"] = notice_burst_seq
+            if remaining:
+                # The resumed burst has no delivery evidence yet. Previous
+                # audio/completion bits belong to the paused burst only.
+                notice_state["audio_sent"] = False
+                notice_state["generation_complete"] = False
+                if self._active_notification_id == resumed_notification_id:
+                    self._active_notification_audio_sent = False
+                    self._active_notification_generation_complete = False
         await self._send_json({
             "event": "playback_resumed",
+            "turn_epoch": self._turn_epoch,
             "notification_id": resumed_notification_id,
             "has_remaining": bool(remaining),
             "notice_burst_seq": notice_burst_seq,
@@ -615,13 +626,14 @@ class VoiceTurnMixin:
                         "text": snap,
                         "epoch": self._turn_epoch,
                         "pre_q": q,
-                        "notification_id": self._active_notification_id or self._current_notice_id,
+                        "notification_id": resumed_notification_id,
                     })
                     if delta:
                         await self._speak_text(
                             delta,
                             wait=False,
-                            notification_id=self._active_notification_id or self._current_notice_id,
+                            notification_id=resumed_notification_id,
+                            inherit_current_notice=False,
                         )
                 else:
                     # Snapshot diverged from the current text (defensive) —
@@ -632,7 +644,9 @@ class VoiceTurnMixin:
                     )
                     await self._speak_text(
                         remaining,
-                        notification_id=self._active_notification_id or self._current_notice_id,
+                        notification_id=resumed_notification_id,
+                        inherit_current_notice=False,
+                        turn_complete=False,
                     )
             else:
                 logger.info(
@@ -641,34 +655,75 @@ class VoiceTurnMixin:
                 )
                 await self._speak_text(
                     remaining,
-                    notification_id=self._active_notification_id or self._current_notice_id,
+                    notification_id=resumed_notification_id,
+                    inherit_current_notice=False,
+                    turn_complete=False,
                 )
         else:
             logger.info("voice playback resumed: no remaining content")
+        if (
+            not resumed_notification_id
+            and self._turn_epoch > 0
+            and self._final_flush_enqueued_epoch == self._turn_epoch
+        ):
+            # Pause drains queued items, including an unconsumed final flush.
+            # Restore that exact final boundary; an in-flight generation has not
+            # set this marker and will enqueue its own final flush later.
+            await self._tts_queue.put({
+                "flush": None,
+                "epoch": self._turn_epoch,
+                "turn_complete": True,
+            })
         if resumed_notification_id:
             notice_state = self._notification_states.get(resumed_notification_id, {})
             if notice_state.get("llm_succeeded") and not notice_state.get("tts_failed"):
                 await self._tts_queue.put({
                     "flush": None,
+                    "epoch": self._turn_epoch,
                     "notification_id": resumed_notification_id,
                     "notification_complete": True,
                 })
                 if not remaining:
-                    # All text was already heard. Settle directly instead of
-                    # racing a client ACK against the restored completion flush.
-                    notice_state["delivered"] = True
+                    # All text was already heard. Settle the durable member(s)
+                    # directly instead of racing a client ACK against the flush.
+                    # A synthetic batch ID is never an outbox row, and a stale
+                    # attempt must not settle a newer delivery attempt.
+                    members = notice_state.get("members") or []
+                    settled = False
+                    if notice_state.get("audio_sent"):
+                        try:
+                            from app.db.database import AsyncSessionLocal
+                            from app.services.voice_notification_service import mark_voice_notification_delivered
+
+                            async with AsyncSessionLocal() as db:
+                                if members:
+                                    outcomes = []
+                                    for member in members:
+                                        outcomes.append(await mark_voice_notification_delivered(
+                                            db,
+                                            str(member.get("notification_id") or ""),
+                                            member.get("delivery_attempt_id"),
+                                        ))
+                                    settled = all(outcomes)
+                                else:
+                                    settled = await mark_voice_notification_delivered(
+                                        db,
+                                        resumed_notification_id,
+                                        notice_state.get("delivery_attempt_id"),
+                                    )
+                        except Exception:
+                            logger.debug("voice zero-remaining notice ACK failed: %s", resumed_notification_id, exc_info=True)
+                    notice_state["delivered"] = bool(settled)
                     self._active_notification_id = None
                     self._active_notification_audio_sent = False
                     self._active_notification_generation_complete = False
-                    try:
-                        from app.db.database import AsyncSessionLocal
-                        from app.services.voice_notification_service import mark_voice_notification_delivered
-
-                        async with AsyncSessionLocal() as db:
-                            await mark_voice_notification_delivered(db, resumed_notification_id)
-                    except Exception:
-                        self._queued_notice_ids.discard(resumed_notification_id)
-                        logger.debug("voice zero-remaining notice ACK failed: %s", resumed_notification_id, exc_info=True)
+                    # Success consumes the replay latch; no-audio/failure releases
+                    # it so replay can retry instead of wedging later notices.
+                    self._queued_notice_ids.discard(resumed_notification_id)
+                    for member in members:
+                        member_id = str(member.get("notification_id") or "")
+                        if member_id:
+                            self._queued_notice_ids.discard(member_id)
     async def _responder(self) -> None:
         _sync_voiceturn_globals()
         while not self._closed:
@@ -723,7 +778,6 @@ class VoiceTurnMixin:
                     input_seq=item_input_seq,
                 )
                 if not text.strip():
-                    self._clear_pending_filler()
                     continue
                 # A queued turn whose utterance was already judged backchannel
                 # (window/cooldown defer + late pre-classify verdict, or a
@@ -735,7 +789,6 @@ class VoiceTurnMixin:
                     ignored_seqs = set(self._coalesced_input_seqs)
                     while self._latest_input_seq > 0 and self._latest_input_seq in ignored_seqs:
                         self._latest_input_seq -= 1
-                    self._clear_pending_filler()
                     await self._send_json({"event": "backchannel", "text": text})
                     await self._set_state("speak")
                     continue
@@ -791,8 +844,8 @@ class VoiceTurnMixin:
                 # the main responder loop so it can terminate cleanly.
                 self._turn_queue.put_nowait(None)
                 break
-            if nxt_item.get("notice"):
-                # Not a speech fragment — a background-task notice. Put it
+            if nxt_item.get("notice") or nxt_item.get("notice_batch"):
+                # Not a speech fragment — a background-task notice/batch. Put it
                 # back for the responder and process the merged text first.
                 self._turn_queue.put_nowait(nxt_item)
                 break
@@ -816,17 +869,6 @@ class VoiceTurnMixin:
         self._style_tag = ""
         self._turn_active = True
         await self._set_state("think")
-
-        # Deterministic noise pre-filter: fast check for transcribed ambient
-        # sounds (coughs, sighs, throat clearing) before any LLM call. This
-        # catches obvious noise that streaming ASR routinely emits, avoids
-        # burning API calls, and never needs the fail-safe default.
-        if _is_voice_noise(text):
-            logger.info("voice turn ignored (deterministic noise): %r", text)
-            self._turn_active = False
-            if not self._closed:
-                await self._set_state("listen")
-            return
 
         # Send user_turn IMMEDIATELY so the frontend shows the user message
         # BEFORE the assistant's streaming response. If the intent classifier
@@ -857,11 +899,8 @@ class VoiceTurnMixin:
             if self._prefetch.get("turn") is not None:
                 self._prefetch = {"turn": None, "text": None, "task": None}
 
-        # Filler prefix (TTFT-gated, 2026-09-13): no longer spoken here. The
-        # decision lives in `_filler_ttft_watch`, scheduled by the generation
-        # path: it plays only if the model has produced no first content token
-        # within `voice_filler_ttft_threshold_seconds`. The old immediate
-        # `_speak_filler()` call here made every turn open with a filler.
+        # W38 handoff T3 (2026-11-06): the filler-prefix chain was removed —
+        # normal answers never open with a synthetic filler (API.md contract).
         self._last_persisted_user_message_id = None
         await self._persist_message("user", text)
         # Voice delegation needs the real source user message for the
@@ -1010,13 +1049,6 @@ class VoiceTurnMixin:
             # 以 "epoch > 钩子时点" 判本轮，超时封顶，等待永远不挂死）。
             self._vmem_gen_done_epoch = self._turn_epoch
             self._vmem_gen_done.set()
-            # TTFT watch lifecycle (A4.9 review Important #1): a generation
-            # that ends WITHOUT content (provider error / empty reply) must not
-            # leave a watch that fires a filler into the silence or over the
-            # user's next utterance. Generations are serialized per session, so
-            # this cannot cancel a newer turn's watch; a watch that already
-            # fired is done and unaffected.
-            self._clear_pending_filler()
     async def _clarification_shadow(self, text: str) -> None:
         """B11（2026-09-14）：语音纠正候选 shadow 记录（applied=False，不应用；
         独立会话，失败静默）。
@@ -1071,7 +1103,9 @@ class VoiceTurnMixin:
             self._interrupt.set()
             self._drain_tts_queue()
             await self._mark_speaking_end()
-            await self._send_json({"event": "generation_cancelled"})
+            await self._send_json({
+                "event": "generation_cancelled", "turn_epoch": self._turn_epoch,
+            })
             raise
     async def _check_interjection(self, full_text: str) -> None:
         """Extract the latest completed sentence and run the interjection

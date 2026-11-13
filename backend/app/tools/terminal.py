@@ -211,11 +211,24 @@ def _tenant_workspace_root():
 
 
 def _resolve_working_dir(args: dict, kwargs: dict) -> tuple[str, Optional[str]]:
+    """同步解析 cwd。任务作用域由调用方（async handler）先行收口写入
+    `kwargs["workspace_path"]`，这里保持纯函数语义（既有租户/穿越测试直接调它）。"""
     workspace_root = _tenant_workspace_root()
-
     wd = args.get("working_dir", "").strip()
     if wd:
         resolved = Path(wd)
+        # 任务作用域 enforce：working_dir 必须落在本轮收口后的根里（scratch/task 域），
+        # 不再接受「租户根内任意绝对路径」——租户根是所有用户工作区的父目录。
+        _scoped_root = str(kwargs.get("workspace_path") or "").strip()
+        try:
+            from app.services.workspace_scope_service import scoping_mode as _scope_mode
+
+            _scoped_enforce = _scope_mode() == "enforce" and bool(_scoped_root)
+        except Exception:
+            _scoped_enforce = False
+        if _scoped_enforce and not _is_within_workspace(resolved, Path(_scoped_root).resolve()):
+            return "", (f"PERMISSION_NEEDED:{wd}") if config.super_admin_bypass else (
+                f"working_dir '{wd}' 不在当前任务作用域内，已拒绝")
         # A caller may pass a persisted (pre-tenant) workspace path; accept it
         # only when it is inside the configured global root, never `/etc`.
         _caller_root = Path(kwargs.get("workspace_path") or workspace_root).resolve()
@@ -320,14 +333,34 @@ async def terminal(args: dict, **kwargs) -> str:
     safety_result = _validate_command(command)
     if safety_result:
         if safety_result.get("_permission_needed"):
-            return json.dumps({
-                "error": f"Permission needed: {safety_result.get('_permission_description', 'Dangerous command')}",
-                "_permission_needed": True,
-                "_command": safety_result.get("_command", command),
-                "_target_path": safety_result.get("_target_path", ""),
-                "_permission_description": safety_result.get("_permission_description", ""),
-            }, ensure_ascii=False)
-        return json.dumps({"error": f"Command blocked: {safety_result.get('error', 'Unknown safety error')}"}, ensure_ascii=False)
+            # 2026-11-12（A4.9 评审 Critical）：用户批准后的重发必须真正执行——否则
+            # rm/mv/重定向/管道等"可批准"类命令批准后仍会再次弹窗。注意：只认
+            # `_user_approved`（由 agent_loop 批准重发路径以 **kwargs 注入，模型无法
+            # 伪造、voice/deathmatch/PTC 的批量 `_permission_granted` 不携带），
+            # 不得用 args 内的 `_permission_granted`（voice 对每个调用无条件置真）。
+            # 硬拦截（sudo/eval/系统目录等 error 类）不受此影响，仍在下面原样返回。
+            if not kwargs.get("_user_approved"):
+                return json.dumps({
+                    "error": f"Permission needed: {safety_result.get('_permission_description', 'Dangerous command')}",
+                    "_permission_needed": True,
+                    "_command": safety_result.get("_command", command),
+                    "_target_path": safety_result.get("_target_path", ""),
+                    "_permission_description": safety_result.get("_permission_description", ""),
+                }, ensure_ascii=False)
+        else:
+            return json.dumps({"error": f"Command blocked: {safety_result.get('error', 'Unknown safety error')}"}, ensure_ascii=False)
+
+    # 任务作用域收口（2026-11-10 §7.3）：enforce 下默认 cwd 是当前 attempt 的 scratch，
+    # 稳定 Task 文件的写入由 controlled_publish 完成；off/shadow 保持原行为。
+    from app.services.workspace_scope_service import apply_scope_or_error
+
+    _legacy_default = str(kwargs.get("workspace_path") or _tenant_workspace_root())
+    _scoped, _scope_err = await apply_scope_or_error(kwargs, default_root=_legacy_default,
+                                                     args=args, access="write",
+                                                     default_scope="scratch")
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+    kwargs = {**kwargs, "workspace_path": _scoped}
 
     cwd, dir_error = _resolve_working_dir(args, kwargs)
     if dir_error:

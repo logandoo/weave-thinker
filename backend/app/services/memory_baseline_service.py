@@ -190,6 +190,11 @@ async def collect_baseline_metrics(db: Any, *, days: int = 7,
         "SELECT COUNT(*) AS n FROM deletion_manifests WHERE status = 'residual'"
         f" AND created_at >= NOW() - (:days * INTERVAL '1 day') {user_sql}",
         params)
+    # J2：验证状态也进入 baseline（contradicted 不作为高价值，confirmed 可观测）。
+    verify_rows = await _rows(
+        "SELECT verification_state, COUNT(*) AS n FROM memory_concepts"
+        f" WHERE valid_to IS NULL {user_sql} GROUP BY verification_state",
+        params)
 
     def _parse_tool_calls(raw: Any) -> List[str]:
         import json
@@ -250,5 +255,9 @@ async def collect_baseline_metrics(db: Any, *, days: int = 7,
         "tools": tools,
         "reopen": reopen,
         "quarantine": quar,
+        "verification": {
+            str(r.get("verification_state") or "unverified"): int(r.get("n") or 0)
+            for r in verify_rows
+        },
         "alerts": alerts,
     }

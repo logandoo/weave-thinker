@@ -16,6 +16,7 @@ import {
   listMySkins,
   saveSkinPreference,
 } from '@/api/skins'
+import { resolveSystemBarColors, compositeSurfaceStack } from '@/utils/systemBars'
 
 export type SkinMode = 'light' | 'dark'
 
@@ -60,12 +61,53 @@ export const useSkinStore = defineStore('skin', () => {
     } else {
       el.removeAttribute('data-theme')
     }
+    // 皮肤×明暗 的唯一变更收口点：任何生效色变化都通知原生系统栏
+    notifyNativeBridge()
+  }
+
+  /** wave-2（透明边到边）：状态栏带下真正绘制的表面色——采样视口顶边中点的命中栈，
+   *  自顶向下 alpha 叠色（抽屉打开时=侧栏色，实现「推移感」的图标深浅联动）。
+   *  未布局/采样失败返回 null，由调用方回退 wave-1 背景解析。 */
+  function sampleStatusSurfaceColor(): string | null {
+    try {
+      // 采样 x 取「视口中点与 160px 的较小者」：移动抽屉实宽 min(85vw,320px)，
+      // x=160 恒落在抽屉覆盖区内（评审 A#2：641–767px 视口中点会错过抽屉）。
+      const x = Math.min(160, Math.floor(window.innerWidth / 2))
+      const stack = document.elementsFromPoint(x, 1)
+      if (!stack.length) return null
+      const layers = stack.map(el => getComputedStyle(el).backgroundColor)
+      const pageBase = getComputedStyle(document.documentElement).getPropertyValue('--color-bg')
+      return compositeSurfaceStack(layers, pageBase || null)
+    } catch {
+      return null
+    }
   }
 
   function notifyNativeBridge() {
-    // Android WebView 桥契约（useDownload.ts 声明）：按布尔明暗通知
+    // Android WebView 桥契约（useDownload.ts 声明）：
+    // - 旧桥 onThemeChanged(布尔)：旧 APK 的回落路径，继续保留；
+    // - 新桥 onThemeColors(status,nav)：下发顶边表面色与页面底色。透明边到边
+    //   （wave-2）下原生只取亮度定图标深浅；旧 APK（不透明色带）直接用作栏色。
     try {
-      window.WeaverNoteApp?.onThemeChanged?.(mode.value === 'dark')
+      const bridge = window.WeaverNoteApp
+      if (!bridge) return
+      bridge.onThemeChanged?.(mode.value === 'dark')
+      if (typeof bridge.onThemeColors === 'function') {
+        const cs = getComputedStyle(document.documentElement)
+        const fallback = resolveSystemBarColors(
+          cs.getPropertyValue('--app-background'),
+          cs.getPropertyValue('--color-bg'),
+          mode.value
+        )
+        const status = sampleStatusSurfaceColor() ?? fallback.status
+        bridge.onThemeColors(status, fallback.nav)
+      }
+      // 冷启动竞态（评审 B#2）：构建产物 module script 可先于样式 link 生效，
+      // 首读可能拿到回退色 → 文档（含样式表）完全加载后重发一次锁定真实色。
+      // readyState==='complete' 时不再调度，无递归。
+      if (document.readyState !== 'complete') {
+        window.addEventListener('load', () => notifyNativeBridge(), { once: true })
+      }
     } catch {
       // 非 WebView 环境忽略
     }
@@ -94,6 +136,9 @@ export const useSkinStore = defineStore('skin', () => {
     link.rel = 'stylesheet'
     link.href = url
     document.head.appendChild(link)
+    // Blob 样式表异步生效（评审 A/B Critical）：立即读计算样式必然拿到旧级联值，
+    // 必须等 load 后再补发系统栏真实色。
+    link.addEventListener('load', () => notifyNativeBridge(), { once: true })
     return true
   }
 
@@ -142,6 +187,8 @@ export const useSkinStore = defineStore('skin', () => {
       const linked = document.getElementById(CSS_LINK_PREFIX + skinId.value) as HTMLLinkElement | null
       if (fresh != null && linked) {
         URL.revokeObjectURL(linked.href)
+        // href 重设后新表异步生效 → load 后再补发（同名重传覆盖场景）
+        linked.addEventListener('load', () => notifyNativeBridge(), { once: true })
         linked.href = URL.createObjectURL(new Blob([fresh], { type: 'text/css' }))
       } else {
         void ensureSkinCss(skinId.value)
@@ -250,7 +297,6 @@ export const useSkinStore = defineStore('skin', () => {
     mode.value = next
     localStorage.setItem(MODE_STORAGE_KEY, next)
     applyToDom()
-    notifyNativeBridge()
   }
 
   function setMode(next: SkinMode): void {
@@ -341,6 +387,7 @@ export const useSkinStore = defineStore('skin', () => {
     removeSkin,
     setMode,
     toggleMode,
+    notifyNativeBridge,
   }
 })
 

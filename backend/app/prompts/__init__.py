@@ -36,6 +36,7 @@ from app.prompts import catalog as _catalog  # noqa: E402,F401
 
 __all__ = [
     "CROSS_TURN_CITATION_NOTE", "MEMORY_INSTRUCTION_BOUNDARY",
+    "MEMORY_EVIDENCE_RULE",
     "MEMORY_RELEVANCE_BOUNDARY", "MEMORY_BOUNDARY_SECTIONS",
     "TOOL_AVAILABILITY_NOTE", "UNTRUSTED_DATA_PREAMBLE", "spotlight",
     "PromptSection", "PromptSpec",

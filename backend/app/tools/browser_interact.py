@@ -73,6 +73,27 @@ def _is_private_url(url: str) -> str:
         return "Invalid URL"
 
 
+async def _browser_session(kwargs: dict, service, conv_id: str):
+    """§10 浏览器：enforce 未放开该模式 → 明确拒绝；放开则会话键含
+    task/run/attempt/epoch/binding，改绑后不会复用旧 Task 的页面状态。"""
+    from app.services.workspace_scope import WorkspaceScopeError as _BErr
+    from app.services.workspace_scoping_runtime import entry_guard as _entry_guard
+
+    ctx = kwargs.get("workspace_ctx")
+    # 门只约束 scoped 执行（legacy 会话 ctx=None 保持旧行为，acceptance #31）
+    if ctx is not None:
+        try:
+            _entry_guard("browser")
+        except _BErr as exc:
+            return None, json.dumps({"error": str(exc), "code": exc.code, "success": False},
+                                    ensure_ascii=False)
+    key = conv_id
+    if ctx is not None:
+        key = f"{conv_id}::{ctx.cache_key}"
+    session = await service.get_or_create_session(key)
+    return session, None
+
+
 async def browser_navigate(args: dict, **kwargs) -> str:
     url = args.get("url", "").strip()
     if not url:
@@ -87,7 +108,9 @@ async def browser_navigate(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "Failed to create browser session. Is Playwright installed?"}, ensure_ascii=False)
 
@@ -110,7 +133,9 @@ async def browser_snapshot(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -126,7 +151,9 @@ async def browser_click(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -145,7 +172,9 @@ async def browser_type(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -169,7 +198,9 @@ async def browser_scroll(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -185,7 +216,9 @@ async def browser_press(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -197,7 +230,9 @@ async def browser_press(args: dict, **kwargs) -> str:
 async def browser_back(args: dict, **kwargs) -> str:
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -214,7 +249,9 @@ async def browser_extract(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -230,7 +267,9 @@ async def browser_execute_js(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -244,7 +283,9 @@ async def browser_screenshot(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -260,10 +301,12 @@ async def browser_screenshot(args: dict, **kwargs) -> str:
                 inline_images_enabled,
             )
             if inline_images_enabled():
-                _env = build_image_envelope_from_file(
+                _env = await build_image_envelope_from_file(
                     result["path"],
                     f"浏览器截图已保存：{result.get('filename')}（url={result.get('url')}）",
                     display_path=str(result.get("filename") or ""),
+                    # P1b：blob 按用户命名空间落盘；无 user 上下文时写侧退回内联。
+                    user_id=str(getattr(kwargs.get("user"), "id", "") or "") or None,
                 )
                 if _env:
                     return _env
@@ -657,7 +700,9 @@ async def browser_video(args: dict, **kwargs) -> str:
     action = str(args.get("action") or "save").strip().lower()
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 
@@ -703,10 +748,12 @@ _MOUSE_SCHEMA = {
     "name": "browser_mouse",
     "description": (
         "Coordinate-based mouse actions in the interactive browser (real CDP mouse events). "
-        "Use this for canvas/WebGL apps, maps, drawing tools and custom widgets that have NO "
-        "DOM refs (snapshot is empty) — identify coordinates from a browser_screenshot first. "
-        "action: move (hover), down/up (drag halves), click (x,y), wheel (scroll at position). "
-        "Coordinates are viewport CSS pixels from the screenshot's top-left."
+        "Works on ANY web page, not only canvas apps: use it whenever a control has no usable "
+        "DOM ref or the task needs a real drag gesture — slider CAPTCHAs (press down on the "
+        "handle, move along the track in small steps, release up), custom-drawn widgets, maps, "
+        "drawing tools, drag-and-drop targets. Identify coordinates from a browser_screenshot "
+        "first. action: move (hover), down/up (drag halves), click (x,y), wheel (scroll at "
+        "position). Coordinates are viewport CSS pixels from the screenshot's top-left."
     ),
     "parameters": {
         "type": "object",
@@ -739,7 +786,9 @@ async def browser_mouse(args: dict, **kwargs) -> str:
 
     service = InteractiveBrowserService.get_instance()
     conv_id = _get_conversation_id(kwargs)
-    session = await service.get_or_create_session(conv_id)
+    session, _scope_err = await _browser_session(kwargs, service, conv_id)
+    if _scope_err:
+        return _scope_err
     if not session:
         return json.dumps({"error": "No active browser session. Use browser_navigate first."}, ensure_ascii=False)
 

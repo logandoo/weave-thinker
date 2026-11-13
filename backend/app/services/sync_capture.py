@@ -90,7 +90,18 @@ _EMBED_STATE_COLS = {"embedding", "embedding_model", "embedding_updated_at"}
 MEMORY_DYNAMICS_COLS = {
     "weight", "activation_strength", "recurrence_count",
     "hot_forget_count", "last_recalled_at",
+    # 2026-11-08 dream verify：服务端 transcript-grounded 计算态，不能让
+    # 客户端旧快照 LWW 覆盖；跨设备只读服务端结果。
+    "verification_state", "last_verified_at", "verification_evidence",
+    # C3/B6：服务端由 transcript 回溯/人工确认产生，客户端旧快照不得覆盖。
+    "verification_correction",
 }
+
+# P1-14（2026-11-08）：source_message_ids/source_kind = 服务端 transcript 推导的
+# 只读派生来源。**策略=服务端权威只读下发**：pull 载荷包含（客户端可展示来源、
+# 两设备一致），push 忽略（sync_apply 的 EXCLUDE_PAYLOAD_COLS 携带本集合，
+# 客户端旧快照/伪造值不得覆盖服务端推导）。
+SERVER_READONLY_PULL_COLS = {"source_message_ids", "source_kind"}
 
 # user_profile 白名单（全量保真波）：users 自行仅四列可同步
 PROFILE_COLS = ("nickname", "avatar_data", "ui_preferences", "agent_permissions")

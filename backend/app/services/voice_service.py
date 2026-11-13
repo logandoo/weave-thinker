@@ -17,7 +17,6 @@ import asyncio
 import collections
 import json
 import logging
-import random
 import re
 import time
 import uuid
@@ -71,6 +70,7 @@ from app.services.voice_text import (
     _strip_emoji,
     _strip_lead_punct,
     _utterance_complete,
+    strip_pseudo_tool_tags,
 )
 from app.services.voice_turn_taking import (
     _is_voice_rate_limit,
@@ -431,38 +431,6 @@ def _is_voice_noise(text: str) -> bool:
     )
 
 
-# P5（2026-09-05）：辅助语音（填充词/应和）近期排除窗口长度。
-_AUX_RECENT_CAP = 3
-
-
-def _pick_aux_phrase(phrases: list, last: str, recent: Optional[list] = None) -> str:
-    """Randomly pick one phrase from ``phrases``, excluding ``last`` AND any
-    phrase in ``recent`` (the session's last-N picks) when alternatives exist
-    (auxiliary speech: filler prefix / backchannel).
-
-    2026-09-05 P5：仅排除上一条时 4 词池高频出现 A-B-A-B 与同族重复
-    （"我来想想啊"/"嗯，我想想" 听感几乎恒为"我想想啊"）——recent 排除
-    把窗口扩到最近 N 条，池 >2 时同短语不会连续 3 次选中。
-
-    Pure and deterministic-friendly for unit tests. Returns "" when the list
-    is empty or contains no usable strings."""
-    def _usable(pool: list) -> list:
-        return [p for p in (pool or []) if isinstance(p, str) and p.strip()]
-
-    avoid = {last} if last else set()
-    for p in (recent or []):
-        if isinstance(p, str) and p.strip():
-            avoid.add(p)
-    pool = [p for p in _usable(phrases) if p not in avoid]
-    if not pool:
-        pool = [p for p in _usable(phrases) if p != last]
-    if not pool:
-        pool = _usable(phrases)
-    if not pool:
-        return ""
-    return random.choice(pool)
-
-
 # Freshness window (s) for aux-echo guards: the mic echo of a filler/
 # backchannel phrase arrives within ~0.2-2s of playback, so a guard older
 # than this can never match a real echo and must not rewrite user speech.
@@ -547,15 +515,6 @@ def _perf(phase: str, ms: float, **extra) -> None:
         logger.info("voice_perf phase=%s ms=%d", phase, int(ms))
 
 
-def _is_low_value_ack_text(text: str) -> bool:
-    clean = strip_voice_tags(text)
-    compact = re.sub(r"[\s，。！？；、…,.!?;~]+", "", clean).casefold()
-    return compact in {
-        "你说", "我听着", "你说我听着", "好的", "好", "好的你说",
-        "好的我听着", "我在听", "嗯", "嗯嗯", "嗯你说", "嗯我听着",
-    }
-
-
 def _build_voice_tool_results(tool_results: list[dict]) -> str | None:
     """Convert the flat voice-mode tool_results list into the rich
     ToolResultsData format (agent_steps etc.) that the frontend
@@ -619,10 +578,14 @@ def _build_voice_tool_results(tool_results: list[dict]) -> str | None:
 
 
 def strip_voice_tags(text: str) -> str:
-    """Remove (风格)/[音频标签] and emoji so the transcript shows clean text."""
+    """Remove (风格)/[音频标签] and emoji so the transcript shows clean text.
+
+    2026-11-07 语音事故防御：同时剥离伪工具标记（<tool_call>… 文本形态），
+    不让其出现在前端展示与朗读文本里。"""
     if not text:
         return ""
-    cleaned = _TAG_RE.sub("", text)
+    cleaned = strip_pseudo_tool_tags(text)
+    cleaned = _TAG_RE.sub("", cleaned)
     cleaned = _strip_emoji(cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
 
@@ -727,14 +690,37 @@ def _split_segments(buffer: str) -> tuple[list[str], str]:
 
     Returns (complete_segments, remainder). Only cuts when bracket/paren
     balance is intact so we never split a (风格) or [音频标签] in half.
+    Sentence boundaries preserve clause-level prosody inside one TTS request;
+    commas and enumeration punctuation deliberately remain in the buffer.
     """
+    boundaries = _TERMINAL_PUNCT + ".\n"
+
+    def boundary_end(text: str, index: int) -> int:
+        ch = text[index]
+        if ch not in boundaries:
+            return -1
+        if ch == ".":
+            previous_is_digit = index > 0 and text[index - 1].isdigit()
+            if index + 1 == len(text):
+                # A digit-ending prefix may become a decimal on the next token.
+                return -1 if previous_is_digit else index
+            next_ch = text[index + 1]
+            if not next_ch.isspace() and next_ch not in "\"'”’":
+                # Decimal points and dotted hosts are not sentence boundaries.
+                return -1
+        end = index
+        while end + 1 < len(text) and text[end + 1] in "\"'”’":
+            end += 1
+        return end
+
     segments: list[str] = []
     rest = buffer
     while True:
         last_idx = -1
-        for i, ch in enumerate(rest):
-            if ch in _SEGMENT_PUNCT:
-                last_idx = i
+        for i, _ch in enumerate(rest):
+            end = boundary_end(rest, i)
+            if end >= 0:
+                last_idx = end
         if last_idx <= 0:
             break
         candidate = rest[: last_idx + 1]
@@ -745,12 +731,13 @@ def _split_segments(buffer: str) -> tuple[list[str], str]:
             # Look for an earlier safe cut.
             safe = -1
             for i in range(last_idx - 1, 0, -1):
-                if rest[i] in _SEGMENT_PUNCT:
-                    sub = rest[: i + 1]
+                end = boundary_end(rest, i)
+                if end >= 0:
+                    sub = rest[: end + 1]
                     if (sub.count("(") == sub.count(")")) and (
                         sub.count("（") == sub.count("）")
                     ) and (sub.count("[") == sub.count("]")):
-                        safe = i
+                        safe = end
                         break
             if safe <= 0:
                 break
@@ -1302,8 +1289,10 @@ def _vmem_budget_clear(uid: Optional[str] = None) -> None:
 class VoiceDuplexSession(VoiceWSMixin, VoiceFillerMixin, VoiceClassifyMixin, VoiceGenerationMixin, VoiceTTSMixin, VoiceASRSessionMixin, VoiceTurnMixin, VoiceSessionSetupMixin, VoiceMemoryMixin):
     """One full-duplex voice session bound to a client WebSocket."""
 
-    def __init__(self, websocket, user, db, conversation_id: Optional[str] = None):
+    def __init__(self, websocket, user, db, conversation_id: Optional[str] = None,
+                 audio_protocol: Optional[str] = None):
         self.websocket = websocket
+        self._audio_protocol = "epoch_v1" if audio_protocol == "epoch_v1" else "legacy"
         self.user = user
         self.db = db
         self.config = get_config()
@@ -1369,43 +1358,13 @@ class VoiceDuplexSession(VoiceWSMixin, VoiceFillerMixin, VoiceClassifyMixin, Voi
         # noisy stretch from re-interrupting the resumed playback).
         self._speaking_started_at = 0.0
         self._last_barge_in_time = 0.0
-        # Auxiliary speech (填充词前缀 / 应和): random-phrase state. These
-        # utterances ride the SAME _tts_queue as answers/interjections (single
-        # consumer → serialized playback, no overlap by construction) and are
-        # marked aux=True so the consumer excludes them from the pause
-        # breakpoint pool (_turn_segments) and the dup window.
-        self._last_filler_phrase = ""
-        # P5（2026-09-05）：最近 N 条已选短语（recent 排除窗口），打破
-        # last-only 排除的 A-B-A-B 交替与同族重复（"几乎总是我想想啊"）。
-        self._recent_filler_phrases: list[str] = []
-        # Filler prefetch (填充词预取): the phrase's TTS synthesis is spawned
-        # SPECULATIVELY while the EoT watchdog is still deciding whether the
-        # utterance ended (arm), and converts to a playable aux item at the
-        # flush (convert) — so the filler is audible ~immediately after ASR
-        # end and truly covers the generation+TTS window instead of arriving
-        # after the answer is nearly ready (2026-08-25). `_last_filler_at` is
-        # the cooldown stamp shared by arm/convert/fallback (min-gap knob).
-        self._last_filler_at = 0.0
-        self._filler_prefetch = {"text": "", "phrase": "", "q": None, "task": None}
-        # TTFT-gated filler (2026-09-13): the EoT prefetch converts to a
-        # PENDING phrase (no playback/event/cooldown yet) and the decision moves
-        # to `_filler_ttft_watch`, scheduled when the main generation starts:
-        # the filler plays ONLY if the model produced no content token within
-        # `voice_filler_ttft_threshold_seconds` (AND-gate). Fast turns stay
-        # silent (overuse fix); 0 = legacy immediate play.
-        self._pending_filler = {"phrase": "", "q": None, "task": None}
-        self._filler_watch_task: Optional[asyncio.Task] = None
-        # Epoch of the turn whose first content token has arrived (0 = none
-        # yet); the watch compares it with its own epoch to suppress.
-        self._answer_content_epoch = 0
+        # (W38 handoff T3, 2026-11-06: filler prefetch / TTFT-watch / audible
+        # backchannel state removed with the unreachable chain — normal answers
+        # never open with a synthetic filler; the backchannel CLASSIFIER chain
+        # below stays live.)
         # Structured-output mode learned per subagent purpose ("schema" |
         # "object" | "off") — see `_quick_classify`.
         self._json_modes: dict[str, str] = {}
-        self._last_backchannel_phrase = ""
-        self._recent_backchannel_phrases: list[str] = []
-        self._last_backchannel_time = 0.0
-        self._backchannel_acked_text = ""
-        self._backchannel_count_this_turn = 0
         # True while the consumer is playing an AUX item (filler/backchannel).
         # The onset barge-in epoch gate compares _speaking_epoch vs
         # _turn_epoch; aux items can carry a stale epoch (spoken before the
@@ -1437,6 +1396,15 @@ class VoiceDuplexSession(VoiceWSMixin, VoiceFillerMixin, VoiceClassifyMixin, Voi
         # against the NEW turn's (already-wiped) segment state (A4.9 r2).
         self._turn_epoch = 0
         self._speaking_epoch = 0
+        # Latest epoch whose TTS send flush completed. A client underrun before
+        # this boundary is temporary and must not end the speaking turn.
+        self._completed_speaking_epoch = 0
+        # Generation-side final flush marker, used to restore a flush dropped
+        # by pause without declaring an in-flight response complete early.
+        self._final_flush_enqueued_epoch = 0
+        # Monotonic audio sequence within this WS session. Together with the
+        # generation epoch it lets the client reject duplicates and stale PCM.
+        self._audio_sequence = 0
         # Latest accepted user-turn ownership. Assigned at enqueue time so a
         # newer user turn can supersede a stale low-value assistant reply.
         self._latest_input_seq = 0

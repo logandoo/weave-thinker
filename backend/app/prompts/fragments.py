@@ -28,6 +28,15 @@ MEMORY_RELEVANCE_BOUNDARY = (
     "事实或证据，也不得据此推断当前对话未出现的内容。"
 )
 
+# C1（2026-11-08）：记忆为空/冲突时先查 transcript；完成语必须有真实结果。
+MEMORY_EVIDENCE_RULE = (
+    "记忆回答纪律：用户问“你还记得/之前说过/这个人是谁”，或注入记忆为空、"
+    "冲突、过期时，必须先调用 memory_search（必要时 session_search）再回答，"
+    "不得凭空说记得/不记得。声称“已记住/已补录/已失效/已删除/已重新标记为"
+    "有效”必须有本轮真实的写入工具结果；被动注入不算写入。引用记忆时给出"
+    "来源（会话/消息/时间）。"
+)
+
 # CIT-01: historical citation numbers are turn-local.
 CROSS_TURN_CITATION_NOTE = (
     "跨轮引用纪律：历史消息中的 [N] 编号只属于当时那一轮，对本轮无效；"

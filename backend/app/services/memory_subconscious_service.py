@@ -313,14 +313,29 @@ async def _load_raw_by_kind(
             """),
             {"uid": user_id, "ow": old_watermark, "t0": t0},
         )
-        for row in result.fetchall():
+        # 任务作用域（2026-11-10 §8.5）：逐消息策略快照过滤。
+        from app.services import workspace_ingest_filter as wif
+
+        rows = result.fetchall()   # 只取一次：Result 不可重复 fetchall
+        try:
+            policies = await wif.policies_for_messages(db, [str(r[0]) for r in rows])
+        except Exception:
+            logger.exception("subconscious message policy lookup failed; legacy behavior")
+            policies = {}
+        for row in rows:
+            policy = policies.get(str(row[0]))
+            if policy == wif.POLICY_EXCLUDE:
+                continue
             user_part = (row[1] or "")[:500]
+            if policy == wif.POLICY_USER_FACTS:
+                user_part, _ = wif.strip_autometadata(user_part)
             if not user_part.strip():
                 continue
             # 琐碎/寒暄预筛由调用方批量 LLM 判断（_filter_trivial_texts）
             source_ids = [row[0]]
             raw = f"用户: {user_part}"
-            if row[2] and row[3]:
+            # user_facts / exclude 通道都不带助手回答与执行状态（§8.5）
+            if row[2] and row[3] and policy not in (wif.POLICY_USER_FACTS, wif.POLICY_EXCLUDE):
                 source_ids.append(row[2])
                 raw += f"\n助手: {(row[3] or '')[:500]}"
             results.append((raw, source_ids))
@@ -336,8 +351,24 @@ async def _load_raw_by_kind(
             """),
             {"uid": user_id, "ow": old_watermark, "t0": t0},
         )
-        for row in result.fetchall():
-            results.append((row[0] or "", [row[1]]))
+        from app.services import workspace_ingest_filter as wif
+
+        note_rows = result.fetchall()
+        try:
+            npol = await wif.note_policies(db, user_id, [str(r[1]) for r in note_rows])
+        except Exception:
+            logger.exception("subconscious note policy lookup failed; legacy behavior")
+            npol = {}
+        for row in note_rows:
+            policy, origin = npol.get(str(row[1])) or (None, None)
+            if not wif.policy_allows_note(policy, origin):
+                continue
+            content = row[0] or ""
+            if policy == wif.POLICY_USER_FACTS:
+                content, _ = wif.strip_autometadata(content)
+                if not content.strip():
+                    continue
+            results.append((content, [row[1]]))
 
     elif kind == "file_memory":
         # §5.1.a 文件记忆水位线拉取：AGENT.md/USER.md 条目按内容哈希去重入库

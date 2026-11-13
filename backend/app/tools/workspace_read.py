@@ -125,6 +125,11 @@ async def workspace_read(args: Dict[str, Any], **kwargs) -> str:
                 ensure_ascii=False,
             )
 
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args)
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
     target = str(args.get("path") or args.get("file_path") or "").strip().strip("'\"")
     if not target:
         return json.dumps(
@@ -160,10 +165,13 @@ async def workspace_read(args: Dict[str, Any], **kwargs) -> str:
             inline_images_enabled,
         )
         if inline_images_enabled():
-            envelope = build_image_envelope_from_file(
+            envelope = await build_image_envelope_from_file(
                 resolved,
                 f"[workspace_read] 图像 {name}（{ext}）已内联返回，可直接判读。",
                 display_path=os.path.relpath(resolved, workspace_root),
+                # P1b：blob 命名空间按用户分片（spec §4.1）。拿不到 user 时写侧
+                # 自动退回内联并计数，绝不猜一个命名空间。
+                user_id=str(getattr(user, "id", "") or "") or None,
             )
             if envelope is not None:
                 return envelope
@@ -213,7 +221,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "path": {
                     "type": "string",
                     "description": "文件路径（绝对路径、工作区相对路径）。",
                 },

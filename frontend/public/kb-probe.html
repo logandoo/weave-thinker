@@ -1,0 +1,96 @@
+<!-- Copyright (c) 2026 Weave Thinker Contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+<title>键盘视口探针 · kb-probe</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, monospace; background: #111; color: #0f0; padding: 8px 8px 120px; }
+  h1 { font-size: 16px; color: #fff; margin: 4px 0 8px; }
+  .ua { color: #ff0; word-break: break-all; font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+  td { border: 1px solid #333; padding: 2px 6px; }
+  td:first-child { color: #8f8; white-space: nowrap; }
+  td:last-child { color: #fff; font-weight: bold; }
+  .changed { background: #330; }
+  #log { white-space: pre-wrap; font-size: 12px; color: #0cf; border-top: 1px solid #333; padding-top: 6px; }
+  button { font-size: 14px; padding: 6px 10px; margin: 4px 4px 4px 0; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; background: #222; padding: 10px; border-top: 2px solid #f0f; }
+  #bar input { width: 100%; font-size: 18px; padding: 10px; }
+  .hint { color: #f80; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>键盘视口探针（点开底部输入框，键盘弹出后截图整屏）</h1>
+<div class="ua" id="ua"></div>
+<div class="hint">操作：① 先截一张「键盘未弹出」的图；② 点最底部紫色条里的输入框；③ 键盘弹出后再截一张。两张图发我。</div>
+<table id="vals"></table>
+<button id="vkbtn">开启 virtualKeyboard.overlaysContent（点我后再试输入框）</button>
+<span id="vkstate"></span>
+<div id="log"></div>
+<div id="bar"><input id="inp" type="text" placeholder="点我弹出键盘"></div>
+<script>
+const $ = id => document.getElementById(id);
+$('ua').textContent = navigator.userAgent;
+const start = Date.now();
+const ts = () => ((Date.now() - start) / 1000).toFixed(1) + 's';
+const logs = [];
+function log(s) {
+  logs.push(ts() + ' ' + s);
+  if (logs.length > 14) logs.shift();
+  $('log').textContent = logs.join('\n');
+}
+const KEYS = [
+  ['innerHeight', () => window.innerHeight],
+  ['clientHeight', () => document.documentElement.clientHeight],
+  ['vv.height', () => window.visualViewport ? +window.visualViewport.height.toFixed(1) : 'N/A'],
+  ['vv.offsetTop', () => window.visualViewport ? +window.visualViewport.offsetTop.toFixed(1) : 'N/A'],
+  ['vv.pageTop', () => window.visualViewport ? +window.visualViewport.pageTop.toFixed(1) : 'N/A'],
+  ['vv.scale', () => window.visualViewport ? window.visualViewport.scale : 'N/A'],
+  ['scrollY', () => window.scrollY],
+  ['screen.height', () => window.screen.height],
+  ['virtualKeyboard', () => 'virtualKeyboard' in navigator],
+  ['vk.boundingRect', () => ('virtualKeyboard' in navigator) ? JSON.stringify(navigator.virtualKeyboard.boundingRect) : 'N/A'],
+  ['inputRect.bottom', () => +$('inp').getBoundingClientRect().bottom.toFixed(1)],
+];
+const prev = {};
+function render() {
+  const rows = KEYS.map(([k, f]) => {
+    let v; try { v = f(); } catch (e) { v = 'ERR'; }
+    const ch = prev[k] !== undefined && prev[k] !== v;
+    prev[k] = v;
+    return '<tr' + (ch ? ' class="changed"' : '') + '><td>' + k + '</td><td>' + v + '</td></tr>';
+  });
+  $('vals').innerHTML = rows.join('');
+}
+setInterval(render, 200);
+render();
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', () => log('vv.resize h=' + window.visualViewport.height.toFixed(1) + ' offsetTop=' + window.visualViewport.offsetTop.toFixed(1)));
+  window.visualViewport.addEventListener('scroll', () => log('vv.scroll offsetTop=' + window.visualViewport.offsetTop.toFixed(1) + ' pageTop=' + window.visualViewport.pageTop.toFixed(1)));
+} else { log('无 visualViewport'); }
+window.addEventListener('resize', () => log('window.resize innerHeight=' + window.innerHeight));
+window.addEventListener('scroll', () => log('window.scroll scrollY=' + window.scrollY));
+document.addEventListener('focusin', () => log('focusin'));
+document.addEventListener('focusout', () => log('focusout'));
+if ('virtualKeyboard' in navigator) {
+  navigator.virtualKeyboard.addEventListener('geometrychange', e => {
+    const r = e.target.boundingRect;
+    log('vk.geometrychange h=' + r.height + ' top=' + r.top);
+  });
+  $('vkbtn').addEventListener('click', () => {
+    try {
+      navigator.virtualKeyboard.overlaysContent = true;
+      $('vkstate').textContent = 'overlaysContent=' + navigator.virtualKeyboard.overlaysContent;
+      log('设置 overlaysContent=true 成功');
+    } catch (e) { log('设置失败: ' + e.message); }
+  });
+} else { $('vkbtn').disabled = true; $('vkbtn').textContent = '此环境无 virtualKeyboard API'; }
+log('探针就绪');
+</script>
+</body>
+</html>

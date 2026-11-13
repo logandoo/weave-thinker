@@ -3,9 +3,11 @@
 
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- wave-2 透明边到边：系统栏全透明，页面内容铺到屏幕缘；
+         安全区由原生注入 wt-safe 前缀 CSS 变量（top/bottom）、前端顶栏消费（对齐 Android 15 方向）。 -->
     <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar">
-        <item name="android:statusBarColor">#FFFFFF</item>
-        <item name="android:navigationBarColor">#F4F6F9</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
         <item name="android:windowTranslucentStatus">false</item>
         <item name="android:windowTranslucentNavigation">false</item>

@@ -70,6 +70,11 @@ services:
       - output_data:/app/backend/output_files
       - checkpoints_data:/app/backend/tma_checkpoints
       - skins_data:/app/backend/skins_custom
+      # 图片 blob 外置根（2026-11-09 零损失内存改造，docs/IMAGE_BLOBS.md）：
+      # named volume 保证重建容器不丢历史图片会话；该卷**必须可写**（写入点与
+      # 物化读都要碰它），SELinux 机器沿用 WT_MOUNT_OPTS 语义时注意 compose 里
+      # named volume 默认带 z 标签，不要给它加 :ro。
+      - image_blobs_data:/app/data/image_blobs
 
 volumes:
   pgdata:
@@ -79,3 +84,4 @@ volumes:
   output_data:
   checkpoints_data:
   skins_data:
+  image_blobs_data:

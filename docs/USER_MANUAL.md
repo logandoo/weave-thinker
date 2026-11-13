@@ -210,7 +210,7 @@ main = "main"
 
 - **注册**：登录页 →「注册新用户」。用户名 2-50 字符，密码至少 6 位；注册成功后自动创建默认助手。
 - **账号与管理员**：注册默认 `role=user`（系统没有「首用户自动成为管理员」的机制）。少数管理端点
-  （如记忆迁移 `/api/admin/memory/*`）要求 `role='admin'`，可在数据库中提升：
+  （如记忆迁移 `/api/admin/memory/*`）要求 `role` 为 `admin` 或 `super_admin`，可在数据库中提升：
   `UPDATE users SET role='admin' WHERE username='你的用户名';`（改完重新登录）。
 - **登录态**：JWT 存于浏览器 `localStorage`（key `chatllm_token`），默认 7 天有效并滑动续期；退出登录会清除本地令牌。
 - **多用户**：每个用户的数据（会话、笔记、记忆、工作区、语音热词、皮肤偏好）互相隔离。
@@ -301,6 +301,19 @@ main = "main"
 - 顶部 **token 徽章**显示本轮上下文估算（CJK 感知），压缩前后会有对比提示。
 - 上下文接近阈值时系统自动压缩（保护开头与最近内容）；长会话可新建会话以降低成本。
 - 「深度思考」开关控制是否启用推理模型/推理预算（按端点与助手配置生效）。
+
+### 5.7 任务工作区（项目 / 任务隔离，实验特性）
+
+默认关闭（`backend/config.toml` 的 `[workspace.task_scoping].mode = "off"`，现网行为不变）。开启后：
+
+- **文件按任务隔离**：会话绑定到「项目 / 任务」，助手的文件读写、终端、交付卡片只落在当前任务目录
+  `projects/p_…/tasks/t_…/workspace/`，看不到用户根或其他任务的文件（同名诱饵也不会误命中）。
+- **徽标**：标题栏出现 `项目 · 任务` 徽标（`shadow` 档为虚线，表示只观测不拦截）；legacy 旧会话不显示、也不迁移。
+- **绑定面板**：点徽标可查看当前绑定与改绑历史，并可显式改绑（只影响后续消息归属，**不移动旧文件**）。
+- **上传附件**：会话内上传进入当前任务的 `inputs/`；首条消息前的附件先进入暂存区，任务激活时按内容哈希交接。
+- **跨任务读取需授权**：助手读其他任务/项目共享区必须由用户在服务端签发一次性 grant，返回的交付卡片会带「来自…」来源标记。
+- **灰度**：`mode = "shadow"` 只记录不拦截；`mode = "enforce"` 仅对 `supported_modes` 列出的链路（当前为 `chat`）强制，
+  未列入的链路（语音/死磕/后台/定时/设备等）会明确拒绝而不是回退共享根。逐链路放开矩阵见 `tests/workspace_scope_matrix_20261110.md`。
 
 ---
 
@@ -634,11 +647,17 @@ WT_MOUNT_OPTS=ro,z
 
 ## 16. 安全说明
 
-- **服务边界**：本项目面向个人/小团队自托管。管理接口（`/api/admin/*`）当前没有独立角色校验（任何登录用户可调用），**不要把服务直接暴露到不可信网络**；公网部署请置于 VPN、内网或加一层带认证的反向代理之后。
+- **服务边界**：本项目面向个人/小团队自托管，**不要把服务直接暴露到不可信网络**；公网部署请置于 VPN、内网或加一层带认证的反向代理之后。
+- **管理员与注册**：用户管理与记忆迁移管理接口（`/api/admin/users/*`、`/api/admin/memory/*`）只允许 `users.role` 为 `admin` 或 `super_admin` 的用户调用，其他登录用户返回 403。管理员需在数据库中手工指定：`UPDATE users SET role='admin' WHERE username='<用户名>';`。自助注册默认开放；在 `config.toml` 的 `[security]` 中设 `registration_open = false` 可关闭注册（管理员仍可通过 `/api/admin/users` 建号），或设 `registration_invite_code = "<邀请码>"` 要求注册时提供匹配的邀请码（`POST /api/auth/register` 的 `invite_code` 字段；**登录页注册模式已有可选「邀请码」输入框**，留空即不发送）。改完重启服务生效。
+  - **邀请码是秘密**：`registration_invite_code` 与数据库密码、JWT 密钥同级——**不要把真实邀请码提交进版本库**。若你的 `config.toml` 会被 git 跟踪（本仓库的开发配置就是如此），把它留空并改用部署时注入（环境变量/挂载的独立配置文件），或先 `git update-index --skip-worktree backend/config.toml` 再改。
+  - **开关写法的坑**：`registration_open` 走严格布尔——`registration_open = false`（不带引号）与 `registration_open = "false"`（带引号）**都**表示关闭；写成 `"开不开都行"` 这类无法解析的值会按安全方向当作关闭，并在启动日志打 `SECURITY CONFIG:` 告警。邀请码只有空白字符 = 等同未启用（同样会告警），过短（<8 位）也会告警。
+- **注册/登录速率限制**：`POST /api/auth/register` 与 `POST /api/auth/login` 有应用层速率限制（默认开启），超配额返回 `429` 并带 `Retry-After` 秒数。三道闸：**尝试窗按来源 IP**（注册 60 次/小时、登录 120 次/分钟，防洪泛）；**失败窗按「来源 IP + 账号」**（登录 20 次/15 分钟，拦单账号口令枚举）；**按来源的失败上限**（登录 60 次/15 分钟，拦「换着账号喷洒」）。注册的失败窗按来源 IP（10 次/15 分钟）——邀请码与账号无关，所以它天然是来源维度。效果：同事在同一个出口上输错自己的口令**不会**连累其他人；但同一出口累计 60 次失败会短暂封住该出口的登录（这是防喷洒上限，可用 `[security.auth_rate_limit.login_ip]` 调档）。可在 `[security] auth_rate_limit_enabled = false` 关闭，或用 `[security.auth_rate_limit.register]` / `[security.auth_rate_limit.login]` / `[security.auth_rate_limit.login_ip]` 逐项调档；排障时也可用环境变量 `WT_AUTH_RATE_LIMIT=off` 临时关闭。
+- **客户端地址从哪来**：限流只信 socket 对端（`request.client.host`），**不读** `X-Forwarded-For`——它由客户端自填，可任意伪造。若服务在反向代理之后，必须让代理覆写该头并**显式**告诉 uvicorn 信任哪些地址：Docker 部署设 `WT_FORWARDED_ALLOW_IPS=<代理地址>`（默认**不**启用 proxy headers）；裸机部署给 uvicorn 加 `--proxy-headers --forwarded-allow-ips=<代理地址>`。**绝不要写 `*`**：那等于信任任意来源的伪造头，限流可被一个请求头绕过，也能被伪造成别人的 IP 做定向锁定。
 - **密钥**：`config.toml` 与 `config_model.toml` 含数据库密码、JWT 密钥、模型 API key；不要提交到代码库、不要打进镜像（本项目 Docker 配置已排除并运行时挂载）。
 - **权限审批**：终端执行、删除笔记等敏感工具默认走审批；可在「权限管理」收紧或放宽（放宽前请确认使用场景）。
 - **提示词注入防护**：网页/文件内容会被当作数据处理；记忆写入有注入扫描与不可见字符防护。
 - **JWT**：`[security] jwt_secret_key` 必须为随机长串；泄露后立即更换并重启（所有人需重新登录）。
+- **配置热重载**：`POST /api/admin/reload-config` 需要请求头 `x-admin-secret`，其值来自**独立**的 `[security] admin_reload_secret`（不再复用 JWT 签名密钥，恒定时间比较）。**未配置该密钥时端点一律 403**——要启用请先设一个随机长串。调用成功会清配置缓存**并**重载模型注册表（改 `config_model.toml` 后免重启生效）。
 
 ---
 

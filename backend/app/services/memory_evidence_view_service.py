@@ -20,7 +20,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,33 @@ _KEY_NOISE_RE = re.compile(
     r"[\d\s:：.．,，;；!！?？、/\\\-—~～()\[\]（）「」『』“”\"']+"
     r"|[不别禁停止改换更新调整要在从把被了的都也还就]"
 )
+
+
+def _parse_iso_dt(value) -> "datetime | None":
+    """P0-08/D3：ISO 解析（datetime/date 对象直取；字符串 fromisoformat；
+    解析失败返回 None = 调用方保守处理）。"""
+    if isinstance(value, datetime):
+        return value
+    try:
+        if hasattr(value, "isoformat") and not isinstance(value, str):
+            import datetime as _d
+            if isinstance(value, _d.date):
+                return datetime(value.year, value.month, value.day)
+    except Exception:
+        return None
+    s = str(value or "").strip().replace("Z", "+00:00")
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s[:len(fmt) + 4].strip(), fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _conflict_group_key(fact: str) -> str:
@@ -57,13 +84,22 @@ def build_evidence_units(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any
         if validity == "valid":
             if c.get("superseded") or c.get("superseded_by"):
                 validity = "superseded"
+            elif c.get("verification_state") == "contradicted":
+                # B9/J2：与原始 transcript 冲突的笔记按 stale 参与裁决，
+                # 不得被当成 valid 注入/加权。
+                validity = "stale"
             elif c.get("valid_to"):
-                # 只有已过期才标 expired（valid_to 在未来 = 仍有效）
+                # 只有已过期才标 expired（valid_to 在未来 = 仍有效）。
+                # P0-08/D3（2026-11-08）：解析成 datetime 比较——旧 `[:10]` 字符串前缀
+                # 比较把 '0abc' 这类垃圾串按字典序误判 expired；解析失败保守按 valid。
                 vt = c.get("valid_to")
-                vt_s = vt.isoformat() if hasattr(vt, "isoformat") else str(vt)
-                now_s = datetime.utcnow().isoformat()
-                if vt_s[:10] < now_s[:10]:
-                    validity = "expired"
+                vt_dt = _parse_iso_dt(vt)
+                if vt_dt is not None:
+                    now_dt = datetime.now(timezone.utc)
+                    if vt_dt.tzinfo is None:
+                        vt_dt = vt_dt.replace(tzinfo=timezone.utc)
+                    if vt_dt < now_dt:
+                        validity = "expired"
         units.append({
             "unit_id": str(c.get("id") or c.get("unit_id") or ""),
             "fact": fact,

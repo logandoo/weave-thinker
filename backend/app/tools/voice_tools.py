@@ -51,6 +51,11 @@ async def asr_transcribe(args: dict, **kwargs) -> str:
     workspace_path = kwargs.get("workspace_path") or ""
     if not workspace_path:
         return _err("无工作区上下文，无法解析音频路径")
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='read')
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
     # W19 P1 混合：设备会话下字节由路由层经设备代理取回注入——不依赖本地盘
     override = kwargs.get("file_bytes_override")
     if isinstance(override, (bytes, bytearray)):
@@ -115,6 +120,11 @@ async def tts_synthesize(args: dict, **kwargs) -> str:
     workspace_path = kwargs.get("workspace_path") or ""
     if not workspace_path:
         return _err("无工作区上下文，无法写入音频文件")
+    from app.services.workspace_scope_service import apply_scope_or_error
+    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='write')
+    if _scope_err:
+        return json.dumps(_scope_err, ensure_ascii=False)
+
     svc = _get_tts_service()
     if not svc.is_configured():
         return _err(

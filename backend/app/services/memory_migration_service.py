@@ -459,26 +459,14 @@ async def _migrate_file_memories(db: AsyncSession, user_id: str, progress: dict)
 
 
 async def _migrate_dream(db: AsyncSession, user_id: str, state: dict, progress: dict) -> None:
-    if not state.get("id"):
-        progress["steps"]["dream"] = {"status": "skipped", "at": datetime.utcnow().isoformat()}
-        return
-    existing = await db.execute(
-        text("SELECT COUNT(*) FROM agent_dreams WHERE agent_state_id = :sid AND dream_type = 'legacy'"),
-        {"sid": state["id"]},
-    )
-    if existing.scalar():
-        progress["steps"]["dream"] = {"status": "done", "at": datetime.utcnow().isoformat()}
-        return
-    dream_summary = state.get("dream_summary")
-    if not dream_summary:
-        progress["steps"]["dream"] = {"status": "skipped", "at": datetime.utcnow().isoformat()}
-        return
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    await db.execute(
-        text("INSERT INTO agent_dreams (id, agent_state_id, generated_for_date, summary, source_note_count, source_message_count, created_at, dream_type) VALUES (:id, :sid, :dt, :sum, 0, 0, :created, 'legacy')"),
-        {"id": str(uuid.uuid4()), "sid": state["id"], "dt": today, "sum": dream_summary[:4000], "created": datetime.utcnow()},
-    )
-    progress["steps"]["dream"] = {"status": "done", "at": datetime.utcnow().isoformat()}
+    """D5（2026-11-08）：v1 dream_summary → `agent_dreams(dream_type='legacy')`
+    的迁移已废弃（dreaming 收敛后 legacy 行只写不读）。步骤保留为 no-op，
+    迁移进度 schema 不变；旧行保留可审计。"""
+    progress["steps"]["dream"] = {
+        "status": "deprecated",
+        "at": datetime.utcnow().isoformat(),
+        "reason": "legacy dream write retired (D5)",
+    }
 
 
 async def _init_watermarks(db: AsyncSession, user_id: str, state: dict, progress: dict) -> None:

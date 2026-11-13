@@ -6,11 +6,12 @@
     <section class="device-exec-section">
       <h3 class="device-exec-title">最近远端执行</h3>
       <div v-if="items.length" class="exec-audit-list">
-        <div v-for="item in items" :key="item.id" class="exec-audit-row">
+        <div v-for="item in pagedItems" :key="item.id" class="exec-audit-row">
           <span class="exec-online-dot" :class="{ online: item.ok }"></span>
           <span class="exec-audit-tool">{{ item.tool }}</span>
           <span class="exec-audit-meta">{{ item.ok ? `${item.duration_ms}ms` : (item.error || '失败') }}</span>
         </div>
+        <PaginationBar v-model:page="currentPage" :total-pages="totalPages" />
       </div>
       <div v-else class="exec-audit-empty">暂无远端执行记录——在客户端设备上执行工具后在此显示</div>
     </section>
@@ -18,16 +19,30 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { clientDevicesApi, type ClientExecAuditItem } from '@/api/clientDevices'
+import PaginationBar from './PaginationBar.vue'
 
 defineProps<{ embedded?: boolean }>()
 
+const PAGE_SIZE = 10
 const items = ref<ClientExecAuditItem[]>([])
+const currentPage = ref(1)
+
+const totalPages = computed(() => Math.max(1, Math.ceil(items.value.length / PAGE_SIZE)))
+const pagedItems = computed(() => {
+  const start = (currentPage.value - 1) * PAGE_SIZE
+  return items.value.slice(start, start + PAGE_SIZE)
+})
+
+watch(totalPages, (pages) => {
+  if (currentPage.value > pages) currentPage.value = pages
+})
 
 onMounted(async () => {
   try {
-    items.value = await clientDevicesApi.listExecutions(20)
+    // 审计端点单次最多 100 条；客户端分页保证条目不再一次性平铺。
+    items.value = await clientDevicesApi.listExecutions(100)
   } catch {
     items.value = []
   }

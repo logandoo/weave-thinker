@@ -68,6 +68,9 @@ async def device_exec_ws(
             "algorithm": "HMAC-SHA256",
             "pairing_secret": session.pairing_secret,  # vw-approved: protocol field; random value, no literal credential
             "canonical_args": "JSON(sort_keys, separators=(',', ':'), ensure_ascii, allow_nan=false)",
+            # 2026-11-12：云端认定的设备身份（设备侧用它验签，避免本地绑定滞后
+            # 导致 grant 恒失败且不可诊断）。
+            "device_id": session.device_id,
         },
     })
     try:

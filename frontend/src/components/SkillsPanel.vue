@@ -71,7 +71,7 @@
 
       <div v-else class="skills-list">
         <div
-          v-for="skill in skills"
+          v-for="skill in pagedSkills"
           :key="skill.id"
           class="skill-item"
           :class="{ inactive: !skill.is_active, 'system-skill': skill.source === 'system' }"
@@ -125,6 +125,7 @@
             </template>
           </div>
         </div>
+        <PaginationBar v-model:page="currentPage" :total-pages="totalPages" />
       </div>
     </div>
 
@@ -248,10 +249,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { skillsApi } from '@/api/skills'
 import type { ScanZipResult } from '@/api/skills'
 import type { Skill, SkillFormData } from '@/types'
+import PaginationBar from './PaginationBar.vue'
 
 const props = defineProps<{
   embedded?: boolean
@@ -262,7 +264,9 @@ const emit = defineEmits<{
   (e: 'updated'): void
 }>()
 
+const PAGE_SIZE = 10
 const skills = ref<Skill[]>([])
+const currentPage = ref(1)
 const loading = ref(false)
 const saving = ref(false)
 const uploading = ref(false)
@@ -283,6 +287,16 @@ const form = ref<SkillFormData>({
   name: '',
   description: '',
   content: '',
+})
+
+const totalPages = computed(() => Math.max(1, Math.ceil(skills.value.length / PAGE_SIZE)))
+const pagedSkills = computed(() => {
+  const start = (currentPage.value - 1) * PAGE_SIZE
+  return skills.value.slice(start, start + PAGE_SIZE)
+})
+
+watch(totalPages, (pages) => {
+  if (currentPage.value > pages) currentPage.value = pages
 })
 
 watch(() => props.embedded, () => {
@@ -650,8 +664,6 @@ function close() {
   gap: 8px;
   width: 100%;
   max-width: 480px;
-  max-height: 300px;
-  overflow-y: auto;
   border: 1px solid var(--panel-border);
   border-radius: 8px;
   padding: 8px;

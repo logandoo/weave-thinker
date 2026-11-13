@@ -46,9 +46,8 @@ from app.prompts.fragments import (
     TOOL_AVAILABILITY_NOTE,
 )
 from app.prompts.memory import (
-    MEMORY_ACTIVE_DREAMING_REHEARSE_PROMPT,
-    MEMORY_ACTIVE_DREAMING_SCENARIOS_PROMPT,
     MEMORY_DREAM_SYSTEM_PROMPT,
+    MEMORY_DREAM_VERIFY_PROMPT,
     MEMORY_SUMMARY_SYSTEM_PROMPT,
 )
 from app.prompts.registry import register
@@ -384,12 +383,11 @@ register(PromptSpec(
 ))
 
 register(PromptSpec(
-    id="memory.active_dreaming", version=VERSION, owner="memory",
-    sections=(_section("memory.active_dreaming.scenarios", MEMORY_ACTIVE_DREAMING_SCENARIOS_PROMPT),
-              _section("memory.active_dreaming.rehearse", MEMORY_ACTIVE_DREAMING_REHEARSE_PROMPT)),
+    id="memory.dream_verify", version=VERSION, owner="memory",
+    sections=(_section("memory.dream_verify", MEMORY_DREAM_VERIFY_PROMPT),),
     scope={"mode": "worker", "locale": "zh"},
     flags={"kind": "text"},
-    used_by=("app/services/memory_dreaming_service.py",),
+    used_by=("app/services/memory_dream_verify_service.py",),
 ))
 
 register(PromptSpec(
@@ -461,7 +459,7 @@ SITE_PROMPT_BY_FILE: Dict[str, str] = {
     "app/services/memory_backfill_service.py": "memory.backfill",
     "app/services/memory_clarification_service.py": "memory.clarification",
     "app/services/memory_consolidation_service.py": "memory.consolidation",
-    "app/services/memory_dreaming_service.py": "memory.active_dreaming",
+    "app/services/memory_dream_verify_service.py": "memory.dream_verify",
     "app/services/memory_listwise_verifier.py": "memory.listwise_verify",
     "app/services/memory_migration_service.py": "memory.migration",
     "app/services/memory_multimodal_service.py": "memory.multimodal",

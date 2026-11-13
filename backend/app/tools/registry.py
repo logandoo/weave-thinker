@@ -283,7 +283,25 @@ class ToolRegistry:
             deathmatch_active = getattr(permission_context, "deathmatch_active", False)
             user = getattr(permission_context, "user", None)
             auto_allowed = super_admin or deathmatch_active
-            if not auto_allowed and user is not None and entry.permission_key:
+            # 2026-11-12：调用点新鲜权限快照优先（进行中会话改设置立即生效）。
+            # None = 旧语义（回落 user.agent_permissions 请求期快照）。
+            # user is None 仍 fail-closed（快照不得让无用户上下文放行）。
+            fresh_perms = getattr(permission_context, "permissions", None)
+            if (
+                not auto_allowed
+                and fresh_perms is not None
+                and user is not None
+                and entry.permission_key
+            ):
+                from app.services.agent_permissions import DEFAULT_AGENT_PERMISSIONS
+
+                auto_allowed = bool(
+                    fresh_perms.get(
+                        entry.permission_key,
+                        DEFAULT_AGENT_PERMISSIONS.get(entry.permission_key, False),
+                    )
+                )
+            elif not auto_allowed and user is not None and entry.permission_key:
                 try:
                     from app.services.agent_permissions import is_permission_allowed
                     auto_allowed = is_permission_allowed(user, entry.permission_key)

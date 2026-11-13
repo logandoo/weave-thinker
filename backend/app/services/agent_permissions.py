@@ -30,6 +30,10 @@ class PermissionContext:
     deathmatch_active: bool = False
     user: Any = None
     callback: Optional[Callable] = None
+    # 2026-11-12：调用点新鲜读取的完整权限表（含默认值合并）。非 None 时
+    # registry 权限闸以它为准，而不是 user.agent_permissions（请求期快照，
+    # 进行中会话改设置后仍是旧值）。None = 旧语义（回落 user）。
+    permissions: Optional[Dict[str, bool]] = None
 
 DEFAULT_AGENT_PERMISSIONS = {
     "terminal_execution": False,
@@ -62,6 +66,16 @@ def parse_permissions(user: Any) -> Dict[str, bool]:
     if user is None:
         return perms
     raw = getattr(user, "agent_permissions", None) or {}
+    return parse_permissions_payload(raw, base=perms)
+
+
+def parse_permissions_payload(raw: Any, base: Optional[Dict[str, bool]] = None) -> Dict[str, bool]:
+    """把 users.agent_permissions 的原始值（JSON 串 / dict / None）解析成完整权限表。
+
+    2026-11-12：`fresh_permissions` 与设备 RPC 的 `permissions` 快照共用同一解析，
+    避免两处口径漂移（默认值合并 + 仅接受 bool 值）。
+    """
+    perms = dict(base) if base is not None else get_default_permissions()
     if isinstance(raw, str):
         try:
             stored = json.loads(raw)
@@ -77,8 +91,57 @@ def parse_permissions(user: Any) -> Dict[str, bool]:
     return perms
 
 
+async def fresh_permissions(db: Any, user: Any) -> Dict[str, bool]:
+    """从 DB **新鲜读取**用户权限（进行中会话改设置后立即生效）。
+
+    请求期加载的 `user` ORM 对象在整轮 stream 内不会刷新；若只读它，用户在
+    设置里改的开关要等下一轮请求才生效（2026-11-12 现场缺陷 #1）。这里用调用点
+    的 db 会话直接 SELECT 该列（不 refresh ORM 对象，避免跨 session 绑定冲突）。
+    读失败/无 db → 回落请求期快照（fail-safe，不改变既有语义）。
+    """
+    base = get_default_permissions()
+    try:
+        base = parse_permissions(user)
+    except Exception:
+        # detached/expired ORM 对象：属性访问即抛 DetachedInstanceError——
+        # 不得让权限读取把工具调用打死，回落默认值（A4.9 评审 Minor #6）。
+        logger.debug("parse_permissions failed; using defaults", exc_info=True)
+    if db is None or user is None:
+        return base
+    try:
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            return base
+        from sqlalchemy import select
+
+        from app.db.database import User
+
+        result = await db.execute(select(User.agent_permissions).where(User.id == user_id))
+        raw = result.scalar_one_or_none()
+        return parse_permissions_payload(raw, base=base)
+    except Exception:
+        logger.debug("fresh_permissions read failed; using request-time snapshot", exc_info=True)
+        return base
+
+
+
 def is_permission_allowed(user: Any, key: str) -> bool:
     return parse_permissions(user).get(key, DEFAULT_AGENT_PERMISSIONS.get(key, False))
+
+
+def permission_allowed_from(kwargs: Any, user: Any, key: str) -> bool:
+    """工具内部自检的权限判定（2026-11-12）。
+
+    优先使用调用点新鲜权限快照 `kwargs["permission_snapshot"]`（云端每次工具调用
+    新鲜读取 / 设备 RPC 随帧下发）；缺省回落 `user.agent_permissions`（旧语义）。
+    这样 process/git/workspace_snapshot 等**无 registry permission_key** 的工具
+    也能即时跟随设置变更（A4.9 评审 Important #2）。
+    """
+    snapshot = (kwargs or {}).get("permission_snapshot") if isinstance(kwargs, dict) else None
+    if isinstance(snapshot, dict):
+        return bool(snapshot.get(key, DEFAULT_AGENT_PERMISSIONS.get(key, False)))
+    return is_permission_allowed(user, key)
+
 
 
 def permission_description(key: str) -> str:

@@ -37,7 +37,7 @@ class User(Base):
     # 用户信息（2026-09-13）：昵称与头像（data URL，256×256 JPEG，服务端重编码）。
     nickname = Column(String(100), nullable=True)
     avatar_data = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     conversations = relationship("Conversation", back_populates="user", cascade="all, delete-orphan")
@@ -506,6 +506,20 @@ class MemoryConcept(Base):
     source_raw_ids = Column(Text, nullable=True)
     source_unit_ids = Column(Text, nullable=True)
     needs_review = Column(Boolean, nullable=False, default=False)
+    # 2026-11-08 dream verify（Anthropic dreaming 适配）：把笔记与原始
+    # transcript 对照后的状态写回；contradicted 不直接 valid_to，而是待核实。
+    verification_state = Column(String(16), nullable=True)  # confirmed|contradicted|insufficient
+    last_verified_at = Column(DateTime, nullable=True)
+    verification_evidence = Column(Text, nullable=True)
+    # 2026-11-08 validity reason（TODO A1）：merged|source_lost|retracted|forgotten|expired
+    invalid_reason = Column(String(20), nullable=True)
+    # C3/B4：概念 → 消息证据链（JSON message id 数组）+ 证据类型
+    source_message_ids = Column(Text, nullable=True)
+    source_kind = Column(String(20), nullable=True)  # message|note|mixed|profile|migration|unknown
+    # B6：judge 提出的修正草案；用户确认后才改写描述。
+    verification_correction = Column(Text, nullable=True)
+    # A6：validity 的同步权威时间戳（旧设备快照不得覆盖修复）。
+    validity_updated_at = Column(DateTime, nullable=True)
     metadata_json = Column(Text, nullable=True)
     last_recalled_at = Column(DateTime, nullable=True)
     valid_from = Column(DateTime, default=datetime.utcnow)
@@ -613,6 +627,13 @@ class MemoryEpisode(Base):
     merged_from = Column(String(36), nullable=True)
     last_recalled_at = Column(DateTime, nullable=True)
     source_type = Column(String(50), default="extracted")  # 'extracted' | 'migration'
+    # 2026-11-08 dream verify（B5/J10）：事件叙事也做 transcript 对照。
+    verification_state = Column(String(16), nullable=True)  # confirmed|contradicted|insufficient
+    last_verified_at = Column(DateTime, nullable=True)
+    verification_evidence = Column(Text, nullable=True)
+    verification_correction = Column(Text, nullable=True)
+    invalid_reason = Column(String(20), nullable=True)
+    validity_updated_at = Column(DateTime, nullable=True)
     # D1（2026-09-14）：RippleMem 式 P/L/T 线索（可空，JSON 数组字符串；存量行保持 NULL）
     participants = Column(String(1000), nullable=True)
     locations = Column(String(1000), nullable=True)
@@ -679,6 +700,240 @@ class UserWorkspace(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="workspace")
+
+
+# ---------------------------------------------------------------------------
+# 任务作用域身份层（2026-11-10 波 · docs/DESIGN_20261108_task_workspace_and_memory.md §4.2）
+#
+# 服务端权威新表，**不参与** Conversation/Message 的 LWW 同步，也不进入
+# memory_concepts / memory_episodes / subconscious_log / MEMORY_SYNC_ENTITIES。
+# 全部新列 additive/nullable（除主键与身份必需字段），旧会话无行即 legacy。
+# 目录 root 只存用户根相对路径（绝对路径会随部署漂移）。
+# ---------------------------------------------------------------------------
+
+class WorkspaceProject(Base):
+    """用户可识别的长期项目：项目共享域 + 项目记忆的容器（不是任务边界）。"""
+
+    __tablename__ = "workspace_projects"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(200), nullable=True)
+    root_rel = Column(String(500), nullable=False)
+    status = Column(String(16), nullable=True, default="active")  # active | archived
+    storage_authority = Column(String(64), nullable=True, default="cloud")  # cloud | device:<id>
+    # 系统记忆 ingestion 策略，Task 的继承源：normal | user_facts | exclude
+    system_memory_ingest = Column(String(16), nullable=True, default="user_facts")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_active_at = Column(DateTime, nullable=True, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "root_rel", name="uq_workspace_projects_user_root"),
+    )
+
+
+class WorkspaceTask(Base):
+    """一个可延续的用户目标/工作上下文：**默认文件与任务记忆边界**。"""
+
+    __tablename__ = "workspace_tasks"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String(36), ForeignKey("workspace_projects.id", ondelete="CASCADE"), nullable=True)
+    title = Column(String(300), nullable=True)
+    goal = Column(Text, nullable=True)
+    root_rel = Column(String(500), nullable=False)
+    status = Column(String(16), nullable=True, default="active")  # active | completed | archived
+    summary = Column(Text, nullable=True)
+    tags_json = Column(Text, nullable=True)
+    artifact_manifest_json = Column(Text, nullable=True)
+    storage_authority = Column(String(64), nullable=True, default="cloud")
+    system_memory_ingest = Column(String(16), nullable=True, default="user_facts")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_active_at = Column(DateTime, nullable=True, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "root_rel", name="uq_workspace_tasks_user_root"),
+    )
+
+
+class WorkspaceBinding(Base):
+    """Conversation → Task 的当前绑定（服务端权威；改绑递增 version）。"""
+
+    __tablename__ = "workspace_bindings"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, unique=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(String(36), ForeignKey("workspace_tasks.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String(36), nullable=True)
+    binding_version = Column(Integer, nullable=False, default=1)
+    # 绑定时的 ingestion 策略快照（后续改绑不追溯改写历史消息）
+    system_memory_ingest = Column(String(16), nullable=True)
+    bound_by = Column(String(32), nullable=True)  # user | system | router
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkspaceBindingEvent(Base):
+    """追加式改绑/策略历史（永不修改历史消息的来源含义）。"""
+
+    __tablename__ = "workspace_binding_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    conversation_id = Column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    from_task_id = Column(String(36), nullable=True)
+    to_task_id = Column(String(36), nullable=True)
+    from_version = Column(Integer, nullable=True)
+    to_version = Column(Integer, nullable=True)
+    run_id = Column(String(36), nullable=True)
+    actor = Column(String(32), nullable=True)
+    reason = Column(Text, nullable=True)
+    system_memory_ingest = Column(String(16), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WorkspaceExecutionBinding(Base):
+    """AgentTask / ScheduledTask / durable job / voice run → WorkspaceTask 的关联。
+
+    (owner_kind, owner_id, run_id) 唯一：recurring 任务的每次 run 各自成行，不覆盖旧关联。
+    """
+
+    __tablename__ = "workspace_execution_bindings"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_kind = Column(String(32), nullable=False)  # agent_task | scheduled_task | durable_job | voice
+    owner_id = Column(String(64), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(String(36), ForeignKey("workspace_tasks.id", ondelete="CASCADE"), nullable=False)
+    run_id = Column(String(36), nullable=True)
+    binding_version = Column(Integer, nullable=True)
+    bound_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("owner_kind", "owner_id", "run_id", name="uq_workspace_exec_binding"),
+    )
+
+
+class WorkspaceRun(Base):
+    """一次执行（可恢复、可审计）。run_spec_json 不含会变化的 attempt 字段。"""
+
+    __tablename__ = "workspace_runs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id = Column(String(36), ForeignKey("workspace_tasks.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String(36), nullable=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    conversation_id = Column(String(36), nullable=True)
+    binding_version = Column(Integer, nullable=False, default=1)
+    run_spec_json = Column(Text, nullable=True)
+    status = Column(String(24), nullable=True, default="running")  # running|waiting_*|completed|parked|failed|cancelled
+    current_attempt_id = Column(String(36), nullable=True)
+    lease_epoch = Column(Integer, nullable=True, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class WorkspaceAttempt(Base):
+    """一次执行的重试/接管。lease_epoch 单调，存储写入拒绝旧 epoch。"""
+
+    __tablename__ = "workspace_attempts"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id = Column(String(36), ForeignKey("workspace_runs.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    lease_epoch = Column(Integer, nullable=False, default=1)
+    status = Column(String(24), nullable=True, default="active")  # active|sealed|superseded
+    frozen_context_json = Column(Text, nullable=True)
+    attempt_root = Column(String(500), nullable=True)
+    artifact_root = Column(String(500), nullable=True)
+    state_root = Column(String(500), nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    ended_at = Column(DateTime, nullable=True)
+
+
+class WorkspaceMessageContext(Base):
+    """逐消息作用域快照：改绑前的消息/附件/当时的策略均可追溯。"""
+
+    __tablename__ = "workspace_message_contexts"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    message_id = Column(String(36), nullable=False, unique=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(String(36), nullable=False)
+    run_id = Column(String(36), nullable=True)
+    attempt_id = Column(String(36), nullable=True)
+    binding_version = Column(Integer, nullable=False)
+    system_memory_ingest = Column(String(16), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WorkspaceArtifactRef(Base):
+    """跨域导入、任务关联笔记与交付的来源记录。"""
+
+    __tablename__ = "workspace_artifact_refs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    artifact_type = Column(String(16), nullable=True)  # file | note | upload | delivery
+    artifact_id = Column(String(64), nullable=True)
+    rel_path = Column(String(500), nullable=True)
+    owner_task_id = Column(String(36), nullable=True)
+    owner_run_id = Column(String(36), nullable=True)
+    owner_attempt_id = Column(String(36), nullable=True)
+    source_task_id = Column(String(36), nullable=True)
+    source_run_id = Column(String(36), nullable=True)
+    source_attempt_id = Column(String(36), nullable=True)
+    content_hash = Column(String(64), nullable=True)
+    origin = Column(String(32), nullable=True)  # agent | user | untrusted_external
+    taint = Column(String(16), nullable=True)   # trusted | agent | untrusted
+    system_memory_ingest = Column(String(16), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class WorkspaceCrossScopeGrant(Base):
+    """跨 Task/Project/legacy/MCP 的 capability grant（claims 服务端权威，agent 只能引用 id）。"""
+
+    __tablename__ = "workspace_cross_scope_grants"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    current_task_id = Column(String(36), nullable=False)
+    source_project_id = Column(String(36), nullable=True)
+    source_task_id = Column(String(36), nullable=True)
+    kind = Column(String(16), nullable=True)  # files | memory | session | legacy | catalog | mcp
+    mode = Column(String(8), nullable=True)   # read
+    claims_json = Column(Text, nullable=False)
+    claims_hash = Column(String(64), nullable=False)
+    issuer = Column(String(32), nullable=True)  # user | ui
+    status = Column(String(16), nullable=True, default="active")  # active|revoked|expired
+    run_id = Column(String(36), nullable=True)
+    attempt_id = Column(String(36), nullable=True)
+    lease_epoch = Column(Integer, nullable=True)
+    binding_version = Column(Integer, nullable=True)
+    not_after = Column(DateTime, nullable=True)
+    audit_count = Column(Integer, nullable=True, default=0)
+    last_audit_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    revoked_at = Column(DateTime, nullable=True)
+
+
+class WorkspaceStagingLease(Base):
+    """首条消息前附件的有界 pre-run 写入许可（设计 §10 首条消息前附件）。"""
+
+    __tablename__ = "workspace_staging_leases"
+
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(String(36), nullable=False)
+    binding_version = Column(Integer, nullable=True)
+    path = Column(String(500), nullable=True)
+    status = Column(String(16), nullable=True, default="open")  # open|committed|expired|orphaned|swept|missing
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class UserAsrHotword(Base):
@@ -1395,6 +1650,43 @@ class StepCheckpoint(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class MemoryPage(Base):
+    """C4（2026-11-08）：实体页/短 wiki 表示层；由夜间 dreaming 维护。
+
+    entity_key 是归一化键；aliases/concept_ids/links 为 JSON 文本（与现有
+    记忆层一致，不引入 JSONB 迁移负担）。页面只是索引+指针，注入层只放
+    title/summary 的前 N 字符。
+    """
+
+    __tablename__ = "memory_pages"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    entity_key = Column(String(120), nullable=False)
+    title = Column(String(255), nullable=False)
+    aliases = Column(Text, nullable=True)
+    summary = Column(Text, nullable=True)
+    concept_ids = Column(Text, nullable=True)
+    importance = Column(Float, nullable=False, default=0.0)
+    last_built_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MemoryPageLink(Base):
+    """C4：实体页之间的关系边（来自 concept_relations 的页级投影）。"""
+
+    __tablename__ = "memory_page_links"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), nullable=False)
+    source_page_id = Column(String(36), nullable=False)
+    target_page_id = Column(String(36), nullable=False)
+    relation_type = Column(String(50), nullable=False, default="related")
+    weight = Column(Float, nullable=False, default=0.5)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class MemoryEvalRun(Base):
     """W0-2（记忆/长程 v2，2026-10-23）：离线评测结果落库（测试/影子库口径，
     不进生产判定；确定性 gold 为主，judge 只辅助——REFLECT <55%）。"""
@@ -1405,6 +1697,7 @@ class MemoryEvalRun(Base):
     run_id = Column(String(64), nullable=False)
     suite = Column(String(64), nullable=False)
     arm = Column(String(64), nullable=False)
+    user_id = Column(String(36), nullable=True)
     metrics_json = Column(JSONB, nullable=False, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow)
 

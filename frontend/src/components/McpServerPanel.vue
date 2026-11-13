@@ -4,13 +4,7 @@
 <template>
   <div class="mcp-panel">
     <div class="mcp-head">
-      <div>
-        <h3 class="mcp-title">MCP 服务器</h3>
-        <p class="mcp-hint">
-          这里的 MCP 只属于你的账号；保存后立即在当前服务生效，下一轮即可调用，无需重启。
-          HTTP 支持 Streamable HTTP；stdio 会在服务端启动独立子进程。
-        </p>
-      </div>
+      <h3 class="mcp-title">MCP 服务器</h3>
       <button class="mcp-primary" :disabled="loading || saving" @click="startAdd">
         + 添加 MCP
       </button>
@@ -72,7 +66,7 @@
     </div>
 
     <div v-else class="mcp-list">
-      <div v-for="server in servers" :key="server.id" class="mcp-card">
+      <div v-for="server in pagedServers" :key="server.id" class="mcp-card">
         <div class="mcp-card-main">
           <div class="mcp-card-title">
             <span class="mcp-name">{{ server.name }}</span>
@@ -115,25 +109,39 @@
           >确认删除</button>
         </div>
       </div>
+      <PaginationBar v-model:page="currentPage" :total-pages="totalPages" />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { mcpApi, type McpServer, type McpServerPayload } from '@/api/mcp'
 import { useToast } from '@/composables/useToast'
+import PaginationBar from './PaginationBar.vue'
 
 defineProps<{ embedded?: boolean }>()
 
 const { show: showToast } = useToast()
+const PAGE_SIZE = 10
 const servers = ref<McpServer[]>([])
+const currentPage = ref(1)
 const loading = ref(false)
 const saving = ref(false)
 const error = ref('')
 const editing = ref(false)
 const editingId = ref<string | null>(null)
 const confirmingDeleteId = ref<string | null>(null)
+
+const totalPages = computed(() => Math.max(1, Math.ceil(servers.value.length / PAGE_SIZE)))
+const pagedServers = computed(() => {
+  const start = (currentPage.value - 1) * PAGE_SIZE
+  return servers.value.slice(start, start + PAGE_SIZE)
+})
+
+watch(totalPages, (pages) => {
+  if (currentPage.value > pages) currentPage.value = pages
+})
 
 const form = reactive({
   name: '',
@@ -300,12 +308,12 @@ onMounted(load)
 
 <style scoped>
 .mcp-panel { display: flex; flex-direction: column; gap: 14px; padding: 4px 2px; }
-.mcp-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.mcp-title { margin: 0 0 4px; font-size: 15px; color: var(--color-text); }
-.mcp-hint { margin: 0; font-size: 12px; line-height: 1.55; color: var(--color-text-light); max-width: 680px; }
+.mcp-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.mcp-title { margin: 0; font-size: 15px; color: var(--color-text); }
 .mcp-primary, .mcp-secondary {
   border: 1px solid var(--panel-border); border-radius: 8px; padding: 7px 12px;
   font-size: 12px; cursor: pointer; background: var(--surface-panel-strong); color: var(--color-text);
+  white-space: nowrap;
 }
 .mcp-primary { background: var(--color-primary); color: #fff; border-color: var(--color-primary); }
 .mcp-primary:disabled, .mcp-secondary:disabled { opacity: .55; cursor: default; }
@@ -338,4 +346,15 @@ onMounted(load)
 .mcp-link { border: none; background: none; padding: 2px; font-size: 12px; color: var(--color-primary); cursor: pointer; }
 .mcp-link:disabled { opacity: .5; cursor: default; }
 .mcp-link--danger { color: var(--color-error); }
+
+@media (max-width: 767px) {
+  .mcp-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .mcp-primary {
+    align-self: flex-start;
+  }
+}
 </style>

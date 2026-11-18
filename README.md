@@ -12,7 +12,7 @@
 
 <p align="center"><strong>记得住你 · 做得完事 · 句句有据</strong><br/>FastAPI · PostgreSQL · Vue 3 · 全双工语音 · 死磕模式 · [N] 引用台账 · 三层仿生记忆</p>
 
-<p align="center"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /> <img alt="Version" src="https://img.shields.io/badge/version-6.73-4c9f70.svg" /> <a href="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml/badge.svg" /></a></p>
+<p align="center"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /> <img alt="Version" src="https://img.shields.io/badge/version-6.74-4c9f70.svg" /> <a href="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/logandoo/weave-thinker/actions/workflows/ci.yml/badge.svg" /></a></p>
 
 </div>
 

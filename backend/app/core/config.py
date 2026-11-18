@@ -54,6 +54,20 @@ def _parse_security_bool(value, *, fail_closed: bool) -> tuple:
     return fail_closed, False
 
 
+def sanitize_deliverable_dir(raw) -> str:
+    """交付物目录名净化（`[workspace.deliverables] dir` 与发布策略共用一份）。
+
+    只接受 write_root 下的**单层**普通目录名：空值 / 多段 / `.` / `..` /
+    反斜杠 / 隐藏目录一律回落 `artifacts`。`workspace_artifact_service`
+    直接复用本函数，避免两套规则漂移（评审 M2）。
+    """
+    text = str(raw if raw is not None else "").strip().strip("/")
+    if (not text or "/" in text or "\\" in text
+            or text in (".", "..") or text.startswith(".")):
+        return "artifacts"
+    return text
+
+
 class Config:
     def __init__(self, config_path: str = None):
         if config_path is None:
@@ -1703,6 +1717,9 @@ class Config:
     # 现网零行为变化（旧会话与旧工具路径完全不变）；shadow 只比较记录不拦截；
     # enforce 仅对 supported_modes 内的新会话生效。逃生口 WT_WORKSPACE_SCOPING=off。
     _WORKSPACE_SCOPING_MODES = ("off", "shadow", "enforce")
+    # Piece 2 跨任务自由读灰度维度（与 mode 正交）：task=现状（读锁当前任务根）
+    # | user_root=本用户工作区内跨任务文件读免 grant。默认 task = 现网零变化。
+    _WORKSPACE_READ_ROOTS = ("task", "user_root")
 
     @property
     def workspace_task_scoping(self) -> dict:
@@ -1736,14 +1753,40 @@ class Config:
         return out or ["chat"]
 
     @property
+    def workspace_task_scoping_read_root(self) -> str:
+        """Piece 2 跨任务自由读灰度维度（与 mode 正交）。
+
+        ``task``（默认）= 现状：读只解析当前任务根，跨任务读需 grant；
+        ``user_root`` = 本用户工作区内 ``scope=task&task_id`` 的**文件读**免 grant
+        （仍保留 ownership + is_inside + storage_authority + 审计日志）。默认 task ⇒ 现网零变化。
+        注：``scope=legacy``（整个用户根）免 grant **未启用**——排除集无法防护递归工具遍历
+        memory 注入库，延后到工具侧遍历过滤硬化波（见 tests/decisions.md D-20261117-waveJ2-5）。
+        逃生口 ``WT_WORKSPACE_READ_ROOT=off`` → 强制 task。
+        """
+        raw = str(self.workspace_task_scoping.get("read_root", "task") or "task").strip().lower()
+        if raw not in self._WORKSPACE_READ_ROOTS:
+            logger.warning("未知的 [workspace.task_scoping] read_root=%r，按 task 处理", raw)
+            return "task"
+        if self._env_off("WT_WORKSPACE_READ_ROOT"):
+            return "task"
+        return raw
+
+    @property
     def workspace_inbox_project_name(self) -> str:
         """未显式选择项目的新会话落入的 inbox Project 名（不自动读取 legacy 根）。"""
-        return str(self.workspace_task_scoping.get("inbox_project_name", "收件箱") or "收件箱")
+        return str(self.workspace_task_scoping.get("inbox_project_name", "默认项目")
+                   or "默认项目")
 
     @property
     def workspace_task_recover_auto(self) -> bool:
         """既有 Task 的自动恢复（设计 §6.2 门槛更高）：未校准前保持关闭。"""
         return bool(self.workspace_task_scoping.get("recover_auto", False))
+
+    @property
+    def workspace_task_classify_new(self) -> bool:
+        """新会话归类建议（2026-11-14 v2，用户要求）：命中强候选任务时**询问**
+        用户是否归类（不静默绑定）；关闭则直接进默认项目。"""
+        return bool(self.workspace_task_scoping.get("classify_new_conversations", True))
 
     @property
     def workspace_task_default_ingest(self) -> str:
@@ -1756,6 +1799,39 @@ class Config:
     def workspace_staging_lease_seconds(self) -> int:
         """首条消息前上传的 pre-run staging lease 有效期（设计 §10 首条消息前附件）。"""
         return max(60, int(self.workspace_task_scoping.get("staging_lease_seconds", 86400)))
+
+    # `[workspace.deliverables]`（2026-11-15 波）：交付物目录约定。
+    # mode = "off"（零行为变化）| "shadow"（落点不变，只记录「不在交付物目录」）|
+    # "enforce"（workspace_publish 的**裸文件名**目标自动落到 dir/ 下）。
+    # 只影响新写入：历史文件与 DB 引用一律不动（本波不做迁移）。
+    # 逃生口：环境变量 WT_WORKSPACE_DELIVERABLES=off。
+    _WORKSPACE_DELIVERABLE_MODES = ("off", "shadow", "enforce")
+
+    @property
+    def workspace_deliverables(self) -> dict:
+        raw = self.workspace.get("deliverables", {})
+        return raw if isinstance(raw, dict) else {}
+
+    @property
+    def workspace_deliverable_dir(self) -> str:
+        """交付物目录名（write_root 下的单层目录）；非法值回落 artifacts。"""
+        raw = str(self.workspace_deliverables.get("dir", "artifacts") or "artifacts")
+        cleaned = sanitize_deliverable_dir(raw)
+        if cleaned != raw.strip().strip("/"):
+            logger.warning("非法的 [workspace.deliverables] dir=%r，按 artifacts 处理", raw)
+        return cleaned
+
+    @property
+    def workspace_deliverable_mode(self) -> str:
+        # 逃生口优先于一切（含非法值回落）：WT_WORKSPACE_DELIVERABLES=off 必须
+        # 无条件生效，否则「配置写错 + 想紧急关掉」会退到 shadow（评审 F4）。
+        if self._env_off("WT_WORKSPACE_DELIVERABLES"):
+            return "off"
+        raw = str(self.workspace_deliverables.get("mode", "shadow") or "shadow").strip().lower()
+        if raw not in self._WORKSPACE_DELIVERABLE_MODES:
+            logger.warning("未知的 [workspace.deliverables] mode=%r，按 shadow 处理", raw)
+            return "shadow"
+        return raw
 
     # 2026-09-19：Office 预览（/api/files/office-pdf，soffice 服务端转 PDF）。
     # enabled=false 或探测不到 soffice → 端点 501，前端自动回退客户端渲染器；
@@ -2611,6 +2687,19 @@ class Config:
         return bool(self.deathmatch.get("completion_memory_write_enabled", True))
 
     @property
+    def deathmatch_completion_memory_scope(self) -> str:
+        """收束摘要的写入域：`legacy`（文件 AGENT memory，默认）| `task`（attempt memory）。
+
+        2026-11-13 parity 波 WP4-I1：enforce+绑定时 attempt memory 只被
+        `<task>/memory` 注入读取，而 `curate_task` 在 app 内无调用方 → 摘要进黑洞
+        （用户会感到「死磕不记住上次任务」）。在 curator 接线前默认写回 legacy
+        文件记忆；显式设 `task` 才走 attempt 候选通道（需先确认 curator 已接线）。
+        """
+        value = str(self.deathmatch.get("completion_memory_scope", "legacy") or "legacy")
+        value = value.strip().lower()
+        return value if value in ("legacy", "task") else "legacy"
+
+    @property
     def deathmatch_stall_triage_enabled(self) -> bool:
         """停滞动作分诊（AEWM 2609.28416 Action Judge 启发）：停滞现场由 LLM
         把最近行动分诊为 critical/exploratory/noisy 并分流——noisy=状态修订
@@ -2945,6 +3034,31 @@ class Config:
         miss is not context rot — re-assert the marker directive and re-answer
         instead. 0 = legacy always-compress behavior."""
         return float(self.agent_canary.get("compress_min_ratio", 0.6))
+
+    @property
+    def agent_canary_max_reanswers_per_turn(self) -> int:
+        """2026-11-17 (conv cdd56a8e): bound on canary-triggered re-answers
+        within one run (`AgentLoopState` is minted per run, so a deathmatch
+        goal-loop shares the counter — the name says "turn" because one normal
+        chat turn == one run).
+
+        HONEST SCOPE (review r2 I2): the LOAD-BEARING fix is dropping
+        `_canary_retry` from `_run_loop`'s cross-iteration carry table. This
+        cap is defense-in-depth — it is checked INSIDE the canary branch, and
+        the historical runaway bypassed that branch entirely (the stale flag
+        re-raised the continue signal while `state.canary_compressed` kept the
+        body short-circuited). Measured: with the carry removed, the spin is
+        gone even at cap=10**6; with the sticky write-back restored, cap=1
+        does NOT stop it. So this knob only bites if some future path resets
+        `canary_compressed` — keep the carry-table rule as the real guard.
+
+        非法值（非整数/None）与 0/负数一律按 1 处理：本键是**下限**而非开关，
+        要彻底停用遵循词重答请用 `[agent.canary] enabled = false`。"""
+        try:
+            value = int(self.agent_canary.get("max_reanswers_per_turn", 1))
+        except (TypeError, ValueError):
+            return 1
+        return max(1, value)
 
     # ---- Citation ledger (引用台账) ----
 

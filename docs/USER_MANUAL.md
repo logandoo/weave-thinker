@@ -309,11 +309,38 @@ main = "main"
 - **文件按任务隔离**：会话绑定到「项目 / 任务」，助手的文件读写、终端、交付卡片只落在当前任务目录
   `projects/p_…/tasks/t_…/workspace/`，看不到用户根或其他任务的文件（同名诱饵也不会误命中）。
 - **徽标**：标题栏出现 `项目 · 任务` 徽标（`shadow` 档为虚线，表示只观测不拦截）；legacy 旧会话不显示、也不迁移。
+  未显式选择项目的新会话自动落入「**默认项目**」（旧版本名为「收件箱」，升级时会原地改名，不移动文件）。
 - **绑定面板**：点徽标可查看当前绑定与改绑历史，并可显式改绑（只影响后续消息归属，**不移动旧文件**）。
+  有进行中的任务时改绑会**自动停泊**它（其后续写入被安全封存）后再完成改绑，不再被「活跃 run」挡住。
+  死磕进行中改绑会换任务文件域并重置校验快照，面板会要求二次确认。
 - **上传附件**：会话内上传进入当前任务的 `inputs/`；首条消息前的附件先进入暂存区，任务激活时按内容哈希交接。
-- **跨任务读取需授权**：助手读其他任务/项目共享区必须由用户在服务端签发一次性 grant，返回的交付卡片会带「来自…」来源标记。
-- **灰度**：`mode = "shadow"` 只记录不拦截；`mode = "enforce"` 仅对 `supported_modes` 列出的链路（当前为 `chat`）强制，
-  未列入的链路（语音/死磕/后台/定时/设备等）会明确拒绝而不是回退共享根。逐链路放开矩阵见 `tests/workspace_scope_matrix_20261110.md`。
+- **跨任务读取需授权**：助手读其他任务/项目共享区必须由用户在服务端签发一次性 grant，返回的交付卡片会带「来自…」来源标记。（运维可在 `[workspace.task_scoping]` 设 `read_root = "user_root"` 放开**同一用户**跨任务的文件读取免逐次授权——仍限本人工作区、卡片仍带「来自…」来源；跨任务读结果记为低权限 untrusted，在 `[security].tma_mode = "enforce"` 下不得用于执行/写类操作（shadow 档仅记录）。默认 `task`，即维持上述需授权行为。整库/legacy 根免授权未开放。）
+- **执行域产物要发布**：`terminal` / `process` 的产物落在本轮执行域（attempt scratch），不会自动出现在任务文件域；
+  助手需调用 `workspace_publish` 把交付物发布到任务文件域，死磕校验器才看得见。要给用户下载卡片，
+  仍需助手显式调用 `provide_file` / `pdf_export`（publish 本身不生成卡片）。
+- **灰度**：`mode = "shadow"` 只记录不拦截；`mode = "enforce"` 仅对 `supported_modes` 列出的链路强制
+  （当前为 `chat` 与 `deathmatch`），未列入的链路（语音/后台/定时/设备等）会明确拒绝而不是回退共享根。
+  逐链路放开矩阵见 `tests/workspace_scope_matrix_20261110.md`。
+
+#### 回滚某条链路（运维）
+
+从 `supported_modes` 摘掉一条链（或把 `deathmatch` 摘回 `["chat"]`）**之前**，必须先清掉窗口期内被绑定的会话，
+否则它们每回合都会被能力门拒绝（`workspace_scope_mode_unsupported`）：
+
+```bash
+cd backend
+# 1) 预检：点名「按拟定白名单会变成死会话」的已绑定会话（只读；有候选时退出码 3）
+python -m scripts.check_scoping_rollback --supported-modes chat
+# 2) 先 dry-run，核对点名的行；确认后加 --execute
+python -m scripts.repair_device_scope_binding --chain deathmatch            # 或 --all-unbound-chains
+python -m scripts.repair_device_scope_binding --chain deathmatch --execute
+# 3) 再跑一次预检（应为空），然后才改配置并重启
+python -m scripts.check_scoping_rollback --supported-modes chat
+```
+
+修复脚本默认只碰 `bound_by='system'` 的自动绑定；删绑定前会把未终态 run 走状态机终态化、追加
+`workspace_binding_events`，并重置死磕的 `deathmatch_last_verification_result`（换根后不清快照会让
+下一轮误报「交付物消失」）。设计细节：`docs/PLAN_20261113_deathmatch_scoping_parity.md`。
 
 ---
 

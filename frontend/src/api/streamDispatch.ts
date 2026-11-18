@@ -75,6 +75,15 @@ export interface StreamMeta {
   conversation_id: string
   requested_conversation_id?: string
   reminted?: boolean
+  /** 2026-11-14 v2：新会话归类建议（非阻塞；UI 询问是否改绑到候选任务）。 */
+  workspace_suggestion?: {
+    task_id: string
+    project_id?: string
+    title?: string
+    score?: number
+    reason?: string
+    last_active_at?: string | null
+  }
 }
 
 /** Handler bundle for streamChat. Options-object form replaces the previous
@@ -90,6 +99,11 @@ export interface StreamHandlers {
     question: string
     candidates: Array<{ task_id: string; project_id?: string; title?: string; reason?: string;
                          last_active_at?: string | null }>
+  }) => void
+  /** 2026-11-14 v2：新会话归类建议（workspace_suggestion，非阻塞）。 */
+  onWorkspaceSuggestion?: (payload: {
+    task_id: string; project_id?: string; title?: string; score?: number; reason?: string;
+    last_active_at?: string | null; conversation_id?: string
   }) => void
   /** Raw HTTP status for transport-sensitive actions (e.g. stop acceptance). */
   onHttpStatus?: (status: number) => void
@@ -255,6 +269,14 @@ export function dispatchStreamPayload(data: any, h: StreamHandlers): boolean {
   // gate-blocked workspace write) is not a stream-fatal error — routing it
   // into the fatal branch coerced `true` to '未知错误', killed the SSE read,
   // and wiped the whole streaming bubble (2026-10-09). Exclude the shape here;
+  // 2026-11-14 v2：新会话归类建议（非阻塞）——不是错误帧，先于 error 分支处理。
+  // **必须返回 false**：true = 终止读取（done/error/busy/ambiguous 专用）；
+  // 返回 true 会在第 2 帧掐断 SSE，回答丢失（评审 r2 Critical）。
+  if (data.workspace_suggestion && h.onWorkspaceSuggestion) {
+    h.onWorkspaceSuggestion(data.workspace_suggestion)
+    return false
+  }
+
   // the router below delivers it to onToolResult.
   const isToolResult = data.call_id !== undefined && data.name !== undefined && 'result' in data
   if (data.error && !isToolResult) {

@@ -60,6 +60,7 @@ async def citation_render(args: dict, **kwargs) -> str:
         style_id = getattr(kwargs.get("assistant"), "citation_style", None) or None
 
     entries = _entries_from_turn_tool_results(kwargs.get("current_turn_tool_results", ""))
+    _src_meta = None  # 跨域读来源标记（仅 file_path 分支会解析；content-only 路径恒 None）
 
     try:
         if file_path:
@@ -79,10 +80,12 @@ async def citation_render(args: dict, **kwargs) -> str:
             try:
                 workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
                 workspace_root = str(Path(workspace.root_path).resolve())
-                from app.services.workspace_scope_service import apply_scope_or_error
+                from app.services.workspace_scope_service import apply_scope_or_error, resolve_scope_meta
                 workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
                 if _scope_err:
                     return json.dumps(_scope_err, ensure_ascii=False)
+                # Piece 2 J2d：跨域读要带来源标记（含 grant_id），供 taint 重判免 grant 跨任务读不携带 agent 权威
+                _src_meta = await resolve_scope_meta(kwargs, args=args, access="read")
 
                 try:
                     resolved = resolve_workspace_file(file_path, workspace_root)
@@ -102,31 +105,61 @@ async def citation_render(args: dict, **kwargs) -> str:
 
         rendered = await asyncio.to_thread(render_citations, raw, entries, style_id=style_id)
         if not rendered.bibliography_section:
-            return json.dumps({
+            _resp = {
                 "success": True,
                 "style_id": rendered.style_id,
                 "family": rendered.family,
                 "used_ids": rendered.used_ids,
                 "message": "正文无 [N] 引用标记，未生成参考文献节（未引用来源不会入表）",
                 "content": rendered.content if resolved is None else None,
-            }, ensure_ascii=False)
+            }
+            if _src_meta:
+                _resp["source_scope"] = _src_meta["scope"]
+                _resp["source_grant_id"] = _src_meta.get("grant_id")
+            return json.dumps(_resp, ensure_ascii=False)
 
         final_text = rendered.content + rendered.bibliography_section
+        wrote_back = False
         if resolved is not None:
-            await asyncio.to_thread(Path(resolved).write_text, final_text, "utf-8")
+            # §7.2 任务作用域内：read-scope 工具绝不得覆写别的任务的文件（user_root 免 grant 或
+            # grant 跨任务读时 resolved 可能指向别的任务根）。无 ctx 的链路（off/shadow/刻意 legacy-intent）
+            # 本就以**用户根**为写域——同回合 workspace_write 也能写该处，citation_render 不另造权限；
+            # 见 AGENTS.md「enforce 对未绑定会话不隔离用户根」既有裁定，不在此围栏内。
+            # ctx 在却缺 write_root = 异常态 → fail-closed 不写。
+            _ctx = kwargs.get("workspace_ctx")
+            if _ctx is None:
+                _foreign = False
+            elif not getattr(_ctx, "write_root", None):
+                _foreign = True
+            else:
+                try:
+                    Path(resolved).resolve().relative_to(Path(_ctx.write_root).resolve())
+                    _foreign = False
+                except (ValueError, OSError, RuntimeError):
+                    _foreign = True
+            if _foreign:
+                logger.info("citation_render: skipped cross-task write-back to %s (read scope)", resolved)
+            else:
+                await asyncio.to_thread(Path(resolved).write_text, final_text, "utf-8")
+                wrote_back = True
 
-        return json.dumps({
+        _resp = {
             "success": True,
             "style_id": rendered.style_id,
             "family": rendered.family,
             "used_ids": rendered.used_ids,
-            "file_path": resolved,
+            "file_path": str(resolved) if resolved is not None else None,
             "message": (
                 f"已按 {rendered.style_id} 渲染 {len(rendered.used_ids)} 条引用"
-                + (f"并覆写 {file_path}" if resolved else "")
+                + (f"并覆写 {file_path}" if wrote_back else
+                   ("（跨任务只读，未覆写，渲染结果见 content）" if resolved is not None else ""))
             ),
-            "content": final_text if resolved is None else None,
-        }, ensure_ascii=False)
+            "content": final_text if not wrote_back else None,
+        }
+        if _src_meta:
+            _resp["source_scope"] = _src_meta["scope"]
+            _resp["source_grant_id"] = _src_meta.get("grant_id")
+        return json.dumps(_resp, ensure_ascii=False)
     except Exception as exc:
         logger.exception("citation_render failed")
         return json.dumps({"error": f"citation_render failed: {exc}"}, ensure_ascii=False)

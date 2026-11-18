@@ -257,11 +257,41 @@ async def assert_write_epoch(db, ctx: ws.WorkspaceContext) -> None:
         raise ws.WorkspaceScopeError(ws.CODE_ATTEMPT_STALE, f"run is {run.status}", ctx.run_id)
     if run.conversation_id:
         binding = await tbs.get_binding(db, user_id=ctx.user_id, conversation_id=run.conversation_id)
-        if binding is not None and int(binding.binding_version) != int(ctx.binding_version):
+        if binding is not None and (
+                int(binding.binding_version) != int(ctx.binding_version)
+                # CF-3（③）：除 version 外也比对 task——堵住「run 仍活跃但绑定已换到别的任务、
+                # 而 version 恰好相等（窄竞态/脏行）」的等值校验盲区。
+                or str(binding.task_id) != str(ctx.task_id)):
             raise ws.WorkspaceScopeError(
                 ws.CODE_BINDING_STALE,
-                f"binding_version {ctx.binding_version} superseded by v{binding.binding_version}",
+                f"binding superseded (ctx task={ctx.task_id} v{ctx.binding_version}; "
+                f"live task={binding.task_id} v{binding.binding_version})",
                 ctx.run_id)
+    else:
+        # D-4（CE-3）：conversation_id=None 的执行链 run（委派/后台/调度）此前**无条件跳过**
+        # 绑定校验 = 没有任何可校验的作用域身份就放行写入。改为查 execution_binding：该 run 必须
+        # 有一条与 ctx 的 task+version 一致的绑定，否则 fail-closed。
+        # 诚实边界（评审 r1 Important-2）：execution_binding 行由 bind_execution 写一次、rebind
+        # 不改它，所以本围栏**捕获的是 ctx 与 run 身份不一致（伪造/串台/脏行）与缺绑定**，不是
+        # 会话改绑（会话改绑不作用于执行链）。它把「静默跳过」收紧为「必须可验证」，是逐链路放开
+        # enforce 前的防御底座；当前 enforce 配置下这些链不在 supported_modes、entry_guard 先于
+        # 建 run 拦截，故为死路径加固 + 直连测试。
+        eb = (await db.execute(
+            select(WorkspaceExecutionBinding)
+            .where(WorkspaceExecutionBinding.run_id == ctx.run_id,
+                   WorkspaceExecutionBinding.user_id == ctx.user_id)
+            .order_by(WorkspaceExecutionBinding.bound_at.desc()).limit(1))).scalar_one_or_none()
+        if eb is None:
+            raise ws.WorkspaceScopeError(
+                ws.CODE_BINDING_STALE,
+                "execution run has no verifiable scope binding", ctx.run_id)
+        if str(eb.task_id) != str(ctx.task_id) or (
+                eb.binding_version is not None
+                and int(eb.binding_version) != int(ctx.binding_version)):
+            raise ws.WorkspaceScopeError(
+                ws.CODE_BINDING_STALE,
+                f"execution scope mismatch (binding task={eb.task_id} v{eb.binding_version}, "
+                f"this ctx is task={ctx.task_id} v{ctx.binding_version})", ctx.run_id)
 
 
 async def finish_run(db, *, user_root: Path | str, run_id: str, status: str = "completed",
@@ -310,6 +340,10 @@ async def park_run(db, *, run_id: str) -> WorkspaceRun:
     run = await _lock_run(db, run_id)
     if run is None:
         raise ws.WorkspaceScopeError(ws.CODE_ATTEMPT_STALE, "run not found", run_id)
+    # 2026-11-16 Wave D（评审 I1）：已终态（completed/failed/cancelled）的 run 不得被回退成
+    # parked（parked 可被 new_attempt 复活 = 终态→非终态）。SELECT 与加锁之间被别处终态化时幂等跳过。
+    if run.status in SETTLED_RUN_STATUSES and run.status not in ("parked", "resumable"):
+        return run
     if run.current_attempt_id:
         attempt = await db.get(WorkspaceAttempt, run.current_attempt_id)
         if attempt is not None and attempt.status == "active":

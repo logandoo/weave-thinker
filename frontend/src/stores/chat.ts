@@ -1429,6 +1429,14 @@ export const useChatStore = defineStore('chat', () => {
         if (conv) conv.title = title
       }
       endStreaming(conversationId)
+      // issue3（2026-11-16 Wave D）：resume（切后台回来 / watchdog 重连 / busy-attach）收尾
+      // 同样可能刚自动建好任务并绑定；这里补上 done→loadBinding（与主 onDone 同一守卫，仅当前会话）。
+      {
+        const _wc = newConvId || conversationId
+        if (_wc === currentConversationId.value || conversationId === currentConversationId.value) {
+          void useWorkspaceScopeStore().loadBinding(_wc)
+        }
+      }
       // 需求 4②：resume 流的自然 done 同样必须冲刷队列。此前只有主发送流的
       // onDone 冲刷，resume（切后台回来 / watchdog 重连 / busy-attach）收尾时
       // 挂着的插话随 refresh 静默消失 —— 「回答完毕后插话被丢弃」的主要来源。
@@ -1905,6 +1913,18 @@ export const useChatStore = defineStore('chat', () => {
       console.error('Failed to create conversation:', e)
       throw e
     }
+  }
+
+  // 跨来源「在侧栏中定位并展开某会话」的请求信号（2026-11-16 Wave C）。
+  // 由任务管理中心「打开会话」等非侧栏入口触发：Sidebar 监听后调
+  // revealConversationInSidebar（展开所属分组 + 滚动到行）。nonce 递增
+  // 保证重复打开同一会话也能再次触发。普通侧栏点击不走这里（保持原 nearest 滚动）。
+  // zen 模式无 Sidebar：工作台抽屉在打开时按当前助手自行重载，故此处不发信号给抽屉。
+  const revealConversationRequest = ref<{ id: string; nonce: number } | null>(null)
+  function requestRevealConversation(id: string) {
+    if (!id) return
+    const nonce = (revealConversationRequest.value?.nonce ?? 0) + 1
+    revealConversationRequest.value = { id, nonce }
   }
 
   async function selectConversation(id: string) {
@@ -2435,6 +2455,9 @@ export const useChatStore = defineStore('chat', () => {
   ) {
     const s = getStream(conversationId)
     s.deathmatchIntentAtRun = deathmatchIntentAtRun
+    // 2026-11-14 v2：新一轮开始即撤下上一轮的归类建议（过期建议不得残留，
+    // 新建议由本轮 workspace_suggestion 事件重新投递）。
+    useWorkspaceScopeStore().clearSuggestion()
     const touch = () => { s._lastEventTime = Date.now(); s._gotFirstEvent = true }
     // Debounced reload of the notes store after the agent's notes tool mutates
     // notes/notebooks server-side, so sidebars & lists stay in sync.
@@ -2462,6 +2485,15 @@ export const useChatStore = defineStore('chat', () => {
         if (s.abortController !== connection) return
         void handleStreamMeta(meta, conversationId)
       },
+      // 2026-11-14 v2：新会话归类建议（非阻塞；作用域装配后单独事件下发）
+      onWorkspaceSuggestion: (payload: any) => {
+        touch()
+        if (s.abortController !== connection) return
+        // 服务端权威 conversation_id（remint 后与流发起时的客户端 id 不同）+
+        // 客户端 id 双键：建议必须能被当前会话任一身份命中。
+        useWorkspaceScopeStore().setSuggestion(
+          String(payload?.conversation_id || conversationId), payload, conversationId)
+      },
       onMessage: (chunk: string) => {
         touch()
         s.content += chunk
@@ -2485,6 +2517,15 @@ export const useChatStore = defineStore('chat', () => {
         if (s.abortController !== connection) return
         onFinalize(messageId, title, toolResults, searchFailed, taskSubmitted)
         endStreaming(conversationId)
+        // issue3（2026-11-16 Wave D）：首条消息常在流终态才自动建任务并绑定，而 chip 只
+        // watch currentConversationId → 不重载就永远不显示新任务、项目管理面板也不刷新。
+        // done 后按服务端权威 id 重载绑定。**仅当这是当前正在看的会话**才写全局快照——
+        // 否则后台会话收尾会把别的会话的绑定盖进 snapshot（评审 r2 Critical）。后台会话切回时
+        // 由 chip 的 currentConversationId watcher 负责重载。
+        const _wc = newConvId || conversationId
+        if (_wc === currentConversationId.value || conversationId === currentConversationId.value) {
+          void useWorkspaceScopeStore().loadBinding(_wc)
+        }
         if (title) {
           const conv = conversations.value.find(c => c.id === newConvId)
           if (conv) conv.title = title
@@ -4392,6 +4433,8 @@ export const useChatStore = defineStore('chat', () => {
     reconcileExecutionTarget,
     applyDefaultExecutionTargetToConversation,
     selectConversation,
+    revealConversationRequest,
+    requestRevealConversation,
     ensureMessageFull,
     ensureFullPayloads,
     loadOlderMessages,

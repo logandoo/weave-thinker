@@ -45,6 +45,11 @@ export function historyLine(
   entry: BindingHistoryEntry,
   titleOf: (taskId: string | null) => string,
 ): string {
+  // 内部事件：换绑定后的快照重置是实现细节，不让 `dm_snapshot_reset` 这种
+  // 内部 token 出现在用户面的绑定历史里。
+  if (entry.reason === 'dm_snapshot_reset') {
+    return '系统：任务切换后已重置死磕校验快照'
+  }
   const from = entry.from_task_id ? titleOf(entry.from_task_id) : '（首绑）'
   const to = titleOf(entry.to_task_id)
   const reason = entry.reason ? `：${entry.reason}` : ''

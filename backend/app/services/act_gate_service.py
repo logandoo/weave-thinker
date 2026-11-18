@@ -34,6 +34,13 @@ ACT_TOOLS = frozenset({
     "pdf_export",
     "workspace_write",
     "workspace_edit",
+    # 2026-11-13 parity 波：publish 是稳定域写路径（terminal scratch → task workspace），
+    # 不登记会完全绕过 untrusted 动作门。
+    "workspace_publish",
+    # 2026-11-14 v2：会话改绑是持久状态变更（agent 按用户显式指令执行），必须过动作门。
+    "workspace_bind_task",
+    # 2026-11-15 任务管理中心：项目/任务编辑与笔记绑定是持久状态变更，必须过动作门。
+    "workspace_project_manage", "workspace_task_manage", "workspace_note_bind",
     "git",
     "schedule",
     "background_task",

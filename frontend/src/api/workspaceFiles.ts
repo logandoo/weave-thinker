@@ -32,32 +32,59 @@ function tokenParam(): string {
   return token ? `&token=${encodeURIComponent(token)}` : ''
 }
 
-export function buildDownloadUrl(target: string, deviceId?: string | null): string {
+/** 会话作用域（2026-11-15）：带上会话 id，服务端才能在用户根解析失败时
+ *  回落到该会话绑定 Task 的 `workspace/` 根（`/api/files/*` 的 Task 兜底）。 */
+function conversationParam(conversationId?: string | null): string {
+  return conversationId ? `&conversation_id=${encodeURIComponent(conversationId)}` : ''
+}
+
+export function buildDownloadUrl(
+  target: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   // W18 G3/G4：设备上下文 → 设备文件代理（仅 workspace 相对路径）；
   // 绝对路径/无设备上下文 → 云端下载（原语义）。纯派生在 utils/deviceUrls（单测缝）。
-  return resolveDownloadUrl(target, deviceId, localStorage.getItem('chatllm_token'))
+  return resolveDownloadUrl(
+    target,
+    deviceId,
+    localStorage.getItem('chatllm_token'),
+    conversationId,
+  )
 }
 
 // W19 P1：设备上下文 → 设备端 zip/office 转换代理（fs/zip · fs/office-* RPC）
-export function buildZipUrl(relPath: string, deviceId?: string | null): string {
+export function buildZipUrl(
+  relPath: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   if (deviceId) {
     return `/api/devices/${encodeURIComponent(deviceId)}/fs/zip?path=${encodeURIComponent(relPath)}${tokenParam()}`
   }
-  return `/api/files/zip?path=${encodeURIComponent(relPath)}${tokenParam()}`
+  return `/api/files/zip?path=${encodeURIComponent(relPath)}${tokenParam()}${conversationParam(conversationId)}`
 }
 
-export function buildOfficePdfUrl(relPath: string, deviceId?: string | null): string {
+export function buildOfficePdfUrl(
+  relPath: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   if (deviceId) {
     return `/api/devices/${encodeURIComponent(deviceId)}/fs/office-pdf?path=${encodeURIComponent(relPath)}${tokenParam()}`
   }
-  return `/api/files/office-pdf?path=${encodeURIComponent(relPath)}${tokenParam()}`
+  return `/api/files/office-pdf?path=${encodeURIComponent(relPath)}${tokenParam()}${conversationParam(conversationId)}`
 }
 
-export function buildOfficeHtmlUrl(relPath: string, deviceId?: string | null): string {
+export function buildOfficeHtmlUrl(
+  relPath: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   if (deviceId) {
     return `/api/devices/${encodeURIComponent(deviceId)}/fs/office-html?path=${encodeURIComponent(relPath)}${tokenParam()}`
   }
-  return `/api/files/office-html?path=${encodeURIComponent(relPath)}${tokenParam()}`
+  return `/api/files/office-html?path=${encodeURIComponent(relPath)}${tokenParam()}${conversationParam(conversationId)}`
 }
 
 export async function fetchDirectory(

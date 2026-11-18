@@ -314,6 +314,14 @@ def complete_compact_delivery(root: Path, conversation_id: str = "") -> str:
     bundle = compact_state_bundle(root)
     vibeweaver_state.record_memory_delivery(root, "compactContext")
     mark_pending_resume(root, conversation_id)
+    # 携带 COMPLETION-NOT-READY 注记的工具结果已随压缩离开上下文：清该会话的完成债
+    # latch，否则同一批 debt 在新窗口里被哈希抑制、再也不重现（gate.js 同款）。
+    try:
+        from app.services import vibeweaver_gate_service as _gate
+
+        _gate.clear_completion_latch_for_session(conversation_id)
+    except Exception:
+        pass  # 投递层不越权：清 latch 失败只记日志，绝不影响压缩收尾
     return bundle
 
 

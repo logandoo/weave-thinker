@@ -159,6 +159,93 @@ def _not_found() -> HTTPException:
     return HTTPException(status_code=404, detail="File not found in workspace")
 
 
+# --- 会话作用域解析（2026-11-15 波 · A 方案）--------------------------------
+# 背景：Task 作用域 enforce 下，agent 写出的相对路径（`artifacts/x.png`、
+# `inputs/y.jpg`）相对的是**任务文件域根**，而本模块所有端点按**用户根**解析
+# ⇒ 用户面上引用 Task 内文件的图片/媒体/链接一律 404（60 生产 2026-11-15）。
+#
+# 契约（§3 不变量 9 的补全，不是替代）：
+#   * 解析顺序固定 **用户根优先** —— 既有能解析的路径永不变成另一个文件；
+#     只有用户根解析失败时才试该会话绑定 Task 的 `workspace/` 根。
+#   * 第二个根**只能由服务端从绑定推导**，绝不接受客户端传入的根；
+#     会话属主 / 绑定属主 / Task 属主三重校验，任一不成立即不启用（fail-closed）。
+#   * 不传 `conversation_id` ⇒ 行为与今天逐字节相同（旧客户端零影响）。
+
+
+async def _task_workspace_root(
+    db: AsyncSession, *, user_id: str, conversation_id: str, user_root: str | Path
+) -> Optional[Path]:
+    """会话当前绑定 Task 的 `workspace/` 绝对路径；任一环不成立返回 None。"""
+    if not conversation_id:
+        return None
+    from app.db.database import Conversation, WorkspaceTask
+    from app.services import task_binding_service
+
+    conv = await db.get(Conversation, str(conversation_id))
+    if conv is None or str(conv.user_id) != str(user_id):
+        return None
+    binding = await task_binding_service.get_binding(
+        db, user_id=str(user_id), conversation_id=str(conversation_id)
+    )
+    task_id = getattr(binding, "task_id", None) if binding is not None else None
+    if not task_id:
+        return None
+    task = await db.get(WorkspaceTask, str(task_id))
+    if task is None or str(task.user_id) != str(user_id):
+        return None
+    root_rel = str(getattr(task, "root_rel", "") or "").strip()
+    if not root_rel:
+        return None
+    candidate = Path(user_root) / root_rel / "workspace"
+    try:
+        resolved_root = Path(user_root).resolve()
+        resolved = candidate.resolve()
+        resolved.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
+async def _iter_scoped_roots(
+    db: AsyncSession, *, user: User, workspace, conversation_id: Optional[str]
+):
+    """解析根序列：用户根在前，会话绑定 Task 的 workspace 根在后。
+
+    惰性求值（2026-11-15 评审 Minor）：Task 根的三次 DB 查询只在用户根**未命中**
+    时才发生——否则每个带 `conversation_id` 的图片请求都要白付 3 次查询。
+    """
+    yield str(workspace.root_path)
+    if conversation_id:
+        task_ws = await _task_workspace_root(
+            db,
+            user_id=str(user.id),
+            conversation_id=str(conversation_id),
+            user_root=workspace.root_path,
+        )
+        if task_ws is not None and task_ws.is_dir():
+            yield str(task_ws)
+
+
+async def _resolve_scoped_file(
+    db: AsyncSession, *, user: User, workspace, path: str,
+    conversation_id: Optional[str],
+) -> Path:
+    """用户根 → Task 根 依次解析一个文件；全失败抛 WorkspacePathError。"""
+    last: Exception | None = None
+    async for root in _iter_scoped_roots(
+        db, user=user, workspace=workspace, conversation_id=conversation_id
+    ):
+        try:
+            return await asyncio.to_thread(resolve_workspace_file, path, root)
+        except (WorkspacePathError, OSError, ValueError) as exc:
+            last = exc
+    if isinstance(last, WorkspacePathError):
+        raise last
+    raise WorkspacePathError(
+        "workspace_path_not_found", "file not found in workspace", path
+    ) from last
+
+
 def _safe_unlink(path: str) -> None:
     try:
         os.unlink(path)
@@ -184,6 +271,10 @@ def _prune_stale_zips(max_age_seconds: int = 3600) -> None:
 async def download_file(
     path: str = Query(..., description="Absolute path or workspace-relative path to the file"),
     token: Optional[str] = Query(None, description="JWT token for <img> tag auth"),
+    conversation_id: Optional[str] = Query(
+        None,
+        description="Optional conversation id — enables Task-workspace fallback resolution",
+    ),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ):
@@ -193,14 +284,19 @@ async def download_file(
     Path resolution is the shared workspace resolver (no filename-walk around
     the containment/symlink rules — A4.9 Critical 2026-09-19); the response is
     pinned to the validated file descriptor.
+
+    ``conversation_id`` (2026-11-15): when the relative path is not found under
+    the user root, it is retried under that conversation's bound Task
+    ``workspace/`` root (server-derived, owner-checked). Omitted ⇒ unchanged.
     """
     user = await _authenticate(credentials, token, db)
 
     workspace = await ensure_user_workspace(db, user.id, user.username)
 
     try:
-        resolved = await asyncio.to_thread(
-            resolve_workspace_file, path, workspace.root_path
+        resolved = await _resolve_scoped_file(
+            db, user=user, workspace=workspace, path=path,
+            conversation_id=conversation_id,
         )
     except (WorkspacePathError, OSError, ValueError) as exc:
         code = getattr(exc, "code", type(exc).__name__)
@@ -226,18 +322,35 @@ async def download_file(
 async def list_files(
     path: str = Query(..., description="Workspace-relative or in-workspace directory path"),
     token: Optional[str] = Query(None, description="JWT token for link-based auth"),
+    conversation_id: Optional[str] = Query(
+        None,
+        description="Optional conversation id — enables Task-workspace fallback resolution",
+    ),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ):
-    """List one directory inside the user's workspace (folder manager)."""
+    """List one directory inside the user's workspace (folder manager).
+
+    2026-11-15（A）：`conversation_id` 给出时，用户根解析失败会回落到该会话绑定
+    Task 的 `workspace/` 根。**返回的 `rel_path` 相对的是实际命中的那个根**
+    （D-78）——调用方要把条目再喂给 `/download|/zip` 时必须带同一个
+    `conversation_id`，否则 Task 相对的条目会 404。
+    """
     user = await _authenticate(credentials, token, db)
     workspace = await ensure_user_workspace(db, user.id, user.username)
 
-    try:
-        result = await asyncio.to_thread(list_directory, workspace.root_path, path)
-    except (WorkspacePathError, OSError, ValueError) as exc:
+    last: Exception | None = None
+    async for root in _iter_scoped_roots(
+        db, user=user, workspace=workspace, conversation_id=conversation_id
+    ):
+        try:
+            result = await asyncio.to_thread(list_directory, root, path)
+            break
+        except (WorkspacePathError, OSError, ValueError) as exc:
+            last = exc
+    else:
         logger.info("list rejected path=%r", path)
-        raise _not_found() from exc
+        raise _not_found() from last
     return result
 
 
@@ -245,23 +358,41 @@ async def list_files(
 async def download_zip(
     path: str = Query(..., description="Workspace-relative or in-workspace directory path"),
     token: Optional[str] = Query(None, description="JWT token for link-based auth"),
+    conversation_id: Optional[str] = Query(
+        None,
+        description="Optional conversation id — enables Task-workspace fallback resolution",
+    ),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
     background: BackgroundTasks = None,
 ):
-    """Zip one folder inside the user's workspace and stream it as a download."""
+    """Zip one folder inside the user's workspace and stream it as a download.
+
+    2026-11-15（A）：`conversation_id` 语义与 `/list` 相同（用户根优先，Task 根兜底）。
+    """
     user = await _authenticate(credentials, token, db)
     workspace = await ensure_user_workspace(db, user.id, user.username)
 
     _prune_stale_zips()
     tmp = tempfile.NamedTemporaryFile(prefix="wt_ws_zip_", suffix=".zip", delete=False)
     tmp.close()
+    info = None
+    last: Exception | None = None
     try:
-        info = await asyncio.to_thread(build_folder_zip, workspace.root_path, path, tmp.name)
-    except (WorkspacePathError, OSError, ValueError) as exc:
-        _safe_unlink(tmp.name)
-        logger.info("zip rejected path=%r", path)
-        raise _not_found() from exc
+        async for root in _iter_scoped_roots(
+            db, user=user, workspace=workspace, conversation_id=conversation_id
+        ):
+            try:
+                info = await asyncio.to_thread(build_folder_zip, root, path, tmp.name)
+                break
+            except (WorkspacePathError, OSError, ValueError) as exc:
+                last = exc
+        if info is None:
+            _safe_unlink(tmp.name)
+            logger.info("zip rejected path=%r", path)
+            raise _not_found() from last
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001 - surface as 500, never leak internals
         _safe_unlink(tmp.name)
         logger.exception("zip failed path=%r", path)
@@ -280,6 +411,10 @@ async def download_zip(
 async def office_pdf(
     path: str = Query(..., description="Workspace-relative or in-workspace office file path"),
     token: Optional[str] = Query(None, description="JWT token for link-based auth"),
+    conversation_id: Optional[str] = Query(
+        None,
+        description="Optional conversation id — enables Task-workspace fallback resolution",
+    ),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ):
@@ -292,8 +427,9 @@ async def office_pdf(
     workspace = await ensure_user_workspace(db, user.id, user.username)
 
     try:
-        resolved = await asyncio.to_thread(
-            resolve_workspace_file, path, workspace.root_path
+        resolved = await _resolve_scoped_file(
+            db, user=user, workspace=workspace, path=path,
+            conversation_id=conversation_id,
         )
     except (WorkspacePathError, OSError, ValueError) as exc:
         logger.info("office-pdf rejected path=%r", path)
@@ -368,6 +504,10 @@ async def office_pdf(
 async def office_html(
     path: str = Query(..., description="Workspace-relative or in-workspace spreadsheet path"),
     token: Optional[str] = Query(None, description="JWT token for link-based auth"),
+    conversation_id: Optional[str] = Query(
+        None,
+        description="Optional conversation id — enables Task-workspace fallback resolution",
+    ),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ):
@@ -386,8 +526,9 @@ async def office_html(
     workspace = await ensure_user_workspace(db, user.id, user.username)
 
     try:
-        resolved = await asyncio.to_thread(
-            resolve_workspace_file, path, workspace.root_path
+        resolved = await _resolve_scoped_file(
+            db, user=user, workspace=workspace, path=path,
+            conversation_id=conversation_id,
         )
     except (WorkspacePathError, OSError, ValueError) as exc:
         logger.info("office-html rejected path=%r", path)

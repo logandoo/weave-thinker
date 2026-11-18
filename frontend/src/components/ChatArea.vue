@@ -16,7 +16,9 @@
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
         </svg>
-        本轮 {{ formatContextTokens(chatStore.currentContextInfo.tokens) }} tokens
+        <span class="token-prefix">本轮 </span>
+        <span class="token-count">{{ formatContextTokens(chatStore.currentContextInfo.tokens) }}</span>
+        <span class="token-suffix"> tokens</span>
       </span>
       <WorkspaceScopeChip />
       <button
@@ -816,6 +818,7 @@ const TOOL_NAME_MAP: Record<string, string> = {
   word_count: '字数统计',
   workspace_read: '文件读取',
   workspace_glob: '文件搜索',
+  workspace_publish: '文件发布',
   provide_file: '提供文件',
 }
 function formatToolName(name: string): string {
@@ -1621,9 +1624,10 @@ watch(
   padding: 0 24px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 10px;
   border-bottom: 1px solid var(--panel-border);
   background-color: var(--surface-panel-strong);
+  min-width: 0;
 }
 
 .chat-title {
@@ -1642,7 +1646,7 @@ watch(
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  margin-left: 12px;
+  margin-left: 0;
   padding: 3px 10px;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
@@ -1657,6 +1661,31 @@ watch(
 
 .context-token-chip svg {
   opacity: 0.7;
+}
+
+/* 作用域 chip 是子组件根节点：保证它可收缩但不会把右侧导出按钮挤出去。 */
+.chat-header :deep(.workspace-scope-chip) {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 220px;
+}
+
+/* 中等宽度（侧栏仍占 292px）：token 只留数字，作用域 chip 收紧；
+   再窄（<1000）token 徽章让位——它是次要状态，可在会话/移动端查看。 */
+@media (max-width: 1200px) and (min-width: 768px) {
+  .token-prefix,
+  .token-suffix {
+    display: none;
+  }
+}
+
+@media (max-width: 1000px) and (min-width: 768px) {
+  .context-token-chip {
+    display: none;
+  }
+  .chat-header :deep(.workspace-scope-chip) {
+    max-width: 150px;
+  }
 }
 
 .message-list {
@@ -2498,6 +2527,7 @@ watch(
 .header-save-note-btn:active {
   transform: scale(0.96);
 }
+
 
 .hide-on-desktop {
   display: none;

@@ -5,7 +5,7 @@
   <Teleport to="body">
     <Transition name="system-settings">
       <div v-if="visible" class="system-settings-overlay" @click.self="close">
-        <div class="system-settings-card">
+        <div class="system-settings-card" :class="{ 'system-settings-card--projects': activeTab === 'projects' }">
           <div class="system-settings-header">
             <h2 class="system-settings-title">系统设置</h2>
             <button class="system-settings-close" @click="close">
@@ -68,6 +68,9 @@
                     <path d="M12 20h9"/>
                     <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
                   </template>
+                  <template v-else-if="tab.key === 'projects'">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                  </template>
                   <template v-else-if="tab.key === 'skins'">
                     <circle cx="13.5" cy="6.5" r=".5"/>
                     <circle cx="17.5" cy="10.5" r=".5"/>
@@ -127,6 +130,10 @@
                 />
               </div>
 
+              <div v-else-if="activeTab === 'projects'" class="tab-panel tab-panel--projects">
+                <WorkspaceProjectsDialog mode="inline" @close="close" />
+              </div>
+
               <div v-else-if="activeTab === 'device-exec'" class="tab-panel">
                 <DeviceExecutionPanel embedded />
               </div>
@@ -177,6 +184,7 @@ import DeviceExecutionPanel from './DeviceExecutionPanel.vue'
 import PermissionSettingsPanel from './PermissionSettingsPanel.vue'
 import SkillsPanel from './SkillsPanel.vue'
 import MemoryPanel from './MemoryPanel.vue'
+import WorkspaceProjectsDialog from './WorkspaceProjectsDialog.vue'
 import SkinPanel from './SkinPanel.vue'
 import UserInfoPanel from './UserInfoPanel.vue'
 import ModelProviderPanel from './ModelProviderPanel.vue'
@@ -218,6 +226,7 @@ const tabs = [
   { key: 'skills', label: '技能管理' },
   { key: 'mcp', label: 'MCP' },
   { key: 'memory', label: '记忆管理' },
+  { key: 'projects', label: '项目管理' },
   { key: 'skins', label: '皮肤选择' },
   { key: 'device-exec', label: '设备执行' },
   { key: 'editor', label: '编辑器' },
@@ -326,6 +335,7 @@ function handleSkillsUpdated() {
   flex-direction: column;
   overflow: hidden;
   flex: 1;
+  min-height: 0;
 }
 
 .settings-tabs {
@@ -363,6 +373,7 @@ function handleSkillsUpdated() {
 
 .settings-tab-content {
   flex: 1;
+  min-height: 0; /* 移动端单滚动链：允许内容区收缩，否则子面板（项目管理）会顶出卡片底部 */
   overflow-y: auto;
   padding: 20px 24px 24px;
   display: flex;
@@ -376,6 +387,38 @@ function handleSkillsUpdated() {
   flex-direction: column;
   align-items: center;
   animation: tab-fade-in 0.2s ease;
+}
+
+/* 项目管理 tab：撑满内容区（单卡片分栏组件需要确定高度；设置卡只有 max-height，
+   百分比高度会退化成 auto，因此这里给确定高度） */
+.tab-panel--projects {
+  align-items: stretch;
+  flex: 1;
+  height: min(640px, 68vh);
+  min-height: 460px;
+}
+
+/* 「项目管理」是双栏管理器，720px 的通用设置卡放不下（右栏滚到底仍被卡片圆角切掉）。
+   这个 tab 单独放宽卡片，并把高度按视口给足，底部（危险区 / 删除按钮）才完整可见。 */
+.system-settings-card--projects {
+  max-width: min(1080px, 94vw);
+  max-height: 92vh;
+}
+.system-settings-card--projects .system-settings-header {
+  padding: 16px 24px;
+}
+.system-settings-card--projects .settings-tab-content {
+  padding: 16px 20px 20px;
+}
+.system-settings-card--projects .tab-panel--projects {
+  height: 100%;
+  min-height: 520px;
+}
+@media (max-width: 767px) {
+  .tab-panel--projects {
+    height: 60vh;
+    min-height: 320px;
+  }
 }
 
 @keyframes tab-fade-in {
@@ -423,8 +466,27 @@ function handleSkillsUpdated() {
     border-radius: 0;
   }
 
+  /* 2026-11-17（真机反馈）：全屏浮层必须避让系统栏——Android 壳注入的
+     --safe-top/--safe-bottom 是状态栏/手势条高度；padding 为 0 时卡片标题栏
+     与 ✕ 会落在状态栏下面，点击被系统手势接管（「关不掉」）。 */
   .system-settings-overlay {
-    padding: 0;
+    padding: var(--safe-top, 0px) 0 var(--safe-bottom, 0px);
+  }
+
+  /* 项目管理：移动端单滚动链。卡片填满安全区，内容区不滚、由任务详情的
+     文件 pane 独占滚动——否则「height:100% + min-height:520px」的 tab 面板
+     会把 pane 底部顶出视口，外层又因 scrollHeight==clientHeight 无法补偿
+     （实测最后一行永远差 8–20px）。 */
+  .system-settings-card--projects {
+    height: 100%;
+  }
+  .system-settings-card--projects .settings-tab-content {
+    overflow: hidden;
+  }
+  .system-settings-card--projects .tab-panel--projects {
+    height: auto;
+    min-height: 0;
+    flex: 1 1 auto;
   }
 }
 </style>

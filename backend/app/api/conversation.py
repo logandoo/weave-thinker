@@ -36,6 +36,7 @@ from app.schemas.chat import (
     ConversationGroupReorderRequest,
 )
 from app.core.deps import get_current_user
+from app.services.task_binding_service import sync_task_title_after_rename
 from app.api.notes import (
     _markdown_to_html_with_mermaid,
     _ensure_heading_ids,
@@ -1143,6 +1144,11 @@ async def update_conversation(
     touched = False
     if conversation_data.title is not None:
         conversation.title = conversation_data.title
+        # 镜像态 Task 跟随改名（2026-11-14 缺陷波）：任务标题是延续检索与
+        # workspace_bind_task 工具的键，会话改名后不同步就会长期挂着旧名。
+        # `user_intent=True`：用户显式改名是 last-writer-wins，**不做采纳**——
+        # 否则两个标签页同时改名时，后保存的那个会被静默丢弃却返回 200（评审 r2 Important-2）。
+        await sync_task_title_after_rename(db, conversation=conversation, user_intent=True)
         touched = True
     if 'group_id' in conversation_data.model_fields_set:
         conversation.group_id = conversation_data.group_id

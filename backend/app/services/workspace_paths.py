@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 import re
 from pathlib import Path
 
@@ -34,6 +35,57 @@ _INVALID_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 CODE_INVALID = "workspace_path_invalid"
 CODE_NOT_FOUND = "workspace_path_not_found"
 CODE_OUTSIDE = "workspace_path_outside"
+
+
+def is_scratch_task_path(path: str | None) -> bool:
+    """True when *path* lives under a per-call ``scratch/task_XXXX`` temp dir.
+
+    Scratch dirs are by design intermediate per-call work dirs (the
+    execute_code prompt tells the agent each call gets a fresh one). Files
+    there are drafts/byproducts — never user-facing deliverables, so they
+    must not surface as download cards (conv 2b36fb09) nor as verifier
+    evidence (2026-11-15 wave).
+
+    Anchored on the exact ``scratch/task_`` layout created by code_execution
+    (``workspace/scratch/task_XXXX``) so a user directory that merely
+    contains a segment named ``scratch`` — including ``artifacts/scratch/`` —
+    is never misclassified. Accepts absolute and workspace-relative forms.
+    """
+    if not path:
+        return False
+    rel = str(path).replace("\\", "/")
+    return rel.startswith("scratch/task_") or "/scratch/task_" in rel
+
+
+def is_legacy_excluded_read(rel: str | None) -> bool:
+    """Piece 2：``read_root=user_root`` 时 ``scope=legacy`` 免 grant 读**不得**触及的
+    执行/记忆内部目录（用户根相对路径）。
+
+    ⚠ **当前为未接线地基**（no production caller）：J2b 评审 r1 撤除了 scope=legacy 免 grant
+    读（排除集只能校验请求前缀，防不住 grep/provide_folder 递归遍历 memory），故本谓词暂无调用方，
+    仅由单测覆盖，留给后续「工具侧逐遍历路径过滤」硬化波启用（tests/decisions.md D-20261117-waveJ2-5）。
+
+    排除集 = ``*/memory``（任务/项目记忆注入库，免 grant 读会架空 ``kind=memory`` gate）、
+    ``*/staging``（上传暂存）、``runs/*/.vibeweaver``（执行态）、``*/scratch``（逐调用草稿）。
+    但**不误伤** ``workspace/`` 下用户自建的同名目录（如 ``workspace/artifacts/memory/``）——
+    那是用户产出，不是注入库。``memory`` 仅在其之前没有 ``workspace`` 段时（即 task/project/
+    attempt 级记忆库）才算内部目录。先 ``posixpath.normpath`` 归一化（防 ``workspace/../memory``
+    绕过）+ 段大小写折叠（防 macOS 大小写不敏感 FS 绕过）+ 绝对/越界 fail-closed。
+    """
+    if not rel:
+        return False
+    raw = str(rel).replace("\\", "/")
+    norm = posixpath.normpath(raw)
+    # 绝对路径或归一化后越出用户根（`../..`）：交上层 is_within 兜底，这里一律视为排除（fail-closed）。
+    if posixpath.isabs(raw) or norm == ".." or norm.startswith("../") or norm.startswith("/"):
+        return True
+    segs = [s.lower() for s in norm.split("/") if s not in ("", ".")]
+    for i, seg in enumerate(segs):
+        if seg in ("staging", "scratch", ".vibeweaver"):
+            return True
+        if seg == "memory" and "workspace" not in segs[:i]:
+            return True
+    return False
 
 
 class WorkspacePathError(ValueError):

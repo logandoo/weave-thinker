@@ -26,6 +26,17 @@ pattern and its documented pitfalls:
 5. **Cost guards** — one compression per run, and auto-disable after 3
    miss-triggered compressions with no intervening hit (a model that never
    echoes the marker must not cause unbounded compression churn).
+   2026-11-17 (conv cdd56a8e): a retry flag leaked across loop iterations
+   (``_canary_retry`` was being carried by ``_run_loop``'s name-table
+   plumbing), turning ONE miss into 50 full re-answers concatenated into a
+   single 49k-char message. The load-bearing fix is that the flag is no
+   longer carried across iterations. A secondary bound was also added —
+   at most ``[agent.canary] max_reanswers_per_turn`` (default 1) re-answers
+   per run, counted on ``AgentLoopState.canary_reanswers`` — but note it is
+   checked INSIDE the trip branch, so it only bites if a future path resets
+   ``state.canary_compressed``; the carry-table rule is the real guard.
+   A missing marker may cost the user ONE re-answer, never N duplicate
+   answers.
 
 The marker is deterministic per conversation (sha256 of conversation id), so
 no DB column or cross-request state is needed, and the strip regex never

@@ -10,7 +10,12 @@ export interface FileParseResult {
   file_type?: string | null
   filename: string
   file_path?: string | null
+  /** 用户根相对路径（`/api/files/*` 解析口径，§3 不变量 9）。 */
   rel_path?: string | null
+  /** Task 内展示路径（agent 解析口径，§3 不变量 9：展示与解析分离）。 */
+  display_path?: string | null
+  /** 用户根相对下载路径（`[file-ref]` 的 `下载路径:` 行，2026-11-15 波 · C）。 */
+  download_path?: string | null
   size?: number
   /** True for chips restored from a message's [file-ref] blocks by edit-mode
    *  (not a fresh upload) — scoped to the edit session: a normal send drops

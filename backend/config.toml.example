@@ -17,7 +17,7 @@ user_mcp_allow_private_hosts = false
 memory_provenance_strict = false
 memory_hmac_key = ""
 multi_tenant_experimental = false
-tma_mode = "shadow"
+tma_mode = "enforce"
 tma_verdict_key = ""
 tma_verdict_key_id = "v1"
 tma_checkpoint_interval = 64
@@ -201,6 +201,7 @@ enabled = true
 miss_threshold = 2
 auto_disable_after = 3
 compress_min_ratio = 0.6
+max_reanswers_per_turn = 1
 
 [agent.citation]
 disambiguate_timeout_seconds = 60.0
@@ -339,11 +340,17 @@ snapshots_max_file_mb = 10
 snapshots_retention = 50
 [workspace.task_scoping]
 mode = "off"
-supported_modes = ["chat"]
-inbox_project_name = "收件箱"
+supported_modes = ["chat", "deathmatch"]
+read_root = "user_root"
+inbox_project_name = "默认项目"
 recover_auto = false
+classify_new_conversations = true
 default_system_memory_ingest = "user_facts"
 staging_lease_seconds = 86400
+
+[workspace.deliverables]
+mode = "enforce"
+dir = "artifacts"
 
 
 [client_exec]
@@ -489,6 +496,7 @@ tts_enabled = true
 
 [deathmatch]
 enabled = true
+completion_memory_scope = "legacy"
 typed_judge_enabled = true
 typed_judge_max_loops = 3
 execution_state_enabled = true

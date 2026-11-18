@@ -41,9 +41,20 @@ export const useWorkspaceScopeStore = defineStore('workspaceScope', () => {
   // 按会话挂载；选择 → expected=0 首绑 → 用户重发消息即续跑。
   const ambiguous = ref<{ conversationId: string; question: string;
                           candidates: AmbiguousCandidate[] } | null>(null)
+  // 2026-11-14 v2：新会话归类建议（meta.workspace_suggestion）——非阻塞询问
+  // conversationId=服务端权威 id；clientId=流发起时的客户端 id（未 remint 时二者不同，
+  // 建议必须两者都能匹配当前会话，否则新会话永远看不到询问条）。
+  const suggestion = ref<{ conversationId: string; clientId?: string;
+                           task: AmbiguousCandidate } | null>(null)
   const snapshot = ref<BindingSnapshot | null>(null)
   const loading = ref(false)
   const lastError = ref('')
+  // 2026-11-16 Wave D（issue4）：改绑时服务端自动停泊的活跃 run 数，供 UI 说明「已停止进行中的任务」。
+  const lastParkedRuns = ref(0)
+  // 2026-11-16 Wave D（issue3）：当前会话「新出现一个绑定任务」时递增，
+  // 让已打开的项目管理面板无需整页刷新即自动重载总览（右上角 chip 走 loadBinding）。
+  const overviewRevision = ref(0)
+  let _lastBoundTaskByConv: Record<string, string> = {}
   let _capsPromise: Promise<void> | null = null
 
   const chipVisible = computed(() => scopeChipVisible(capabilities.value, snapshot.value))
@@ -93,6 +104,12 @@ export const useWorkspaceScopeStore = defineStore('workspaceScope', () => {
         if (snap?.bound && ambiguous.value?.conversationId === conversationId) {
           ambiguous.value = null
         }
+        // issue3：本轮首次出现绑定任务（自动建任务/别处改绑）→ 通知已打开的项目管理重载。
+        const boundTaskId = snap?.bound ? String(snap.task?.id || '') : ''
+        if (boundTaskId && _lastBoundTaskByConv[conversationId] !== boundTaskId) {
+          _lastBoundTaskByConv[conversationId] = boundTaskId
+          overviewRevision.value++
+        }
       }
     } catch (err) {
       if (seq === _bindingSeq) {
@@ -110,8 +127,10 @@ export const useWorkspaceScopeStore = defineStore('workspaceScope', () => {
     const version = snapshot.value?.binding_version ?? 0
     loading.value = true
     lastError.value = ''
+    lastParkedRuns.value = 0
     try {
-      await rebindConversation(conversationId, taskId, version, reason)
+      const res = await rebindConversation(conversationId, taskId, version, reason)
+      lastParkedRuns.value = Number(res?.parked_runs || 0)
       await loadBinding(conversationId)
       return true
     } catch (err) {
@@ -133,6 +152,51 @@ export const useWorkspaceScopeStore = defineStore('workspaceScope', () => {
   }
   function clearAmbiguous() {
     ambiguous.value = null
+  }
+
+  /** 归类建议：服务端 meta.workspace_suggestion（本轮已在默认项目执行）。 */
+  function setSuggestion(conversationId: string, task: AmbiguousCandidate, clientId?: string) {
+    if (!conversationId || !task?.task_id) return
+    suggestion.value = { conversationId, clientId: clientId || undefined, task }
+  }
+  function clearSuggestion() {
+    suggestion.value = null
+  }
+  /** 接受建议：CAS 改绑到候选任务（后续消息生效；旧任务文件不动）。 */
+  async function acceptSuggestion(): Promise<boolean> {
+    const s = suggestion.value
+    if (!s) return false
+    loading.value = true
+    lastError.value = ''
+    try {
+      const snap = await fetchBinding(s.conversationId)
+      await rebindConversation(s.conversationId, s.task.task_id,
+                               snap.binding_version ?? 0, '归类建议')
+      await loadBinding(s.conversationId)
+      suggestion.value = null
+      return true
+    } catch (err) {
+      const code = bindingErrorCode(err)
+      if (isBindingStale(code)) {
+        lastError.value = '绑定已变更（其他端改绑或新 run），已刷新，请重试'
+        await loadBinding(s.conversationId)
+      } else if (code === 'workspace_run_active') {
+        // 2026-11-16 Wave D：后端已改为自动停泊活跃 run，正常情况下不再返回此码；
+        // 保留为对旧后端的兜底，文案不再要求用户「等回答完成」。
+        lastError.value = '归类失败：进行中的任务未能自动停止，请稍后重试'
+      } else if (code === 'workspace_scope_mode_unsupported') {
+        lastError.value = '该会话的执行模式暂不支持任务归类'
+      } else {
+        lastError.value = code || String((err as Error)?.message || err)
+      }
+      return false
+    } finally {
+      loading.value = false
+    }
+  }
+  /** 拒绝建议：保持默认项目（不产生任何写入）。 */
+  function dismissSuggestion() {
+    suggestion.value = null
   }
   async function chooseTask(taskId: string): Promise<boolean> {
     const conv = ambiguous.value?.conversationId
@@ -176,11 +240,18 @@ export const useWorkspaceScopeStore = defineStore('workspaceScope', () => {
     ambiguous,
     setAmbiguous,
     clearAmbiguous,
+    suggestion,
+    setSuggestion,
+    clearSuggestion,
+    acceptSuggestion,
+    dismissSuggestion,
     chooseTask,
     chooseNewTask,
     snapshot,
     loading,
     lastError,
+    lastParkedRuns,
+    overviewRevision,
     chipVisible,
     badgeText,
     modeHint,

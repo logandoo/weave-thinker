@@ -1607,7 +1607,10 @@ class AgentLoopOrchestratorMixin:
         conversation = kw.get('conversation')
         _c_after = _loop_result._c_after
         _c_before = _loop_result._c_before
-        _canary_retry = _loop_result._canary_retry
+        # 2026-11-17（conv cdd56a8e 复盘）：本标志是**单轮输出**，绝不可从
+        # `_loop_result` 继承——`_run_loop` 每轮新建 `_LoopResult` 但按名字表
+        # 搬运 locals，继承 = 上一轮的 True 复活 → 每轮 continue、永收到尾。
+        _canary_retry = False
         _conv_key = _loop_result._conv_key
         _ctx_len = _loop_result._ctx_len
         _disabled = _loop_result._disabled
@@ -1645,19 +1648,39 @@ class AgentLoopOrchestratorMixin:
                                 if (_misses >= _threshold
                                         and canary_tracker.can_compress(_conv_key)
                                         and not _disabled):
-                                    # A4.9 I2 (conv 97ff355d fix review): the
-                                    # retry RE-ANSWERS the turn, so the salvage
-                                    # flag must not suppress the synthesis pass
-                                    # of that retry — otherwise non-live mode
-                                    # ships an empty answer (the relay already
-                                    # wiped its copy of the salvage).
-                                    state.salvaged_final = False
+                                    # NOTE (2026-11-17, review r1 I3): the A4.9 I2
+                                    # salvage reset used to sit HERE, i.e. it also
+                                    # ran for the ship-as-is exits (audit_accepted /
+                                    # cap reached) — clearing that flag without any
+                                    # re-answer lets the synthesis decision re-fire
+                                    # and the synthesis pass regenerate on top of
+                                    # already-shipped content (the double-answer
+                                    # shape). The reset now lives in the two branches
+                                    # that actually re-answer.
                                     from app.services.context_compressor import estimate_request_tokens_rough
                                     _c_before = estimate_request_tokens_rough(state.messages, tools=self.tool_schemas)
                                     _ctx_len = _resolve_context_length(self.llm)
                                     _min_ratio = config.agent_canary_compress_min_ratio
                                     _ratio = (_c_before / _ctx_len) if _ctx_len > 0 else 1.0
-                                    if state.audit_accepted:
+                                    if (state.canary_reanswers
+                                            >= config.agent_canary_max_reanswers_per_turn):
+                                        # 2026-11-17（conv cdd56a8e 复盘）：每轮重答硬上限。
+                                        # `state.canary_compressed` 只是「本请求内不重复触发」的闸，
+                                        # 一旦该闸被复位（本次事故：粘滞 `_canary_retry` 让续跑
+                                        # 每轮发生），漏标就退化成无界重答——50 次模型调用 +
+                                        # 用户看到同一份答案重复数十次。上限耗尽 → 只记录出货。
+                                        logger.warning(
+                                            "Canary trip (conv=%s): %d misses but per-turn "
+                                            "re-answer cap reached (%d/%d) — recording miss, "
+                                            "shipping as-is (no re-answer)",
+                                            _conv_key, _misses, state.canary_reanswers,
+                                            config.agent_canary_max_reanswers_per_turn,
+                                        )
+                                        # 上限耗尽 = 本请求不再对 canary 采取任何动作。
+                                        # 不置该闸会让之后每次终答迭代都重进 trip 块，
+                                        # 刷 miss 计数与日志（review r1 I4）。
+                                        state.canary_compressed = True
+                                    elif state.audit_accepted:
                                         # 2026-08-22（conv efaf8f9c 复盘）：最终稿
                                         # 已被审计接受——canary 漏标只是警告信号
                                         # （SOTA：连贯且通过质检的回答漏标=记录继续），
@@ -1688,6 +1711,10 @@ class AgentLoopOrchestratorMixin:
                                         # a model that keeps missing the marker
                                         # re-trips up to max_iterations.
                                         state.canary_compressed = True
+                                        # A4.9 I2 (conv 97ff355d fix review): 本分支会
+                                        # 重答本轮，salvage 标志不得压制重答的合成 pass
+                                        # （否则非 live 模式会交空答——relay 已清掉它那份）。
+                                        state.salvaged_final = False
                                         logger.warning(
                                             "Canary trip (conv=%s): %d consecutive misses but "
                                             "context at %.0f%% < %.0f%% ratio gate — "
@@ -1701,6 +1728,7 @@ class AgentLoopOrchestratorMixin:
                                             "请重新完整回答用户最近的一条消息，"
                                             "并记得在回答最后一行原样输出校验标记。",
                                         )
+                                        state.canary_reanswers += 1
                                         _canary_retry = True
                                     else:
                                         # Per-request guard BEFORE the await: if
@@ -1730,6 +1758,11 @@ class AgentLoopOrchestratorMixin:
                                             "请基于压缩后的上下文，重新完整回答用户最近的一条消息，"
                                             "并记得在回答最后一行输出校验标记。",
                                         )
+                                        # A4.9 I2 同上，且必须放在 raisable 的
+                                        # compress_async **之后**：压缩抛异常时根本不会
+                                        # 重答，先清标志就复刻了 r1 I3 的双答案形（r2 I3）。
+                                        state.salvaged_final = False
+                                        state.canary_reanswers += 1
                                         _canary_retry = True
                                 else:
                                     _log_miss = logger.debug if _disabled else logger.info
@@ -2231,7 +2264,7 @@ class AgentLoopOrchestratorMixin:
         _budget_spent = _loop_result._budget_spent
         _c_after = _loop_result._c_after
         _c_before = _loop_result._c_before
-        _canary_retry = _loop_result._canary_retry
+        _canary_retry = False   # 单轮信号：本迭代真值只来自 _finalize_canary_branch 的写回
         _conv_key = _loop_result._conv_key
         _cov_note = _loop_result._cov_note
         _ctx_len = _loop_result._ctx_len
@@ -2406,6 +2439,12 @@ class AgentLoopOrchestratorMixin:
                 if _final_content:
                     _final_content = _CANARY_RE.sub('', _final_content)
                 if _canary_retry:
+                    # 2026-11-17（conv cdd56a8e）：续跑出口必须可定位——本次事故
+                    # 有 49 次静默 continue，日志里只剩一条 Canary trip，归因极难。
+                    logger.warning(
+                        "canary re-answer continue (conv=%s iteration=%d)",
+                        _conv_key, state.iterations,
+                    )
                     raise _LoopContinueSignal()
 
                 # Deathmatch verdict evaluation after final thinking
@@ -3466,7 +3505,7 @@ class AgentLoopOrchestratorMixin:
 
             state.consecutive_tool_iterations = 0
             _loop_result = _LoopResult()
-            for _name in ('_adv_ev', '_adv_events', '_adv_text', '_audit_family', '_audit_reject_budget', '_audit_target', '_base_text', '_budget_spent', '_c_after', '_c_before', '_canary_retry', '_conv_key', '_cov_note', '_ctx_len', '_disabled', '_dm_content', '_dm_should_continue', '_ev', '_family_stall', '_final_content', '_g_blocked', '_g_ev', '_g_events', '_hit', '_is_repeating', '_last_user_msg', '_lc_note', '_log_miss', '_marker', '_min_ratio', '_misses', '_need_synthesis', '_npg_no_progress', '_prev_stash', '_ratio', '_reset_ev', '_restart', '_salvage_ev', '_salvage_parts', '_search_only', '_shipped_guidance', '_shipped_text', '_ships_as_final', '_soft_limit', '_stitched_audit', '_synth_guidance', '_synth_shipped_guidance', '_threshold', '_turns', 'assistant_content', 'compressed', 'decision', 'dm', 'event', 'guidance', 'msg', 'rep_prompt', 'retry_prompt'):
+            for _name in ('_adv_ev', '_adv_events', '_adv_text', '_audit_family', '_audit_reject_budget', '_audit_target', '_base_text', '_budget_spent', '_c_after', '_c_before', '_conv_key', '_cov_note', '_ctx_len', '_disabled', '_dm_content', '_dm_should_continue', '_ev', '_family_stall', '_final_content', '_g_blocked', '_g_ev', '_g_events', '_hit', '_is_repeating', '_last_user_msg', '_lc_note', '_log_miss', '_marker', '_min_ratio', '_misses', '_need_synthesis', '_npg_no_progress', '_prev_stash', '_ratio', '_reset_ev', '_restart', '_salvage_ev', '_salvage_parts', '_search_only', '_shipped_guidance', '_shipped_text', '_ships_as_final', '_soft_limit', '_stitched_audit', '_synth_guidance', '_synth_shipped_guidance', '_threshold', '_turns', 'assistant_content', 'compressed', 'decision', 'dm', 'event', 'guidance', 'msg', 'rep_prompt', 'retry_prompt'):
                 if _name in locals():
                     setattr(_loop_result, _name, locals()[_name])
             _kw = locals()

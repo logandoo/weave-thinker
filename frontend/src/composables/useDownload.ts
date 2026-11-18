@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Weave Thinker Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+import { mimeFromContentType } from '@/utils/downloadName'
+
 declare global {
   interface Window {
     WeaverNoteApp?: {
@@ -74,6 +76,9 @@ async function streamDownload(url: string, filename: string, options: DownloadOp
       return { success: false, error: `下载失败: ${response.status}` }
     }
     const total = parseInt(response.headers.get('content-length') || '0', 10)
+    // 2026-11-15: Blob 必须带真实 MIME。`new Blob(chunks)` 的 type 为空时，
+    // Chrome 对「无后缀文件名」按 text/plain 推断后缀 → 图片被存成 `.txt`。
+    const contentType = mimeFromContentType(response.headers.get('content-type'))
     const reader = response.body?.getReader()
     if (!reader) {
       return { success: false, error: '无法读取响应流' }
@@ -100,7 +105,7 @@ async function streamDownload(url: string, filename: string, options: DownloadOp
       }
     }
 
-    const blob = new Blob(chunks)
+    const blob = new Blob(chunks, { type: contentType })
     const objectUrl = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = objectUrl

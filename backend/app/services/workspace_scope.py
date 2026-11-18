@@ -11,7 +11,9 @@
 * 空 root、用户根本身、别名（symlink 重定向）、嵌套、与其他 Task 重叠的 root 全部拒绝；
 * 单次 run 内冻结（frozen dataclass）：路由、恢复、压缩、工具调用共用同一个
   `binding_version` 与 attempt/epoch，不在执行中途静默换根；
-* 缺任一必要字段即 fail closed（`workspace_scope_missing`），**绝不回退用户根**。
+* 缺任一必要字段即 fail closed（`workspace_scope_missing`），**构造出的 context 绝不回退用户根**
+  （指本模块的 context 构建语义；工具层「缺 ctx 怎么办」的例外见
+  `workspace_scope_service.apply_scope_or_error` 的 `workspace_scoping_intent`）；
 
 这里只有纯逻辑与文件系统判定，不查库；DB 归属查询在 `task_binding_service` /
 `workspace_task_service`，工具侧统一入口在 `workspace_scope_service`。
@@ -25,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
+from app.core.config import get_config
+
 logger = logging.getLogger(__name__)
 
 # --- 错误码（与 PLAN Consistency Hub 一致，勿随意增删）------------------------
@@ -37,6 +41,10 @@ CODE_ATTEMPT_STALE = "workspace_attempt_stale"
 CODE_MODE_UNSUPPORTED = "workspace_scope_mode_unsupported"
 CODE_CROSS_SCOPE_DENIED = "workspace_cross_scope_denied"
 CODE_RUN_ACTIVE = "workspace_run_active"
+# 2026-11-15 任务管理中心：编辑 CAS 冲突 / 默认项目保留 / 确认名不符
+CODE_PROJECT_STALE = "workspace_project_stale"
+CODE_TASK_STALE = "workspace_task_stale"
+CODE_PROJECT_RESERVED = "workspace_project_reserved"
 
 PROJECT_DIR_PREFIX = "p_"
 TASK_DIR_PREFIX = "t_"
@@ -205,6 +213,7 @@ class WorkspaceContext:
     system_memory_ingest: str
     lease_epoch: int
     execution_target: str | None = None
+    read_root: str = "task"  # Piece 2 灰度维度，装配处解析一次钉入（绝不每工具调用现读 config）
     project_root: Path | None = None
     task_inputs_root: Path | None = None
     task_artifacts_root: Path | None = None
@@ -229,6 +238,7 @@ class WorkspaceContext:
             "system_memory_ingest": self.system_memory_ingest,
             "lease_epoch": self.lease_epoch,
             "execution_target": self.execution_target,
+            "read_root": self.read_root,
             "conversation_id": self.conversation_id,
             "rel": dict(self.rel),
         }
@@ -362,9 +372,14 @@ def _assert_relations(project, task, binding, run=None, attempt=None) -> None:
 
 def build_workspace_context(*, user_id: str, user_root: Path | str, project, task, binding,
                             run, attempt, existing_task_roots: Iterable[str] = (),
-                            execution_target: str | None = None) -> WorkspaceContext:
+                            execution_target: str | None = None,
+                            read_root: str | None = None) -> WorkspaceContext:
     """执行期唯一上下文对象；任何一项校验不过即 raise（fail closed）。"""
     base = Path(user_root).resolve()
+    # read_root 灰度在装配处解析一次钉入 ctx（绝不每工具调用现读 config → SIGHUP 中途翻档
+    # 会重造 inode bug）；显式传入时优先（重启恢复用 frozen_json 里的钉档值）。
+    if read_root is None:
+        read_root = get_config().workspace_task_scoping_read_root
     project = _row(project, "project")
     task = _row(task, "task")
     binding = _row(binding, "binding")
@@ -416,6 +431,7 @@ def build_workspace_context(*, user_id: str, user_root: Path | str, project, tas
         system_memory_ingest=ingest,
         lease_epoch=int(attempt.lease_epoch),
         execution_target=execution_target,
+        read_root=str(read_root or "task"),
         project_root=project_root,
         task_inputs_root=task_root / "workspace" / "inputs",
         task_artifacts_root=task_root / "workspace" / "artifacts",
@@ -444,7 +460,8 @@ def context_from_frozen_json(payload: Any, *, user_root: Path | str, user_id: st
             CODE_BINDING_STALE, "frozen context binding differs from current", str(attempt.id))
     return build_workspace_context(user_id=user_id, user_root=user_root, project=project,
                                    task=task, binding=binding, run=run, attempt=attempt,
-                                   execution_target=data.get("execution_target"))
+                                   execution_target=data.get("execution_target"),
+                                   read_root=data.get("read_root"))
 
 
 # --- 工具/链路侧的 fail-closed 入口 -------------------------------------------
@@ -452,8 +469,11 @@ def context_from_frozen_json(payload: Any, *, user_root: Path | str, user_id: st
 def require_context(kwargs: Mapping[str, Any] | None, *, mode: str) -> WorkspaceContext | None:
     """scoped 模式缺 context → 拒绝；off（legacy）→ 返回 None 由调用方走旧路径。
 
-    这是「不允许悄悄退回用户根」的单一实现点：`shadow` 也返回 None（只记录不拦截），
-    由 `workspace_scope_service` 负责记录比较日志。
+    ⚠ **本函数在 app 侧无调用方**（只有 `tests/test_workspace_scope_context_20261110.py` 用它
+    测语义），真正的工具根收口在 `workspace_scope_service.apply_scope_or_error`。
+    2026-11-13 续波后，那里对「缺 ctx」多了一个**显式**例外：装配层声明
+    `workspace_scoping_intent="legacy"` 时用用户根（只认精确值、模型不可伪造、有日志）。
+    所以「单一实现点」这句话不再成立——别再把它当权威入口引用。
     """
     ctx = (kwargs or {}).get("workspace_ctx")
     if isinstance(ctx, WorkspaceContext):

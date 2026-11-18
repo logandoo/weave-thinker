@@ -304,27 +304,39 @@ async def upload_and_parse_files(
     # 任务作用域（§10 上传）：enforce 下 scoped 会话的上传只能进当前 Task。
     # run 身份由**服务端**按会话活跃 run 推导（客户端字段只是断言，不符即 409）：
     # 有活跃 run → writer lease 校验后落 `workspace/inputs/`；
-    # 无活跃 run（含首条消息前）→ 先确定绑定（新会话按 §6.1 解析进收件箱空 Task），
+    # 无活跃 run（含首条消息前）→ 先确定绑定（新会话按 §6.1 解析进默认项目空 Task），
     # 每个文件一张 staging lease，字节落 lease 锚定路径，首 run 激活时自动交接为
     # inputs——不产生无 lease 的不可追踪文件。legacy 会话保持原 uploads/ 路径。
     from app.services import workspace_scope as _ws
     from app.services import workspace_scope_service as _wss
+    from app.services import workspace_scoping_runtime as _sc_rt
 
     _upload_target_root: str | None = None
     _staging_view = None
     _staging_prefix = ""
     _task_rel_root: str | None = None
+    _conv = None
     if _wss.scoping_mode() == "enforce" and conversation_id:
         from app.db.database import Conversation as _Conv
+
+        _conv = await db.get(_Conv, str(conversation_id))
+        if _conv is None or str(_conv.user_id) != str(current_user.id):
+            raise HTTPException(status_code=404, detail={"error": "conversation not found"})
+
+    # 链预检（2026-11-13 60 事故的**第二制造面**，评审 C1）：会话没有绑定时，下面会
+    # resolve() 并 commit —— 等于给尚未放开作用域的执行链（device:*）制造作用域身份，
+    # 于是「修复」被一次普通文件上传当场抵消（下一回合每次设备工具调用又回到
+    # workspace_scope_mode_unsupported）。这类会话退回 legacy 上传路径（uploads/），不建绑定。
+    _scope_upload = _conv is not None and not _sc_rt.mints_identity_for_unsupported_chain(
+        getattr(_conv, "execution_target", None))
+
+    if _scope_upload:
         from app.services import task_binding_service as _tbs
         from app.services import workspace_artifact_service as _arts
         from app.services import workspace_run_service as _yrs
         from app.services import workspace_task_service as _svc
         from app.services.workspace_scope import build_binding_view as _build_view
 
-        _conv = await db.get(_Conv, str(conversation_id))
-        if _conv is None or str(_conv.user_id) != str(current_user.id):
-            raise HTTPException(status_code=404, detail={"error": "conversation not found"})
         _binding = await _tbs.get_binding(db, user_id=current_user.id,
                                           conversation_id=str(conversation_id))
         if _binding is None:
@@ -388,17 +400,24 @@ async def upload_and_parse_files(
                 ext = os.path.splitext(filename)[1].lower()
                 rel_path = os.path.relpath(file_path, workspace_root).replace(os.sep, "/")
                 _display = None
+                _download = rel_path
                 if _task_rel_root:
                     # agent 侧按 Task 根解析：inputs 直传即 inputs/<name>；
                     # staging 附件按首 run 激活后的交接位置 inputs/<lease 文件名> 引用。
                     _leaf = Path(file_path).name
                     _display = f"inputs/{_leaf}"
+                    # 2026-11-15（C）：下载口径必须是**交接后稳定**的位置。
+                    # 无活跃 run 时 rel_path 指向 `staging/<lease>`，首 run 激活会
+                    # move 到 `inputs/<lease name>` 并 unlink staging ⇒ rel_path 是死路径。
+                    # 交接目标由 `auto_commit_staged` 固定为 `inputs/{source.name}`。
+                    _download = f"{_task_rel_root}/inputs/{_leaf}"
                 results.append(FileParseResult(
                     success=True,
                     filename=filename,
                     file_path=file_path,
                     rel_path=rel_path,
                     display_path=_display,
+                    download_path=_download,
                     size=size,
                     file_type=ext.lstrip(".") or "bin",
                 ))

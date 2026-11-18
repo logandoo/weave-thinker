@@ -132,10 +132,11 @@ async def word_count(args: Dict[str, Any], **kwargs) -> str:
     workspace_root = str(Path(workspace.root_path).resolve())
 
     paths: List[str] = []
-    from app.services.workspace_scope_service import apply_scope_or_error
+    from app.services.workspace_scope_service import apply_scope_or_error, resolve_scope_meta
     workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
     if _scope_err:
         return json.dumps(_scope_err, ensure_ascii=False)
+    _src_meta = await resolve_scope_meta(kwargs, args=args, access="read")
 
     single = args.get("path") or args.get("file_path")
     if single:
@@ -190,6 +191,9 @@ async def word_count(args: Dict[str, Any], **kwargs) -> str:
     }
     if not_found:
         resp["not_found"] = not_found
+    if _src_meta:
+        resp["source_scope"] = _src_meta["scope"]
+        resp["source_grant_id"] = _src_meta.get("grant_id")
 
     return json.dumps(resp, ensure_ascii=False)
 
@@ -208,7 +212,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "path": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only; a cross-task read needs a server-issued grant_id, or is grant-free within your own workspace when same-user free cross-task reads are enabled."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "path": {
                     "type": "string",
                     "description": "单个文件的路径（绝对路径、工作区相对路径）。与 files 二选一。",
                 },

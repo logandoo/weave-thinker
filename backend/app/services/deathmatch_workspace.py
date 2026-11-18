@@ -8,7 +8,7 @@ monkeypatches of ``deathmatch_service.<name>`` keep working.
 """
 from __future__ import annotations
 
-_GLOBALS = ('Any', 'CodeExecutionService', 'Counter', 'CriteriaCandidateRejected', 'DeathmatchManager', 'Dict', 'List', 'PlanResult', 'STYLE_REGISTRY', '_CONSENSUS_CACHE', '_CONSENSUS_MAX_CACHE', '_CONSENSUS_PROMPT', '_EVIDENCE_STEP_IDS_CACHE', '_EVIDENCE_STEP_IDS_MAX_CACHE', '_PLACEHOLDER_JUDGE_CACHE', '_PLACEHOLDER_JUDGE_MAX_CACHE', '_PLACEHOLDER_JUDGE_PROMPT', '_STEP_KINDS', '_build_obligation_criteria', '_build_placeholder_judge_content', '_contract_hash', '_evidence_step_ids_bucket', '_evidence_step_ids_cached', '_execution_need_cached', '_flatten_grilling_qa', '_format_criteria_block', '_is_creative_goal', '_mechanical_checks', '_merge_criteria', '_normalize_done_check', '_normalize_evidence_spec', '_normalize_rel_path', '_os', '_parse_criteria_response', '_placeholder_judge_obligation_context', '_read_deliverable_excerpt', '_read_pair', '_recovery_action', '_safe_exact_file_path', '_safe_workspace_path', '_sanitize_gate_output', '_step_forbids_new_files', '_sanitize_step_file_contract', '_output_allowed_by_boundary', '_tool_registry', '_touch_json', '_truncate', '_validate_plan_protocol', 'config', 'defaultdict', 'exc', 'hashlib', 'json', 'judge_json', 'logger', 'parse_contract', 'render_plan_hints', 'write_through_bg', 'x')
+_GLOBALS = ('Any', 'CodeExecutionService', 'Counter', 'CriteriaCandidateRejected', 'DeathmatchManager', 'Dict', 'List', 'PlanResult', 'STYLE_REGISTRY', '_CONSENSUS_CACHE', '_CONSENSUS_MAX_CACHE', '_CONSENSUS_PROMPT', '_EVIDENCE_STEP_IDS_CACHE', '_EVIDENCE_STEP_IDS_MAX_CACHE', '_PLACEHOLDER_JUDGE_CACHE', '_PLACEHOLDER_JUDGE_MAX_CACHE', '_PLACEHOLDER_JUDGE_PROMPT', '_STEP_KINDS', '_build_obligation_criteria', '_build_placeholder_judge_content', '_contract_hash', '_evidence_step_ids_bucket', '_evidence_step_ids_cached', '_execution_need_cached', '_flatten_grilling_qa', '_format_criteria_block', '_is_creative_goal', '_is_scratch_path', '_mechanical_checks', '_merge_criteria', '_normalize_done_check', '_normalize_evidence_spec', '_normalize_rel_path', '_os', '_parse_criteria_response', '_placeholder_judge_obligation_context', '_read_deliverable_excerpt', '_read_pair', '_recovery_action', '_safe_exact_file_path', '_safe_workspace_path', '_sanitize_gate_output', '_step_forbids_new_files', '_sanitize_step_file_contract', '_output_allowed_by_boundary', '_tool_registry', '_touch_json', '_truncate', '_validate_plan_protocol', 'config', 'defaultdict', 'exc', 'hashlib', 'json', 'judge_json', 'logger', 'parse_contract', 'render_plan_hints', 'write_through_bg', 'x')
 
 
 def _sync_deathmatchworkspace_globals() -> None:
@@ -1267,7 +1267,7 @@ class DeathmatchWorkspaceMixin:
                     except Exception:
                         continue
                     p = _normalize_rel_path(rel)
-                    if p:
+                    if p and not _is_scratch_path(p):
                         out.append(p)
         except Exception as exc:
             logger.debug("baseline capture failed (unknown=strict mtime): %s", exc)
@@ -1290,6 +1290,10 @@ class DeathmatchWorkspaceMixin:
                     try:
                         st = _os.stat(fp)
                         rel = _os.path.relpath(fp, workspace_path)
+                        # 2026-11-15: scratch/ 是 execute_code 的临时 cwd，
+                        # 不是交付面 —— 不进快照，也不进 verifier 的文件清单。
+                        if _is_scratch_path(rel):
+                            continue
                         snap.append({
                             "path": rel,
                             "size": st.st_size,

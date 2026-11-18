@@ -3187,3 +3187,65 @@ async def bulk_move_notes(
 
     await db.commit()
     return BulkMoveResponse(status="ok", moved_count=len(notes))
+
+
+# --- 笔记 ↔ 任务绑定（2026-11-15 任务管理中心 · DESIGN_20261115 §4.9）----------
+
+from pydantic import BaseModel as _PydBase  # noqa: E402
+
+
+class NoteTaskBindingRequest(_PydBase):
+    task_id: str | None = None  # null = 解绑（不删笔记）
+    # 2026-11-16 Wave B：一条笔记可绑多个任务。action 缺省 = 「加绑」（幂等，
+    # 不影响该笔记在其他任务上的绑定）；`unbind` = 只解 task_id 那一条；
+    # `clear` = 清空全部绑定（= task_id=null 的旧语义）。
+    action: str = "bind"
+
+
+@router.post("/{note_id}/task-binding")
+async def bind_note_to_task(
+    note_id: str,
+    body: NoteTaskBindingRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把笔记绑定/解绑到任务。绑定是**关系**：改绑不复制内容，解绑不删除笔记。
+
+    多对多（2026-11-16 Wave B）：同一笔记可同时绑多个任务/项目，响应里的
+    `task_ids` 是当前全部绑定，`task_id` 是镜像列（= 最早那条绑定）。
+    """
+    from app.services import workspace_note_binding_service as nbs
+    from app.services import workspace_scope as ws
+
+    action = (body.action or "bind").strip().lower()
+    if action not in ("bind", "unbind", "clear"):
+        raise HTTPException(status_code=422,
+                            detail={"error": "action 仅支持 bind/unbind/clear",
+                                    "code": "workspace_invalid_args"})
+    # 评审 m2：`unbind` 必须指名解哪一条，否则字面语义（解一条）与实际行为（全清）相反
+    if action == "unbind" and body.task_id is None:
+        raise HTTPException(status_code=422,
+                            detail={"error": "action=unbind 需要同时提供 task_id（清空全部请用 clear）",
+                                    "code": "workspace_invalid_args"})
+    try:
+        if body.task_id is None or action == "clear":
+            await nbs.clear_bindings(db, user_id=current_user.id, note_id=note_id)
+        elif action == "unbind":
+            await nbs.remove_binding(db, user_id=current_user.id, note_id=note_id,
+                                     task_id=str(body.task_id))
+        else:
+            await nbs.add_binding(db, user_id=current_user.id, note_id=note_id,
+                                  task_id=str(body.task_id))
+        note = await nbs.get_note(db, user_id=current_user.id, note_id=note_id)
+        if note is None:
+            raise ws.WorkspaceScopeError(ws.CODE_FOREIGN_SCOPE, "note not found for user", note_id)
+        bound = await nbs.tasks_for_note(db, user_id=current_user.id, note_id=note_id)
+        await db.commit()
+    except ws.WorkspaceScopeError as exc:
+        status = 404 if exc.code == ws.CODE_FOREIGN_SCOPE else 422
+        raise HTTPException(status_code=status,
+                            detail={"error": str(exc), "code": exc.code})
+    return {"id": note.id, "task_id": note.task_id,
+            "task_bound_at": note.task_bound_at.isoformat() if note.task_bound_at else None,
+            "task_ids": [b["task_id"] for b in bound],
+            "bound_tasks": bound}

@@ -771,6 +771,14 @@ def _draft_ships_as_final(live: bool, enable_reasoning: bool, retry_thinking_off
 # and keep notes). Undeclared → full registry (default, opt-in-by-absence).
 _DM_STEP_TOOL_CORE = frozenset({
     "workspace_read", "workspace_write", "workspace_glob", "execute_code",
+    # 2026-11-13 parity 波：terminal 产物必须能经 publish 进稳定域；步骤声明了
+    # tools 子集时若看不到它，B1（scratch 交付物不可见）会原样复发。
+    "workspace_publish",
+    # 2026-11-14 v2：用户显式要求归类时，死磕步骤也必须能改绑会话。
+    "workspace_bind_task",
+    # 2026-11-15 任务管理中心：步骤内可管理项目/任务、绑笔记、看任务文件。
+    "workspace_project_manage", "workspace_task_manage",
+    "workspace_note_bind", "workspace_task_files",
     "calculate", "memory", "memory_search", "notes", "provide_file", "word_count",
     # 引用格式波（2026-09-27 A4.9 ②）：论文完稿工具必须在步骤核心集内，
     # 否则步骤 tools 子集 fail-closed 会拒绝通稿「必须调用」的 citation_render。
@@ -2409,6 +2417,11 @@ class AgentLoopState:
     # request — the per-request budget (cross-request budget is the tracker's
     # auto_disable_after).
     canary_compressed: bool = False
+    # 遵循词 canary（2026-11-17，conv cdd56a8e 复盘）：本回合已重答次数。
+    # `canary_compressed` 只保证「同一请求内分支不重复触发」，一旦该闸被复位
+    # （事故形：粘滞 `_canary_retry` 使续跑每轮发生），漏标就退化成无界重答。
+    # 本计数配 `[agent.canary] max_reanswers_per_turn` 做**语义级**上限。
+    canary_reanswers: int = 0
     # search_required=True 且模型未调 web_search 时，是否已注入过一次检索
     # 提醒 directive（conv 86e51bbd follow-up 2026-08-10）：每轮只提醒一次，
     # 防止顽固模型反复触发无限迭代（有界：最多注入一次后交给预算/审计）。
@@ -4215,8 +4228,17 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
         self.workspace_path = workspace_path
         # 任务作用域（2026-11-10）：单次 run 冻结的 WorkspaceContext；None = legacy/off。
         # 与 workspace_path 并存：off/shadow 档继续用 workspace_path，enforce 档由
-        # workspace_ctx 决定工具根，缺 context 时各工具 fail closed（不回用户根）。
+        # workspace_ctx 决定工具根，缺 context 时各工具 fail closed——**除非**下面
+        # workspace_scoping_intent 被装配层显式声明为 legacy（2026-11-13 续波）。
         self.workspace_ctx = workspace_ctx
+        # 本轮作用域意图（2026-11-13 续波）：`task` = 已绑定 Task；`legacy` = 服务端**刻意**
+        # 让本轮走旧用户根（老会话不换房 / 链路未放开作用域，如 device）。enforce 下工具层
+        # 据此决定「缺 ctx 是设计如此」还是「链路漏了作用域」——后者必须继续 fail-closed。
+        # 只由装配层写、只经 dispatch kwargs 注入，模型参数无法伪造。
+        self.workspace_scoping_intent = None
+        # legacy 判定的来源（predates_scoping | chain_unsupported | …），线上要能分清
+        # 「设计如此」与「链路漏接线」，否则日志永远是 unspecified。
+        self.workspace_legacy_source = None
         # C3: first judge evaluation of a run counts as the user-initiated
         # turn (does not consume the deathmatch max_turns budget). chat.py
         # constructs one AgentLoop per user message and run() is called once,
@@ -4608,12 +4630,20 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
             except Exception:
                 _ctx_est = 0
         timeout = config.agent_tool_loop_judge_timeout
+        _scratch_path = ""
+        _ws_ctx = getattr(self, "workspace_ctx", None)
+        if _ws_ctx is not None:
+            try:
+                _scratch_path = str(_ws_ctx.attempt_root / "scratch")
+            except Exception:  # noqa: BLE001 - 无 attempt 域 = 不提示 publish
+                _scratch_path = ""
         if timeout <= 0:
             try:
                 return await dm.evaluate_after_turn(
                     content,
                     user_initiated=user_initiated,
                     workspace_path=workspace_path,
+                    scratch_path=_scratch_path,
                     tool_results=tool_results,
                     ctx_estimate_tokens=_ctx_est,
                 )
@@ -4645,6 +4675,7 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
                     content,
                     user_initiated=user_initiated,
                     workspace_path=workspace_path,
+                    scratch_path=_scratch_path,
                     tool_results=tool_results,
                     ctx_estimate_tokens=_ctx_est,
                 ),
@@ -7489,8 +7520,12 @@ class AgentLoop(AuditMixin, CoordinatorMixin, CompressionMixin, AgentToolMixin, 
             logger.exception("checkpoint_cb failed (fail-open)")
 
     _SIDE_EFFECT_TOOLS = frozenset({
-        "workspace_write", "workspace_edit", "notes", "terminal",
+        "workspace_write", "workspace_edit", "workspace_publish", "notes", "terminal",
         "process", "execute_code", "job_submit",
+        # 2026-11-14 v2：改绑是持久状态变更（恢复重放去重必须覆盖）
+        "workspace_bind_task",
+        # 2026-11-15 任务管理中心：项目/任务编辑与笔记绑定是持久状态变更
+        "workspace_project_manage", "workspace_task_manage", "workspace_note_bind",
         # R6 补全：其余有外部/持久副作用的工具一并进台账（恢复重放去重覆盖）；
         # memory 的 read 动作无副作用——不记账（避免把热读缓存成截断结果）
         "memory", "background_task", "schedule", "delegate_task",

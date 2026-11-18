@@ -48,8 +48,14 @@ async def process(args: Dict[str, Any], **kwargs) -> str:
 
     ctx = kwargs.get("workspace_ctx")
     scope_key = getattr(ctx, "task_id", None)
+    # CF-1 延伸（评审 r1 F Wave F Minor）：只有真正 spawn/写 stdin 的动作（start/write）才需要
+    # 写围栏（它们在被放弃 attempt 的 scratch 里跑）；list/read/kill 只操作进程管理器状态、按
+    # scope.task_id 隔离，不该被写围栏挡——否则回合中改绑后模型连清理自己遗留 PTY 都做不到
+    # （泄漏到 30min 空闲回收）。读型动作走 access='read'（scratch 读不拦截），任务隔离仍由
+    # process_manager 的 scope.task_id 强制。
+    _proc_access = "write" if action in ("start", "write") else "read"
     exec_cwd, cwd_err = await apply_scope_or_error(kwargs, default_root=workspace_root,
-                                                   args=args, access="write",
+                                                   args=args, access=_proc_access,
                                                    default_scope="scratch")
     if cwd_err:
         return _error(str(cwd_err.get("error") or "任务作用域拒绝执行。"))

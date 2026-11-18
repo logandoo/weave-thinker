@@ -20,10 +20,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from app.core.config import get_config
 from app.db.database import (
+    Conversation,
     WorkspaceBinding,
     WorkspaceBindingEvent,
     WorkspaceMessageContext,
@@ -38,13 +39,38 @@ RECOVER_MIN_SCORE = 0.55
 RECOVER_MARGIN = 0.12
 AMBIGUOUS_MARGIN = 0.05
 
+# 占位标题：这些值**不代表用户起的名字**，因此允许被会话标题改写
+# （conversations.title 的 DB 默认是「新对话」；bind 兜底「新任务」；
+#   create_task 兜底「未命名任务」；标题生成兜底「未命名会话」；
+#   语音链路自建「新语音对话」并以「语音会话」兜底 —— 评审 r1 Important-4）。
+PLACEHOLDER_TASK_TITLES = frozenset({"新对话", "新任务", "未命名任务", "未命名会话",
+                                     "新语音对话", "语音会话"})
+
+# 自动任务一次性命名的摘要长度（DESIGN_20261115 §4.3：≤24 字）
+AUTO_TASK_TITLE_MAX = 24
+
+
+def _auto_task_title(hint: str | None) -> str:
+    """首条用户消息 → 一次性任务名（≤24 字，压平空白，去掉纯占位词）。
+
+    只用于**创建时**；之后任务标题独立，不跟随会话改名（§4.3）。
+    """
+    text = " ".join(str(hint or "").split())
+    if not text:
+        return ""
+    text = text[:AUTO_TASK_TITLE_MAX].strip()
+    if not text or text in PLACEHOLDER_TASK_TITLES:
+        return ""
+    return text
+
 
 @dataclass(frozen=True)
 class ScopingSettings:
     mode: str = "off"
     supported_modes: tuple[str, ...] = ("chat",)
     recover_auto: bool = False
-    inbox_project_name: str = "收件箱"
+    classify_new: bool = True
+    inbox_project_name: str = "默认项目"
     default_ingest: str = "user_facts"
     staging_lease_seconds: int = 86400
 
@@ -55,6 +81,7 @@ def _settings() -> ScopingSettings:
         mode=cfg.workspace_task_scoping_mode,
         supported_modes=tuple(cfg.workspace_task_scoping_supported_modes),
         recover_auto=cfg.workspace_task_recover_auto,
+        classify_new=bool(getattr(cfg, "workspace_task_classify_new", True)),
         inbox_project_name=cfg.workspace_inbox_project_name,
         default_ingest=cfg.workspace_task_default_ingest,
         staging_lease_seconds=cfg.workspace_staging_lease_seconds,
@@ -79,15 +106,25 @@ class BindingResolution:
     candidates: list[TaskCandidate] = field(default_factory=list)
     question: str | None = None
     task_root_rel: str = ""
+    # 2026-11-14 v2：新会话归类建议（不静默绑定——本轮仍进默认项目，UI 询问用户）
+    suggested_task: TaskCandidate | None = None
 
 
 # --- 读 -----------------------------------------------------------------------
 
-async def get_binding(db, *, user_id: str, conversation_id: str) -> WorkspaceBinding | None:
-    res = await db.execute(
-        select(WorkspaceBinding).where(WorkspaceBinding.conversation_id == conversation_id,
-                                       WorkspaceBinding.user_id == user_id)
-    )
+async def get_binding(db, *, user_id: str, conversation_id: str,
+                      for_update: bool = False) -> WorkspaceBinding | None:
+    stmt = select(WorkspaceBinding).where(WorkspaceBinding.conversation_id == conversation_id,
+                                          WorkspaceBinding.user_id == user_id)
+    if for_update:
+        # 改绑 CAS 的行锁：并发两个 rebind 不能都读到同一 binding_version 再各自 +1
+        # （否则同一 version 对两个任务都成立，使 assert_write_epoch 的等值校验形同虚设）。
+        # populate_existing=True 必带：FOR UPDATE 重读若走 identity map 会原样返回**已加载的旧对象**
+        # （评审 r2 Important：实测锁读返回 v=3 而行已为 4），CAS 仍拿改绑前的版本比较 → 洞没堵上。
+        stmt = stmt.with_for_update()
+        res = await db.execute(stmt, execution_options={"populate_existing": True})
+    else:
+        res = await db.execute(stmt)
     return res.scalar_one_or_none()
 
 
@@ -164,26 +201,71 @@ async def _append_event(db, *, conversation_id: str, user_id: str, from_task_id:
     await db.flush()
 
 
-async def _has_active_run(db, *, conversation_id: str | None = None,
-                          task_id: str | None = None) -> bool:
-    from app.db.database import WorkspaceRun
-    from app.services.workspace_run_service import ACTIVE_RUN_STATUSES
+async def _reset_deathmatch_snapshot(db, *, conversation_id: str, user_id: str,
+                                     from_task_id: str | None, to_task_id: str | None,
+                                     from_version: int | None, to_version: int | None,
+                                     system_memory_ingest: str | None,
+                                     trigger: str) -> bool:
+    """换根（首绑/改绑）后清空验证快照 + 追加事件（WP2 行为 1）。
 
-    stmt = select(WorkspaceRun.id)
-    if conversation_id:
-        stmt = stmt.where(WorkspaceRun.conversation_id == conversation_id)
-    if task_id:
-        stmt = stmt.where(WorkspaceRun.task_id == task_id)
-    stmt = stmt.where(WorkspaceRun.status.in_(ACTIVE_RUN_STATUSES)).limit(1)
-    res = await db.execute(stmt)
-    return res.first() is not None
+    不清空 → 下一回合拿旧根的 `workspace_files` 比新根 → 完整性违规 +
+    已定案步骤翻案 + claim 撤回（B2）。非死磕会话不写事件。
+    """
+    from app.db.database import Conversation
+    from app.services.deathmatch_verification import reset_verification_snapshot
+
+    conv = await db.get(Conversation, conversation_id)
+    if conv is None or not bool(getattr(conv, "deathmatch_mode", False)):
+        return False
+    if not reset_verification_snapshot(conv, reason=f"binding_change:{trigger}"):
+        return False
+    await _append_event(
+        db, conversation_id=conversation_id, user_id=user_id,
+        from_task_id=from_task_id, to_task_id=to_task_id,
+        from_version=from_version, to_version=to_version,
+        actor="system", reason="dm_snapshot_reset",
+        system_memory_ingest=system_memory_ingest)
+    return True
+
+
+async def _park_active_runs(db, *, conversation_id: str) -> int:
+    """显式改绑前停泊该会话的活跃 run（§6.3「先 stop/park 再改绑」的自动化，2026-11-16 Wave D）。
+
+    用户裁定：项目/任务管理是用户主权，绝不因「有进行中的 run」被拒。park_run 封存
+    current attempt，配合 rebind 的 binding_version 递增，使旧 attempt 的后续写入在
+    `assert_write_epoch` 处 fail-closed（CODE_ATTEMPT_STALE / CODE_BINDING_STALE）——
+    安全底座不削弱，只是把「先停」这一步从甩给用户改成服务端自动完成。返回停泊数。
+    """
+    from app.db.database import WorkspaceRun
+    from app.services.workspace_run_service import ACTIVE_RUN_STATUSES, park_run
+
+    res = await db.execute(
+        select(WorkspaceRun.id).where(
+            WorkspaceRun.conversation_id == conversation_id,
+            WorkspaceRun.status.in_(ACTIVE_RUN_STATUSES)))
+    parked = 0
+    for (rid,) in res.all():
+        run = await park_run(db, run_id=rid)
+        if str(run.status) == "parked":   # 只数真正停泊的（park_run 对终态 run 幂等跳过）
+            parked += 1
+    return parked
 
 
 async def rebind(db, *, user_id: str, conversation_id: str, task_id: str,
                  expected_binding_version: int, actor: str = "user",
                  reason: str = "") -> WorkspaceBinding:
-    """显式改绑：CAS + 活跃 run 守卫 + 事件追加（不移动任何文件）。"""
-    current = await get_binding(db, user_id=user_id, conversation_id=conversation_id)
+    """显式改绑：CAS + 活跃 run 自动停泊 + 事件追加（**本服务函数不移动文件**）。
+
+    文件归属：改绑后若源任务变空，由**调用方**（HTTP 端点 / agent 工具）在 commit 之后调
+    `workspace_task_lifecycle_service.migrate_orphaned_task_files` 迁移孤儿文件；本函数保持
+    「不搬文件」语义，使逐消息来源快照与跨任务产出视图的既有测试不受影响（2026-11-18 issue4）。
+
+    2026-11-16 Wave D：活跃 run 不再阻断改绑——服务端自动 park 后再 CAS（§6.3「先停再改」
+    自动化）。park_run 封存 attempt + binding_version 递增使旧 attempt 写入 fail-closed。
+    返回的 binding 带 transient `_parked_active_runs`（停泊数）供 API/工具透出。
+    """
+    current = await get_binding(db, user_id=user_id, conversation_id=conversation_id,
+                                for_update=True)
     if current is None:
         # 歧义选择器闭环（§6.1「只问一次」）：未绑定会话允许 expected=0 首绑，
         # CAS 语义 =「当前必须无绑定」；并发双选只有一个成功，另一个按 stale 处理。
@@ -199,11 +281,19 @@ async def rebind(db, *, user_id: str, conversation_id: str, task_id: str,
             task = await svc.get_task(db, user_id=user_id, task_id=task_id)
             if task is None:
                 raise ws.WorkspaceScopeError(ws.CODE_FOREIGN_SCOPE, "task not found", str(task_id))
-            if str(task.status or "active") == "archived":
+            if str(task.status or "active") in ("archived", "deleted"):
                 raise ws.WorkspaceScopeError(ws.CODE_RELATION_INVALID,
-                                             "cannot bind to archived task", str(task_id))
-            return await _bind(db, user_id=user_id, conversation_id=conversation_id,
-                               task=task, existing=None, actor=actor, reason=reason or "user_choice")
+                                             "cannot bind to archived/deleted task", str(task_id))
+            # 评审 r2 Important-1：首绑也可能遇到「有活跃 run 但无绑定」的会话（resolve 会
+            # 删除指向已归档/删除任务的绑定，留下孤儿活跃 run）。不 park 的话，新绑定 v1 与
+            # 旧 run 的 binding_version=1 相等 → assert_write_epoch 的等值校验放行 → 旧回合
+            # 继续写旧任务。首绑前先停泊该会话活跃 run（正常首绑无 run，幂等空操作）。
+            parked = await _park_active_runs(db, conversation_id=conversation_id)
+            new_binding = await _bind(db, user_id=user_id, conversation_id=conversation_id,
+                                      task=task, existing=None, actor=actor,
+                                      reason=reason or "user_choice")
+            new_binding._parked_active_runs = parked
+            return new_binding
         raise ws.WorkspaceScopeError(ws.CODE_BINDING_STALE,
                                      "conversation has no binding to rebind", conversation_id)
     if int(current.binding_version) != int(expected_binding_version):
@@ -211,18 +301,28 @@ async def rebind(db, *, user_id: str, conversation_id: str, task_id: str,
             ws.CODE_BINDING_STALE,
             f"binding_version {current.binding_version} != expected {expected_binding_version}",
             conversation_id)
-    if await _has_active_run(db, conversation_id=conversation_id, task_id=current.task_id):
-        # 设计 §6.3：先 stop/park，确认旧 attempt 不再写入后再改绑
-        raise ws.WorkspaceScopeError(ws.CODE_RUN_ACTIVE,
-                                     "park the active run before rebinding", conversation_id)
     if str(current.task_id) == str(task_id):
-        return current
+        return current   # 同任务幂等：不触碰活跃 run
+
+    # 2026-11-16 Wave D（用户裁定 issue4/5：项目/任务管理是用户主权，绝不因「有进行中的
+    # run」被拒）。原 `_has_active_run → CODE_RUN_ACTIVE` 拒绝让 UI 改绑遇卡死 running run
+    # 永久失败，且 agent 改绑（永远发生在自己的活跃 run 内）恒失败。改为自动停泊活跃 run
+    # 后继续 CAS：park_run 封存 attempt + 下面 binding_version 递增，使旧 attempt 的后续
+    # 写入在 assert_write_epoch 处 fail-closed（安全底座不削弱，只是把「先停」自动化）。
+    current._parked_active_runs = await _park_active_runs(db, conversation_id=conversation_id)
+    # D-5（CE-2 修订，评审 r2 Critical）：**不**改写 deathmatch_status。
+    # deathmatch_status 是控制字段（deathmatch_service.DEATHMATCH_CONTROL_FIELDS），从改绑
+    # 这条外部事务写它会被 goal-loop 的 merge_sync 冻结整条流 → 循环的 done/partial 终局写
+    # 被丢弃 → 用户下次发消息 resume 到「已完成的 goal」= 双跑；且 goal-loop 读的是 detached
+    # 内存副本，根本看不到这次外部写。正确语义：goal 随会话迁移到新任务——park 旧 run 让旧
+    # 回合写入在围栏处 fail-closed（D-3/D-4），下一回合 attach_chat_scope 见无活跃 run，
+    # 在新任务上 mint 新 run 续跑。故此处只停泊、不动状态。
 
     task = await svc.get_task(db, user_id=user_id, task_id=task_id)
     if task is None:
         raise ws.WorkspaceScopeError(ws.CODE_FOREIGN_SCOPE, "target task not found for user", task_id)
-    if str(task.status or "active") == "archived":
-        raise ws.WorkspaceScopeError(ws.CODE_RELATION_INVALID, "target task is archived", task_id)
+    if str(task.status or "active") in ("archived", "deleted"):
+        raise ws.WorkspaceScopeError(ws.CODE_RELATION_INVALID, "target task is archived/deleted", task_id)
 
     from_version = int(current.binding_version)
     to_version = from_version + 1
@@ -238,6 +338,13 @@ async def rebind(db, *, user_id: str, conversation_id: str, task_id: str,
                         from_task_id=from_task_id,
                         to_task_id=task.id, from_version=from_version, to_version=to_version,
                         actor=actor, reason=reason, system_memory_ingest=task.system_memory_ingest)
+    # WP2：换根即重置死磕验证快照（旧根的相对路径在新根上没有意义）。
+    await _reset_deathmatch_snapshot(
+        db, conversation_id=conversation_id, user_id=user_id,
+        from_task_id=from_task_id, to_task_id=task.id,
+        from_version=from_version, to_version=to_version,
+        system_memory_ingest=task.system_memory_ingest,
+        trigger=f"rebind:{reason or actor}")
     return current
 
 
@@ -308,13 +415,16 @@ class TaskBindingService:
             raise ws.WorkspaceScopeError(ws.CODE_SCOPE_MISSING, "conversation id required", "")
 
         existing = await get_binding(db, user_id=user_id, conversation_id=conv_id)
+        # 2026-11-14 v2（评审 M6）：曾绑定过的会话（含绑定指向已消失任务）不是「新会话」，
+        # 不得触发归类建议——否则有历史的会话会被当成新会话打扰。
+        had_binding = existing is not None
 
         # 1) 已有绑定：普通续聊继续同一 Task（改绑必须走 CAS）
         if existing is not None and not explicit_task_id:
             task = await svc.get_task(db, user_id=user_id, task_id=existing.task_id)
             project = await svc.get_project(db, user_id=user_id,
                                             project_id=task.project_id) if task else None
-            if task is not None and project is not None and str(task.status) != "archived":
+            if task is not None and project is not None and str(task.status) not in ("archived", "deleted"):
                 view = ws.build_binding_view(user_id=user_id, user_root=user_root,
                                              project=project, task=task, binding=existing,
                                              conversation_id=conv_id)
@@ -376,21 +486,37 @@ class TaskBindingService:
                                                      conversation_id=conv_id)
                         return BindingResolution(binding, view, "bound", strong, None, chosen.root_rel)
 
+        # 3.5) 归类建议（2026-11-14 v2，用户要求）：新会话首条消息命中**唯一强候选**
+        #      任务时，不静默绑定——本轮仍进默认项目，候选作为建议交给 UI 询问用户
+        #      （「要归类到该任务吗？」）。判断不了/无候选 → 默认项目（不打扰）。
+        suggestion: TaskCandidate | None = None
+        if (bool(getattr(settings, "classify_new", True)) and existing is None
+                and not had_binding and str(continuation_hint or "").strip()):
+            candidates = await search_tasks(db, user_id=user_id, query=continuation_hint, limit=6)
+            strong = [c for c in candidates if c.score >= RECOVER_MIN_SCORE]
+            if len(strong) == 1:
+                runner_up = candidates[1].score if len(candidates) > 1 else 0.0
+                if len(strong) == len(candidates) or strong[0].score - runner_up >= RECOVER_MARGIN:
+                    suggestion = strong[0]
+
         # 4) 默认：inbox Project 下的新空 Task（不自动恢复任何旧 Task）
         project = await svc.ensure_inbox_project(db, user_id=user_id, user_root=user_root)
-        title = str(getattr(conversation, "title", "") or "").strip() or "新任务"
+        # 2026-11-15（DESIGN_20261115 §4.3 / 验收 #10）：自动任务**一次性**取首条
+        # 用户消息摘要（≤24 字）作为初始名，origin='auto'；之后不跟随会话改名。
+        title = _auto_task_title(continuation_hint) or "未命名任务"
         task = await svc.create_task(db, user_id=user_id, user_root=user_root,
-                                     project_id=project.id, title=title[:300])
+                                     project_id=project.id, title=title, origin="auto")
         binding = await _bind(db, user_id=user_id, conversation_id=conv_id, task=task,
                               existing=existing, actor="system", reason="new_conversation")
         view = ws.build_binding_view(user_id=user_id, user_root=user_root, project=project,
                                      task=task, binding=binding, conversation_id=conv_id)
-        return BindingResolution(binding, view, "created", [], None, task.root_rel)
+        return BindingResolution(binding, view, "created", [], None, task.root_rel,
+                                 suggested_task=suggestion)
 
 
 async def bind_new_task(db, *, user_id: str, user_root, conversation_id: str,
                         title: str = "", actor: str = "user") -> WorkspaceBinding:
-    """歧义「开新任务」：在收件箱 Project 下建空 Task 并绑定。
+    """歧义「开新任务」：在默认项目下建空 Task 并绑定。
 
     幂等：会话已有绑定时原样返回（不新建、不改绑）——「只问一次」的落地面，
     绑定后下一回合 resolve 直接 reuse。"""
@@ -399,7 +525,8 @@ async def bind_new_task(db, *, user_id: str, user_root, conversation_id: str,
         return existing
     project = await svc.ensure_inbox_project(db, user_id=user_id, user_root=user_root)
     task = await svc.create_task(db, user_id=user_id, user_root=user_root,
-                                 project_id=project.id, title=(title or "新任务")[:300])
+                                 project_id=project.id, title=(title or "新任务")[:300],
+                                 origin="user")
     try:
         return await _bind(db, user_id=user_id, conversation_id=conversation_id, task=task,
                            existing=None, actor=actor, reason="user_new_task")
@@ -424,6 +551,33 @@ async def bind_new_task(db, *, user_id: str, user_root, conversation_id: str,
         except OSError:
             logger.warning("bind_new_task loser cleanup failed for %s", task.root_rel)
         return winner
+
+
+async def sync_task_title_from_conversation(db, *, user_id: str, conversation_id: str,
+                                            previous_title: str | None,
+                                            new_title: str | None) -> bool:
+    """**已停用**（2026-11-15 任务管理中心 · DESIGN_20261115 §4.3 / 验收 #10）。
+
+    任务标题**不再持续镜像会话标题**：自动任务在创建时一次性取首条用户消息摘要
+    作为初始名（`origin='auto'`），之后由用户/agent 独立改名。这里保留函数签名
+    作为兼容空操作，返回 False（未写入），调用点无需改动。
+
+    旧行为（2026-11-14 缺陷波）用镜像解决「任务永远叫新对话」；新设计用
+    **创建时一次性命名**解决同一问题，且不再让会话改名污染任务标题。
+    """
+    return False
+
+
+async def sync_task_title_after_rename(db, *, conversation,
+                                       previous_title: str | None = None,
+                                       new_title: str | None = None,
+                                       user_intent: bool = False) -> bool:
+    """**已停用**（同 `sync_task_title_from_conversation`）：兼容空操作，恒返回 False。
+
+    保留包装是因为会话 PUT / 聊天终态 / 语音 / worker 多处调用它；删除调用点会
+    扩大回归面，而空操作语义与「任务标题独立」完全一致。
+    """
+    return False
 
 
 async def _bind(db, *, user_id: str, conversation_id: str, task, existing: WorkspaceBinding | None,
@@ -454,6 +608,12 @@ async def _bind(db, *, user_id: str, conversation_id: str, task, existing: Works
     await _append_event(db, conversation_id=conversation_id, user_id=user_id,
                         from_task_id=None, to_task_id=task.id, from_version=0, to_version=1,
                         actor=actor, reason=reason, system_memory_ingest=task.system_memory_ingest)
+    # WP2：首绑同样换根（旧实现只守 rebind，首绑分支绕过 active-run 守卫）。
+    await _reset_deathmatch_snapshot(
+        db, conversation_id=conversation_id, user_id=user_id,
+        from_task_id=None, to_task_id=task.id, from_version=0, to_version=1,
+        system_memory_ingest=task.system_memory_ingest,
+        trigger=f"bind:{reason or actor}")
     return binding
 
 

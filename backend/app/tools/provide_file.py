@@ -145,7 +145,8 @@ async def provide_file(args: Dict[str, Any], **kwargs) -> str:
             "rel_path": rel_path,
             "display_path": to_rel_path(resolved, str(workspace_root)),
             **({"source_scope": _src_meta["scope"], "source_label": _src_meta["source"],
-                "source_task_id": _src_meta.get("task_id")} if _src_meta else {}),
+                "source_task_id": _src_meta.get("task_id"),
+                "source_grant_id": _src_meta.get("grant_id")} if _src_meta else {}),
             "size": size,
             "type": _guess_file_type(name),
         })
@@ -192,7 +193,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "file_path": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only; a cross-task read needs a server-issued grant_id, or is grant-free within your own workspace when same-user free cross-task reads are enabled."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "file_path": {
                     "type": "string",
                     "description": "单个文件的路径（绝对路径、工作区相对路径或文件名）。与 files 二选一。",
                 },

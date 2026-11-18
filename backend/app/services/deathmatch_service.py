@@ -189,6 +189,8 @@ def _build_turn_guidance(turn: int, max_turns: int) -> str:
         return (
             "如果需要搜索信息，调用 web_search。"
             "如果需要生成文件，调用 execute_code（PDF 导出除外——导出 PDF 必须使用 pdf_export 工具）。"
+            "如果使用 terminal / process 生成交付物，完成后必须调用 workspace_publish 把文件发布到"
+            "任务文件域（执行域的产物不会自动出现在交付区，校验器看不见）。"
             "如果需要浏览网页，调用 browser。"
             "在继续之前，先使用 workspace_read 回顾前序步骤已生成的文件内容，确保衔接。"
         )
@@ -563,6 +565,43 @@ def _is_bible_file(p: str) -> bool:
     if base not in BIBLE_FILE_NAMES:
         return False
     return p.startswith("bible/") or "/bible/" in p
+
+
+def _is_scratch_path(p: str) -> bool:
+    """True for the task-domain scratch directory (2026-11-15 波).
+
+    `workspace/scratch/task_*` is execute_code's per-call temp cwd — it is NOT
+    the deliverable surface. Counting its files as "this turn's output" makes
+    the verifier treat throwaway artifacts (docx copies, preview PNGs) as
+    evidence.
+
+    单一实现：`app.services.workspace_paths.is_scratch_task_path`（锚定
+    `scratch/task_`，`artifacts/scratch/` 这类用户目录不误伤）。
+    """
+    from app.services.workspace_paths import is_scratch_task_path
+
+    return is_scratch_task_path(p)
+
+
+def _is_noise_path(p: str) -> bool:
+    """Workspace paths that must never count as evidence or deliverables.
+
+    Shared by the verifier's "new files this turn" computation and the
+    workspace snapshot listing (2026-11-15: scratch/ added — it used to leak
+    execute_code temp output into the verifier's evidence surface).
+    """
+    path = str(p or "")
+    return (
+        "__pycache__" in path
+        or path.startswith("tool_results/")
+        or "/tool_results/" in path
+        # Bible spec files are SETTINGS, not deliverables — excluded from
+        # evidence/progress. Precise match on the 5 generated file names so a
+        # REAL deliverable inside a directory named "bible" is never falsely
+        # excluded (A4.9 review d/b).
+        or _is_bible_file(path)
+        or _is_scratch_path(path)
+    )
 
 
 BIBLE_GENERATION_PROMPT = BIBLE_GENERATION_PROMPT
@@ -1717,6 +1756,15 @@ class DeathmatchManager(DeathmatchPlanCoreMixin, DeathmatchGrillingFlowMixin, De
         # Workspace path set by evaluate_after_turn / verify_step_outputs;
         # used for bible snippets and deliverable collection.
         self._workspace_path = ""
+        # 2026-11-13 parity 波：作用域装配点显式注入的权威根 / 执行域根。
+        # `_workspace_path` 的旧语义依赖调用时序（计划创建时为空，且
+        # `compress_conversation_context` 会把它写成用户根）——计划基线捕获必须
+        # 用 `_plan_root`，否则 enforce 下名单与校验根不同构（B4）。
+        self._plan_root = ""
+        self._scratch_path = ""
+        # True = 本轮根由作用域装配点显式注入（enforce + ctx）。用于区分
+        # 「本波前的旧计划名单来自用户根」与「legacy 会话本来就在用户根校验」。
+        self._scope_injected = False
         # Transient: final deliverable file attachments collected when the
         # goal is deemed complete. Surfaced via get_verdict_dict() so the
         # agent loop / chat endpoint can attach download cards to the final
@@ -1726,6 +1774,46 @@ class DeathmatchManager(DeathmatchPlanCoreMixin, DeathmatchGrillingFlowMixin, De
         # deathmatch_plan remains the only status authority. Default off.
         self._execution_state = None
         self._est_nodes: Dict[str, List[str]] = {}
+
+    def set_workspace_root(self, write_root: str, *, scratch_root: str = "") -> None:
+        """作用域装配点注入权威根（enforce 下 = `ctx.write_root` / attempt scratch）。
+
+        显式根优先于 `_workspace_path` 的时序语义：计划创建时 manager 每请求新建，
+        `_workspace_path` 恒空；`compress_conversation_context` 又会把它落成用户根。
+        B4 的根分裂就是这两者叠加出来的。
+        """
+        root = str(write_root or "").strip()
+        if not root:
+            return
+        self._plan_root = root
+        self._workspace_path = root
+        self._scope_injected = True
+        if scratch_root:
+            self._scratch_path = str(scratch_root)
+        logger.info("deathmatch manager workspace root: %s (scratch=%s)",
+                    root, self._scratch_path or "-")
+
+    async def _plan_workspace_root(self, db) -> str:
+        """计划创建时的权威根：注入根 → 已解析根 → 旧用户根（legacy 兜底）。"""
+        root = str(getattr(self, "_plan_root", "") or "").strip()
+        if root:
+            return root
+        legacy = str(getattr(self, "_workspace_path", "") or "").strip()
+        if legacy:
+            self._plan_root = legacy
+            return legacy
+        try:
+            from app.services.workspace_service import ensure_user_workspace
+
+            workspace = await ensure_user_workspace(db, self._conv.user_id)
+            root = str(getattr(workspace, "root_path", "") or "")
+        except Exception as exc:  # noqa: BLE001 - 解析失败 → 严格 mtime（不写名单）
+            logger.debug("baseline workspace resolve failed (strict mtime): %s", exc)
+            root = ""
+        if root:
+            self._plan_root = root
+        return root
+
 
 
 
@@ -1772,6 +1860,15 @@ class DeathmatchManager(DeathmatchPlanCoreMixin, DeathmatchGrillingFlowMixin, De
 
         if _scope_mode() != "enforce":
             return False   # off/shadow 不改写系统记忆行为（§14：shadow 只记录不拦截）
+        # WP4-I1：默认 legacy —— attempt memory 目前无读取方（curate_task 无 app 调用方），
+        # 写进去等于黑洞。要改路由必须先接线 curator。
+        try:
+            from app.core.config import get_config as _get_config
+
+            if _get_config().deathmatch_completion_memory_scope != "task":
+                return False
+        except Exception:  # noqa: BLE001 - 配置不可读时保守回 legacy
+            return False
         async with AsyncSessionLocal() as db:
             binding = await tbs.get_binding(db, user_id=self._conv.user_id,
                                             conversation_id=self._conv.id)
@@ -1809,14 +1906,18 @@ class DeathmatchManager(DeathmatchPlanCoreMixin, DeathmatchGrillingFlowMixin, De
         try:
             content = self._completion_memory_entry()
             # 任务作用域（2026-11-10 §8.4 / §10）：scoped 会话的 completion **不得**写系统
-            # AGENT 记忆、不得触发 v2 subconscious hook；改投 run candidate，由 task
-            # curator 去重核对后再晋升。未绑定任务的 legacy 会话保持原行为。
+            # AGENT 记忆且**不触发 v2 subconscious hook**（notify_subconscious=False）；
+            # 本波 ADR D-20261113-dmparity-1：curator 未接线前默认走 legacy 文件记忆，
+            # 但系统写入绝不进入 v2 摄入。未绑定任务的 legacy 会话保持原行为。
             if await self._persist_completion_candidate(content):
                 return
             from app.tools.memory import memory as memory_tool
             await memory_tool(
                 {"action": "add", "target": "agent", "content": content},
                 user_id=self._conv.user_id,
+                # WP4-I1 / 评审 #3：收束摘要属系统写入，不得触发 v2 subconscious
+                # 摄入（DESIGN §505/§666）；文件记忆本身仍保留。
+                notify_subconscious=False,
             )
         except Exception:
             logger.debug(

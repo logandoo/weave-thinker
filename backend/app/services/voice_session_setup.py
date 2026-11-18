@@ -620,6 +620,11 @@ class VoiceSessionSetupMixin:
             conv_row = result.scalar_one_or_none()
             if conv_row and conv_row.title == "\u65b0\u8bed\u97f3\u5bf9\u8bdd":
                 conv_row.title = title
+                # 语音链路也是会话标题写入点（评审 r1 Important-4）：不接线的话，语音会话
+                # 一旦被 file_upload / attach_chat_scope 绑定，Task 就永远停在「新语音对话」。
+                # 本文件按既有风格用惰性导入（模块级不 import app.*，避免与 voice.py 成环）。
+                from app.services.task_binding_service import sync_task_title_after_rename
+                await sync_task_title_after_rename(self.db, conversation=conv_row)
                 await self.db.commit()
                 logger.info("voice title generated: %s", title)
         except Exception as exc:

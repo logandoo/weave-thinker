@@ -1242,6 +1242,88 @@ $$"""),
     ("users_created_at_backfill", "UPDATE users SET created_at = (NOW() AT TIME ZONE 'UTC') WHERE created_at IS NULL"),
     ("users_created_at_default", "ALTER TABLE users ALTER COLUMN created_at SET DEFAULT (now() AT TIME ZONE 'UTC')"),
     ("users_created_at_not_null", "ALTER TABLE users ALTER COLUMN created_at SET NOT NULL"),
+    # 2026-11-13 产品更名：自动收件箱项目「收件箱」→「默认项目」。
+    # 旧名在 UI 上被读成邮箱，实际语义是「未选择项目的新会话落入的默认项目」。
+    # 只改 name（root_rel = projects/p_<id> 不变，不移动任何文件）；幂等。
+    ("workspace_inbox_project_rename_default",
+     "UPDATE workspace_projects SET name = '默认项目' WHERE name = '收件箱' AND status = 'active'"),
+    # ------------------------------------------------------------------
+    # 任务管理中心（2026-11-15 · DESIGN_20261115_task_management.md §3）
+    # 全部 additive；默认项目以 kind='inbox' 稳定标识（改名不分裂）；编辑 CAS
+    # 用 row_version；删除两段式 archive → deleted（deleted_at）；笔记→任务绑定
+    # 是逻辑 FK（无物理 FK，避免同步冲突）。置于 pgvector_extension 之前。
+    # ------------------------------------------------------------------
+    ("workspace_projects_kind", "ALTER TABLE workspace_projects ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'user'"),
+    ("workspace_projects_description", "ALTER TABLE workspace_projects ADD COLUMN IF NOT EXISTS description TEXT"),
+    ("workspace_projects_row_version", "ALTER TABLE workspace_projects ADD COLUMN IF NOT EXISTS row_version INTEGER NOT NULL DEFAULT 1"),
+    ("workspace_projects_deleted_at", "ALTER TABLE workspace_projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP"),
+    # 存量默认项目回填 kind='inbox'（按旧名/新名 + 每用户最早一个，幂等）
+    ("workspace_projects_backfill_inbox_kind", """UPDATE workspace_projects p SET kind = 'inbox'
+        WHERE p.kind = 'user' AND p.status = 'active'
+          AND p.name IN ('默认项目', '收件箱')
+          AND p.id = (SELECT p2.id FROM workspace_projects p2
+                      WHERE p2.user_id = p.user_id AND p2.status = 'active'
+                        AND p2.kind = 'user'
+                        AND p2.name IN ('默认项目', '收件箱')
+                      ORDER BY p2.created_at ASC, p2.id ASC LIMIT 1)"""),
+    ("workspace_projects_inbox_unique", """CREATE UNIQUE INDEX IF NOT EXISTS uq_workspace_projects_user_inbox
+        ON workspace_projects (user_id) WHERE kind = 'inbox'"""),
+    ("workspace_tasks_description", "ALTER TABLE workspace_tasks ADD COLUMN IF NOT EXISTS description TEXT"),
+    ("workspace_tasks_origin", "ALTER TABLE workspace_tasks ADD COLUMN IF NOT EXISTS origin VARCHAR(16)"),
+    ("workspace_tasks_row_version", "ALTER TABLE workspace_tasks ADD COLUMN IF NOT EXISTS row_version INTEGER NOT NULL DEFAULT 1"),
+    ("workspace_tasks_deleted_at", "ALTER TABLE workspace_tasks ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP"),
+    ("workspace_tasks_deleted_reason", "ALTER TABLE workspace_tasks ADD COLUMN IF NOT EXISTS deleted_reason VARCHAR(16)"),
+    ("idx_workspace_tasks_deleted", "CREATE INDEX IF NOT EXISTS idx_workspace_tasks_deleted ON workspace_tasks(user_id, deleted_at)"),
+    ("notes_task_id", "ALTER TABLE notes ADD COLUMN IF NOT EXISTS task_id VARCHAR(36)"),
+    ("notes_task_bound_at", "ALTER TABLE notes ADD COLUMN IF NOT EXISTS task_bound_at TIMESTAMP"),
+    ("idx_notes_task", "CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id)"),
+    # 悬空 task_id 清理（无物理 FK，任务被物理删除后可能留悬空引用）
+    ("notes_cleanup_dangling_task", """UPDATE notes SET task_id = NULL, task_bound_at = NULL
+        WHERE task_id IS NOT NULL AND task_id NOT IN (SELECT id FROM workspace_tasks)"""),
+    # --- 2026-11-16 Wave B：笔记 ↔ 任务 多对多 --------------------------------
+    # 权威关系表；notes.task_id 降级为「最早绑定」镜像列（见服务层 docstring）。
+    # note_id 用**物理 FK + ON DELETE CASCADE**：删笔记/删笔记本/删用户/同步删除
+    # 等任何路径都自动带走绑定行（评审 B1：单绑时代关系长在 notes 行上，删笔记即
+    # 消失；改独立表后若只靠调用点清理，五条删除路径必漏）。task_id 仍是逻辑 FK：
+    # 任务 purge 只置 status='deleted'（行不删），解绑由服务层显式做。
+    ("create_note_task_bindings", """CREATE TABLE IF NOT EXISTS note_task_bindings (
+        id VARCHAR(36) PRIMARY KEY,
+        note_id VARCHAR(36) NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+        task_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL DEFAULT '',
+        bound_at TIMESTAMP)"""),
+    ("uq_note_task_bindings", "CREATE UNIQUE INDEX IF NOT EXISTS uq_note_task_bindings "
+        "ON note_task_bindings (note_id, task_id)"),
+    ("idx_note_task_bindings_task", "CREATE INDEX IF NOT EXISTS idx_note_task_bindings_task "
+        "ON note_task_bindings (task_id)"),
+    # 不建 idx_note_task_bindings_note：唯一索引 uq_note_task_bindings(note_id, task_id)
+    # 的最左前缀已覆盖按 note_id 查，单列索引是冗余（tests/test_startup_migrations_sql.py
+    # 的 test_no_redundant_index_pairs 会拦）。老库若已建过，这里显式 DROP。
+    ("idx_note_task_bindings_note_drop", "DROP INDEX IF EXISTS idx_note_task_bindings_note"),
+    ("idx_note_task_bindings_user", "CREATE INDEX IF NOT EXISTS idx_note_task_bindings_user "
+        "ON note_task_bindings (user_id)"),
+    # 老库（本表建时无 FK）：先清孤儿行，再补 FK，两步都幂等
+    ("note_task_bindings_prune_orphans", """DELETE FROM note_task_bindings
+        WHERE note_id NOT IN (SELECT id FROM notes)"""),
+    ("note_task_bindings_fk_note", """ALTER TABLE note_task_bindings
+        DROP CONSTRAINT IF EXISTS note_task_bindings_note_id_fkey"""),
+    ("note_task_bindings_add_fk_note", """ALTER TABLE note_task_bindings
+        ADD CONSTRAINT note_task_bindings_note_id_fkey
+        FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE"""),
+    # 回填：单绑时代的 notes.task_id → 一条关系行（幂等，ON CONFLICT 去重）。
+    # bound_at 直接沿用 task_bound_at（可为 NULL）——评审 m9：不伪造绑定时间。
+    ("note_task_bindings_backfill", """INSERT INTO note_task_bindings (id, note_id, task_id, user_id, bound_at)
+        SELECT gen_random_uuid()::text, n.id, n.task_id, nb.user_id, n.task_bound_at
+        FROM notes n JOIN notebooks nb ON nb.id = n.notebook_id
+        WHERE n.task_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM workspace_tasks t WHERE t.id = n.task_id)
+        ON CONFLICT (note_id, task_id) DO NOTHING"""),
+    # 刻意**没有**「镜像归位 / 镜像清空」两条 UPDATE notes：回填是 1:1 从镜像列
+    # 派生的，跑完后「最早绑定」恒等于原 task_id，归位语句按构造是 no-op；而
+    # `notes` 是 SYNC_ENTITIES 成员，迁移里的裸 Core UPDATE 不产生同步事件
+    # （sync_capture 模块头的自订规则），一条 no-op 换一次同步泄漏不值得。
+    # 悬空 task_id 由上一行的 notes_cleanup_dangling_task（Wave A 既有）负责。
+    # 运行期任何绑定变更都走 _sync_mirror 逐行 ORM 回写，镜像不会漂。
     ("pgvector_extension", "CREATE EXTENSION IF NOT EXISTS vector"),
     # memory_concepts
     ("create_memory_concepts", """CREATE TABLE IF NOT EXISTS memory_concepts (

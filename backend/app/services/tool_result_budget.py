@@ -28,7 +28,7 @@ class BudgetConfig:
 DEFAULT_BUDGET = BudgetConfig()
 
 
-_UNLIMITED_TOOLS = frozenset({"memory", "memory_search", "session_search", "workspace_read", "word_count", "workspace_glob", "provide_file", "grep", "diff", "workspace_write", "workspace_edit", "workspace_snapshot"})
+_UNLIMITED_TOOLS = frozenset({"memory", "memory_search", "session_search", "workspace_read", "word_count", "workspace_glob", "provide_file", "grep", "diff", "workspace_write", "workspace_edit", "workspace_publish", "workspace_snapshot"})
 
 
 def _is_inline_image_message(msg: Dict) -> bool:

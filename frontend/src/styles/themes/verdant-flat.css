@@ -748,6 +748,27 @@ html[data-skin="verdant-flat"][data-theme="dark"] .zen-exit-btn:focus-visible,
 html[data-skin="verdant-flat"][data-theme="dark"] .zen-exit-btn:active {
   background: color-mix(in srgb, #E07B54 22%, #1d201d);
 }
+/* 工作台选项「项目列表」（2026-11-14）：同款卡几何，中性色（非破坏性红） */
+html[data-skin="verdant-flat"] .zen-menu-btn {
+  width: 170px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  min-height: 44px;
+  border-radius: 14px;
+  border: 1px solid #dfe7d8;
+  background: var(--surface-panel-strong);
+  box-shadow: 0 4px 16px rgba(45, 59, 36, 0.10);
+  color: var(--color-text);
+  font-size: 13px;
+  font-weight: 600;
+  gap: 8px;
+}
+html[data-skin="verdant-flat"] .zen-menu-btn:hover {
+  background: #f8faf6;
+  color: var(--color-primary-dark);
+  border-color: #cfdbc4;
+  transform: none;
+}
 
 /* 滚动条 */
 html[data-skin="verdant-flat"] ::-webkit-scrollbar { width: 6px; height: 6px; }

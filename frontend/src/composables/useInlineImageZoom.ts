@@ -9,11 +9,16 @@
  * open the zoomable MediaLightbox on click. The image src is already a signed
  * /api/files/download URL, so the lightbox reuses it directly; downloads go
  * through downloadUrl with the same signed URL.
+ *
+ * 2026-11-15: 下载名必须带真实后缀。旧实现直接用 alt 文本当文件名，alt 是描述
+ * （"江南水乡水巷…"）没有后缀，加上 typeless Blob，Chrome 存成 `.txt`。
+ * 现在后缀只从 URL 的真实文件名取（见 `utils/downloadName`）。
  */
 import { computed, ref } from 'vue'
 import type { FileAttachment } from '@/types'
 import { downloadUrl } from '@/composables/useDownload'
 import { useToast } from '@/composables/useToast'
+import { downloadNameFromSrc } from '@/utils/downloadName'
 
 export function useInlineImageZoom() {
   const lightboxMedia = ref<FileAttachment | null>(null)
@@ -23,18 +28,8 @@ export function useInlineImageZoom() {
   const lightboxKind = computed<'image' | 'video'>(() => 'image')
 
   function nameFromSrc(src: string, alt: string): string {
-    if (alt && alt.trim()) return alt.trim().slice(0, 200)
-    try {
-      const u = new URL(src, window.location.origin)
-      const p = u.searchParams.get('path')
-      if (p) return decodeURIComponent(p).split('/').pop() || '图片'
-    } catch { /* fall through */ }
-    try {
-      const last = (src || '').split('/').pop() || ''
-      return last ? decodeURIComponent(last).slice(0, 200) : '图片'
-    } catch {
-      return '图片'
-    }
+    // alt 只作人类可读基名；后缀来自 URL 的真实文件名（绝不猜）。
+    return downloadNameFromSrc(src, alt)
   }
 
   /** Open the lightbox for a clicked <img>. Returns true when opened. */

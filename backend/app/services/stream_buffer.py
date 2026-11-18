@@ -59,6 +59,12 @@ _TOOL_TITLE_ZH: Dict[str, str] = {
     "word_count": "字数统计",
     "workspace_read": "文件读取",
     "workspace_glob": "文件搜索",
+    "workspace_publish": "文件发布",
+    "workspace_bind_task": "任务改绑",
+    "workspace_project_manage": "项目管理",
+    "workspace_task_manage": "任务管理",
+    "workspace_note_bind": "笔记绑定",
+    "workspace_task_files": "任务文件",
     "provide_file": "提供文件",
 }
 

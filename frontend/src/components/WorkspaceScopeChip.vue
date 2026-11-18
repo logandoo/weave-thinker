@@ -12,18 +12,43 @@ import { computed, ref, watch } from 'vue'
 import { useChatStore } from '@/stores/chat'
 import { useWorkspaceScopeStore } from '@/stores/workspaceScope'
 import { useToast } from '@/composables/useToast'
-import WorkspaceBindingDialog from './WorkspaceBindingDialog.vue'
+import ConversationTaskDrawer from './workspace/ConversationTaskDrawer.vue'
 
 const chatStore = useChatStore()
 const scope = useWorkspaceScopeStore()
 const { show: showToast } = useToast()
-const panelOpen = ref(false)
+const drawerOpen = ref(false)
 const pickerOpen = ref(false)
 
 // §6.1「歧义只问一次」：后端 workspace_task_ambiguous → 本会话候选选择器
 const ambiguousHere = computed(
   () => scope.ambiguous?.conversationId === chatStore.currentConversationId ? scope.ambiguous : null,
 )
+
+// 2026-11-14 v2：新会话归类建议（meta.workspace_suggestion）——本会话专属
+// （服务端 id 或流发起时的客户端 id 任一匹配即可；未 remint 时二者不同）
+const suggestionHere = computed(() => {
+  const s = scope.suggestion
+  const cur = chatStore.currentConversationId
+  if (!s || !cur) return null
+  return s.conversationId === cur || s.clientId === cur ? s : null
+})
+const suggestionOpen = ref(false)
+
+// 建议变化（切换会话/接受/拒绝）时收起旧对话框，避免残留弹窗
+watch(suggestionHere, () => { suggestionOpen.value = false })
+
+async function acceptSuggestion() {
+  const ok = await scope.acceptSuggestion()
+  suggestionOpen.value = false
+  if (ok) showToast('已归类到该任务，后续消息与文件进入新任务（旧任务文件不动）', 'success')
+  else showToast(scope.lastError || '归类失败，请重试', 'error')
+}
+
+function dismissSuggestion() {
+  scope.dismissSuggestion()
+  suggestionOpen.value = false
+}
 
 function fmtCandidate(c: { title?: string; reason?: string; last_active_at?: string | null }): string {
   const bits: string[] = []
@@ -84,20 +109,58 @@ watch(
       </div>
     </div>
   </Teleport>
+  <button
+    v-if="suggestionHere"
+    class="workspace-scope-chip is-suggest"
+    data-testid="workspace-suggestion-cta"
+    :title="`这条对话看起来属于「${suggestionHere.task.title || '未命名任务'}」`"
+    @click="suggestionOpen = true"
+  >
+    📁 归类到「{{ suggestionHere.task.title || '未命名任务' }}」？
+  </button>
+  <Teleport v-if="suggestionHere && suggestionOpen" to="body">
+    <div class="wap-mask" data-testid="workspace-suggestion-dialog" @click.self="suggestionOpen = false">
+      <div class="wap-panel" role="dialog" aria-label="归类建议">
+        <h3>要归类到「{{ suggestionHere.task.title || '未命名任务' }}」吗？</h3>
+        <p class="wap-hint">
+          这条对话看起来和该任务相关。归类后，后续消息与文件进入该任务（旧任务文件不动）；
+          不归类则保持在「默认项目」。
+        </p>
+        <p v-if="chatStore.isStreamingCurrentConversation" class="wap-hint" data-testid="workspace-suggestion-wait">
+          回答完成后才能归类（本轮仍在运行）。
+        </p>
+        <button
+          class="wap-item"
+          data-testid="workspace-suggestion-accept"
+          :disabled="scope.loading || chatStore.isStreamingCurrentConversation"
+          @click="acceptSuggestion"
+        >
+          <span class="wap-item__title">归类到「{{ suggestionHere.task.title || '未命名任务' }}」</span>
+          <span class="wap-item__meta">{{ suggestionHere.task.reason || '' }}</span>
+        </button>
+        <button
+          class="wap-dismiss"
+          data-testid="workspace-suggestion-dismiss"
+          :disabled="scope.loading"
+          @click="dismissSuggestion"
+        >保持默认项目</button>
+      </div>
+    </div>
+  </Teleport>
   <template v-if="scope.chipVisible">
     <button
       class="workspace-scope-chip"
       :class="{ 'is-shadow': scope.snapshot?.mode === 'shadow' }"
       :title="scope.modeHint || '当前任务'"
       data-testid="workspace-scope-chip"
-      @click="panelOpen = true"
+      @click="drawerOpen = true"
     >
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
       </svg>
       <span class="workspace-scope-chip__text">{{ scope.badgeText }}</span>
     </button>
-    <WorkspaceBindingDialog v-if="panelOpen" @close="panelOpen = false" />
+    <ConversationTaskDrawer :visible="drawerOpen" @close="drawerOpen = false" />
   </template>
 </template>
 
@@ -126,6 +189,12 @@ watch(
 .workspace-scope-chip.is-ambiguous {
   border-color: var(--color-primary);
   color: var(--color-primary);
+}
+/* 2026-11-14 v2：归类建议 CTA 与普通徽标区分（主色描边 + 浅底） */
+.workspace-scope-chip.is-suggest {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 8%, var(--surface-panel-strong, var(--color-bg)));
 }
 .wap-mask {
   position: fixed;

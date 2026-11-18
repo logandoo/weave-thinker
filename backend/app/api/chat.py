@@ -48,7 +48,10 @@ _PARTIAL_CLOSE_RE = _re.compile(r'^[^<]*</(?:think|tool_call)>')  # incomplete c
 
 logger = logging.getLogger(__name__)
 
-# §5.4 澄清 fire-and-forget 任务强引用集（防 GC 中断在途任务）
+# 远程图片/媒体（用于 media 本地化被作用域门拒绝时的可见提示判定）
+_REMOTE_MEDIA_RE = _re.compile(
+    r"https?://[^\s\"'<>)\]]+\.(?:png|jpe?g|gif|webp|bmp|svg|mp4|webm|mov|mp3|wav|m4a|ogg)",
+    _re.IGNORECASE)
 _clarification_tasks: set = set()
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -189,13 +192,12 @@ def _is_scratch_path(path: str | None) -> bool:
     must not surface as download cards (conv 2b36fb09 showed a scratch
     draft docx attached next to the real deliverable).
 
-    Anchored on the exact ``scratch/task_`` layout created by
-    code_execution (workspace/scratch/task_XXXX) so a user directory that
-    merely contains a segment named ``scratch`` is never misclassified.
+    单一实现：`app.services.workspace_paths.is_scratch_task_path`（锚定
+    `scratch/task_`，用户自建的 `artifacts/scratch/` 不误伤）。
     """
-    if not path:
-        return False
-    return "/scratch/task_" in str(path).replace("\\", "/")
+    from app.services.workspace_paths import is_scratch_task_path
+
+    return is_scratch_task_path(path)
 
 
 def _collect_download_attachments(tool_results_accumulated: list[dict]) -> list[dict]:
@@ -815,7 +817,16 @@ async def _localize_media_for_persist(
             try:
                 _media_guard("media")
             except _MErr as _mexc:
-                logger.info("media localization skipped by workspace scope gate: %s", _mexc.code)
+                logger.warning("media localization skipped by workspace scope gate: %s — "
+                               "keeping remote URLs (may expire / leak source URL)",
+                               _mexc.code)
+                # WP4-I5：静默跳过会让用户拿到会过期的热链。只在**确有远程媒体**时
+                # 附一条可见提示，避免污染普通回答。
+                _probe = f"{content or ''}\n{tool_results_json or ''}"
+                if _REMOTE_MEDIA_RE.search(_probe):
+                    note = ("> 提示：本轮远程媒体保留原始链接（任务作用域未启用 media "
+                            "本地化）。链接可能过期。")
+                    content = f"{content}\n\n{note}" if content else note
                 return content, tool_results_json
         async with AsyncSessionLocal() as ml_db:
             ws = await ensure_user_workspace(ml_db, user_id, username)

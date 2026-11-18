@@ -83,6 +83,7 @@
           :rel-path="previewing.rel_path"
           :source-path="previewing.rel_path"
           :type="previewing.type"
+          :z-index="PREVIEW_Z_INDEX"
           @close="previewing = null"
         />
       </div>
@@ -101,6 +102,11 @@ import FilePreviewDialog from './FilePreviewDialog.vue'
 
 const props = defineProps<{ folder: FolderAttachment; deviceId?: string | null }>()
 const emit = defineEmits<{ close: [] }>()
+
+// 内嵌预览的层级（2026-11-15 同族隐患波）：本组件遮罩是 10000，预览默认也是 10000，
+// 原来靠「预览后挂载 → 在 body 里排在后面」的 DOM 顺序打平——一次重挂载（加 Transition、
+// 换 v-if 结构）就会复现「预览被宿主压住」。显式给 10001，让关系与顺序无关。
+const PREVIEW_Z_INDEX = 10001
 
 const rootPath = computed(() => props.folder.rel_path || props.folder.path || '')
 const currentPath = ref(rootPath.value)

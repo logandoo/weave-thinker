@@ -6,9 +6,16 @@
 语义与 OpenCode 插件逐条对齐（共用 scripts/assert_artifacts.py 为唯一裁判）：
 
 - vibeweaver-active 判定 = 工作区存在 ``tests/verification_log.md``。
-- write/edit 后置检查：跑 ``tests/assert_artifacts.py``（4 种 flag 组合），
-  blocking 失败 → GATE-BLOCKED（结果变红，完成声明被挡而非执行被停）；
-  结构缺口 → GATE-WARNING（非阻断，追加到结果文本）。
+- write/edit 后置检查：跑 ``tests/assert_artifacts.py``（4 种 flag 组合），按 checker
+  的 ``kind`` 分级（graduated gate，对齐 gate.js W19/W23 + COMPLETION_GATE §A4.4.2）：
+  · ``violation``（secret/tamper/checker-pin/class/test-change/显式 pre-deny）→ GATE-BLOCKED
+    （结果变红，但写已落地——这是 integrity 错误，不是 completion debt，也不是执行停止）；
+  · ``unavailable``（checker 跑不了/prose-only 无 kind/畸形 JSON）→ GATE-CHECK-UNAVAILABLE
+    （fail-closed，绝不静默放行）；
+  · ``completion``（tests/evidence 缺失、完工表/final-run 未落等**完成债**）→
+    ``[VIBEWEAVER COMPLETION-NOT-READY]`` 注记（**写成功，编辑继续**，error=False），
+    仅「声明完成」被挡到 stop/``--final``——绝不再把完成债伪装成 phantom 工具错误。
+  · 结构缺口 → GATE-WARNING（非阻断，追加到结果文本）。
 - 证据修复豁免：写入路径首段为 tests/ / test/ / memory/ 的**不设门**
   （证据修复就是这些写入，拦截会造成首条日志死锁——gate.js 同款规则）。
 - assert_artifacts.py 缺失 → 内联证据地板检查（≥1 条 `- iter N PASS/FAIL:`、
@@ -32,6 +39,7 @@ import os
 import re
 import shutil
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +54,14 @@ STALL_RUN = 3
 MAX_OPS = 20
 FLAG_COMBOS: List[List[str]] = [[], ["--existing"], ["--backend-only"], ["--existing", "--backend-only"]]
 BLOCKING_HINTS = ("verification_log", "acceptance", "cap=5", "screenshot", "iter ", "script/linux", "workflows")
+# graduated gate 兜底分类用（与 assert_artifacts.py 的 VIOLATION_CODES /
+# COMPLETION_CODES 同步；checker 已给 kind 时优先用 checker 的值）。
+_VIOLATION_CODES = {"14", "15", "18", "22", "25", "evidence-lock", "checker-pin"}
+_COMPLETION_CODES = {
+    "1", "2", "3", "4", "5", "5b", "6", "7", "8", "9", "10", "11",
+    "12", "12b", "13", "16", "17", "17a", "17b", "19", "20", "21",
+    "23", "24",
+}
 
 _GATED_TOOLS = {"workspace_write", "workspace_edit"}
 _ITER_ENTRY_RE = re.compile(r"^- iter \d+ (PASS|FAIL):", re.M)
@@ -434,10 +450,15 @@ async def run_assert(
     """
     attempts: List[Dict[str, Any]] = []
     script = script or (root / "tests" / "assert_artifacts.py")
+    # VIBEWEAVER_GATE_FINAL=1 → 让 checker 以 --final 严格档运行（staged_check 把
+    # 完成债从 warn 升为 block），与 gate_check_write_async 的 completion→violation
+    # 提升配套（对齐 gate.js：final 模式完成债不能停留在注记）。
+    final_extra = ["--final"] if os.environ.get("VIBEWEAVER_GATE_FINAL") == "1" else []
     for flags in FLAG_COMBOS:
+        label = " ".join(flags) or "(none)"
         try:
             proc = await asyncio.create_subprocess_exec(
-                runner, str(script), "--root", str(root), *flags, "--json",
+                runner, str(script), "--root", str(root), *flags, *final_extra, "--json",
                 cwd=str(root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -448,84 +469,164 @@ async def run_assert(
             output = (stdout + ("\n" + stderr if stderr else "")).strip()
             payload = _assert_json(stdout)
             if proc.returncode == 0 and payload and payload.get("ok") is True:
-                return True, [{
-                    "flags": flags,
-                    "output": output,
-                    "failures": [],
-                    "warnings": _assert_warnings(payload),
-                }]
+                # 累积到目前为止的 attempts（attempts[0] = 最严 combo，供 lenient 摘录）
+                # + 通过项标记 ok/passing，check_gate_async 据此发「passed only under」注记。
+                attempts.append({"flags": flags, "label": label, "output": output,
+                                 "failures": [], "warnings": _assert_warnings(payload),
+                                 "ok": True, "passing": True})
+                return True, attempts
             if proc.returncode == 0 and payload is None and allow_legacy_unpinned:
-                return True, [{
-                    "flags": flags,
-                    "output": "legacy unpinned checker: exit 0 (no JSON)",
-                    "failures": [],
-                    "legacy": True,
-                }]
+                # legacy 档（无 --json 的旧 checker，exit 0）：放行但附升级提示（gate.js
+                # TERMINAL_MESSAGES.legacy 同款），绝不静默当成正典通过。
+                attempts.append({"flags": flags, "label": label,
+                                 "output": "legacy unpinned checker: exit 0 (no JSON)",
+                                 "failures": [], "legacy": True, "ok": True, "passing": True,
+                                 "warnings": ["tests/assert_artifacts.py is a legacy copy without "
+                                              "--json — upgrade from the skill's scripts/assert_artifacts.py "
+                                              "(this host is running it in prose mode; the canonical pinned "
+                                              "checker verifies structurally, this one only passed on exit 0)"]})
+                return True, attempts
             failures = payload.get("fails") if payload and isinstance(payload.get("fails"), list) else None
             if failures is None:
-                failures = [{"severity": "block", "detail": output or f"exit {proc.returncode}"}]
-            attempts.append({"flags": flags, "output": output, "failures": failures})
+                # 跑过但没有可解析 JSON：无法验证 → unavailable（fail-closed 硬块）。
+                failures = [{"severity": "block", "kind": "unavailable",
+                             "detail": output or f"exit {proc.returncode}"}]
+            attempts.append({"flags": flags, "label": label, "output": output, "failures": failures})
         except asyncio.TimeoutError:
             try:
                 proc.kill()
                 await proc.wait()
             except Exception:
                 pass
-            attempts.append({"flags": flags, "output": "assert_artifacts.py timeout (15s)", "failures": [
-                {"severity": "block", "detail": "assert_artifacts.py timeout (15s)"}
+            attempts.append({"flags": flags, "label": label, "output": "assert_artifacts.py timeout (15s)", "failures": [
+                {"severity": "block", "kind": "unavailable", "detail": "assert_artifacts.py timeout (15s)"}
             ]})
         except OSError as exc:
-            attempts.append({"flags": flags, "output": f"assert run failed: {exc}", "failures": [
-                {"severity": "block", "detail": f"assert run failed: {exc}"}
+            attempts.append({"flags": flags, "label": label, "output": f"assert run failed: {exc}", "failures": [
+                {"severity": "block", "kind": "unavailable", "detail": f"assert run failed: {exc}"}
             ]})
     return False, attempts
 
 
-def _failure_messages(attempts: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+def _failure_messages(attempts: List[Dict[str, Any]]) -> List[Tuple[str, str, str, str]]:
+    """把各 flag 组合的失败拍平为 ``(detail, severity, kind, code)``。
+
+    ``kind`` 直接采用 checker 的结构化字段（assert_artifacts.py 的
+    ``finding_kind``）；checker 没给（畸形 JSON / prose-only / 合成项）时留空，
+    交由 ``classify_gate_finding`` 兜底（默认 unavailable = fail-closed）。
+    """
     seen = set()
-    messages: List[Tuple[str, str]] = []
+    messages: List[Tuple[str, str, str, str]] = []
     for a in attempts:
         failures = a.get("failures")
-        if isinstance(failures, list):
+        if isinstance(failures, list) and failures:
             for item in failures:
                 if not isinstance(item, dict):
-                    continue
+                    item = {"detail": str(item)}
                 msg = str(item.get("detail") or item.get("code") or "assert failed").strip()
                 severity = str(item.get("severity") or "block").strip().lower()
-                key = (msg, severity)
+                kind = str(item.get("kind") or "").strip().lower()
+                code = str(item.get("code") or "").strip()
+                key = (msg, severity, kind)
                 if msg and key not in seen:
                     seen.add(key)
-                    messages.append(key)
+                    messages.append((msg, severity, kind, code))
         else:
+            # 非结构化失败（或空 fails 列表）→ 回落扫 prose `- ` 行（gate.js 同款）。
             for line in (a.get("output") or "").splitlines():
                 m = line.strip()
                 if not m.startswith("- "):
                     continue
-                key = (m[2:], "")
+                key = (m[2:], "", "")
                 if key not in seen:
                     seen.add(key)
-                    messages.append(key)
+                    messages.append((m[2:], "block", "", ""))
     if not messages and attempts:
-        messages.append(((attempts[-1].get("output") or "")[:400], "block"))
+        raw = (attempts[-1].get("output") or "")[:400].strip()
+        messages.append((raw or "checker exited non-zero without a parseable failure list (fail-closed)",
+                         "block", "unavailable", ""))
     return messages
 
 
-def _classify(messages: List[Any]) -> Tuple[List[str], List[str]]:
-    blocking, warnings = [], []
+def classify_gate_finding(code: str, detail: str, kind: str = "") -> str:
+    """graduated gate 的分类（gate.js ``classifyGateFinding`` 移植）。
+
+    checker 已给 ``kind`` 时直接采用；否则按 code/detail 兜底。未知结构一律
+    ``unavailable``：分类 bug 绝不把安全/完整性项悄悄降级成完成债。
+    """
+    k = str(kind or "").strip().lower()
+    if k in ("violation", "unavailable", "completion"):
+        return k
+    c = str(code or "")
+    low = (detail or "").lower()
+    if c == "15b":
+        if any(t in low for t in (
+                "tamper", "hash mismatch", "sealed evidence missing",
+                "manifest.json missing", "partial seal")):
+            return "violation"
+        return "completion"
+    if c in _VIOLATION_CODES:
+        return "violation"
+    if c == "21" and any(t in low for t in (
+            "cannot verify", "could not run", "failed inside an existing .git",
+            "timed out", "overflowed", "fail-closed")):
+        return "unavailable"
+    if c in ("3", "10", "11") and any(t in low for t in (
+            "not a real png", "wrong format", "magic", "is not a real")):
+        return "violation"
+    if any(t in low for t in (
+            "secret scan:", "evidence-lock fail", "checker was modified",
+            "class contradiction", "test-change guard:")):
+        return "violation"
+    if c in _COMPLETION_CODES:
+        return "completion"
+    return "unavailable"
+
+
+def _classify(messages: List[Any]) -> Tuple[List[str], List[str], List[str]]:
+    """→ ``(blocking, warnings, kinds)``，``kinds`` 与 ``blocking`` 平行。
+
+    完成债不再被并进 blocking：``severity == warn`` 才是 warning；其余 severity
+    一律进 blocking，但携带 ``kind``，由 ``split_gate_result`` 决定 block 还是 note。
+    """
+    blocking, warnings, kinds = [], [], []
     for item in messages:
-        msg, severity = item if isinstance(item, tuple) else (str(item), "")
+        if isinstance(item, tuple):
+            msg, severity, kind, code = (item + ("", ""))[:4]
+        else:
+            msg, severity, kind, code = str(item), "", "", ""
         severity = str(severity or "").strip().lower()
         if severity == "warn":
             warnings.append(msg)
-        elif severity:
-            # Upstream treats every non-warn severity as blocking. Unknown /
-            # future severity values must never silently downgrade a failure.
-            blocking.append(msg)
-        elif any(h in msg for h in BLOCKING_HINTS):
-            blocking.append(msg)
+            continue
+        blocking.append(msg)
+        kinds.append(classify_gate_finding(code, msg, kind))
+    return blocking, warnings, kinds
+
+
+def split_gate_result(result: Dict[str, Any]) -> Dict[str, List[str]]:
+    """把 blocking 按 kind 切成 ``violations``（含 unavailable，硬块）与
+    ``completion``（完成债，转 COMPLETION-NOT-READY 注记）。gate.js 同款。"""
+    blocking = result.get("blocking") or []
+    kinds = result.get("kinds") or []
+    violations: List[str] = []
+    completion: List[str] = []
+    v_kinds: List[str] = []
+    c_kinds: List[str] = []
+    for i, msg in enumerate(blocking):
+        kind = kinds[i] if i < len(kinds) else classify_gate_finding("", msg, "")
+        if kind == "completion":
+            completion.append(msg)
+            c_kinds.append(kind)
         else:
-            warnings.append(msg)
-    return blocking, warnings
+            violations.append(msg)
+            v_kinds.append(kind)
+    return {
+        "violations": violations,
+        "completion": completion,
+        "violation_kinds": v_kinds,
+        "completion_kinds": c_kinds,
+    }
 
 
 def inline_check(root: Path) -> List[str]:
@@ -548,36 +649,108 @@ def inline_check(root: Path) -> List[str]:
 # ---------- 检查编排 ----------
 
 async def check_gate_async(root: Path) -> Optional[Dict[str, Any]]:
+    result = await _compute_gate_result(root)
+    # gate.js 同款：每次评估把完整结果落 tests/gate_result.json，
+    # 让「Full list: tests/gate_result.json」/「details: …」指针真实可解析。
+    if result is not None:
+        _write_gate_result(root, result)
+    return result
+
+
+def _write_gate_result(root: Path, result: Dict[str, Any]) -> None:
+    try:
+        out = root / "tests" / "gate_result.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(out)
+    except OSError as exc:
+        # 落盘失败不阻断门禁裁决（观察者不越权），但绝不静默吞掉：按 root 记一笔，
+        # 由该 root 的下一次发信如实上报（gate.js takePersistError，但 root-keyed 防跨租户泄漏）。
+        key = str(root)
+        _PERSIST_ERROR[key] = (
+            "[GATE-WARNING (vibeweaver)] persist-error: gate_result.json write failed "
+            f"for this scope — details may be stale ({type(exc).__name__})."
+        )
+        _PERSIST_ERROR.move_to_end(key)
+        while len(_PERSIST_ERROR) > _PERSIST_ERROR_CAP:
+            _PERSIST_ERROR.popitem(last=False)
+
+
+def _take_persist_error(root: Path) -> Optional[str]:
+    return _PERSIST_ERROR.pop(str(root), None)
+
+
+def _warn_once(root: Path, msg: str) -> Optional[str]:
+    """advisory 去重：同一 (root, 文本) 只放行一次（gate.js LENIENT_NOTED 同款）。"""
+    if not msg:
+        return None
+    key = f"{root}|{msg}"
+    if key in _WARN_NOTED:
+        _WARN_NOTED.move_to_end(key)  # LRU：命中即最近使用，避免热键被淘汰
+        return None
+    _WARN_NOTED[key] = None
+    _WARN_NOTED.move_to_end(key)
+    while len(_WARN_NOTED) > _WARN_NOTED_CAP:
+        _WARN_NOTED.popitem(last=False)
+    return msg
+
+
+async def _compute_gate_result(root: Path) -> Optional[Dict[str, Any]]:
     script = _ensure_assert_script(root)
     runner = shutil.which("python3")
     if script is not None and runner:
         canonical = _canonical_assert_script()
         if canonical is not None and not _canonical_checker_pin(canonical) and not _legacy_resource_resolver_missing():
-            return {"blocking": ["canonical checker pin is missing — completion verification is blocked (fail-closed)"], "warnings": []}
+            return {"blocking": ["canonical checker pin is missing — completion verification is blocked (fail-closed)"],
+                    "warnings": [], "kinds": ["unavailable"]}
         ok, attempts = await run_assert(
             root, runner, script, allow_legacy_unpinned=_legacy_resource_resolver_missing()
         )
         if ok:
-            warnings = [
-                warning
-                for attempt in attempts
-                for warning in (attempt.get("warnings") or [])
-            ]
-            return {"blocking": [], "warnings": warnings} if warnings else None
-        blocking, warnings = _classify(_failure_messages(attempts))
+            warnings: List[str] = []
+            for attempt in attempts:
+                for w in (attempt.get("warnings") or []):
+                    deduped = _warn_once(root, w)
+                    if deduped:
+                        warnings.append(deduped)
+            passing = next((a for a in attempts if a.get("passing")), None)
+            label = passing.get("label", "(none)") if passing else "(none)"
+            # lenient-pass 透明化（gate.js Review B4）：只在非最严 combo 下通过时，
+            # 如实标注「strict 那一次报了啥」——Modify-Existing/backend 任务属正常，
+            # 新项目则可疑。去重键 = (root, combo)，对齐 gate.js（不是整条消息，否则
+            # strict 首行抖动会重复刷屏、首行相同但深层变化又永不重贴）。
+            if label and label != "(none)":
+                note_key = f"{root}|{label}"
+                if note_key not in _LENIENT_NOTED:
+                    _LENIENT_NOTED[note_key] = None
+                    _LENIENT_NOTED.move_to_end(note_key)
+                    while len(_LENIENT_NOTED) > _WARN_NOTED_CAP:
+                        _LENIENT_NOTED.popitem(last=False)
+                    strict_lines = (attempts[0].get("output") or "").splitlines() if attempts else []
+                    strict_excerpt = (strict_lines[0] if strict_lines else "failures")[:120]
+                    warnings.append(
+                        f"assert_artifacts.py passed only under {label} — the strict run reported: "
+                        f"{strict_excerpt} (expected for Modify-Existing/backend tasks; suspicious for new projects)"
+                    )
+            return {"blocking": [], "warnings": warnings, "kinds": []} if warnings else None
+        blocking, warnings, kinds = _classify(_failure_messages(attempts))
         return {
             "blocking": blocking,
             "warnings": warnings,
+            "kinds": kinds,
             "attempts": ["[" + " ".join(a["flags"]) + "]" for a in attempts],
         }
     if _legacy_resource_resolver_missing():
         failures = inline_check(root)
         if failures:
-            return {"blocking": failures, "warnings": [], "inline": True}
+            # 内联证据地板缺的是 tests/evidence —— 完成债，非 unavailable（gate.js 同款）。
+            return {"blocking": failures, "warnings": [], "kinds": ["completion"] * len(failures), "inline": True}
         return None
     return {
         "blocking": ["canonical assert_artifacts.py or a valid checker pin is unavailable — completion verification is blocked (fail-closed)"],
         "warnings": [],
+        "kinds": ["unavailable"],
     }
 
 
@@ -633,13 +806,71 @@ def stall_observation(root: Path, file_rel: str) -> Optional[str]:
 
 # ---------- 对外入口（hook 回调用） ----------
 
-def _block_message(root: Path, result: Dict[str, Any]) -> str:
+# DESIGN NOTE — 刻意不实现上游的 RESULT_CACHE（非「忘了移植」，勿顺手加 naive 版）：
+# 上游 gate.js 用进程内 RESULT_CACHE（键=整树内容指纹，值=verdict）省重复 checker。
+# 本层刻意不缓存，每次 checkGate 都重算。依据（实测 + 上游源码 + 联网检索）：
+#  1) 写路径几乎无收益：缓存是 input-addressed（Bazel AC 模型），键含整树内容摘要；
+#     agent 每次 write/edit 都改变树 → 下次写必然 miss 重算。命中的只是「同树重复检查」
+#     （主要是 stop/idle 复检，每轮 ≤1 次，非每次写）。
+#  2) 省不了 intra-check 的 4 个 FLAG_COMBOS 串行开销（那是单次 checkGate 内部，非跨调用）。
+#  3) 典型生产 root 是非 git 的 agent 任务工作区——上游自己遇到无 .git 就
+#     LOSSY_FINGERPRINT.add(root) 直接「Do not cache its verdict at all」，照搬也不会启用。
+#  4) 多租户共享进程里一份缓存 = 投毒面：缓存的 green 无法从键自证（AC 非 CAS），
+#     任何指纹漏项（git HEAD / working-tree 改动 / checker 脚本本身 / 跨 root 键碰撞）
+#     → 过期 green 或 A 的 verdict 判给 B（Pixee「identity≠validity」/ Bazel AC 投毒 / OWASP 共享缓存）。
+# 若将来确需缓存（profiling 证明 idle 复检是瓶颈），必须照搬上游全套守卫：content/git
+# 摘要键 + 非 git/lossy 树拒绝缓存 + 按 tenant/root 隔离 + `--final` 与 gate_result.json 强制旁路（force）。
+
+# graduated gate 去重 latch（gate.js LAST_BLOCK / LAST_COMPLETION 的进程内移植）：
+# 同一批 blocking 不变时只整段贴一次，之后压成一行摘要，避免每次写都刷屏。
+# 两者都按 ``root|session_key`` 键并封顶 LRU（dual-root 下 root 是 per-attempt 目录，
+# 长跑服务每 attempt 一个键，无界会泄漏）。
+_LAST_BLOCK: "OrderedDict[str, str]" = OrderedDict()
+_LAST_BLOCK_CAP = 64
+_COMPLETION_LATCH: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_COMPLETION_LATCH_CAP = 64
+# 警告去重 latch（gate.js LENIENT_NOTED 同款）：advisory 每次写都贴=告警洪水，
+# 训练告警盲视；同一 (root, 文本) 只贴一次。
+_WARN_NOTED: "OrderedDict[str, None]" = OrderedDict()
+_WARN_NOTED_CAP = 64
+# lenient-pass 注记去重：键 = (root, combo)，对齐 gate.js（非整条消息）。
+_LENIENT_NOTED: "OrderedDict[str, None]" = OrderedDict()
+# gate 自身持久化失败（gate_result.json 写不进）→ 下一次发信时如实上报并清零
+# （gate.js takePersistError 同款，但**按 root 键**：本仓是多租户共享进程，
+# 全局单值会把 A 用户的路径泄漏进 B 用户的上下文并错配归属）。
+_PERSIST_ERROR: "OrderedDict[str, str]" = OrderedDict()
+_PERSIST_ERROR_CAP = 64
+
+
+def _block_message(root: Path, result: Dict[str, Any], session_key: str = "") -> str:
+    """硬块文案（仅 violations + unavailable 进入这里；completion 已由
+    ``_completion_notice`` 转注记）。前缀按 kinds 是否全 unavailable 选 integrity
+    还是 unavailable，并明确「这不是完成债」——对齐 gate.js ``blockMessage``。"""
+    blocking = result.get("blocking", [])
+    kinds = result.get("kinds", [])
+    digest = hashlib.sha256(json.dumps(blocking, ensure_ascii=False).encode("utf-8")).hexdigest()
+    latch_key = f"{root}|{session_key}"
+    repeat = _LAST_BLOCK.get(latch_key) == digest
+    _LAST_BLOCK[latch_key] = digest
+    _LAST_BLOCK.move_to_end(latch_key)
+    while len(_LAST_BLOCK) > _LAST_BLOCK_CAP:
+        _LAST_BLOCK.popitem(last=False)
+    unavailable = bool(kinds) and all(k == "unavailable" for k in kinds)
+    prefix = ("GATE-CHECK-UNAVAILABLE (vibeweaver physical gate)" if unavailable
+              else "GATE-BLOCKED (vibeweaver integrity)")
+    if repeat:
+        first = (blocking[0][:160] + "…") if blocking and len(blocking[0]) > 160 else (blocking[0] if blocking else "")
+        return (
+            f"{prefix}: WRITE SUCCEEDED — {len(blocking)} hard blocking item(s) UNCHANGED since "
+            f"last edit (first: {first or 'see tests/gate_result.json'}). Full list: "
+            "tests/gate_result.json. THE WRITE LANDED; this is an integrity/unavailable error, "
+            "not a completion-debt note."
+        )
     lines = [
-        "GATE-BLOCKED (vibeweaver physical gate): WRITE SUCCEEDED — this is a completion gate, "
-        "NOT an execution stop. The task cannot be DECLARED complete yet — verification evidence "
-        "is missing or falsified:",
+        f"{prefix}: WRITE SUCCEEDED — a hard violation or unavailable check was found; this is NOT "
+        "completion debt and NOT an execution stop. The task cannot be completed until these are fixed:",
     ]
-    lines.extend(f"- {m}" for m in result.get("blocking", []))
+    lines.extend(f"- {m}" for m in blocking)
     if result.get("warnings"):
         lines.append("Non-blocking structure warnings (fix before the final [Verification Gate] line):")
         lines.extend(f"- {m}" for m in result["warnings"])
@@ -655,11 +886,64 @@ def _block_message(root: Path, result: Dict[str, Any]) -> str:
     elif result.get("attempts"):
         lines.append("assert_artifacts.py flag attempts: " + " ".join(result["attempts"]))
     lines.append(
-        "This gate is re-checkable, not a dead stop: fix the artifacts, then your next write/edit "
-        "re-runs it automatically. If the failure is legitimately out of scope, set VIBEWEAVER_GATE=off "
-        "or escalate to the user."
+        "This gate is re-checkable: fix the violation, then your next write/edit re-runs it "
+        "automatically. If the finding is a false positive, record the evidence and escalate to the "
+        "user; bypassing via bash or disabling the gate is not a repair."
     )
     return "\n".join(lines)
+
+
+def _completion_notice(root: Path, items: List[str], session_key: str = "") -> Optional[str]:
+    """完成债注记（非阻断）：写成功、编辑可继续，仅「声明完成」被挡到 stop/--final。
+
+    按内容哈希去重（同一批 debt 不每次写都展开），只展开新增条目（≤3），
+    上限 64 条 latch（LRU 淘汰）。对齐 gate.js ``completionNotice``。
+    """
+    if not items:
+        return None
+    digest = hashlib.sha256(json.dumps(items, ensure_ascii=False).encode("utf-8")).hexdigest()
+    key = f"{root}|{session_key}"
+    prev = _COMPLETION_LATCH.get(key)
+    if prev and prev.get("hash") == digest:
+        return None
+    new_items = [m for m in items if m not in (prev or {}).get("items", [])] if prev else []
+    shown = (new_items or items)[:3]
+    _COMPLETION_LATCH[key] = {"hash": digest, "items": items}
+    _COMPLETION_LATCH.move_to_end(key)
+    while len(_COMPLETION_LATCH) > _COMPLETION_LATCH_CAP:
+        _COMPLETION_LATCH.popitem(last=False)
+    suffix = f" ({len(new_items)} new/changed)" if new_items else ""
+    return (
+        f"[VIBEWEAVER COMPLETION-NOT-READY] WRITE SUCCEEDED — scope={root} | completion=BLOCKED | "
+        f"{len(items)} completion item(s){suffix} — editing may continue; DECLARING DONE is blocked "
+        "until `--final` exits 0.\n"
+        + "\n".join(f"- {m}" for m in shown)
+        + f"\ndetails: {root / 'tests' / 'gate_result.json'}"
+    )
+
+
+def _clear_completion_latch(root: Path, session_key: str = "") -> None:
+    """证据修复写后清 latch：让一次纯证据修复不会留下旧 debt 遮罩回归。
+
+    给了 session_key 只清该会话（对齐 gate.js ``clearCompletionLatch``，多会话共享
+    同一 root 时互不串扰）；未给则清该 root 下全部（无会话上下文的兜底）。
+    """
+    exact = f"{root}|{session_key}"
+    prefix = f"{root}|"
+    for key in [k for k in _COMPLETION_LATCH
+                if k == exact or (not session_key and k.startswith(prefix))]:
+        _COMPLETION_LATCH.pop(key, None)
+
+
+def clear_completion_latch_for_session(session_key: str) -> None:
+    """compaction / 会话收尾时清该会话的全部完成债 latch（gate.js
+    ``clearCompletionLatchForSession``）：携带注记的工具结果已随压缩离开上下文，
+    若仍按哈希抑制，新会话窗口里同一批 debt 将不再重现。"""
+    if not session_key:
+        return
+    suffix = f"|{session_key}"
+    for key in [k for k in _COMPLETION_LATCH if k.endswith(suffix)]:
+        _COMPLETION_LATCH.pop(key, None)
 
 
 def is_evidence_path(root: Path, file_path: Optional[str]) -> bool:
@@ -989,8 +1273,17 @@ async def check_protected_evidence_async(root: Path, file_path: Optional[str]) -
     return None
 
 
-async def gate_check_write_async(root: Path, file_path: Optional[str]) -> Optional[Dict[str, Any]]:
-    """一次落盘后的门禁评估。返回 {block} | {notes} | None。"""
+async def gate_check_write_async(
+    root: Path, file_path: Optional[str], session_key: str = ""
+) -> Optional[Dict[str, Any]]:
+    """一次落盘后的门禁评估。返回 {block} | {notes} | None。
+
+    graduated gate（对齐 gate.js W19/W23 + COMPLETION_GATE §A4.4.2）：
+    · violation / unavailable → ``block``（结果变红，但写已落地）；
+    · completion（完成债）→ ``notes`` 里的 COMPLETION-NOT-READY 注记（写成功、
+      编辑继续、error=False），仅「声明完成」留给 stop/``--final`` 拦截；
+    · ``VIBEWEAVER_GATE_FINAL=1`` 把完成债升级为硬块（第二道防线）。
+    """
     try:
         if not get_config().vibeweaver_gate_enabled:
             return None
@@ -1000,16 +1293,18 @@ async def gate_check_write_async(root: Path, file_path: Optional[str]) -> Option
     if protected:
         return protected
     if is_evidence_path(root, file_path):
+        # 证据修复写本身不设门；清 latch 让一次纯证据修复不会遮罩后续回归。
+        _clear_completion_latch(root, session_key)
         return None
     result = await check_gate_async(root)
-    if result and result.get("blocking"):
-        return {"block": _block_message(root, result)}
-    notes: List[str] = []
-    if result and result.get("warnings"):
-        notes.append(
-            "[GATE-WARNING (vibeweaver)] non-blocking: " + "; ".join(result["warnings"])
-            + " — fix before the final [Verification Gate] line."
-        )
+    split = split_gate_result(result) if result else {
+        "violations": [], "completion": [], "violation_kinds": [], "completion_kinds": []
+    }
+    if os.environ.get("VIBEWEAVER_GATE_FINAL") == "1" and split["completion"]:
+        split["violations"].extend(split["completion"])
+        split["violation_kinds"].extend(["violation"] * len(split["completion"]))
+        split["completion"] = []
+    # 停顿观察器先记一笔（gate.js O1/W23：RED 不能把 stall 观察器弄瞎）。
     rel = ""
     if file_path:
         try:
@@ -1017,22 +1312,59 @@ async def gate_check_write_async(root: Path, file_path: Optional[str]) -> Option
         except (OSError, ValueError):
             rel = file_path
     stall = stall_observation(root, rel or "(unknown file)")
+    pe = _take_persist_error(root)  # 该 scope 上次 gate_result.json 写失败，本次如实上报后清零
+    if split["violations"]:
+        block_result = dict(result or {})
+        block_result["blocking"] = split["violations"]
+        block_result["kinds"] = split["violation_kinds"]
+        msg = _block_message(root, block_result, session_key=session_key)
+        if stall:
+            msg += "\n[GATE-WARNING (vibeweaver-stall)] " + stall
+        if pe:
+            msg += "\n" + pe
+        return {"block": msg}
+    notes: List[str] = []
+    if result and result.get("warnings"):
+        notes.append(
+            "[GATE-WARNING (vibeweaver)] non-blocking: " + "; ".join(result["warnings"])
+            + " — fix before the final [Verification Gate] line."
+        )
+    if split["completion"]:
+        notice = _completion_notice(root, split["completion"], session_key)
+        if notice:
+            notes.append(notice)
+    else:
+        _clear_completion_latch(root, session_key)
     if stall:
         notes.append("[GATE-WARNING (vibeweaver-stall)] " + stall)
+    if pe:
+        notes.append(pe)
     return {"notes": notes} if notes else None
 
 
 async def gate_idle_check_async(root: Path) -> Optional[Dict[str, Any]]:
-    """turn 收尾巡检：门禁红 → {blocking}（调用方留痕/拦截收尾）。"""
+    """turn 收尾巡检：门禁红 → {blocking}（调用方留痕/拦截收尾）。
+
+    收尾是「声明完成」的时刻——completion debt 在此**仍拦截**（这正是 graduated
+    gate 的合法拦截点：写时放行、收尾挡住直到 ``--final`` 绿）。返回的 ``blocking``
+    含 violations + completion，``hard`` 仅 violations，便于调用方区分文案。
+    """
     try:
         if not get_config().vibeweaver_gate_enabled:
             return None
     except Exception:
         return None
     result = await check_gate_async(root)
-    if result and result.get("blocking"):
-        return {"blocking": result["blocking"]}
-    return None
+    if not result or not result.get("blocking"):
+        return None
+    split = split_gate_result(result)
+    if not split["violations"] and not split["completion"]:
+        return None
+    return {
+        "blocking": split["violations"] + split["completion"],
+        "hard": split["violations"],
+        "completion": split["completion"],
+    }
 
 
 # ---------- hook 安装 ----------
@@ -1089,6 +1421,11 @@ async def _tool_after_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_s
         return None
     if ctx.tool_name not in _GATED_TOOLS:
         return None
+    if getattr(ctx, "is_error", False):
+        # 写/编辑本身失败（如 edit oldString 未命中）：没有任何东西落盘，门禁与
+        # graduated 注记都不适用——否则会给一次失败的写贴上「WRITE SUCCEEDED」。
+        # 同时避免 _record_task_change / delivery / stall 把幻影改动记进台账。
+        return None
     key = ctx.conversation_id or ctx.session_id
     scope_ctx = getattr(ctx, "workspace_ctx", None)
     if enforce_without_dual_root(ctx):
@@ -1110,7 +1447,7 @@ async def _tool_after_hook(ctx: hook_service.ToolHookContext) -> Optional[hook_s
     _record_task_change(scope_ctx, file_path)
     from app.services import vibeweaver_delivery_service as _delivery
 
-    out = await gate_check_write_async(root, file_path)
+    out = await gate_check_write_async(root, file_path, session_key=key)
     if out and out.get("block"):
         # D5：证据红时 cue 也必须到达（JS 同款：投递不依赖门禁为绿）
         try:
@@ -1154,11 +1491,24 @@ async def _stop_hook(ctx: hook_service.StopContext) -> Optional[hook_service.Sto
     out = await gate_idle_check_async(root)
     if not out:
         return None
+    hard = out.get("hard") or []
+    completion = out.get("completion") or []
+    if not hard and not completion:
+        # 兼容只返回 {blocking} 的旧形状调用方/桩：兜底全部按完成债呈现，
+        # 绝不退化成「只有表头、零条目」的空反馈（那会白烧 stop 预算又拦不住）。
+        completion = out.get("blocking") or []
+    parts = []
+    if hard:
+        parts.append("硬违规（必须先修复，写已落地但完整性/可用性受损）：\n"
+                     + "\n".join(f"- {m}" for m in hard))
+    if completion:
+        parts.append("完成债（写成功、可继续编辑，但尚未满足完工条件）：\n"
+                     + "\n".join(f"- {m}" for m in completion))
     feedback = (
-        "[vibeweaver stop hook] 收尾被门禁拦截：验证证据缺失/不实，本轮不能声明完成。"
+        "[vibeweaver stop hook] 收尾被门禁拦截：本轮不能声明完成。"
         "请按下列条目修复证据（写入 tests/、memory/ 不受门禁限制），"
         "并在 tests/verification_log.md 追加 `- iter N PASS/FAIL:` 条目后重新收尾：\n"
-        + "\n".join(f"- {m}" for m in out.get("blocking", []))
+        + "\n\n".join(parts)
     )
     return hook_service.StopDecision(allow=False, feedback=feedback, reason="gate red at stop")
 

@@ -658,7 +658,9 @@ async def skill_run_script(args: dict, **kwargs) -> str:
     workspace_path = str(kwargs.get("workspace_path") or "")
     cwd_arg = str(args.get("cwd") or "").strip()
     from app.services.workspace_scope_service import apply_scope_or_error
-    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='read')
+    # D-3（评审 r1 Critical）：skill_run_script 以任务根为 cwd 运行、并把用户技能脚本物化进
+    # workspace/skill_scripts/，是写工具 → 必须按 access='write' 解析，改绑后旧回合不得再写旧任务。
+    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='write')
     if _scope_err:
         return json.dumps(_scope_err, ensure_ascii=False)
 

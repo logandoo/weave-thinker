@@ -88,6 +88,21 @@ def _scoped_workspace_section(ctx: Any) -> str:
     """§9 的 scoped 段：最小高信号上下文，不列文件树、不预注入其他任务。"""
     from app.services import workspace_memory_service as wmem
 
+    # 交付物目录约定（2026-11-15 波）：只有 enforce 才会自动重定向裸文件名，
+    # 其余模式必须如实说「要显式带目录」——不能让提示词断言一个不成立的
+    # 工具行为（评审 F3）。
+    deliverable_dir = config.workspace_deliverable_dir
+    if config.workspace_deliverable_mode == "enforce":
+        deliverable_clause = (
+            f"交付物统一放 `{deliverable_dir}/`（`rel_target` 用 "
+            f"`{deliverable_dir}/<文件名>`；裸文件名会自动落到该目录）；"
+            "`scratch/` 是本轮临时目录，不是交付面，不要把交付物留在那里。")
+    else:
+        deliverable_clause = (
+            f"交付物统一放 `{deliverable_dir}/`（`rel_target` 必须显式写 "
+            f"`{deliverable_dir}/<文件名>`；裸文件名会落在任务文件域根，不会自动归类）；"
+            "`scratch/` 是本轮临时目录，不是交付面，不要把交付物留在那里。")
+
     lines = [
         f"当前项目：{getattr(ctx, 'project_name', None) or ctx.project_id}（{ctx.project_id}）",
         f"当前任务：{getattr(ctx, 'task_title', None) or ctx.task_id}（{ctx.task_id}）",
@@ -95,6 +110,10 @@ def _scoped_workspace_section(ctx: Any) -> str:
         f"当前绑定版本：{ctx.binding_version}（attempt {ctx.attempt_id[:8]} · epoch {ctx.lease_epoch}）",
         "",
         "默认只能发现和修改当前任务文件域。用户根、其他任务和同名旧文件不是本任务的既往证据。",
+        "terminal / process 的产物落在本轮执行域（attempt scratch），不会自动出现在任务文件域；"
+        "死磕校验器只认任务文件域，交付物必须用 workspace_publish(src=执行域相对路径, "
+        "rel_target=任务文件域相对路径) 发布（要给用户下载卡片仍需 provide_file / pdf_export）。",
+        deliverable_clause,
         "确需项目共享、其他任务或 legacy 文件时，使用显式 scope 做按需只读检索，并保留来源。",
         "不要因路径相邻、文件名相同或历史对话出现而推断关联。",
     ]
@@ -277,6 +296,10 @@ async def build_agent_system_prompt(
         "上传文件处理规则（完全自主）：\n"
         "用户消息含 `[file-ref:文件名]` 标记时文件已入库，你必须完全自主判断解析方式，"
         "禁止依赖/硬编码'某类型文件必须用某库解析'的映射：\n"
+        "**块内路径口径（2026-11-15）**：`工作区路径` 是**本任务文件域内**的相对路径，"
+        "工具（workspace_read / execute_code / terminal 等）只认这一条；"
+        "`下载路径` 是**用户根相对**路径，仅供浏览器下载/预览，**不要传给工具**。"
+        "两者都在时以 `工作区路径` 为准。\n"
         "用户指定了技能就直接用；否则 skill_manage(action='list') 找匹配技能并 skill_view 加载 → "
         "没有就 web_search 查最佳解析方式 → execute_code/skill_run_script/terminal 执行解析"
         "（缺库 terminal pip install，禁止 --break-system-packages）→ 基于内容回答。"

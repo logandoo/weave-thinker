@@ -11,33 +11,43 @@
     />
     <main class="chat-main">
       <div class="mobile-header hide-on-desktop">
-        <button class="menu-toggle" @click="sidebarOpen = true">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="3" y1="12" x2="21" y2="12"/>
-            <line x1="3" y1="6" x2="21" y2="6"/>
-            <line x1="3" y1="18" x2="21" y2="18"/>
-          </svg>
-        </button>
-        <span class="mobile-title">{{ currentTitle }}</span>
-        <span
-          v-if="showMobileContextChip"
-          class="context-token-chip context-token-chip-mobile"
-          :title="mobileContextTooltip"
-        >
-          本轮 {{ formatContextTokens(chatStore.currentContextInfo!.tokens) }}
-        </span>
-        <WorkspaceScopeChip />
-        <button
-          v-if="showMobileSaveNote"
-          class="mobile-save-note-btn"
-          @click="enterSaveMode"
-          title="选择消息添加到笔记"
-          aria-label="选择消息添加到笔记"
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
-          </svg>
-        </button>
+        <div class="mobile-header-main">
+          <button class="menu-toggle" @click="sidebarOpen = true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="3" y1="12" x2="21" y2="12"/>
+              <line x1="3" y1="6" x2="21" y2="6"/>
+              <line x1="3" y1="18" x2="21" y2="18"/>
+            </svg>
+          </button>
+          <span class="mobile-title">{{ currentTitle }}</span>
+          <button
+            v-if="showMobileSaveNote"
+            class="mobile-save-note-btn"
+            @click="enterSaveMode"
+            title="选择消息添加到笔记"
+            aria-label="选择消息添加到笔记"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+            </svg>
+          </button>
+        </div>
+        <!-- 第二行：次要状态（token / 默认项目）。横向可滚动，绝不把顶栏按钮挤出屏幕。 -->
+        <div v-if="showMobileMetaRow" class="mobile-header-meta" data-testid="mobile-header-meta">
+          <span
+            v-if="showMobileContextChip"
+            class="context-token-chip context-token-chip-mobile"
+            :title="mobileContextTooltip"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+            </svg>
+            <span class="token-prefix">本轮 </span>
+            <span class="token-count">{{ formatContextTokens(chatStore.currentContextInfo!.tokens) }}</span>
+            <span class="token-suffix"> tokens</span>
+          </span>
+          <WorkspaceScopeChip />
+        </div>
       </div>
       <router-view v-slot="{ Component, route: childRoute }">
         <Transition :name="transitionName">
@@ -88,6 +98,7 @@ import { useChatStore } from '@/stores/chat'
 import { useNotesStore } from '@/stores/notes'
 import { useAssistantStore } from '@/stores/assistant'
 import { useSkinStore } from '@/stores/skin'
+import { useWorkspaceScopeStore } from '@/stores/workspaceScope'
 import { formatContextTokens, contextTokenTooltipText } from '@/composables/useContextTokens'
 import { computeKeyboardInset } from '@/composables/keyboardInset'
 const route = useRoute()
@@ -97,6 +108,7 @@ const chatStore = useChatStore()
 const notesStore = useNotesStore()
 const assistantStore = useAssistantStore()
 const skinStore = useSkinStore()
+const workspaceScope = useWorkspaceScopeStore()
 const sidebarOpen = ref(false)
 
 // wave-2（透明边到边）：抽屉开合改变顶边实际绘制面（侧栏滑入覆盖）→ 350ms 防抖
@@ -202,6 +214,12 @@ const showMobileContextChip = computed(() => {
   return !!chatStore.currentContextInfo
 })
 const mobileContextTooltip = computed(() => contextTokenTooltipText(chatStore.currentContextInfo))
+// 第二行只在有次要状态时出现（token / 任务绑定 / 歧义选择器）。
+const showMobileMetaRow = computed(() => (
+  showMobileContextChip.value
+  || workspaceScope.chipVisible
+  || !!workspaceScope.ambiguous
+))
 
 function enterSaveMode() {
   chatStore.saveModeActive = true
@@ -304,12 +322,50 @@ onBeforeUnmount(() => {
 
 .mobile-header {
   display: none;
-  align-items: center;
-  gap: 12px;
-  height: calc(var(--header-height) + var(--safe-top, 0px));
-  padding: var(--safe-top, 0px) 16px 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  height: auto;
+  padding: var(--safe-top, 0px) 0 0;
   background-color: var(--surface-panel-strong);
   border-bottom: 1px solid var(--panel-border);
+  min-width: 0;
+}
+
+/* 第一行：菜单 / 标题 / 导出。标题吃掉剩余空间，导出按钮永远固定在右侧。 */
+.mobile-header-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: var(--header-height);
+  padding: 0 16px;
+  min-width: 0;
+}
+
+/* 第二行：次要状态（token / 默认项目）。右对齐、可横向滚动，绝不撑破顶栏。 */
+.mobile-header-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 0 16px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mobile-header-meta::-webkit-scrollbar {
+  display: none;
+}
+
+.mobile-header-meta > * {
+  flex: 0 0 auto;
+}
+
+/* 右对齐 + 320px 最小宽度下仍必须整组放得下（长任务名省略，不产生左溢出）。 */
+.mobile-header-meta :deep(.workspace-scope-chip.workspace-scope-chip) {
+  max-width: 200px;
 }
 
 @media (max-width: 767px) {
@@ -374,7 +430,8 @@ onBeforeUnmount(() => {
 .context-token-chip-mobile {
   display: inline-flex;
   align-items: center;
-  margin-left: 8px;
+  gap: 4px;
+  margin-left: 0;
   padding: 2px 8px;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -385,6 +442,16 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   flex-shrink: 0;
   cursor: default;
+}
+
+.context-token-chip-mobile svg {
+  opacity: 0.7;
+}
+
+/* 顶栏空间优先给标题与导出：token 只留图标 + 数字，完整说明在 tooltip。 */
+.context-token-chip-mobile .token-prefix,
+.context-token-chip-mobile .token-suffix {
+  display: none;
 }
 
 .mobile-save-note-btn {

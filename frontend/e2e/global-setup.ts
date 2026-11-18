@@ -20,6 +20,9 @@ async function globalSetup() {
     path.join(projectRoot, 'tests', 'citation_ui_seed.py'),
     path.join(projectRoot, 'tests', 'seed_workspace_preview_fixtures.py'),
     path.join(projectRoot, 'tests', 'voice_delegation_ui_seed.py'),
+    // 工作台「项目列表」spec 的账号 fixture（2026-11-14）；门禁其他 spec 会清理
+    // test 账号会话，必须每次套件重播——seed 本身按名称幂等。
+    path.join(projectRoot, 'tests', 'seed_zen_projects_fixture.py'),
   ];
   for (const seed of seeds) {
     if (!fs.existsSync(seed) || !fs.existsSync(python)) {

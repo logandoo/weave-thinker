@@ -18,7 +18,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
-_WRITE_TOOLS_WITH_PATH = frozenset({"workspace_write", "workspace_edit"})
+_WRITE_TOOLS_WITH_PATH = frozenset({"workspace_write", "workspace_edit", "workspace_publish"})
 
 _MAX_LOCKS = 1024
 _locks: Dict[tuple, "asyncio.Lock"] = {}
@@ -71,7 +71,7 @@ def _tc_path(tc: Dict[str, Any], workspace_path: Any = None) -> Optional[str]:
             return None
     if not isinstance(args, dict):
         return None
-    p = args.get("path") or args.get("file_path")  # 别名同键
+    p = args.get("path") or args.get("file_path") or args.get("rel_target")  # 别名同键
     if not isinstance(p, str) or not p:
         return None
     return canonical_key_path(workspace_path, p) if workspace_path else _norm_path(p)

@@ -634,7 +634,7 @@ async def _audit_tool_before(ctx: hook_service.ToolHookContext) -> Optional[hook
     终端/搜索/只读/脚本执行不封（修复路径需要它们跑 assert_artifacts）。"""
     if not ctx.vibeweaver_active:
         return None  # W17 轮次门控：非激活轮不封写（RED latch 对新轮不生效）
-    if ctx.tool_name not in ("workspace_write", "workspace_edit", "git"):
+    if ctx.tool_name not in ("workspace_write", "workspace_edit", "workspace_publish", "git"):
         return None
     from app.services.vibeweaver_gate_service import resolve_session_root
     root = resolve_session_root(

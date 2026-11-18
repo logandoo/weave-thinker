@@ -824,25 +824,22 @@ class DeathmatchPlanMixin:
         # ——os.walk 全量 + 归一 + 排序 + cap 5000（超 cap 记 baseline_truncated
         # = 名单不完整 → 禁用豁免）。turn-1 产出（含 unzip/tar 保 mtime 产物）
         # 在捕获之后才存在 → 不是基线成员 → 豁免成立（修 turn-1 误拒）。
-        # workspace 解析（scoped 复审必修）：计划创建时 self._workspace_path
-        # 恒空（manager 每请求新建，仅 verify/evaluate 才赋值）——必须经
-        # ensure_user_workspace 解析真实工作区，否则捕获死接线 → 永远 late
-        # 兜底 → 豁免禁用 → turn-1 保 mtime 误拒不治。解析仍不可得 → 不写
-        # 名单（未知=严格 mtime，phantom 侧安全）。
-        _ws = self._workspace_path
-        if not _ws:
-            try:
-                from app.services.workspace_service import ensure_user_workspace
-                _ws_obj = await ensure_user_workspace(db, self._conv.user_id)
-                _ws = str(getattr(_ws_obj, "root_path", "") or "")
-            except Exception as exc:
-                logger.debug("baseline workspace resolve failed (strict mtime): %s", exc)
-                _ws = ""
+        # B4（2026-11-13 parity 波）：根必须是**作用域装配点显式注入**的根。
+        # 旧实现用 `self._workspace_path`，为空回落 ensure_user_workspace → 即使本轮
+        # 已作用域到 Task 根，名单也永远从用户根捕获（且 compress_conversation_context
+        # 还会把它写成用户根）→ 名单与校验根不同构。
+        _ws = await self._plan_workspace_root(db)
         _baseline = self._capture_baseline_paths(_ws)
         if _baseline is not None:
             plan["baseline_paths"] = _baseline[: self._BASELINE_PATHS_CAP]
             if len(_baseline) > self._BASELINE_PATHS_CAP:
                 plan["baseline_truncated"] = True
+            try:
+                from app.services.deathmatch_verification import workspace_root_fingerprint
+
+                plan["baseline_root_sha"] = workspace_root_fingerprint(_ws)
+            except Exception:  # noqa: BLE001 - 指纹失败 → 校验侧按旧计划严格 mtime
+                pass
         # C1（评审）：目标环启动时刻 = lane 1 证据出处锚（同步骤早轮产出
         # 过闸 / 目标启动前的同名遗留文件不过闸）。
         plan.setdefault("created_at", _time.time())

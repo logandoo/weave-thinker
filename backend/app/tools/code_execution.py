@@ -210,7 +210,10 @@ async def generate_and_execute_code(args: dict, **kwargs) -> str:
     workspace_path = kwargs.get("workspace_path", "")
     assistant = kwargs.get("assistant")
     from app.services.workspace_scope_service import apply_scope_or_error
-    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='read')
+    # D-3（评审 r1 Critical）：execute_code 会在任务根下 mkdir scratch、durable 作业更直接以
+    # 任务稳定根为 workdir 写任意文件——它是写工具，必须按 access='write' 解析，否则回合中改绑
+    # 后旧 ctx 仍能经此把交付物落进被放弃的旧任务（绕过写围栏=跨 Task 写逃逸）。
+    workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='write')
     if _scope_err:
         return json.dumps(_scope_err, ensure_ascii=False)
 

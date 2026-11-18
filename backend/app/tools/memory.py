@@ -352,7 +352,8 @@ async def memory(args: dict, **kwargs) -> str:
                 sync_entries, path, user_id, target, current_entries, origins=origins,
             )
             logger.info("Memory: added entry to %s for user %s (%d entries total)", target, user_id, len(current_entries))
-            asyncio.create_task(_notify_subconscious_hook(user_id, "add", target, content))
+            if kwargs.get("notify_subconscious", True):
+                asyncio.create_task(_notify_subconscious_hook(user_id, "add", target, content))
             return json.dumps({
                 "action": "add",
                 "target": target,
@@ -421,7 +422,8 @@ async def memory(args: dict, **kwargs) -> str:
                 origins=new_origins, tombstones=tombstones,
             )
             logger.info("Memory: replaced entry in %s for user %s", target, user_id)
-            asyncio.create_task(_notify_subconscious_hook(user_id, "replace", target, content))
+            if kwargs.get("notify_subconscious", True):
+                asyncio.create_task(_notify_subconscious_hook(user_id, "replace", target, content))
             return json.dumps({
                 "action": "replace",
                 "target": target,

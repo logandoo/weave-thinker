@@ -66,15 +66,27 @@
     <Teleport to="body">
       <div class="zen-exit-dropdown" :class="{ expanded: showZenExitMenu }">
         <Transition name="zen-curtain">
-          <button v-if="showZenExitMenu" class="zen-exit-btn" @click="exitZenMode(); showZenExitMenu = false">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M4 14h6v6M20 10h-6V4"/>
-              <path d="M14 10l7-7M3 21l7-7"/>
-            </svg>
-            <span>退出工作台</span>
-          </button>
+          <div v-if="showZenExitMenu" class="zen-exit-menu" :class="{ 'is-fresh': menuFresh }">
+            <button
+              class="zen-menu-btn"
+              data-testid="zen-projects-btn"
+              @click="showProjectsDialog = true; showZenExitMenu = false"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+              <span>项目管理</span>
+            </button>
+            <button class="zen-exit-btn" @click="exitZenMode(); showZenExitMenu = false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 14h6v6M20 10h-6V4"/>
+                <path d="M14 10l7-7M3 21l7-7"/>
+              </svg>
+              <span>退出工作台</span>
+            </button>
+          </div>
         </Transition>
-        <button class="zen-exit-arrow" @click="showZenExitMenu = !showZenExitMenu" title="工作台选项">
+        <button class="zen-exit-arrow" @click="toggleExitMenu" title="工作台选项">
           <svg class="zen-exit-gear" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           <span class="zen-exit-label">工作台选项</span>
           <svg v-if="showZenExitMenu" class="zen-exit-caret" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 15 12 9 18 15"/></svg>
@@ -83,18 +95,21 @@
       </div>
     </Teleport>
 
+    <WorkspaceProjectsDialog v-if="showProjectsDialog" @close="showProjectsDialog = false" />
+
     <Toast />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import ChatArea from './ChatArea.vue'
 import ZenHistoryDrawer from './ZenHistoryDrawer.vue'
 import Toast from './Toast.vue'
 import ZenNotePanel from './ZenNotePanel.vue'
 import ZenNotesDrawer from './ZenNotesDrawer.vue'
+import WorkspaceProjectsDialog from './WorkspaceProjectsDialog.vue'
 import { useZenStore } from '@/stores/zen'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 
@@ -105,6 +120,48 @@ const { confirmThreeWay } = useConfirmDialog()
 const leftDrawerOpen = ref(false)
 const rightDrawerOpen = ref(false)
 const showZenExitMenu = ref(false)
+// 2026-11-14 用户反馈：菜单打开后**不得有任何 hover 状态**。
+// 菜单在光标下方展开时浏览器会立刻命中 :hover——解药是打开瞬间给菜单项
+// 关闭 pointer-events，直到用户真正移动鼠标（首次 mousemove）再恢复。
+const menuFresh = ref(false)
+let menuFreshTimer: ReturnType<typeof setTimeout> | null = null
+let menuFreshCleanup: (() => void) | null = null
+
+function clearMenuFresh() {
+  menuFresh.value = false
+  if (menuFreshTimer) {
+    clearTimeout(menuFreshTimer)
+    menuFreshTimer = null
+  }
+  menuFreshCleanup?.()
+  menuFreshCleanup = null
+}
+
+function armMenuFresh() {
+  clearMenuFresh()
+  menuFresh.value = true
+  const onMove = () => clearMenuFresh()
+  window.addEventListener('mousemove', onMove, { once: true, passive: true })
+  menuFreshCleanup = () => window.removeEventListener('mousemove', onMove)
+  // 兜底：1.5s 内完全没动鼠标也恢复，避免菜单永久不可点
+  menuFreshTimer = setTimeout(() => clearMenuFresh(), 1500)
+}
+
+/** 2026-11-14 用户反馈：菜单打开后不得有默认焦点（退出按钮不得显示"被选中"）。
+ *  鼠标点击打开时主动移除触发器焦点；键盘用户仍可用 Tab 进入菜单。 */
+function toggleExitMenu() {
+  showZenExitMenu.value = !showZenExitMenu.value
+  if (showZenExitMenu.value) {
+    armMenuFresh()
+    void nextTick(() => {
+      const el = document.activeElement as HTMLElement | null
+      if (el && el.closest('.zen-exit-dropdown')) el.blur()
+    })
+  } else {
+    clearMenuFresh()
+  }
+}
+const showProjectsDialog = ref(false)
 const zenNotePanelRef = ref<InstanceType<typeof ZenNotePanel> | null>(null)
 
 function getHalfWidth() {
@@ -207,6 +264,7 @@ onUnmounted(() => {
     isResizing.value = false
   }
   window.removeEventListener('resize', onWindowResize)
+  clearMenuFresh()
 })
 </script>
 
@@ -325,6 +383,47 @@ onUnmounted(() => {
 }
 
 .zen-exit-btn:hover {
+  background-color: var(--color-hover);
+  color: var(--color-primary);
+}
+
+/* 下拉展开容器（项目列表 + 退出工作台，2026-11-14）：容器只承担堆叠与入场动画，
+   卡片外观完全交给各皮肤主题的 .zen-exit-btn / .zen-menu-btn 规则（评审 r1 I1：
+   容器不得自带 chrome，否则 mono-brutal 硬边硬影与 verdant 14px 卡全被顶掉）。 */
+.zen-exit-menu {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  animation: slideDown 0.3s ease forwards;
+}
+
+.zen-exit-menu .zen-exit-btn,
+.zen-exit-menu .zen-menu-btn {
+  animation: none;
+}
+
+/* 打开瞬间抑制 hover（直到用户真正移动鼠标），见 armMenuFresh */
+.zen-exit-menu.is-fresh .zen-exit-btn,
+.zen-exit-menu.is-fresh .zen-menu-btn {
+  pointer-events: none;
+}
+
+/* 「项目列表」按钮基线外观（与 .zen-exit-btn 同几何、中性色）；三皮肤各自覆盖。 */
+.zen-menu-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  color: var(--color-text);
+  font-size: 13px;
+  background: var(--surface-panel-strong);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 2px 8px rgba(90, 130, 60, 0.05);
+  white-space: nowrap;
+}
+
+.zen-menu-btn:hover {
   background-color: var(--color-hover);
   color: var(--color-primary);
 }

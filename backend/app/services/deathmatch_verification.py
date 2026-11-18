@@ -33,6 +33,111 @@ GATE_BLOCK_OVERRIDE_AFTER = 2
 GATE_BLOCK_STUCK_AFTER = 3
 
 
+def workspace_root_fingerprint(workspace_path: Any) -> str:
+    """快照根的稳定指纹（sha256(realpath) 前 16 位）。
+
+    跨回合快照比较必须**同根**：首绑/改绑/回滚都会换根，拿旧根的
+    `workspace_files` 比新根会误报「交付物消失」。存指纹是为了在
+    「未来又冒出新的换根路径」时也能识别（宁可漏报一次，不误翻案）。
+    """
+    try:
+        real = _os.path.realpath(str(workspace_path or ""))
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    if not real:
+        return ""
+    return hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
+
+
+def reset_verification_snapshot(conv: Any, *, reason: str = "") -> bool:
+    """把上一回合的验证快照清空（返回是否真的清过）。
+
+    绑定变化 = 换根 = 旧快照的路径口径失效。换绑/首绑/回滚修复都必须调用；
+    下一轮因此走 baseline 分支（只看不判），不会拿旧根比新根。
+    """
+    if conv is None:
+        return False
+    if getattr(conv, "deathmatch_last_verification_result", None) is None:
+        return False
+    conv.deathmatch_last_verification_result = None
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(conv, "deathmatch_last_verification_result")
+    except Exception:  # noqa: BLE001 - 非 ORM 测试伪会话
+        pass
+    logger.info("deathmatch verification snapshot reset (conv=%s reason=%s)",
+                getattr(conv, "id", "?"), reason or "unspecified")
+    return True
+
+
+def _sync_plan_baseline_root(manager: Any, plan: Any, workspace_path: str) -> None:
+    """B4：让 `baseline_paths`（mtime 豁免名单）与当前作用域根同构。
+
+    必须在**每次** verify 时调用（同根时为 no-op）——换绑/回滚会把
+    `deathmatch_last_verification_result` 清空，此时 `_root_changed` 分支根本不会触发；
+    只在那里同步会让旧根的名单继续被当成新根的豁免集（phantom completion）。
+
+    规则：
+    * 名单有根指纹且与当前根一致 → no-op；
+    * 名单有指纹但不一致 → 从当前根重捕；捕不到则**丢弃名单**（严格 mtime，不盖指纹）；
+    * 名单无指纹（本波上线前的旧计划）→ 禁用豁免（严格 mtime）并盖上当前指纹，
+      避免每轮重复判定。
+    """
+    if not isinstance(plan, dict) or "baseline_paths" not in plan:
+        return
+    import time as _time
+
+    current_sha = workspace_root_fingerprint(workspace_path)
+    stored_sha = str(plan.get("baseline_root_sha") or "")
+    if stored_sha and current_sha and stored_sha == current_sha:
+        return
+    if not stored_sha:
+        # 旧计划（本波前创建）没有根指纹。两种情形必须分开：
+        # * legacy 会话：旧代码的回落根就是用户根，而本轮校验也在用户根 → 名单同源，
+        #   保留豁免（既有的 turn-1 保 mtime 行为不能无端失效）；
+        # * scoped 会话：旧代码的名单来自用户根，校验在 Task 根 → 禁豁免（安全侧）。
+        if getattr(manager, "_scope_injected", False):
+            plan["baseline_captured_late"] = True
+            if current_sha:
+                plan["baseline_root_sha"] = current_sha
+            logger.info("deathmatch baseline: legacy plan under scoped root — "
+                        "mtime exemption disabled (conv=%s)",
+                        getattr(getattr(manager, "_conv", None), "id", "?"))
+        else:
+            if current_sha:
+                plan["baseline_root_sha"] = current_sha
+            logger.info("deathmatch baseline: legacy plan without fingerprint — "
+                        "same-root assumption kept (conv=%s)",
+                        getattr(getattr(manager, "_conv", None), "id", "?"))
+    else:
+        captured = manager._capture_baseline_paths(workspace_path)
+        if captured is None:
+            # 判不了 ≠ 没内容：宁可严格 mtime，也不把旧名单盖成新根。
+            plan.pop("baseline_paths", None)
+            plan["baseline_captured_late"] = True
+            plan.pop("baseline_root_sha", None)
+            logger.warning("deathmatch baseline: root changed but recapture failed — "
+                           "baseline disabled (conv=%s)",
+                           getattr(getattr(manager, "_conv", None), "id", "?"))
+        else:
+            plan["baseline_paths"] = captured[: manager._BASELINE_PATHS_CAP]
+            plan["baseline_truncated"] = len(captured) > manager._BASELINE_PATHS_CAP
+            plan["baseline_recaptured_at"] = _time.time()
+            if current_sha:
+                plan["baseline_root_sha"] = current_sha
+            logger.warning("deathmatch baseline: root changed — recaptured %d paths "
+                           "(conv=%s)", len(captured),
+                           getattr(getattr(manager, "_conv", None), "id", "?"))
+    try:
+        from app.services.deathmatch_service import _touch_json
+
+        _touch_json(manager._conv, "deathmatch_plan")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+
 def _receipt_command_segments(command: Any) -> list[list[str]]:
     """Split only on unquoted mandatory &&/; operators, preserving quote state."""
     text = str(command or "")
@@ -132,6 +237,30 @@ def _head_tail_truncate(*a, **k):
 def _is_bible_file(*a, **k):
     from app.services.deathmatch_service import _is_bible_file as f
     return f(*a, **k)
+
+
+def _declared_path_variants(rel: str) -> tuple[str, ...]:
+    """声明产出的候选落点：原路径 + 交付物目录约定解析后的落点。
+
+    2026-11-15：`workspace_publish` 在 enforce 下把**裸文件名**重定向到
+    `<dir>/`，而死磕计划仍按裸名声明产出——不桥接会让证据闸永久判「声明
+    交付物缺失」并卡死步骤。这里只**多认一个落点**，不迁移任何历史文件：
+    根目录的旧文件仍按原路径命中，`artifacts/` 下的新文件按新落点命中。
+    """
+    path = str(rel or "")
+    if not path:
+        return ()
+    try:
+        from app.services import workspace_artifact_service as _was
+
+        directory, mode = _was.publish_deliverable_policy()
+        resolved, _placement = _was.resolve_publish_target(
+            path, deliverable_dir=directory, mode=mode)
+    except Exception:  # noqa: BLE001 - 策略不可读时退回原路径（不阻断证据闸）
+        return (path,)
+    if resolved and resolved != path:
+        return (path, resolved)
+    return (path,)
 
 
 def _is_noise_path(*a, **k):
@@ -271,11 +400,74 @@ class DeathmatchVerificationMixin:
             "retry_instruction": f"修复后重跑验证命令：{command[:200]}",
         }
 
+    def _scratch_publish_hint(self, declared: List[str], workspace_path: str) -> str:
+        """WP1.2：把「交付物只存在于执行域」从静默不收敛变成可执行指引。
+
+        双源：attempt scratch（terminal/process 的 cwd）与 write_root/scratch/task_*
+        （execute_code 的产物目录）。只查这两个真实来源，不做全盘扫描。
+        """
+        scratch = str(getattr(self, "_scratch_path", "") or "")
+        if not declared:
+            return ""
+        found: List[str] = []
+        wr_scratch = _os.path.join(str(workspace_path or ""), "scratch")
+        for raw in declared:
+            safe = _safe_workspace_path(raw)
+            if not safe:
+                continue
+            candidates = []
+            if scratch:
+                candidates.append(_os.path.join(scratch, safe))
+            try:
+                if _os.path.isdir(wr_scratch):
+                    for name in _os.listdir(wr_scratch):
+                        sub = _os.path.join(wr_scratch, name)
+                        if _os.path.isdir(sub):
+                            candidates.append(_os.path.join(sub, safe))
+            except OSError:
+                pass
+            for candidate in candidates:
+                try:
+                    if _os.path.isfile(candidate):
+                        found.append(safe)
+                        break
+                except OSError:
+                    continue
+        if not found:
+            return ""
+        # 已经发布到稳定域、但 mtime 早于目标启动（provenance 闸拒绝）：再 publish
+        # 一次只会复制同一个旧 mtime。给真正可执行的下一步，而不是循环指令。
+        stale_in_stable = []
+        for raw in declared:
+            safe = _safe_workspace_path(raw)
+            if not safe:
+                continue
+            candidate = _os.path.join(str(workspace_path or ""), safe)
+            try:
+                if _os.path.isfile(candidate) and _os.path.getsize(candidate) > 0:
+                    stale_in_stable.append(safe)
+            except OSError:
+                continue
+        if stale_in_stable:
+            return (
+                "；交付物已在任务文件域但时间戳早于本目标启动（视为过期证据）："
+                + ", ".join(stale_in_stable[:3])
+                + "。请重新生成/覆盖该文件（workspace_publish 会刷新 mtime），"
+                  "不要只重复发布同一份旧文件。"
+            )
+        return (
+            "；检测到这些交付物只存在于执行域（attempt scratch 或 workspace/scratch/task_*）："
+            + ", ".join(found[:3])
+            + "。请调用 workspace_publish(src=<执行域相对路径>, rel_target=<任务文件域相对路径>) "
+              "把文件发布到任务文件域后重试（terminal/execute_code 产物不会自动出现在任务文件域）。"
+        )
+
     async def verify_step_outputs(
         self,
         last_response: str,
         workspace_path: str,
         tool_results: Optional[List[Any]] = None,
+        scratch_path: str = "",
     ) -> Dict[str, Any]:
         """Independent verifier: LLM-based step completion assessment.
 
@@ -286,8 +478,15 @@ class DeathmatchVerificationMixin:
         """
         if workspace_path:
             self._workspace_path = workspace_path
+        if scratch_path:
+            self._scratch_path = str(scratch_path)
+        _root_sha = workspace_root_fingerprint(workspace_path)
         files = self._workspace_file_snapshot(workspace_path)
         plan = self._conv.deathmatch_plan or {"steps": []}
+        # B4：每次 verify 都做一次幂等对账。换绑/回滚会清空上一轮快照，
+        # `_root_changed`（依赖 prev sha）根本不会触发——只在那里同步 = 旧根名单
+        # 继续被当成新根的豁免集（可让预置旧文件冒充本轮交付）。
+        _sync_plan_baseline_root(self, plan, workspace_path)
         steps = plan.get("steps") or []
 
         issues: List[str] = []
@@ -321,12 +520,28 @@ class DeathmatchVerificationMixin:
             "current_step": current_step.get("id") if current_step else None,
             "continuity_brief": "",
             "integrity": "clean",  # G3: flips to "violation" on protected-deletion
+            # wp2: 快照根指纹（旧快照没有该键 = 根未知 → 本轮跳过 vanished 判定）
+            "snapshot_root_sha": _root_sha,
         }
 
         # Baseline for progress/new-file detection: the previous verification's
         # snapshot. Computed up-front so the verifier can see THIS turn's
         # new/changed files and the progress detector below can reuse it.
         prev_result = self._conv.deathmatch_last_verification_result or {}
+        _prev_root_sha = str((prev_result or {}).get("snapshot_root_sha") or "")
+        _root_changed = bool(prev_result) and bool(_prev_root_sha) and bool(_root_sha) \
+            and _prev_root_sha != _root_sha
+        _root_unknown = bool(prev_result) and not _prev_root_sha
+        if _root_changed:
+            # 换根（首绑/改绑/回滚修复）后的第一轮：旧根的相对路径在新根上没有意义。
+            # 宁可漏报一次，也不误判「已定案交付物消失」→ 翻案 + 撤回 claim。
+            logger.warning(
+                "PEVR verifier: workspace root changed for conv=%s (%s → %s) — "
+                "resetting snapshot and re-baselining", self._conv.id,
+                _prev_root_sha, _root_sha)
+            reset_verification_snapshot(self._conv, reason="root_changed")
+            prev_result = {}
+            _sync_plan_baseline_root(self, plan, workspace_path)
         if not prev_result:
             # A4.9 r4: the FIRST verification of a goal loop is a BASELINE
             # round — capture the workspace snapshot without judging, so
@@ -363,6 +578,7 @@ class DeathmatchVerificationMixin:
                 "no_content_turns": 1 if not (last_response or "").strip() else 0,
                 "tool_result_hashes": {},
                 "integrity": "clean",  # G3 contract symmetry (A4.9 R3 Minor-1)
+                "snapshot_root_sha": _root_sha,
             }
             self._conv.deathmatch_last_verification_result = baseline
             # A-N1（fix-round C1/C2）：兜底捕获 = 全量 os.walk + late 标记。
@@ -385,17 +601,10 @@ class DeathmatchVerificationMixin:
             prev_files = {}
         prev_completed = set(prev_result.get("completed_steps") or [])
 
-        def _is_noise_path(p: str) -> bool:
-            return (
-                "__pycache__" in p
-                or p.startswith("tool_results/")
-                or "/tool_results/" in p
-                # Bible spec files are SETTINGS, not deliverables — excluded
-                # from evidence/progress. Precise match on the 5 generated
-                # file names so a REAL deliverable inside a directory named
-                # "bible" is never falsely excluded (A4.9 review d/b).
-                or _is_bible_file(p)
-            )
+        # 噪声路径规则单一实现（2026-11-15 评审 M1）：模块级
+        # `_is_noise_path` 转发到 `deathmatch_service`，本方法直接使用它。
+        # 旧实现在此处另有一份闭包副本，与模块级版本漂移（scratch/ 排除
+        # 只加在一份上就会失效）。
 
         # Files new or changed since the previous verification = THIS turn's
         # actual output. The verifier MUST see their content (head+tail) —
@@ -424,7 +633,11 @@ class DeathmatchVerificationMixin:
             p for p in _protected_deliverables(steps)
             if p in prev_files
             and not _os.path.exists(_os.path.join(workspace_path, p))
-        )
+        ) if not _root_unknown else []
+        if _root_unknown and prev_result:
+            logger.info(
+                "PEVR verifier: previous snapshot has no root fingerprint (conv=%s) — "
+                "vanished check skipped once; root fingerprint now stamped", self._conv.id)
         integrity_issue = (
             "完整性违规：已完成步骤的交付物已从工作区消失："
             + ", ".join(deleted_protected[:5])
@@ -692,6 +905,10 @@ class DeathmatchVerificationMixin:
                             _normalize_rel_path(_safe_workspace_path(p))
                             for p in _declared if _safe_workspace_path(p)
                         }
+                        # 2026-11-15 交付物目录约定桥接：声明裸名在 enforce 下
+                        # 实际落在 `<dir>/` 下，证据集合也要认这个落点。
+                        for _dp in list(_declared_norm):
+                            _declared_norm.update(_declared_path_variants(_dp))
                         _evidence_files = [
                             f for f in new_files
                             if f.get("size", 0) > 0
@@ -745,9 +962,19 @@ class DeathmatchVerificationMixin:
                                 # 声明 ./deliverable.md 必须命中基线成员
                                 # deliverable.md，形态洞不得骗豁免）。
                                 _p = _normalize_rel_path(_p)
-                                try:
-                                    _st = _os.stat(_os.path.join(workspace_path, _p))
-                                except Exception:
+                                # 2026-11-15 交付物目录约定桥接：enforce 下裸名
+                                # 声明实际落在 `<dir>/` 下——多认这一个落点。
+                                # 只多认、不迁移：根目录的旧文件仍按原路径命中。
+                                _st = None
+                                for _cand in _declared_path_variants(_p):
+                                    try:
+                                        _cand_st = _os.stat(_os.path.join(workspace_path, _cand))
+                                    except Exception:
+                                        continue
+                                    _p = _cand
+                                    _st = _cand_st
+                                    break
+                                if _st is None:
                                     break
                                 if (
                                     _st.st_size > 0
@@ -905,6 +1132,7 @@ class DeathmatchVerificationMixin:
                                 result["issues"] = list(result["issues"]) + [
                                     f"证据门拦截：步骤 {current_step.get('id', '?')} 声明完成但"
                                     f"声明交付物（{', '.join(_declared[:3]) or '产出文件'}）缺失或早于本目标启动（过期）— 需产出实际文件"
+                                    + self._scratch_publish_hint(_declared, workspace_path)
                                 ]
                                 self._set_step_status(current_step, "in_progress", "evidence_gate_block")
                             logger.info(
@@ -1158,6 +1386,7 @@ class DeathmatchVerificationMixin:
         *,
         user_initiated: bool = False,
         workspace_path: str = "",
+        scratch_path: str = "",
         tool_results: Optional[List[Any]] = None,
         ctx_estimate_tokens: int = 0,
     ) -> Dict[str, Any]:
@@ -1173,6 +1402,8 @@ class DeathmatchVerificationMixin:
         self._ctx_estimate_tokens = int(ctx_estimate_tokens or 0)
         if workspace_path:
             self._workspace_path = workspace_path
+        if scratch_path:
+            self._scratch_path = str(scratch_path)
         if not self.is_goal_active:
             return {
                 "status": self._conv.deathmatch_status,
@@ -1386,7 +1617,7 @@ class DeathmatchVerificationMixin:
         if workspace_path:
             try:
                 verify_result = await self.verify_step_outputs(
-                    last_response, workspace_path, tool_results=tool_results
+                    last_response, workspace_path, tool_results=tool_results,
                 )
             except Exception as exc:
                 logger.warning("PEVR verifier failed: %s", exc)
@@ -1779,6 +2010,10 @@ class DeathmatchVerificationMixin:
                     "issues": [],
                     "current_step": _completed_step_ids[-1] if _completed_step_ids else None,
                     "integrity": _previous_verification.get("integrity", "clean"),
+                    # 终局也必须带根指纹，否则下一轮被当成「根未知」而跳过 vanished 检查。
+                    "snapshot_root_sha": (
+                        _previous_verification.get("snapshot_root_sha")
+                        or workspace_root_fingerprint(workspace_path)),
                 }
             # Generate the final task summary table.
             final_table = self.generate_final_summary_table()

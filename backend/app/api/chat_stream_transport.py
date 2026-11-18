@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.chat_persistence import interjection_anchor_from_buffer, interjection_items_from_buffer
+from app.services.task_binding_service import sync_task_title_after_rename
 from app.api.interjection_display import (
     SEGMENT_SEPARATOR,
     commit_prepared_item,
@@ -201,6 +202,9 @@ class _ChatStreamState:
     _dm_terminal_status_saved: Any = None
     # 任务作用域：本轮是否 enforce 装配成功（media 门只约束 scoped 回合）
     ws_scoped_localize: bool = False
+    # 本轮作用域 run id（2026-11-14 v2：终态化在 stream_chat_response 的嵌套闭包里执行，
+    # 拿不到 _chat_run_tool_loop 的局部变量，必须经 _state 传递）
+    ws_scoped_run_id: str | None = None
     # 本轮 user 消息 id（装配/逐消息快照的精确锚点；stream_chat_response 写入）
     ws_turn_message_id: str | None = None
     _injected_mem_ids: Any = None
@@ -2346,6 +2350,16 @@ async def _chat_agent_loop_impl(_state, **kw):
         if _deathmatch_mgr is not None and task_conversation is not None:
             _rebind_deathmatch_manager_conversation(_deathmatch_mgr, task_conversation)
             agent_loop.deathmatch_manager = _deathmatch_mgr
+            # 2026-11-13 parity：作用域根在装配点显式交给 manager（B4：计划基线
+            # 不能靠 `_workspace_path` 的时序巧合，且 compress 会把它写成用户根）。
+            _dm_ws_ctx = getattr(agent_loop, "workspace_ctx", None)
+            if _dm_ws_ctx is not None:
+                try:
+                    _deathmatch_mgr.set_workspace_root(
+                        str(_dm_ws_ctx.write_root),
+                        scratch_root=str(_dm_ws_ctx.attempt_root / "scratch"))
+                except Exception:  # noqa: BLE001 - 根注入失败不阻断本轮
+                    logger.warning("deathmatch manager root injection failed", exc_info=True)
             from app.services.deathmatch_service import (
                 DEATHMATCH_SYNC_FIELDS as _DM_SYNC_FIELDS,
                 _ensure_creative_judged,
@@ -2758,11 +2772,12 @@ async def _attach_workspace_scope(*, conversation, conversation_id, current_user
         from app.services.workspace_scope import WorkspaceScopeError as _WSScopeErr
 
         if isinstance(_ws_exc, _WSScopeErr) and _ws_exc.code == _WS_UNSUPPORTED:
-            logger.warning("workspace scope rejected run (conversation=%s): %s",
-                           conversation_id, _ws_exc)
+            logger.warning(
+                "workspace scope rejected run (conversation=%s): %s — "
+                "operator: check [workspace.task_scoping].supported_modes / mode",
+                conversation_id, _ws_exc)
             return None, {"event": "error", "data": json.dumps({
-                "error": ("该运行模式尚未支持任务作用域（不会回退到共享工作区根）。"
-                          "请在设置中调整 [workspace.task_scoping] 或新建普通会话继续。"),
+                "error": "该会话暂不支持此执行模式，请新建普通会话后重试。",
                 "code": _ws_exc.code, "success": False}, ensure_ascii=False)}
         logger.exception("workspace scope attach failed (conversation=%s)", conversation_id)
         return None, {"event": "error", "data": json.dumps({
@@ -3238,6 +3253,24 @@ async def _chat_run_tool_loop(_state, **kw):
                                       current_user=current_user,
                                       message_id=kw.get('user_message_id'))
     _state.ws_scoped_localize = bool(_scoped_run is not None and _scoped_run.enforced)
+    # 2026-11-14 v2（评审 r2 Critical）：把 run id 挂到流状态上——终态化在
+    # `_finalize_and_emit_done`（stream_chat_response 的嵌套闭包）里执行，那里
+    # 拿不到本函数的局部 `_scoped_run`（上一版直接引用 = NameError + 永不 park）。
+    _state.ws_scoped_run_id = getattr(_scoped_run, "run_id", None)
+
+    # 2026-11-14 v2：新会话归类建议（非阻塞）——必须在作用域装配**之后**下发
+    # （meta 事件早于装配，评审 C1/C2：挂 meta 既拿不到 _scoped_run，也永远为空）。
+    # 本轮已在默认项目执行；前端据此询问用户是否改绑到候选任务。
+    if _scoped_run is not None and getattr(_scoped_run, "suggested_task", None):
+        _suggestion_payload = dict(_scoped_run.suggested_task)
+        # 评审 r2 Minor：事件自带权威 conversation_id——remint 后前端 current 是
+        # 服务端 id，只挂客户端 id 会匹配不上（建议永远不显示或显示错会话）。
+        _suggestion_payload["conversation_id"] = conversation_id
+        yield {
+            "event": "workspace_suggestion",
+            "data": json.dumps({"workspace_suggestion": _suggestion_payload},
+                               ensure_ascii=False),
+        }
 
     # W17 vibeweaver 轮次门控：force-inject 全文与 gate/audit 执法仅对
     # coding 任务或显式提及 vibeweaver 的轮次激活（生产 conv dd3b2408：
@@ -3471,8 +3504,9 @@ async def _chat_run_tool_loop(_state, **kw):
             src = (_tq or full_content or "").strip()
             generated_title = src[:16] if src else "未命名会话"
         conv_row.title = generated_title
+        await sync_task_title_after_rename(bg_db, conversation=conv_row)
         await bg_db.commit()
-        return generated_title
+        return conv_row.title or generated_title  # 落库值（采纳时≠generated_title，r2 C1）
 
     # Deathmatch terminal-status flag shared with the nested
     # _agent_loop_task (which sets it) and this function's finalize
@@ -4113,6 +4147,7 @@ async def _chat_event_generator(_state, **kw):
                             _src = (_tq or interrupted_content or "").strip()
                             gt = _src[:16] if _src else "未命名会话"
                         conv_row.title = gt
+                        await sync_task_title_after_rename(bg_db, conversation=conv_row)
                         await bg_db.commit()
             except Exception:
                 import traceback as _tb
@@ -4878,8 +4913,10 @@ async def stream_chat_response(request, req, db, current_user):
                     generated_title = "未命名会话"
 
             refreshed_conversation.title = generated_title
+            await sync_task_title_after_rename(db, conversation=refreshed_conversation)
             await db.commit()
-            return generated_title
+            # 同上（评审 r2 Critical-1）：返回落库值，而不是被采纳逻辑丢弃的生成标题。
+            return refreshed_conversation.title or generated_title
         except Exception:
             import traceback as _tb
             _tb.print_exc()
@@ -4896,6 +4933,19 @@ async def stream_chat_response(request, req, db, current_user):
         with the FINAL title (so the frontend never has to wait for a separate
         title_update event to display it), then optionally emit title_update
         for existing client-side listeners. Used by every exit path."""
+        # 2026-11-14 v2（评审 C2）：回合终态化作用域 run（park + 封存 attempt）。
+        # 不终态化 → run 永远 running → 改绑被 workspace_run_active 永久挡住
+        # （用户反馈「无法改绑」的根因之一：面板/agent 改绑都要求先 park）。
+        try:
+            from app.services.workspace_scoping_runtime import finalize_scope_run as _fin_scope
+
+            await _fin_scope(db, run_id=getattr(_state, "ws_scoped_run_id", None),
+                             status="parked")
+            # 评审 r3 Important：finish_run 只 flush，终态化路径必须自己 commit，
+            # 否则已命名会话的 run 在 done 后仍是 running（改绑继续被拒）。
+            await db.commit()
+        except Exception:  # noqa: BLE001 - 收尾失败不反噬回答
+            logger.debug("scope run finalize skipped", exc_info=True)
         refreshed = None
         try:
             conv_result = await db.execute(

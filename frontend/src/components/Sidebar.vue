@@ -1417,6 +1417,23 @@ watch(() => chatStore.currentConversationId, (id) => {
   })
 })
 
+// 跨来源打开会话（任务管理中心「打开会话」按钮）：sidebar 焦点同步——展开该会话
+// 所属分组并滚动到行。普通侧栏点击不走这条信号（保持上面 nearest 滚动语义不变）。
+// 跨助手时 Sidebar 的 assistant watcher 会异步重载会话/分组（其 seq 高于调用方自己的
+// load，调用方的 load 被 stale 守卫丢弃），故这里必须等目标会话进入列表、其分组进入
+// groupStore.groups 之后再展开+滚动，否则分组展开会漏掉（评审 #2 Important-1）。
+watch(() => chatStore.revealConversationRequest, async (req) => {
+  if (!req) return
+  for (let i = 0; i < 40; i++) {
+    const conv = chatStore.conversations.find((c) => c.id === req.id)
+    const gid = conv?.group_id || null
+    const groupReady = !gid || groupStore.groups.some((g) => g.id === gid)
+    if (conv && groupReady) break
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  await revealConversationInSidebar(req.id)
+})
+
 onMounted(async () => {
   if (auth.isAuthenticated) {
     // 先加载本人上传皮肤（运行时注册表），再做远端偏好同步/归属判定

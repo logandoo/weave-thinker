@@ -80,7 +80,7 @@
           <div v-else-if="item.type === 'reasoning_step'" class="reasoning-block">
             <details @toggle="(e) => onLazyToggle(`rs-${idx}`, e)">
               <summary class="reasoning-summary"><span class="step-title">{{ item.title || '💭 思考过程' }}</span><span v-if="truncBadge(item)" class="trunc-badge">{{ truncBadge(item) }}</span></summary>
-              <div v-if="isLazyOpen(`rs-${idx}`)" class="reasoning-text" v-html="renderMarkdownToHtml(item.content, { deviceId: messageDeviceId })"></div>
+              <div v-if="isLazyOpen(`rs-${idx}`)" class="reasoning-text" v-html="renderMarkdownToHtml(item.content, { deviceId: messageDeviceId, conversationId: messageConversationId })"></div>
             </details>
           </div>
           <div
@@ -267,7 +267,8 @@
       :filename="previewFileRef.filename"
       :url="fileRefUrl(previewFileRef)"
       :rel-path="previewFileRef.relPath || null"
-      :source-path="previewFileRef.relPath || previewFileRef.absolutePath || null"
+      :source-path="previewFileRef.downloadPath || previewFileRef.relPath || previewFileRef.absolutePath || null"
+      :conversation-id="messageConversationId"
       :type="previewFileRef.fileType || null"
       @close="filePreviewRef = null"
     />
@@ -424,6 +425,7 @@ import { deriveToolStatus } from '@/utils/toolStatus'
 import { isExternalizedStub, stubMarkersTrusted } from '@/api/chat'
 import { classifyFile } from '@/composables/filePreview'
 import { buildDownloadUrl } from '@/api/workspaceFiles'
+import { fileRefDownloadTarget } from '@/utils/fileRefs'
 import { buildDeviceDownloadUrl, deviceIdFromTarget } from '@/api/clientDevices'
 import { downloadUrl } from '@/composables/useDownload'
 import {
@@ -1408,6 +1410,12 @@ interface FileRefInfo {
   filename: string
   relPath: string
   absolutePath: string
+  /**
+   * 用户根相对路径（2026-11-15 波 · C）。上传响应同时带两个口径：
+   * `工作区路径` = Task 相对（agent 解析用），`下载路径` = 用户根相对
+   * （`/api/files/download` 解析用）。旧消息没有这一行 ⇒ 回落到 relPath。
+   */
+  downloadPath: string
   fileType: string
   sizeText: string
 }
@@ -1427,6 +1435,7 @@ const fileRefs = computed<FileRefInfo[]>(() => {
       filename: match[1],
       relPath: _refMeta(content, '工作区路径'),
       absolutePath: _refMeta(content, '文件路径'),
+      downloadPath: _refMeta(content, '下载路径'),
       fileType: _refMeta(content, '文件类型'),
       sizeText: _refMeta(content, '文件大小'),
     })
@@ -1446,7 +1455,10 @@ function fileRefUrl(ref: FileRefInfo): string {
   if (deviceId && ref.relPath) {
     return buildDeviceDownloadUrl(deviceId, ref.relPath)
   }
-  return buildDownloadUrl(ref.relPath || ref.absolutePath, deviceId)
+  // 2026-11-15：优先 `下载路径`（用户根相对，上传时服务端给出）；旧消息没有
+  // 这一行 ⇒ 回落到 `工作区路径`/`文件路径`，并带上会话 id 让服务端做 Task 兜底。
+  const target = fileRefDownloadTarget(ref)
+  return buildDownloadUrl(target, deviceId, props.message.conversation_id)
 }
 
 // W18 G4：消息所属会话的设备 id——meta-miss 时经 resolveExecTargetFor 兜底
@@ -1458,6 +1470,11 @@ const messageDeviceId = computed(() => {
     : null
   return deviceIdFromTarget(target)
 })
+
+// 2026-11-15：会话 id 用于 `/api/files/*` 的 Task 兜底解析（Task 相对路径）。
+const messageConversationId = computed<string | null>(
+  () => props.message.conversation_id || null,
+)
 
 function onFileRefClick(ref: FileRefInfo) {
   const kind = classifyFile(ref.filename, ref.fileType)
@@ -1485,7 +1502,7 @@ const previewHtml = computed(() => {
   if (previewIdx.value === null) return ''
   const ref = noteRefs.value[previewIdx.value]
   if (!ref) return ''
-  return renderMarkdownToHtml(ref.content, { deviceId: messageDeviceId.value })
+  return renderMarkdownToHtml(ref.content, { deviceId: messageDeviceId.value, conversationId: messageConversationId.value })
 })
 
 const formattedContent = computed(() => {
@@ -1496,7 +1513,7 @@ const formattedContent = computed(() => {
   const source = props.message.role === 'user'
     ? convertTabTablesToMarkdown(strippedContent.value)
     : strippedContent.value
-  let html = renderMarkdownToHtml(source, { deviceId: messageDeviceId.value })
+  let html = renderMarkdownToHtml(source, { deviceId: messageDeviceId.value, conversationId: messageConversationId.value })
   if (citationsPayload.value) {
     // M6：服务端载荷驱动（样式族形态 + 服务端编号），跳过本地启发式/重排
     html = applyCitationInText(html, citationsPayload.value)
@@ -1519,7 +1536,7 @@ function formatTextWithCitations(content: string): string {
   let processed = content
     .replace(BIBLIOGRAPHY_SECTION_REGEX, '')
     .replace(INLINE_SOURCE_REGEX, '[$1]')
-  let html = renderMarkdownToHtml(processed, { deviceId: messageDeviceId.value })
+  let html = renderMarkdownToHtml(processed, { deviceId: messageDeviceId.value, conversationId: messageConversationId.value })
   if (citationsPayload.value) {
     html = applyCitationInText(html, citationsPayload.value)
   } else if (parsedToolResults.value.length > 0) {
@@ -1539,10 +1556,10 @@ const formattedReasoning = computed(() => {
   if (isExternalizedStub(props.message.reasoning_content)) {
     try {
       const stub = JSON.parse(props.message.reasoning_content)
-      return renderMarkdownToHtml(stub.preview || '', { deviceId: messageDeviceId.value })
+      return renderMarkdownToHtml(stub.preview || '', { deviceId: messageDeviceId.value, conversationId: messageConversationId.value })
     } catch { /* fall through */ }
   }
-  return renderMarkdownToHtml(props.message.reasoning_content, { deviceId: messageDeviceId.value })
+  return renderMarkdownToHtml(props.message.reasoning_content, { deviceId: messageDeviceId.value, conversationId: messageConversationId.value })
 })
 
 // P0-1：只 watch formattedContent——watch 数组里放 formattedReasoning 会在挂载时

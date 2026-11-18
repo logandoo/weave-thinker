@@ -1589,7 +1589,12 @@ async function handleSend() {
               ? `${(f.size / 1024).toFixed(1)} KB`
               : `${(f.size / 1048576).toFixed(1)} MB`
           : '未知'
-        fullContent += `[file-ref:${f.filename}]\n工作区路径: ${f.display_path || f.rel_path || f.file_path}\n文件类型: ${f.file_type || 'unknown'}\n文件大小: ${sizeStr}\n[/file-ref]\n\n`
+        // 2026-11-15（C）：`工作区路径` 是 **Task 相对**（agent 解析用），
+        // `下载路径` 是 **用户根相对**（`/api/files/download` 解析用）。两个口径
+        // 必须同时给出——只给 Task 相对会让浏览器按用户根解析而 404。
+        const _dl = f.download_path || f.rel_path || f.file_path || ''
+        const _dlLine = _dl ? `下载路径: ${_dl}\n` : ''
+        fullContent += `[file-ref:${f.filename}]\n工作区路径: ${f.display_path || f.rel_path || f.file_path}\n${_dlLine}文件类型: ${f.file_type || 'unknown'}\n文件大小: ${sizeStr}\n[/file-ref]\n\n`
       }
     }
   }
@@ -3017,6 +3022,17 @@ defineExpose({ setEditContent })
   font-size: 13px;
 }
 
+/* 同 FilePreviewDialog / StreamMarkdown 等 5 面：围栏代码块的底色归 `.code-block`
+   外壳（皮肤给的是深色块 + 近白字）。scoped `pre` 浅色底会把字与底压成同色，
+   本条 (0,3,1) 同时压过本文件后面那条 `.note-preview-body :deep(pre)` 皮肤段。 */
+.note-preview-body :deep(.code-block pre) {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  margin: 0;
+  padding: 12px;
+}
+
 .note-preview-body :deep(code) {
   font-family: var(--font-mono);
   background-color: var(--color-sidebar);
@@ -3419,13 +3435,20 @@ defineExpose({ setEditContent })
   background-color: var(--color-primary);
 }
 
-/* 生成中占用语音槽位的停止按钮：同尺寸同位置，换用 error 令牌色以资识别。 */
-.stop-generating-btn {
-  background-color: var(--color-error);
+/* 生成中占用语音槽位的停止按钮：同尺寸同位置，换用专用停止红（--color-stop）以资识别。
+   不用 --color-error——它在默认皮肤是 terracotta，读不出「停止」的红色语义。
+   选择器用 `.voice-mode-toggle-btn.stop-generating-btn` 双类（scoped 后 +[data-v] = 0,3,0），
+   压过皮肤的 `html[data-skin] .voice-mode-toggle-btn`（0,2,1，会把语音按钮刷成白底）。 */
+.voice-mode-toggle-btn.stop-generating-btn {
+  background-color: var(--color-stop, #D6161C);
+  /* 皮肤把 .voice-mode-toggle-btn 的图标色刷成主色（verdant 深绿 / ink 青），红底上读不出
+     「停止」；这里强制白图标（双类 0,3,0 压过皮肤 0,2,1 的 color）。 */
+  color: #fff;
 }
 
-.stop-generating-btn:hover:not(:disabled) {
-  background-color: var(--color-error);
+.voice-mode-toggle-btn.stop-generating-btn:hover:not(:disabled) {
+  background-color: var(--color-stop, #D6161C);
+  color: #fff;
   filter: brightness(1.08);
 }
 

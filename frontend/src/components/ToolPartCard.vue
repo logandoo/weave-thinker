@@ -152,6 +152,43 @@ function formatToolName(name: string): string {
   }
   return map[name] || name
 }
+
+// S8（2026-11-15 任务管理中心）：4 个 workspace 管理工具的结果以「键值卡」呈现，
+// 而不是整块 JSON。失败（ok=false）与 purge 被拒也走同一张卡（带 code）。
+const WORKSPACE_TOOLS = new Set([
+  'workspace_project_manage', 'workspace_task_manage',
+  'workspace_note_bind', 'workspace_task_files',
+])
+const workspaceKv = computed<Array<[string, string]> | null>(() => {
+  if (!WORKSPACE_TOOLS.has(String(props.item.name || ''))) return null
+  const raw = props.item.result
+  if (!raw) return null
+  try {
+    const p = JSON.parse(raw) as Record<string, any>
+    if (!p || typeof p !== 'object') return null
+    const out: Array<[string, string]> = []
+    const push = (k: string, v: unknown) => {
+      if (v === undefined || v === null || v === '') return
+      out.push([k, typeof v === 'object' ? JSON.stringify(v) : String(v)])
+    }
+    push('ok', p.ok === true ? '✓ ok' : p.ok === false ? '✕ 失败' : undefined)
+    if (p.error) push('error', p.error)
+    if (p.code) push('code', p.code)
+    const obj = p.project || p.task || p.note || null
+    if (obj && typeof obj === 'object') {
+      for (const [k, v] of Object.entries(obj)) push(k, v)
+    }
+    push('task_id', p.task_id)
+    push('note_id', p.note_id)
+    push('binding_version', p.binding_version)
+    if (Array.isArray(p.produced)) push('produced', `${p.produced.length} 个文件`)
+    if (Array.isArray(p.tasks)) push('tasks', `${p.tasks.length} 个任务`)
+    if (Array.isArray(p.projects)) push('projects', `${p.projects.length} 个项目`)
+    return out.length ? out : null
+  } catch {
+    return null
+  }
+})
 </script>
 
 <template>
@@ -191,7 +228,12 @@ function formatToolName(name: string): string {
         全文取回失败，当前为截断预览
         <button type="button" class="fetch-retry" @click.stop="fetchFullIfNeeded">重试取回全文</button>
       </div>
-      <StreamMarkdown :content="displayResult" />
+      <dl v-if="workspaceKv" class="ws-kv">
+        <template v-for="[k, v] in workspaceKv" :key="k">
+          <dt>{{ k }}</dt><dd>{{ v }}</dd>
+        </template>
+      </dl>
+      <StreamMarkdown v-else :content="displayResult" />
     </div>
   </div>
 </template>
@@ -205,6 +247,17 @@ function formatToolName(name: string): string {
   overflow: hidden;
   transition: border-color 0.2s, box-shadow 0.2s;
 }
+
+.ws-kv {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 10px 14px;
+  font-size: 12.5px;
+}
+.ws-kv dt { color: var(--color-text-light, #6b7280); font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 11.5px; }
+.ws-kv dd { margin: 0; overflow-wrap: anywhere; }
 
 .tool-part-card.tool-error {
   border-color: #fca5a5;

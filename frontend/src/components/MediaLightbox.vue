@@ -17,7 +17,6 @@
             @pointermove="onPointerMove"
             @pointerup="onPointerUp"
             @pointercancel="onPointerUp"
-            @contextmenu.prevent
             draggable="false"
           />
         </div>
@@ -115,6 +114,10 @@ function onWheel(e: WheelEvent) {
 
 function onPointerDown(e: PointerEvent) {
   if (!imgEl.value) return
+  // 2026-11-15: 只有主键（左键）开始平移。右键必须留给浏览器原生菜单
+  // （复制图片 / 图片另存为），否则右键会顺手把图片拖走并吞掉菜单。
+  // macOS 的 Ctrl+左键是右键语义（同 WysiwygEditor 的判定），一并排除。
+  if (e.button !== 0 || e.ctrlKey) return
   drag.active = true
   drag.startX = e.clientX
   drag.startY = e.clientY

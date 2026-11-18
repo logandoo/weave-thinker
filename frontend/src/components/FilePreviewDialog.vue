@@ -3,7 +3,7 @@
 
 <template>
   <Teleport to="body">
-    <div class="file-preview-overlay" @click.self="close">
+    <div class="file-preview-overlay" :style="overlayStyle" @click.self="close">
       <div class="file-preview-dialog" :class="{ 'file-preview-dialog--fill': isFillKind }" role="dialog" aria-modal="true">
         <div class="file-preview-header">
           <div class="file-preview-heading">
@@ -87,6 +87,45 @@
             </div>
           </div>
 
+          <div v-else-if="kind === 'html'" class="file-preview-html-view">
+            <div class="file-preview-tabs" role="tablist" aria-label="HTML 预览模式">
+              <button
+                class="file-preview-tab"
+                :class="{ 'file-preview-tab--active': htmlView === 'render' }"
+                role="tab"
+                :aria-selected="htmlView === 'render'"
+                @click="htmlView = 'render'"
+              >渲染</button>
+              <button
+                class="file-preview-tab"
+                :class="{ 'file-preview-tab--active': htmlView === 'source' }"
+                role="tab"
+                :aria-selected="htmlView === 'source'"
+                @click="htmlView = 'source'"
+              >源码</button>
+              <label
+                class="file-preview-script-toggle"
+                title="脚本在沙箱隔离环境中运行（无法读取应用数据、无法弹窗或跳转顶层）；关闭后仅渲染静态内容"
+              >
+                <input type="checkbox" v-model="htmlScriptsEnabled" />
+                <span>允许脚本</span>
+              </label>
+            </div>
+            <template v-if="htmlView === 'render'">
+              <iframe
+                v-if="htmlRenderUrl"
+                :key="htmlRenderKey"
+                :src="htmlRenderUrl"
+                :sandbox="htmlSandbox"
+                class="file-preview-html"
+                referrerpolicy="no-referrer"
+                title="HTML 渲染预览"
+              ></iframe>
+              <div v-else class="file-preview-status">渲染内容不可用，请切换「源码」查看</div>
+            </template>
+            <pre v-else class="file-preview-pre file-preview-pre--source">{{ textContent }}</pre>
+          </div>
+
           <div
             v-else-if="kind === 'markdown'"
             class="file-preview-markdown markdown-body"
@@ -110,7 +149,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, markRaw, onMounted, onUnmounted, ref, shallowRef, type Component } from 'vue'
+import { computed, markRaw, onMounted, onUnmounted, ref, shallowRef, watch, type Component, type CSSProperties } from 'vue'
 import { renderMarkdownToHtml } from '@/composables/useMarkdown'
 import { classifyFile, fileTypeLabel, type FileKind } from '@/composables/filePreview'
 import { buildOfficeHtmlUrl, buildOfficePdfUrl } from '@/api/workspaceFiles'
@@ -131,16 +170,33 @@ const props = defineProps<{
    * build from the same fallback.
    */
   sourcePath?: string | null
+  /**
+   * 会话 id（2026-11-15）：office 转换端点用它做 Task 兜底解析——Task 作用域下
+   * 附件路径可能是 Task 相对（`artifacts/x.docx`），用户根解析不到时回落到该
+   * 会话绑定 Task 的 workspace 根。不传 ⇒ 行为与今天一致。
+   */
+  conversationId?: string | null
+  /**
+   * 遮罩层级覆盖（2026-11-14 层级缺陷波）。本组件 Teleport 到 body，所以它只跟
+   * body 层的兄弟节点比 z-index：调用方若把自己嵌在更高层的弹窗里（设置弹窗遮罩
+   * 10003），默认 10000 会被宿主压住。不传 = 用样式表默认 10000（既有调用方零变化）。
+   */
+  zIndex?: number
 }>()
 
 const emit = defineEmits<{ close: [] }>()
 
+// 不传 zIndex 时不写内联样式，让样式表的 10000 继续生效（既有调用方零变化）。
+const overlayStyle = computed<CSSProperties | undefined>(() =>
+  props.zIndex ? { zIndex: String(props.zIndex) } : undefined)
+
 const kind = computed<FileKind>(() => classifyFile(props.filename, props.type))
 const isOfficeKind = computed(() => kind.value === 'word' || kind.value === 'excel' || kind.value === 'ppt')
 // PDF / Office bodies own a fixed-height frame so the viewer gets real estate;
-// other kinds (text, image, audio) keep an auto-height dialog.
+// other kinds (text, image, audio) keep an auto-height dialog. HTML render view
+// fills too — the sandboxed iframe collapses in an auto-height flex column.
 const isFillKind = computed(
-  () => kind.value === 'pdf' || isOfficeKind.value,
+  () => kind.value === 'pdf' || isOfficeKind.value || kind.value === 'html',
 )
 const officeSource = computed(() => props.sourcePath || props.relPath || '')
 
@@ -161,6 +217,30 @@ function releaseOfficeHtml() {
   }
 }
 
+// HTML file render view (2026-11-14): the fetched source is rendered from a
+// blob URL inside a sandboxed iframe. Default `sandbox="allow-scripts"` runs
+// scripts in an opaque origin (no access to the app DOM / localStorage / cookies,
+// no popups, no top navigation, no forms) — NEVER add `allow-same-origin` to it.
+// The scripts toggle drops to `sandbox=""` (no scripts at all).
+const htmlView = ref<'render' | 'source'>('render')
+const htmlScriptsEnabled = ref(true)
+const htmlRenderUrl = ref('')
+// Bumping the key recreates the iframe on sandbox change — mutating the
+// sandbox attribute alone does not reliably reload the frame cross-browser.
+const htmlRenderKey = ref(0)
+const htmlSandbox = computed(() => (htmlScriptsEnabled.value ? 'allow-scripts' : ''))
+
+function releaseHtmlRender() {
+  if (htmlRenderUrl.value) {
+    URL.revokeObjectURL(htmlRenderUrl.value)
+    htmlRenderUrl.value = ''
+  }
+}
+
+watch(htmlScriptsEnabled, () => {
+  if (kind.value === 'html') htmlRenderKey.value += 1
+})
+
 // Guards the async HTML fetch: incremented on every content (re)load and on
 // unmount so a late-resolving response can never store a blob URL on a dead
 // or superseded component (each unrevoked URL pins the whole document).
@@ -173,6 +253,7 @@ const renderedHtml = computed(() =>
         deviceId: props.url.startsWith('/api/devices/')
           ? props.url.split('/api/devices/')[1].split('/')[0]
           : null,
+        conversationId: props.conversationId ?? null,
       })
     : ''
 )
@@ -219,7 +300,7 @@ async function loadOffice() {
     if (kind.value === 'excel') {
       const loadId = ++officeHtmlLoadId
       try {
-        const res = await fetch(buildOfficeHtmlUrl(source, deviceId))
+        const res = await fetch(buildOfficeHtmlUrl(source, deviceId, props.conversationId))
         if (res.ok) {
           const html = await res.text()
           if (unmounted || loadId !== officeHtmlLoadId) return
@@ -237,7 +318,7 @@ async function loadOffice() {
       if (unmounted || loadId !== officeHtmlLoadId) return
     }
     try {
-      const res = await fetch(buildOfficePdfUrl(source, deviceId))
+      const res = await fetch(buildOfficePdfUrl(source, deviceId, props.conversationId))
       if (res.ok) {
         pdfBytes.value = await res.arrayBuffer()
         officeMode.value = 'server'
@@ -262,6 +343,7 @@ async function loadContent() {
   officeMode.value = 'none'
   officeHtmlLoadId += 1
   releaseOfficeHtml()
+  releaseHtmlRender()
   officeBuffer.value = null
   officeComponent.value = null
   pdfBytes.value = null
@@ -273,6 +355,15 @@ async function loadContent() {
       await loadOffice()
     } else if (kind.value === 'markdown' || kind.value === 'text' || kind.value === 'code') {
       await loadText()
+    } else if (kind.value === 'html') {
+      const loadId = officeHtmlLoadId
+      await loadText()
+      if (!unmounted && loadId === officeHtmlLoadId) {
+        releaseHtmlRender()
+        htmlRenderUrl.value = URL.createObjectURL(
+          new Blob([textContent.value], { type: 'text/html' }),
+        )
+      }
     }
     // image/video/audio/unknown/archive render directly from `url`
   } catch (e) {
@@ -320,6 +411,7 @@ onUnmounted(() => {
   officeHtmlLoadId += 1
   document.removeEventListener('keydown', onKeydown)
   releaseOfficeHtml()
+  releaseHtmlRender()
 })
 </script>
 
@@ -472,6 +564,67 @@ onUnmounted(() => {
   min-height: 0;
 }
 
+/* HTML render view (2026-11-14): tab row + sandboxed iframe (render) or
+   source <pre>; the view fills the fixed-height dialog like PDF/Office. */
+.file-preview-html-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 8px;
+}
+
+.file-preview-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.file-preview-tab {
+  font-size: 12px;
+  color: var(--color-text-light);
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.file-preview-tab:hover {
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  color: var(--color-text);
+}
+
+.file-preview-tab--active {
+  color: var(--color-primary);
+  border-color: color-mix(in srgb, var(--color-primary) 40%, transparent);
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+}
+
+.file-preview-script-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--color-text-light);
+  cursor: pointer;
+  user-select: none;
+}
+
+.file-preview-script-toggle input {
+  accent-color: var(--color-primary);
+  cursor: pointer;
+}
+
+.file-preview-pre--source {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
 .file-preview-image {
   max-width: 100%;
   max-height: 76vh;
@@ -622,6 +775,19 @@ onUnmounted(() => {
   border-radius: var(--radius-md);
   overflow-x: auto;
   margin: 8px 0;
+}
+
+/* 围栏代码块的画框与底色由 `.code-block` 外壳承载（main.css `.code-block` + 皮肤
+   `--code-block-bg`）。上面那条 scoped `pre` 浅色底特异性 (0,2,1) 会压过外壳的
+   `pre{transparent}` (0,1,1)，而皮肤把 `pre code` 定成深色块用的近白字 →
+   「近白字压近白底」1.04:1 不可读（2026-11-18 用户报告：黑白构成皮肤 md 预览）。
+   与 StreamMarkdown / MessageBubble / NoteEditor / ZenNotePanel / WysiwygEditor 同法豁免。 */
+.file-preview-markdown :deep(.code-block pre) {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  margin: 0;
+  padding: 12px 16px;
 }
 
 .file-preview-markdown :deep(pre code) {

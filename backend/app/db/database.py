@@ -720,10 +720,15 @@ class WorkspaceProject(Base):
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     name = Column(String(200), nullable=True)
     root_rel = Column(String(500), nullable=False)
-    status = Column(String(16), nullable=True, default="active")  # active | archived
+    status = Column(String(16), nullable=True, default="active")  # active | archived | deleted
     storage_authority = Column(String(64), nullable=True, default="cloud")  # cloud | device:<id>
     # 系统记忆 ingestion 策略，Task 的继承源：normal | user_facts | exclude
     system_memory_ingest = Column(String(16), nullable=True, default="user_facts")
+    # 2026-11-15 任务管理中心：默认项目以稳定标识查找（不按名字——改名会分裂）
+    kind = Column(String(16), nullable=False, default="user")  # inbox | user
+    description = Column(Text, nullable=True)  # 项目备注（Markdown 纯文本，进 agent 项目上下文）
+    row_version = Column(Integer, nullable=False, default=1)  # 项目编辑 CAS
+    deleted_at = Column(DateTime, nullable=True)  # 软删除时间（purge 前 7 天可恢复）
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_active_at = Column(DateTime, nullable=True, default=datetime.utcnow)
@@ -744,12 +749,20 @@ class WorkspaceTask(Base):
     title = Column(String(300), nullable=True)
     goal = Column(Text, nullable=True)
     root_rel = Column(String(500), nullable=False)
-    status = Column(String(16), nullable=True, default="active")  # active | completed | archived
+    status = Column(String(16), nullable=True, default="active")  # active | completed | archived | deleted
     summary = Column(Text, nullable=True)
     tags_json = Column(Text, nullable=True)
     artifact_manifest_json = Column(Text, nullable=True)
     storage_authority = Column(String(64), nullable=True, default="cloud")
     system_memory_ingest = Column(String(16), nullable=True, default="user_facts")
+    # 2026-11-15 任务管理中心：用户/agent 可写备注 + 来源 + 编辑 CAS + 软删除
+    description = Column(Text, nullable=True)  # 用户/agent 可写的备注（Markdown 纯文本）
+    origin = Column(String(16), nullable=True)  # user | auto | fork | agent
+    row_version = Column(Integer, nullable=False, default=1)  # 任务编辑 CAS
+    deleted_at = Column(DateTime, nullable=True)  # 软删除时间（purge 前 7 天可恢复）
+    # 删除来源：user（单独 purge）/ project（项目级 purge 级联）——恢复时只复活
+    # 与项目同批删除的任务，不复活用户单独 purge 过的任务（评审 I3）
+    deleted_reason = Column(String(16), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_active_at = Column(DateTime, nullable=True, default=datetime.utcnow)
@@ -1003,10 +1016,43 @@ class Note(Base):
     title = Column(String(255), nullable=True)
     content = Column(Text, default="")
     raw_transcription = Column(Text, nullable=True)  # Original voice transcription before editing
+    # 2026-11-15 任务管理中心：笔记→任务绑定是**关系**（逻辑 FK，不加物理 FK 以免同步冲突）
+    # 2026-11-16 Wave B：一条笔记可绑多个任务/项目 → 权威关系表 `note_task_bindings`；
+    # 本列降级为**镜像**（= 最早的那条绑定，见 workspace_note_binding_service._sync_mirror），
+    # 保留是为了不破坏既有读者（overview 计数、同步面、agent 工具出参）。
+    task_id = Column(String(36), nullable=True)
+    task_bound_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     notebook = relationship("Notebook", back_populates="notes")
+
+
+class NoteTaskBinding(Base):
+    """笔记 ↔ 任务 多对多绑定（2026-11-16 Wave B）。
+
+    一条笔记可以同时属于多个任务（进而属于多个项目）：绑定是**关系**，不复制内容，
+    解绑不删笔记。权威面是本表；`notes.task_id` 只是「最早绑定」的镜像列。
+
+    逻辑 FK（与 `notes.task_id` 同一理由：不加物理 FK 以免同步/删除顺序冲突）；
+    owner 冗余存 `user_id` 以便按用户过滤与索引，值来自 `notebooks.user_id`。
+    本表**不在** `SYNC_ENTITIES` 内：绑定关系是服务端工作区元数据，不参与笔记内容同步。
+    """
+    __tablename__ = "note_task_bindings"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # 物理 FK + CASCADE（评审 B1）：删笔记/删笔记本/删用户/同步删除任何路径都自动带走绑定行，
+    # 不依赖调用点逐个清理。task_id 保持逻辑 FK：任务 purge 只置 status='deleted'，行不删。
+    note_id = Column(String(36), ForeignKey("notes.id", ondelete="CASCADE"), nullable=False)
+    task_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
+    bound_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("note_id", "task_id", name="uq_note_task_bindings"),
+        Index("idx_note_task_bindings_task", "task_id"),
+        Index("idx_note_task_bindings_user", "user_id"),
+    )
 
 
 class AgentTask(Base):

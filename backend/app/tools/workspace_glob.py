@@ -66,10 +66,12 @@ async def workspace_glob(args: Dict[str, Any], **kwargs) -> str:
             )
 
     pattern = str(args.get("pattern") or "*").strip()
-    from app.services.workspace_scope_service import apply_scope_or_error
+    from app.services.workspace_scope_service import apply_scope_or_error, resolve_scope_meta
     workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
     if _scope_err:
         return json.dumps(_scope_err, ensure_ascii=False)
+    # Piece 2：跨域 glob 要带来源 meta（含 grant_id），供 taint 重判免 grant 跨任务读不携带 agent 权威
+    _src_meta = await resolve_scope_meta(kwargs, args=args, access="read")
 
     if not pattern:
         pattern = "*"
@@ -116,13 +118,17 @@ async def workspace_glob(args: Dict[str, Any], **kwargs) -> str:
     matches.sort(key=lambda x: x.get("mtime", 0), reverse=True)
     truncated = len(matches) >= _MAX_RESULTS
 
-    return json.dumps({
+    result = {
         "success": True,
         "count": len(matches),
         "truncated": truncated,
         "pattern": pattern,
         "files": matches,
-    }, ensure_ascii=False)
+    }
+    if _src_meta:
+        result["source_scope"] = _src_meta["scope"]
+        result["source_grant_id"] = _src_meta.get("grant_id")
+    return json.dumps(result, ensure_ascii=False)
 
 
 registry.register(
@@ -139,7 +145,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "pattern": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only; a cross-task read needs a server-issued grant_id, or is grant-free within your own workspace when same-user free cross-task reads are enabled."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "pattern": {
                     "type": "string",
                     "description": "文件名匹配模式，支持通配符 * 和 ?。例如 '*.docx'、'chapter*.txt'。默认 '*'。",
                 },

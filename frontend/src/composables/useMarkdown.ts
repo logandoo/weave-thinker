@@ -3,6 +3,7 @@
 
 import { marked } from 'marked'
 import { buildDeviceDownloadUrl } from '@/api/clientDevices'
+import { isWorkspaceFileLink } from '@/utils/deviceUrls'
 import { buildCodeFence, collapseExtraBlankLines, encodeMathClosers, escapePuaMarkers, decodeMathClosers, stripMathFraming, mathLiteralHtml } from './snippetInsert'
 import { stableRenderCacheKey } from './stringCacheKey'
 import hljs from 'highlight.js'
@@ -74,14 +75,28 @@ export function clearRenderCache(): void {
   renderCache.clear()
 }
 
-function getRenderCacheKey(content: string, deviceId?: string | null): string {
+function getRenderCacheKey(
+  content: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   // 全串散列键 —— 旧 len+head4+tail4 会同长同头尾碰撞串稿（wave-2 C6）。
   // W18 G4：设备上下文入键——同内容在云端/设备渲染出的 src 不同，不得串缓存。
-  return stableRenderCacheKey(content) + (endnoteEnabled.value ? '|e1' : '|e0') + `|d:${deviceId ?? ''}`
+  // 2026-11-15：会话 id 也入键——它决定 `/api/files/download` 是否带 Task 兜底。
+  return (
+    stableRenderCacheKey(content) +
+    (endnoteEnabled.value ? '|e1' : '|e0') +
+    `|d:${deviceId ?? ''}` +
+    `|c:${conversationId ?? ''}`
+  )
 }
 
-function getCachedRender(content: string, deviceId?: string | null): string | undefined {
-  const key = getRenderCacheKey(content, deviceId)
+function getCachedRender(
+  content: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string | undefined {
+  const key = getRenderCacheKey(content, deviceId, conversationId)
   const hit = renderCache.get(key)
   if (hit !== undefined) {
     // LRU: move to end
@@ -91,8 +106,13 @@ function getCachedRender(content: string, deviceId?: string | null): string | un
   return hit
 }
 
-function setCachedRender(content: string, deviceId: string | null | undefined, html: string): void {
-  const key = getRenderCacheKey(content, deviceId)
+function setCachedRender(
+  content: string,
+  deviceId: string | null | undefined,
+  html: string,
+  conversationId?: string | null,
+): void {
+  const key = getRenderCacheKey(content, deviceId, conversationId)
   if (renderCache.has(key)) renderCache.delete(key)
   else if (renderCache.size >= RENDER_CACHE_MAX) {
     const first = renderCache.keys().next().value
@@ -1008,14 +1028,27 @@ function restoreSafeIframes(html: string, placeholders: Record<string, string>):
   return out
 }
 
-function signedFileUrl(src: string, deviceId?: string | null): string {
+function signedFileUrl(
+  src: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   // W18 G4：设备上下文 → 设备文件代理（PLAN §6.2）；否则云端 files 下载。
   if (deviceId) return buildDeviceDownloadUrl(deviceId, src)
   const token = localStorage.getItem('chatllm_token') || ''
-  return `/api/files/download?path=${encodeURIComponent(src)}&token=${encodeURIComponent(token)}`
+  // 2026-11-15：带上会话 id，服务端可在用户根解析失败时回落到该会话绑定
+  // Task 的 workspace 根（模型写出的 `artifacts/x.png` 是 Task 相对路径）。
+  const conv = conversationId
+    ? `&conversation_id=${encodeURIComponent(conversationId)}`
+    : ''
+  return `/api/files/download?path=${encodeURIComponent(src)}&token=${encodeURIComponent(token)}${conv}`
 }
 
-function rewriteImageUrls(html: string, deviceId?: string | null): string {
+function rewriteImageUrls(
+  html: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   if (!html) return html
   try {
     // Parse into an INERT <template>: a plain detached <div>.innerHTML would
@@ -1040,7 +1073,7 @@ function rewriteImageUrls(html: string, deviceId?: string | null): string {
         if (!img.hasAttribute('data-original-src')) {
           img.setAttribute('data-original-src', src)
         }
-        img.setAttribute('src', signedFileUrl(src, deviceId))
+        img.setAttribute('src', signedFileUrl(src, deviceId, conversationId))
         changed = true
       }
     })
@@ -1078,7 +1111,11 @@ function serializeFragment(frag: DocumentFragment): string {
  * Mirrors rewriteImageUrls. <picture> sources use srcset (never src) and
  * are left untouched.
  */
-function rewriteMediaUrls(html: string, deviceId?: string | null): string {
+function rewriteMediaUrls(
+  html: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
   if (!html) return html
   try {
     // Inert <template> parse (see rewriteImageUrls) — a detached <div> would
@@ -1097,13 +1134,56 @@ function rewriteMediaUrls(html: string, deviceId?: string | null): string {
         if (!el.hasAttribute('data-original-src')) {
           el.setAttribute('data-original-src', src)
         }
-        el.setAttribute(attr, signedFileUrl(src, deviceId))
+        el.setAttribute(attr, signedFileUrl(src, deviceId, conversationId))
         changed = true
       }
     }
     media.forEach((el) => {
       sign(el, 'src')
       el.querySelectorAll('source[src]').forEach((s) => sign(s, 'src'))
+    })
+    return changed ? serializeFragment(container) : html
+  } catch {
+    return html
+  }
+}
+
+/**
+ * 把指向工作区文件的 Markdown 链接（`[下载](artifacts/x.pdf)`）改写成签名下载
+ * URL（2026-11-15 波 · S4）。
+ *
+ * 为什么需要：`renderer.link` 原样输出 `<a href="artifacts/x.pdf">`，浏览器按
+ * **站点**相对解析 ⇒ `/app/frontend/artifacts/x.pdf` ⇒ 404。图片/媒体早已改写，
+ * 链接是同类出口的遗漏面（60 生产实测 0 例，属 latent，但同一根因）。
+ *
+ * 边界（保守，避免误伤）：
+ *   * 只处理 `isFilesystemPath` 且**带文件扩展名**的 href（`#anchor` / http(s) /
+ *     data: / blob: / mailto: / 无扩展名的路由式相对链接一律不动）；
+ *   * 与图片一致，把原始路径留在 `data-original-src`，避免下游把 token URL 当原文。
+ */
+function rewriteLinkUrls(
+  html: string,
+  deviceId?: string | null,
+  conversationId?: string | null,
+): string {
+  if (!html) return html
+  try {
+    const tpl = document.createElement('template')
+    tpl.innerHTML = html
+    const container = tpl.content
+    const anchors = container.querySelectorAll('a[href]')
+    if (anchors.length === 0) return html
+    const token = localStorage.getItem('chatllm_token')
+    if (!token) return html
+    let changed = false
+    anchors.forEach((a) => {
+      const href = a.getAttribute('href') || ''
+      if (!isWorkspaceFileLink(href)) return
+      if (!a.hasAttribute('data-original-src')) {
+        a.setAttribute('data-original-src', href)
+      }
+      a.setAttribute('href', signedFileUrl(href, deviceId, conversationId))
+      changed = true
     })
     return changed ? serializeFragment(container) : html
   } catch {
@@ -1123,6 +1203,19 @@ function canonicalImageSrc(src: string): string {
     } catch { /* keep src */ }
   }
   return src
+}
+
+/**
+ * 锚点 href 的规范化（2026-11-15 评审 Critical）。
+ *
+ * `rewriteLinkUrls` 会把 `[报告](artifacts/r.pdf)` 的 href 换成带 JWT 的签名
+ * 下载 URL；笔记编辑器是 render → 编辑 → `htmlToMarkdown` → 落库的往返链路，
+ * 若序列化时原样写回 href，**用户 token 会被写进笔记正文**（并在过期后变成死链）。
+ * 因此回写一律取 `data-original-src`（改写前的规范路径），再走一次
+ * `canonicalImageSrc` 兜住历史遗留的签名 URL。
+ */
+function canonicalAnchorHref(el: Element): string {
+  return canonicalImageSrc(el.getAttribute('data-original-src') || el.getAttribute('href') || '')
 }
 
 // ===== 尾注（endnote）—— CommonMark 脚注语法 =====
@@ -1263,11 +1356,12 @@ function preprocessEndnoteSyntax(md: string): { text: string; defs: EndnoteDef[]
 
 export function renderMarkdownToHtml(
   content: string,
-  opts?: { deviceId?: string | null },
+  opts?: { deviceId?: string | null; conversationId?: string | null },
 ): string {
   if (!content) return ''
   const deviceId = opts?.deviceId ?? null
-  const cached = getCachedRender(content, deviceId)
+  const conversationId = opts?.conversationId ?? null
+  const cached = getCachedRender(content, deviceId, conversationId)
   if (cached !== undefined) return cached
   try {
     headingAutoIdCounter = 0
@@ -1290,8 +1384,9 @@ export function renderMarkdownToHtml(
       ADD_TAGS: ['button'],
     })
     const withIframes = restoreSafeIframes(sanitized, iframePlaceholders)
-    const rewritten = rewriteImageUrls(withIframes, deviceId)
-    const mediaRewritten = rewriteMediaUrls(rewritten, deviceId)
+    const rewritten = rewriteImageUrls(withIframes, deviceId, conversationId)
+    const mediaRewritten = rewriteMediaUrls(rewritten, deviceId, conversationId)
+    const linkRewritten = rewriteLinkUrls(mediaRewritten, deviceId, conversationId)
     // 尾注定义段追加到文末：正文走 marked.parseInline 保格式（禁 textContent）。
     // 整体再过一次 DOMPurify（id/href 属性已转义，这里是纵深防御——A4.9 C1）。
     let endnoteHtml = ''
@@ -1309,13 +1404,13 @@ export function renderMarkdownToHtml(
       endnoteHtml += buildEndnoteDefHtml(d.id, d.num, bodyHtml, firstDef)
     }
     const withEndnotes = endnoteHtml
-      ? mediaRewritten +
+      ? linkRewritten +
         DOMPurify.sanitize(endnoteHtml, {
           ALLOW_DATA_ATTR: true,
           ADD_ATTR: ['target', 'rel', 'style'],
         })
-      : mediaRewritten
-    setCachedRender(content, deviceId, withEndnotes)
+      : linkRewritten
+    setCachedRender(content, deviceId, withEndnotes, conversationId)
     return withEndnotes
   } catch (err) {
     // W12：不再静默吞——裸回退即「格式全丢」（60 生产思考区事故根因）。
@@ -2459,7 +2554,8 @@ export function htmlToMarkdown(html: string): string {
           break
         }
         case 'a': {
-          const href = (el.getAttribute('href') || '').replace(/"/g, '&quot;')
+          // 同上：回写规范路径，永不落 token。
+          const href = canonicalAnchorHref(el).replace(/"/g, '&quot;')
           out += '<a href="' + href + '">' + kids() + '</a>'
           break
         }
@@ -2781,7 +2877,8 @@ export function htmlToMarkdown(html: string): string {
         break
       }
       case 'a': {
-        const href = el.getAttribute('href') || ''
+        // 2026-11-15 评审 Critical：绝不把签名 URL（含 JWT）写回正文。
+        const href = canonicalAnchorHref(el)
         result = '[' + processChildren(el) + '](' + href + ')'
         break
       }

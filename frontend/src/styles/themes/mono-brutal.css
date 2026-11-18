@@ -576,7 +576,9 @@ html[data-skin="mono-brutal"] .context-token-chip {
   font-weight: 800;
   font-family: var(--font-mono, monospace);
   box-shadow: 3px 3px 0 var(--skin-line);
-  transform: rotate(-2deg);
+  /* 2026-11-14 用户裁定：状态徽章保持水平，与「默认项目」/导出按钮同一基线；
+     不要再做 -2deg 倾斜（风格不统一）。 */
+  transform: none;
 }
 
 /* 顶栏「添加到笔记」按钮（P3 2026-09-05）：硬边直角 + 2px 黑框 + 硬偏移影，
@@ -852,10 +854,40 @@ html[data-skin="mono-brutal"] .zen-exit-btn {
   box-shadow: 5px 5px 0 var(--skin-line);
   gap: 10px;
 }
+/* 2026-11-14 用户反馈：菜单项 hover 不再用黄色「选中感」填充，改为中性反转 */
 html[data-skin="mono-brutal"] .zen-exit-btn:hover {
-  background: var(--skin-yl);
+  background: var(--skin-wt);
   color: var(--skin-line);
   transform: none;
+}
+html[data-skin="mono-brutal"] .zen-exit-btn:focus-visible {
+  outline: 2px dashed var(--skin-line);
+  outline-offset: 2px;
+}
+/* 工作台选项「项目列表」（2026-11-14）：0 圆角硬边硬影同款，中性色 */
+html[data-skin="mono-brutal"] .zen-menu-btn {
+  width: 200px;
+  margin-top: 10px;
+  padding: 11px 16px;
+  border-radius: 0;
+  border: 2px solid var(--skin-line);
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+  font-family: var(--skin-serif);
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  box-shadow: 5px 5px 0 var(--skin-line);
+  gap: 10px;
+}
+html[data-skin="mono-brutal"] .zen-menu-btn:hover {
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  transform: none;
+}
+html[data-skin="mono-brutal"] .zen-menu-btn:focus-visible {
+  outline: 2px dashed var(--skin-line);
+  outline-offset: 2px;
 }
 
 /* 滚动条：细黑 */
@@ -2206,3 +2238,586 @@ html[data-skin="mono-brutal"] .toc-header { background: var(--skin-lt); border-b
 html[data-skin="mono-brutal"] .toc-close-btn { border-radius: 0; }
 html[data-skin="mono-brutal"] .toc-item { border-radius: 0; }
 html[data-skin="mono-brutal"] .toc-item:hover { background: var(--skin-lt); }
+
+/* ══════════ 2026-11-13：任务作用域（「默认项目」chip / 绑定面板 / 歧义选择器）+ 后台任务面板补洞 ══════════
+   mono-brutal 的设计语言是 0 圆角 + 2-3px 硬边 + 偏移硬阴影；这两个组件此前没有皮肤覆盖，
+   在黑白构成下仍是 999px 药丸 / 12px 圆角卡片，与整页完全脱节。 */
+html[data-skin="mono-brutal"] .workspace-scope-chip.workspace-scope-chip {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  padding: 3px 9px;
+  font-weight: 800;
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .workspace-scope-chip.workspace-scope-chip:hover {
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+  border-color: var(--skin-line);
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .workspace-scope-chip.workspace-scope-chip.is-shadow {
+  border-style: dashed;
+  box-shadow: none;
+}
+html[data-skin="mono-brutal"] .workspace-scope-chip.workspace-scope-chip.is-ambiguous {
+  background: var(--color-primary);
+  border-color: var(--skin-line);
+  color: #ffffff;
+}
+html[data-skin="mono-brutal"][data-theme="dark"] .workspace-scope-chip.workspace-scope-chip.is-ambiguous { color: #111111; }
+
+html[data-skin="mono-brutal"] .wap-mask,
+html[data-skin="mono-brutal"] .wsd-mask { background: rgba(17, 17, 17, 0.55); }
+html[data-skin="mono-brutal"] .wap-panel,
+html[data-skin="mono-brutal"] .wsd-panel {
+  border: 3px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  box-shadow: 6px 6px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wap-panel h3,
+html[data-skin="mono-brutal"] .wsd-head h3 { font-weight: 900; letter-spacing: 0.5px; }
+html[data-skin="mono-brutal"] .wap-hint { font-weight: 600; }
+html[data-skin="mono-brutal"] .wap-item {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  box-shadow: 3px 3px 0 var(--skin-line);
+  padding: 10px 12px;
+}
+html[data-skin="mono-brutal"] .wap-item:hover {
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+  border-color: var(--skin-line);
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wap-item__title { font-weight: 900; }
+html[data-skin="mono-brutal"] .wap-item__meta { color: inherit; opacity: 0.75; }
+html[data-skin="mono-brutal"] .wap-dismiss {
+  border: 2px dashed var(--skin-line);
+  border-radius: 0;
+  margin-top: 4px;
+  padding: 8px;
+  font-weight: 800;
+  color: var(--color-text);
+}
+html[data-skin="mono-brutal"] .wap-dismiss:hover { background: var(--skin-fill); color: var(--skin-onfill); }
+
+html[data-skin="mono-brutal"] .wsd-close {
+  width: 26px;
+  height: 26px;
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  font-weight: 900;
+  line-height: 1;
+}
+html[data-skin="mono-brutal"] .wsd-close:hover { background: var(--skin-fill); color: var(--skin-onfill); }
+html[data-skin="mono-brutal"] .wsd-current {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-lt);
+  padding: 10px 12px;
+}
+html[data-skin="mono-brutal"] .wsd-current__title { font-weight: 900; }
+html[data-skin="mono-brutal"] .wsd-label { font-weight: 800; color: var(--color-text); }
+html[data-skin="mono-brutal"] .wsd-select,
+html[data-skin="mono-brutal"] .wsd-input {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  font-weight: 600;
+  padding: 7px 9px;
+}
+html[data-skin="mono-brutal"] .wsd-select:focus-visible,
+html[data-skin="mono-brutal"] .wsd-input:focus-visible,
+html[data-skin="mono-brutal"] .wap-item:focus-visible,
+html[data-skin="mono-brutal"] .workspace-scope-chip.workspace-scope-chip:focus-visible {
+  outline: 2px solid var(--skin-fill);
+  outline-offset: 2px;
+}
+html[data-skin="mono-brutal"] .wsd-rebind {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--color-primary);
+  color: #ffffff;
+  font-weight: 900;
+  padding: 8px 14px;
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"][data-theme="dark"] .wsd-rebind { color: #111111; }
+html[data-skin="mono-brutal"] .wsd-rebind:hover:not(:disabled) {
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wsd-rebind:disabled { opacity: 0.45; box-shadow: none; transform: none; }
+html[data-skin="mono-brutal"] .wsd-risk {
+  border: 2px solid var(--color-danger);
+  border-radius: 0;
+  background: var(--skin-lt);
+  color: var(--color-text);
+  font-weight: 600;
+}
+html[data-skin="mono-brutal"] .wsd-notice { font-weight: 900; }
+html[data-skin="mono-brutal"] .wsd-history li { border-bottom: 2px solid var(--skin-line); }
+
+/* 后台任务面板：补上此前未覆盖的 tabs / 未读通知 / 摘要 / 空态（否则同一面板内
+   一半直角硬边、一半 18px 药丸，视觉上像两个组件拼起来的）。 */
+html[data-skin="mono-brutal"] .btp-tabs { border-bottom: 2px solid var(--skin-line); gap: 0; }
+html[data-skin="mono-brutal"] .btp-tab {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  font-weight: 800;
+  margin-right: -2px;
+  padding: 4px 12px;
+}
+html[data-skin="mono-brutal"] .btp-tab.active { background: var(--skin-fill); color: var(--skin-onfill); }
+html[data-skin="mono-brutal"] .btp-notification.btp-notification {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-lt);
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .btp-notification.btp-notification:hover { background: var(--skin-wt); }
+html[data-skin="mono-brutal"] .btp-notification-title { font-weight: 800; }
+html[data-skin="mono-brutal"] .btp-summary {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .btp-empty { font-weight: 700; }
+html[data-skin="mono-brutal"] .btp-toggle { border-radius: 0; }
+
+/* 项目管理卡片（2026-11-14 v2）：与 .wsd-panel 同一硬边语言——0 圆角 + 硬边 + 偏移硬影 */
+html[data-skin="mono-brutal"] .wpm-card {
+  border: 3px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  box-shadow: 6px 6px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-mask.is-inline .wpm-card.wpm-card {
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wpm-head,
+html[data-skin="mono-brutal"] .wpm-files-head,
+html[data-skin="mono-brutal"] .wpm-crumbs,
+html[data-skin="mono-brutal"] .wpm-create {
+  border-bottom: 2px solid var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-head h3 {
+  font-weight: 900;
+  letter-spacing: 0.5px;
+}
+html[data-skin="mono-brutal"] .wpm-tree {
+  border-right: 2px solid var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-icon-btn {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  box-shadow: 2px 2px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-icon-btn:hover {
+  background: var(--skin-yl);
+  color: var(--skin-line);
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-project__row,
+html[data-skin="mono-brutal"] .wpm-task,
+html[data-skin="mono-brutal"] .wpm-entry {
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wpm-project__row:hover,
+html[data-skin="mono-brutal"] .wpm-task:hover,
+html[data-skin="mono-brutal"] .wpm-entry:hover {
+  background: var(--skin-yl);
+}
+html[data-skin="mono-brutal"] .wpm-task.is-active {
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+}
+html[data-skin="mono-brutal"] .wpm-badge,
+html[data-skin="mono-brutal"] .wpm-conv {
+  border: 1px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+}
+html[data-skin="mono-brutal"] .wpm-conv.is-empty {
+  border-style: dashed;
+  background: transparent;
+}
+html[data-skin="mono-brutal"] .wpm-crumb {
+  border-radius: 0;
+  font-weight: 800;
+}
+html[data-skin="mono-brutal"] .wpm-create__input,
+html[data-skin="mono-brutal"] .wpm-rename__input {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--color-text);
+  font-weight: 700;
+}
+html[data-skin="mono-brutal"] .wpm-create__btn {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+  font-weight: 900;
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-create__cancel {
+  font-weight: 800;
+}
+html[data-skin="mono-brutal"] .wpm-back {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  padding: 2px 8px;
+  font-weight: 800;
+}
+
+/* 悬停提示（2026-11-14）：与硬边语言一致 */
+html[data-skin="mono-brutal"] .wpm-tip {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  box-shadow: 4px 4px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-conv.is-count {
+  border: 1px dashed var(--skin-line);
+  border-radius: 0;
+}
+
+/* ============================================================
+   任务管理中心（2026-11-15 · S1–S10）——黑白构成硬边语言
+   设计原型 design/DESIGN_task_management_20261115.html：
+   0 圆角 · 2–3px 墨线 · 偏移硬影 · 黄底黑字选中 · 黑底黄字 tab · Arial Black 标题
+   （旧 .wpm-* 规则为 2026-11-14 两栏面板，已被 .wtm-* 取代，保留无害）
+   ============================================================ */
+html[data-skin="mono-brutal"] .wtm-card,
+html[data-skin="mono-brutal"] .wtm-inline {
+  border: 3px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  box-shadow: 6px 6px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-head {
+  border-bottom: 2px solid var(--skin-line);
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .wtm-head__title,
+html[data-skin="mono-brutal"] .wtm-title,
+html[data-skin="mono-brutal"] .wtm-crumb,
+html[data-skin="mono-brutal"] .wtm-tree__head b,
+html[data-skin="mono-brutal"] .wtm-modal__head h3,
+html[data-skin="mono-brutal"] .wtm-trash__head b,
+html[data-skin="mono-brutal"] .wtm-note h4,
+html[data-skin="mono-brutal"] .wtm-danger h4 {
+  font-family: var(--skin-serif);
+  font-weight: 900;
+  letter-spacing: .02em;
+}
+html[data-skin="mono-brutal"] .wtm-tree {
+  border-right: 2px solid var(--skin-line);
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .wtm-tree__head,
+html[data-skin="mono-brutal"] .wtm-tree__foot {
+  border-color: var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-tabs {
+  border-bottom: 2px solid var(--skin-line);
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .wtm-tab {
+  border-right: 2px solid var(--skin-line);
+  border-radius: 0;
+  font-family: var(--skin-serif);
+  font-weight: 900;
+}
+html[data-skin="mono-brutal"] .wtm-tab.is-on {
+  background: var(--skin-fill);
+  color: var(--skin-yl);
+}
+html[data-skin="mono-brutal"] .wtm-prow,
+html[data-skin="mono-brutal"] .wtm-trow {
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wtm-prow:hover,
+html[data-skin="mono-brutal"] .wtm-trow:hover {
+  background: var(--skin-yl);
+  color: var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-prow.is-sel,
+html[data-skin="mono-brutal"] .wtm-trow.is-sel {
+  background: var(--skin-yl);
+  color: var(--skin-line);
+  border: 2px solid var(--skin-line);
+  box-shadow: 2px 2px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-prow.is-sel .wtm-prow__count,
+html[data-skin="mono-brutal"] .wtm-trow.is-sel .wtm-trow__meta {
+  color: var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-btn,
+html[data-skin="mono-brutal"] .wtm-icon-btn,
+html[data-skin="mono-brutal"] .wtm-more {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  box-shadow: 2px 2px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-btn:hover,
+html[data-skin="mono-brutal"] .wtm-icon-btn:hover,
+html[data-skin="mono-brutal"] .wtm-more:hover {
+  background: var(--skin-yl);
+  color: var(--skin-line);
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-btn--primary {
+  background: var(--color-primary);
+  color: #fff;
+  border-color: var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-btn--danger {
+  background: var(--color-error);
+  color: #fff;
+  border-color: var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-chip {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+}
+html[data-skin="mono-brutal"] .wtm-chip--lt { background: var(--skin-lt); }
+html[data-skin="mono-brutal"] .wtm-chip--dash { border-style: dashed; background: transparent; }
+html[data-skin="mono-brutal"] .wtm-chip--yl { background: var(--skin-yl); color: var(--skin-line); border-color: var(--skin-line); }
+html[data-skin="mono-brutal"] .wtm-chip--active { background: var(--color-success); color: #fff; border-color: var(--skin-line); }
+html[data-skin="mono-brutal"] .wtm-chip--archived { background: var(--skin-gy); color: #fff; border-color: var(--skin-line); }
+html[data-skin="mono-brutal"] .wtm-input,
+html[data-skin="mono-brutal"] .wtm-textarea,
+html[data-skin="mono-brutal"] .wtm-select {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+}
+html[data-skin="mono-brutal"] .wtm-input:focus,
+html[data-skin="mono-brutal"] .wtm-textarea:focus,
+html[data-skin="mono-brutal"] .wtm-select:focus {
+  outline: 3px solid var(--skin-yl);
+  outline-offset: 0;
+}
+html[data-skin="mono-brutal"] .wtm-ftable,
+html[data-skin="mono-brutal"] .wtm-frow,
+html[data-skin="mono-brutal"] .wtm-crow,
+html[data-skin="mono-brutal"] .wtm-note,
+html[data-skin="mono-brutal"] .wtm-taskcard {
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wtm-ftable { border: 2px solid var(--skin-line); }
+html[data-skin="mono-brutal"] .wtm-frow { border-bottom: 2px solid var(--skin-line); }
+html[data-skin="mono-brutal"] .wtm-frow--head { background: var(--skin-lt); }
+html[data-skin="mono-brutal"] .wtm-frow--click:hover { background: var(--skin-yl); }
+html[data-skin="mono-brutal"] .wtm-ficon {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+}
+html[data-skin="mono-brutal"] .wtm-empty {
+  border: 2px dashed var(--skin-line);
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wtm-moremenu {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-moremenu button { border-bottom: 2px solid var(--skin-line); }
+html[data-skin="mono-brutal"] .wtm-moremenu button:hover { background: var(--skin-yl); }
+html[data-skin="mono-brutal"] .wtm-danger {
+  border: 2px solid var(--color-error);
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wtm-modal {
+  border: 3px solid var(--skin-line);
+  border-radius: 0;
+  box-shadow: 6px 6px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-modal__head,
+html[data-skin="mono-brutal"] .wtm-modal__foot {
+  border-color: var(--skin-line);
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .wtm-radio-row {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wtm-radio-row.is-on {
+  border-color: var(--color-primary);
+  box-shadow: 3px 3px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-rb {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+}
+html[data-skin="mono-brutal"] .wtm-toast {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-fill);
+  color: var(--skin-onfill);
+  box-shadow: 4px 4px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wtm-seg { border: 2px solid var(--skin-line); border-radius: 0; }
+html[data-skin="mono-brutal"] .wtm-seg button.is-on { background: var(--skin-fill); color: var(--skin-yl); }
+
+/* 2026-11-16 Wave B 新增面：全部走「0 圆角 + 2-3px 墨线 + 偏移硬影 + 黄底选中」 */
+html[data-skin="mono-brutal"] .wtm-chip--multi {
+  border: 2px dashed var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-yl);
+  color: var(--skin-line);
+}
+html[data-skin="mono-brutal"] .ctd-chip--multi {
+  border: 2px dashed var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-yl);
+  color: var(--skin-line);
+}
+html[data-skin="mono-brutal"] .wpm-filenav .wtm-icon-btn {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  font-weight: 900;
+}
+html[data-skin="mono-brutal"] .wpm-filenav .wtm-icon-btn:hover:not(:disabled) { background: var(--skin-yl); }
+html[data-skin="mono-brutal"] .wpm-filenav .wtm-icon-btn:disabled { opacity: .3; box-shadow: none; }
+
+/* 笔记绑定选择器卡片 */
+html[data-skin="mono-brutal"] .nbp-card,
+html[data-skin="mono-brutal"] .crd-card {
+  border: 3px solid var(--skin-line);
+  border-radius: 0;
+  box-shadow: 8px 8px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .nbp-title,
+html[data-skin="mono-brutal"] .nbp-group__name,
+html[data-skin="mono-brutal"] .nbp-row__title,
+html[data-skin="mono-brutal"] .crd-title,
+html[data-skin="mono-brutal"] .crd-current__title { font-family: var(--skin-serif); font-weight: 900; }
+html[data-skin="mono-brutal"] .nbp-input,
+html[data-skin="mono-brutal"] .crd-input,
+html[data-skin="mono-brutal"] .crd-select {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+}
+html[data-skin="mono-brutal"] .nbp-group__head {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .nbp-row { border-bottom: 1px dashed var(--skin-line); border-radius: 0; }
+html[data-skin="mono-brutal"] .nbp-row:hover { background: var(--skin-yl); }
+html[data-skin="mono-brutal"] .nbp-chip { border: 2px solid var(--skin-line); border-radius: 0; background: var(--skin-wt); }
+html[data-skin="mono-brutal"] .nbp-chip--on,
+html[data-skin="mono-brutal"] .nbp-chip--dash { border: 2px solid var(--skin-line); border-radius: 0; background: var(--skin-wt); color: var(--skin-line); }
+html[data-skin="mono-brutal"] .nbp-chip--on { background: var(--skin-fill); color: var(--skin-yl); }
+html[data-skin="mono-brutal"] .nbp-empty { border: 2px dashed var(--skin-line); border-radius: 0; }
+html[data-skin="mono-brutal"] .nbp-foot,
+html[data-skin="mono-brutal"] .crd-current { border-color: var(--skin-line); border-radius: 0; }
+html[data-skin="mono-brutal"] .nbp-btn,
+html[data-skin="mono-brutal"] .crd-btn,
+html[data-skin="mono-brutal"] .nbp-x,
+html[data-skin="mono-brutal"] .crd-x,
+html[data-skin="mono-brutal"] .nbp-caret {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  box-shadow: 2px 2px 0 var(--skin-line);
+  font-weight: 900;
+}
+html[data-skin="mono-brutal"] .nbp-btn:hover:not(:disabled),
+html[data-skin="mono-brutal"] .crd-btn:hover:not(:disabled),
+html[data-skin="mono-brutal"] .nbp-x:hover,
+html[data-skin="mono-brutal"] .crd-x:hover,
+html[data-skin="mono-brutal"] .nbp-caret:hover { background: var(--skin-yl); }
+html[data-skin="mono-brutal"] .nbp-btn:active:not(:disabled),
+html[data-skin="mono-brutal"] .crd-btn:active:not(:disabled) { transform: translate(1px, 1px); box-shadow: 1px 1px 0 var(--skin-line); }
+html[data-skin="mono-brutal"] .nbp-btn--primary,
+html[data-skin="mono-brutal"] .crd-btn--primary { background: var(--skin-fill); color: var(--skin-yl); }
+html[data-skin="mono-brutal"] .nbp-btn:disabled,
+html[data-skin="mono-brutal"] .crd-btn:disabled { box-shadow: none; opacity: .35; }
+html[data-skin="mono-brutal"] .crd-risk { border: 2px solid var(--skin-line); border-radius: 0; background: var(--skin-yl); }
+html[data-skin="mono-brutal"] .crd-history li { border-bottom: 1px dashed var(--skin-line); }
+
+/* S7 会话侧任务卡片（2026-11-16 由右抽屉改居中卡片：硬边方角 + 偏移硬影） */
+html[data-skin="mono-brutal"] .ctd-drawer {
+  border: 3px solid var(--skin-line);
+  border-radius: 0;
+  box-shadow: 8px 8px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .ctd-head {
+  border-bottom: 2px solid var(--skin-line);
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .ctd-head b { font-family: var(--skin-serif); font-weight: 900; }
+html[data-skin="mono-brutal"] .ctd-tile,
+html[data-skin="mono-brutal"] .ctd-crow {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+}
+html[data-skin="mono-brutal"] .ctd-btn,
+html[data-skin="mono-brutal"] .ctd-icon {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  box-shadow: 2px 2px 0 var(--skin-line);
+}
+html[data-skin="mono-brutal"] .ctd-btn:hover,
+html[data-skin="mono-brutal"] .ctd-icon:hover { background: var(--skin-yl); }
+html[data-skin="mono-brutal"] .ctd-chip {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+}
+html[data-skin="mono-brutal"] .ctd-empty { border: 2px dashed var(--skin-line); border-radius: 0; }
+html[data-skin="mono-brutal"] .ctd-thumb {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-lt);
+}
+html[data-skin="mono-brutal"] .ctd-title { font-family: var(--skin-serif); font-weight: 900; }
+html[data-skin="mono-brutal"] .ctd-eyebrow { letter-spacing: .12em; }
+
+/* 会话标题栏任务徽标（S7 入口）：方角硬边，不再是胶囊 */
+html[data-skin="mono-brutal"] .workspace-scope-chip {
+  border: 2px solid var(--skin-line);
+  border-radius: 0;
+  background: var(--skin-wt);
+  color: var(--skin-line);
+  font-weight: 700;
+}
+html[data-skin="mono-brutal"] .workspace-scope-chip:hover {
+  background: var(--skin-yl);
+  color: var(--skin-line);
+  border-color: var(--skin-line);
+}

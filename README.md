@@ -194,10 +194,10 @@ cd ..
 
 ## 内置工具与技能
 
-后端 `app/tools/` 经 `registry.register()` 静态注册 65 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 11 项系统技能。
+后端 `app/tools/` 经 `registry.register()` 静态注册 66 个工具函数；外部 MCP 服务可在运行时动态注册为工具，`search_tools` 提供渐进式发现；`backend/skills/` 另有 11 项系统技能。
 
 <details>
-<summary>完整工具清单（65 个）</summary>
+<summary>完整工具清单（66 个）</summary>
 
 | 类别 | 工具函数 | 说明 |
 | --- | --- | --- |
@@ -220,7 +220,7 @@ cd ..
 | 交互 | `request_user_input` | 后台任务缺信息时向用户发起一次性提问（等待态），回复后续跑 |
 | 持久作业 | `job_submit` / `job_status` / `job_logs` / `job_cancel` / `job_list` / `job_artifacts` | 持久长作业（5h+）：脱离进程后台执行、重启不中断、退出回执、增量日志、产物登记、取消回执 |
 | 文件工作区 | `workspace_read` / `workspace_glob` / `grep` / `diff` / `word_count` / `provide_file` / `provide_folder` | 读取、查找、对比、字数统计；文件与文件夹交付（预览/下载/整包 zip） |
-| 工作区写入 | `workspace_write` / `workspace_edit` / `workspace_snapshot` | 写入与精确编辑（先读后写 + 差异回执）、影子快照与一键回滚 |
+| 工作区写入 | `workspace_write` / `workspace_edit` / `workspace_snapshot` / `workspace_publish` | 写入与精确编辑（先读后写 + 差异回执）、影子快照与一键回滚、执行域产物发布到任务文件域 |
 | 导出 | `pdf_export` | 笔记、对话记录、工作区文件导出 PDF |
 | 引用渲染 | `citation_render` | 按学术引用格式渲染 `[N]` 引用并生成参考文献节（11 种样式） |
 | 技能 | `skill_view` / `skill_manage` / `skill_run_script` | 加载 SKILL.md、创建用户技能、执行捆绑脚本 |
@@ -247,7 +247,7 @@ frontend/  Vue 3 + TS + Vite + Pinia（SSE 流式渲染 · 全双工语音 UI ·
 backend/    FastAPI + async SQLAlchemy 2.0
   ├─ app/api/        35 个 API 模块（30 个挂载 router：auth/chat/conversations/notes/assistants/skills/voice/asr/sync/devices/server-drain/…）
   ├─ app/services/   Agent 编排 · AgentLoop（工具循环）· 记忆三层 · 死磕 · 调度 · 导出 · 联网同步
-  ├─ app/tools/      工具体系（65 个工具函数 + MCP 动态扩展）
+  ├─ app/tools/      工具体系（66 个工具函数 + MCP 动态扩展）
   ├─ app/db/         模型 + 启动幂等迁移（无 Alembic，STARTUP_MIGRATIONS）
   └─ skills/         系统技能（SKILL.md 目录，Agent 可加载执行）
 webview-app/ Android WebView 壳（可选，JS 桥 window.WeaverNoteApp）

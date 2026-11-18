@@ -101,7 +101,13 @@ MEMORY_DYNAMICS_COLS = {
 # 只读派生来源。**策略=服务端权威只读下发**：pull 载荷包含（客户端可展示来源、
 # 两设备一致），push 忽略（sync_apply 的 EXCLUDE_PAYLOAD_COLS 携带本集合，
 # 客户端旧快照/伪造值不得覆盖服务端推导）。
-SERVER_READONLY_PULL_COLS = {"source_message_ids", "source_kind"}
+# 2026-11-16 Wave B 追加 notes.task_id / task_bound_at：笔记↔任务绑定的权威面是
+# `note_task_bindings`（不同步），镜像列由服务端 `_sync_mirror` 逐行回写。
+# 不挡 push 的话，离线设备的旧笔记快照会在 LWW 中把镜像写回一个**没有关系行**的
+# task_id（评审 M1）：绑定面看不到它、purge 也清不掉它、一次性回填迁移又不会重跑
+# → 永久脏。SYNC_ENTITIES 里只有 Note 有这两列，全局集合不会误伤其他实体。
+SERVER_READONLY_PULL_COLS = {"source_message_ids", "source_kind",
+                             "task_id", "task_bound_at"}
 
 # user_profile 白名单（全量保真波）：users 自行仅四列可同步
 PROFILE_COLS = ("nickname", "avatar_data", "ui_preferences", "agent_permissions")

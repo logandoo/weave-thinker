@@ -44,6 +44,9 @@ html[data-skin="mono-brutal"] { --mobile-tab-bar-offset: 60px; }
   --color-hover: #eaf2e6;
   --color-error: #BE5033;
   --color-danger: var(--color-error);
+  /* 停止生成按钮专用红：跨皮肤一致的「停止/危险」语义。--color-error 在默认皮肤是
+     terracotta（#BE5033），不足以表达「停止」，故单列一个真正的红色，不随皮肤变化。 */
+  --color-stop: #D6161C;
   --color-success: #5a8a3a;
   --color-warning: #C8871C;
   --color-info: #4E9A8F;
@@ -239,6 +242,7 @@ html[data-skin] body .sidebar-header {
   --color-hover: #2a2e2a;
   --color-error: #E07B54;
   --color-danger: var(--color-error);
+  --color-stop: #F04438;
   --color-success: #8fbe5e;
   --color-warning: #DFAF3C;
   --color-info: #5fbeaa;
@@ -767,7 +771,11 @@ input::placeholder, textarea::placeholder {
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.4;
-  color: var(--color-text-light);
+  /* 外壳底色是深色块（--code-block-bg），所以头部文字必须跟块内注释同一色系：
+     原来用 --color-text-light（浅色主题=深灰），在浅色主题下等于把灰字压在近黑块上
+     （实测 verdant 1.83:1 / ink 2.54:1，标签几乎看不见）。--code-comment 是各皮肤
+     都为深色块准备的弱化色（三皮明暗六组全有定义），弱化语义不变、对比达标。 */
+  color: var(--code-comment, var(--color-text-light));
   user-select: none;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -784,7 +792,9 @@ input::placeholder, textarea::placeholder {
   height: 26px;
   border-radius: 6px;
   background: transparent;
-  color: var(--color-text-light);
+  /* 同 .code-block-lang：图标是 currentColor 描边，坐在深色块上必须用块内弱化色，
+     不能用页面浅色主题的深灰（实测 1.83:1）。皮肤可继续用 --code-block-text 覆写。 */
+  color: var(--code-comment, var(--color-text-light));
   cursor: pointer;
   transition: background-color var(--transition-fast), color var(--transition-fast);
 }
@@ -840,6 +850,11 @@ input::placeholder, textarea::placeholder {
 .code-block pre code {
   background: none;
   padding: 0;
+  /* 字色与外壳底色成对下发：外壳是深色块（--code-block-bg），文字就用块文字色
+     （--code-block-text，基线默认 = --color-text，内置皮肤另有同值覆写）。
+     少了这条，任何只配了 --code-block-bg 的皮肤（含上传皮肤）在「外壳承载画框」
+     的面上都会深色字压深色底。 */
+  color: var(--code-block-text);
 }
 
 /* ══════════ wave-16：公式 / mermaid 查看卡（v-html 内容，上下文无关全局规则；皮肤逐皮覆写 --formula-*） ══════════ */

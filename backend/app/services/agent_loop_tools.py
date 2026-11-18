@@ -265,6 +265,10 @@ class AgentToolMixin:
                     assistant=assistant,
                     workspace_path=self.workspace_path,
                     workspace_ctx=getattr(self, "workspace_ctx", None),
+                    # 服务端声明的本轮作用域意图（模型不可见、不可伪造）；enforce 下工具层
+                    # 用它区分「刻意 legacy」与「链路漏接作用域」（后者必须 fail-closed）。
+                    workspace_scoping_intent=getattr(self, "workspace_scoping_intent", None),
+                    workspace_legacy_source=getattr(self, "workspace_legacy_source", None),
                 )
                 if getattr(self, "task_principal", ""):
                     dispatch_kwargs["_task_principal"] = self.task_principal

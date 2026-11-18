@@ -38,6 +38,59 @@ logger = logging.getLogger(__name__)
 MANIFEST_REL = ".vibeweaver/workspace-change-manifest.jsonl"
 _INPUTS = "workspace/inputs"
 
+# --- 交付物目录约定（2026-11-15 波 · A+B+C 阶段 1+2）-------------------------
+# `artifacts/` 是设计 §4.2 约定的稳定交付物目录（docs/DESIGN_20261108_...:239），
+# 但此前没有任何代码写入或校验它，于是交付物落在 `workspace/` 根。
+# 本波只约束**新写入**的落点，历史文件与 DB 引用一律不动（不做迁移）。
+DELIVERABLE_PLACEMENT_OFF = "off"            # mode=off：零行为变化
+DELIVERABLE_PLACEMENT_IN_DIR = "in_dir"      # 目标已在交付物目录内
+DELIVERABLE_PLACEMENT_REDIRECTED = "redirected"  # 裸文件名被重定向进目录
+DELIVERABLE_PLACEMENT_OUTSIDE = "outside"    # 目标在交付物目录外（shadow 只记录）
+
+
+def publish_deliverable_policy() -> tuple[str, str]:
+    """当前生效的 (交付物目录名, mode)，来自 `[workspace.deliverables]`。"""
+    from app.core.config import get_config
+
+    cfg = get_config()
+    return cfg.workspace_deliverable_dir, cfg.workspace_deliverable_mode
+
+
+def resolve_publish_target(rel_target: str, *, deliverable_dir: str = "artifacts",
+                           mode: str = "shadow") -> tuple[str, str]:
+    """把发布目标解析成 (最终 rel_target, placement)。
+
+    规则（唯一权威，见 docs/PLAN_20261115_deliverables_dir.md）：
+
+    * ``off``      —— 原样返回，placement=``off``（历史行为）；
+    * ``shadow``   —— 原样返回，落点不变，只标记 ``in_dir`` / ``outside``；
+    * ``enforce``  —— **裸文件名**（无 ``/``）重定向到 ``<dir>/<name>``，
+      显式子路径（``notes/x.md``）保留并标记 ``outside``；
+      已在目录内（``<dir>/x.md``）原样返回，绝不叠加第二层前缀。
+
+    ``rel_target`` 必须已通过 ``ws.normalize_rel``（调用方负责）；未知 mode
+    一律按 ``shadow`` 处理——绝不静默 enforce。
+    """
+    rel = str(rel_target or "")
+    from app.core.config import sanitize_deliverable_dir
+
+    directory = sanitize_deliverable_dir(deliverable_dir)
+    setting = str(mode or "shadow").strip().lower()
+    if setting not in ("off", "shadow", "enforce"):
+        setting = "shadow"
+    if setting == "off":
+        return rel, DELIVERABLE_PLACEMENT_OFF
+    # 大小写不敏感比较：`Artifacts/x.md` 在 macOS/Windows 上就是同一目录，
+    # 不认它会在大小写不敏感文件系统上叠出 `artifacts/Artifacts/x.md`（评审 M3）。
+    lowered = rel.casefold()
+    if lowered == directory.casefold() or lowered.startswith(directory.casefold() + "/"):
+        return rel, DELIVERABLE_PLACEMENT_IN_DIR
+    if setting == "shadow":
+        return rel, DELIVERABLE_PLACEMENT_OUTSIDE
+    if "/" not in rel:
+        return f"{directory}/{rel}", DELIVERABLE_PLACEMENT_REDIRECTED
+    return rel, DELIVERABLE_PLACEMENT_OUTSIDE
+
 
 def sha256_file(path: Path | str) -> str:
     digest = hashlib.sha256()
@@ -152,6 +205,13 @@ async def controlled_publish(db, ctx, *, src: Path | str, rel_target: str,
     try:
         shutil.copy2(source, tmp)
         os.replace(tmp, target)   # 原子替换：不留半截文件
+        # 发布 = 本轮产出：copy2 会保留源 mtime，而校验器的「本轮新文件」与
+        # provenance 闸（mtime ≥ 目标启动）都以 mtime 为锚——不刷新会让刚发布的
+        # 交付物被当成过期证据，模型被迫反复 publish（livelock）。
+        try:
+            os.utime(target, None)
+        except OSError:
+            pass
     except OSError as exc:
         try:
             tmp.unlink()
@@ -340,4 +400,6 @@ async def sweep_staging(db, *, now: datetime | None = None) -> int:
 
 __all__ = ["MANIFEST_REL", "StagingLease", "append_change", "commit_staging", "controlled_publish",
            "copy_into_task", "merge_into_task", "read_manifest", "record_ref", "sha256_file",
-           "sweep_staging"]
+           "sweep_staging", "publish_deliverable_policy", "resolve_publish_target",
+           "DELIVERABLE_PLACEMENT_OFF", "DELIVERABLE_PLACEMENT_IN_DIR",
+           "DELIVERABLE_PLACEMENT_REDIRECTED", "DELIVERABLE_PLACEMENT_OUTSIDE"]

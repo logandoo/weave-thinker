@@ -219,7 +219,7 @@ async def verify_grant(db, grant_id: str, *, ctx: ws.WorkspaceContext, kind: str
                                         task_id=str(claims["source_task_id"]))
             if source is None:
                 return denied(CODE_GRANT_EXPIRED, "source task no longer exists")
-            if str(source.status or "active") == "archived":
+            if str(source.status or "active") in ("archived", "deleted"):
                 return denied(CODE_GRANT_EXPIRED, "source task archived")
 
     if kind in ("files", "legacy", "memory") and kind != "catalog":

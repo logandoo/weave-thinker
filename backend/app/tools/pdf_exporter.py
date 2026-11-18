@@ -136,6 +136,26 @@ def _resolve_workspace_file(target: str, workspace_root: str) -> Optional[str]:
 _TEXT_PDF_EXTS = {".md", ".markdown", ".txt", ".text"}
 
 
+def _download_rel_path(kwargs: dict, resolved: Path | str, workspace_root: str) -> str:
+    """对外 `rel_path` 统一为**用户根**相对（/api/files/download 按用户根解析）。
+
+    scoped 回合里 `workspace_root` 是 `ctx.write_root`（Task 文件域），直接对 workspace_root
+    取相对会得到 task 相对路径 → 下载 404（wp4-I4）。有 ctx 时按 `ctx.user_root` 取。
+    """
+    ctx = (kwargs or {}).get("workspace_ctx")
+    try:
+        if ctx is not None:
+            return Path(resolved).resolve().relative_to(
+                Path(ctx.user_root).resolve()).as_posix()
+    except (ValueError, OSError, RuntimeError):
+        pass
+    try:
+        return Path(resolved).resolve().relative_to(
+            Path(workspace_root).resolve()).as_posix()
+    except (ValueError, OSError, RuntimeError):
+        return str(resolved)
+
+
 async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
     action = (args.get("action") or "export_note").lower()
     user = kwargs.get("user")
@@ -209,7 +229,7 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                     "generated_files": [
                         {
                             "name": filename,
-                            "rel_path": f"pdf_exports/{filename}",
+                            "rel_path": _download_rel_path(kwargs, file_path, workspace_root),
                             "size": len(pdf_bytes),
                             "type": "pdf",
                         }
@@ -294,7 +314,7 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                     "generated_files": [
                         {
                             "name": filename,
-                            "rel_path": f"pdf_exports/{filename}",
+                            "rel_path": _download_rel_path(kwargs, out_path, workspace_root),
                             "size": len(pdf_bytes),
                             "type": "pdf",
                         }
@@ -362,7 +382,7 @@ async def pdf_export(args: Dict[str, Any], **kwargs) -> str:
                     "generated_files": [
                         {
                             "name": filename,
-                            "rel_path": f"pdf_exports/{filename}",
+                            "rel_path": _download_rel_path(kwargs, file_path, workspace_root),
                             "size": len(pdf_bytes),
                             "type": "pdf",
                         }

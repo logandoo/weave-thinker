@@ -148,10 +148,25 @@ async def git(args: Dict[str, Any], **kwargs) -> str:
         workspace_root = str(Path(workspace.root_path).resolve())
     else:
         workspace_root = str(Path(workspace_root).resolve())
-    from app.services.workspace_scope_service import apply_scope_or_error
-    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access='read')
+    from app.services.workspace_scope_service import apply_scope_or_error, resolve_scope_meta
+    # D-3（评审 r1 Critical）：写型子命令（commit/add/restore/...）会改任务根里的 .git/工作树，
+    # 改绑后旧回合不得再写旧任务 → 按 access='write' 解析走写围栏（`_assert_write_binding_current`）；
+    # 只读子命令保持 access='read'（读不拦截是刻意设计，见 workspace_scope_service 写围栏注释）。
+    _git_access = 'read' if subcommand in _READ_ONLY_SUBCOMMANDS else 'write'
+    workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root, args=args, access=_git_access)
     if _scope_err:
         return json.dumps(_scope_err, ensure_ascii=False)
+    # J2e-2（收 D-7）：只读子命令在 read_root=user_root 下免 grant 读别的任务时，git 输出含 foreign
+    # 内容（status/diff/log）→ 取来源标记，附到下面 payload，供 taint classifier 据 grant-free 降级。
+    _src_meta = await resolve_scope_meta(kwargs, args=args, access=_git_access)
+
+    def _with_meta(payload: dict) -> str:
+        # 跨任务读（含执行失败/超时的错误返回，可能回显 foreign cwd 路径）都带来源标记，
+        # 让 classifier 据 grant-free 降级，保持本工具各返回路径一致。
+        if _src_meta:
+            payload["source_scope"] = _src_meta["scope"]
+            payload["source_grant_id"] = _src_meta.get("grant_id")
+        return json.dumps(payload, ensure_ascii=False)
 
     # ---- 越界守卫（2026-11-10 §11.1）：-C / --git-dir / --work-tree 不许指向作用域外 ----
     _root_resolved = Path(workspace_root).resolve()
@@ -214,13 +229,14 @@ async def git(args: Dict[str, Any], **kwargs) -> str:
         code, out, err = await run_git_command(git_args, cwd=workspace_root, timeout=timeout)
 
     if code == 127:
-        return _payload_error(
-            "git executable not found —— 运行环境缺失 git 可执行"
-            "（打包环境检查 Resources/bin/git；裸机安装 Git 或 Xcode CLT）",
-            exit_code=127,
-        )
+        return _with_meta({
+            "success": False,
+            "error": "git executable not found —— 运行环境缺失 git 可执行"
+                     "（打包环境检查 Resources/bin/git；裸机安装 Git 或 Xcode CLT）",
+            "exit_code": 127,
+        })
     if code in (124, 125, 126):
-        return _payload_error(err or f"git 执行失败({code})", exit_code=code)
+        return _with_meta({"success": False, "error": err or f"git 执行失败({code})", "exit_code": code})
 
     out, out_trunc = _truncate(out, out_cap)
     err, err_trunc = _truncate(err, out_cap // 2)
@@ -234,7 +250,7 @@ async def git(args: Dict[str, Any], **kwargs) -> str:
     }
     if out_trunc or err_trunc:
         payload["truncated"] = True
-    return json.dumps(payload, ensure_ascii=False)
+    return _with_meta(payload)
 
 
 registry.register(

@@ -59,11 +59,20 @@ async def diff(args: Dict[str, Any], **kwargs) -> str:
     workspace = await ensure_user_workspace(db, user.id, getattr(user, "username", None))
     workspace_root = str(Path(workspace.root_path).resolve())
 
-    from app.services.workspace_scope_service import apply_scope_or_error
+    from app.services.workspace_scope_service import apply_scope_or_error, resolve_scope_meta
     workspace_root, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_root,
                                                             args=args)
     if _scope_err:
         return json.dumps(_scope_err, ensure_ascii=False)
+    _src_meta = await resolve_scope_meta(kwargs, args=args, access="read")
+
+    def _with_meta(payload: dict) -> str:
+        # 错误返回也可能回显别的任务的绝对路径（跨任务读尝试的副产物）→ 同样带来源标记，
+        # 让 classifier 把免 grant 跨任务读的结果降级，保持本工具各返回路径一致。
+        if _src_meta:
+            payload["source_scope"] = _src_meta["scope"]
+            payload["source_grant_id"] = _src_meta.get("grant_id")
+        return json.dumps(payload, ensure_ascii=False)
 
     def _resolve(target: str) -> str | None:
         stripped = target.strip().strip("'\"")
@@ -86,34 +95,29 @@ async def diff(args: Dict[str, Any], **kwargs) -> str:
             missing.append(f"file_a: {args.get('file_a') or args.get('old') or '(missing)'}")
         if not path_b:
             missing.append(f"file_b: {args.get('file_b') or args.get('new') or '(missing)'}")
-        return json.dumps(
+        return _with_meta(
             {"error": f"文件未找到: {'; '.join(missing)}", "success": False},
-            ensure_ascii=False,
         )
 
     if _is_binary(path_a):
-        return json.dumps(
+        return _with_meta(
             {"error": f"无法对比二进制文件: {path_a}", "success": False},
-            ensure_ascii=False,
         )
     if _is_binary(path_b):
-        return json.dumps(
+        return _with_meta(
             {"error": f"无法对比二进制文件: {path_b}", "success": False},
-            ensure_ascii=False,
         )
 
     lines_a = _read_lines(path_a)
     lines_b = _read_lines(path_b)
 
     if lines_a is None:
-        return json.dumps(
+        return _with_meta(
             {"error": f"无法读取文件 A: {path_a}（文件过大或编码错误）", "success": False},
-            ensure_ascii=False,
         )
     if lines_b is None:
-        return json.dumps(
+        return _with_meta(
             {"error": f"无法读取文件 B: {path_b}（文件过大或编码错误）", "success": False},
-            ensure_ascii=False,
         )
 
     name_a = args.get("label_a") or os.path.relpath(path_a, workspace_root)
@@ -129,14 +133,18 @@ async def diff(args: Dict[str, Any], **kwargs) -> str:
     diff_lines = list(differ)
 
     if not diff_lines:
-        return json.dumps({
+        result = {
             "success": True,
             "identical": True,
             "file_a": name_a,
             "file_b": name_b,
             "diff": "",
             "summary": "两个文件完全相同。",
-        }, ensure_ascii=False)
+        }
+        if _src_meta:
+            result["source_scope"] = _src_meta["scope"]
+            result["source_grant_id"] = _src_meta.get("grant_id")
+        return json.dumps(result, ensure_ascii=False)
 
     truncated = len(diff_lines) > _MAX_DIFF_LINES
     if truncated:
@@ -148,7 +156,7 @@ async def diff(args: Dict[str, Any], **kwargs) -> str:
     added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
     removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
 
-    return json.dumps({
+    result = {
         "success": True,
         "identical": False,
         "file_a": name_a,
@@ -159,7 +167,11 @@ async def diff(args: Dict[str, Any], **kwargs) -> str:
         "added_lines": added,
         "removed_lines": removed,
         "context_lines": context_lines,
-    }, ensure_ascii=False)
+    }
+    if _src_meta:
+        result["source_scope"] = _src_meta["scope"]
+        result["source_grant_id"] = _src_meta.get("grant_id")
+    return json.dumps(result, ensure_ascii=False)
 
 
 registry.register(
@@ -175,7 +187,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "file_a": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only; a cross-task read needs a server-issued grant_id, or is grant-free within your own workspace when same-user free cross-task reads are enabled."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "file_a": {
                     "type": "string",
                     "description": "文件 A 的路径（旧文件）。",
                 },

@@ -78,7 +78,10 @@ but not bound to any npm script; there is no Python lint config. Do not invent
   iterations (`[agent.tool_loop] max_iterations`, default 50; parallel tool calls
   on by default)
 - **Anti-hallucination stack**: `agentic_judge.py` (semantic router),
-  `canary_marker.py`, send-audit with reject budgets, `citation_ledger.py`
+  `canary_marker.py` (per-turn re-answer cap `[agent.canary] max_reanswers_per_turn`,
+  default 1 — a missing marker may re-answer only once; single-turn control flags must
+  never be carried across iterations by the `_run_loop` `_LoopResult` name tables),
+  send-audit with reject budgets, `citation_ledger.py`
   (`[N]` citation ledger with frontend badges), `pre_tool_gate.py`,
   `error_classifier.py`; markdown sanitization in `markdown_sanitizer.py`
 - **OpenCode boundary**: Weave Thinker consumes the upstream vibeweaver skill payload but does not install or synchronize local OpenCode. Local OpenCode is managed only by the upstream vibeweaver repo's own `install.sh`; never copy the host-adapted skill/plugin back into `~/.config/opencode`.
@@ -189,8 +192,12 @@ embedding retrieval (autocreated when available).
 - **Static build**: `frontend/dist/` and `backend/static/` are gitignored —
   run `./scripts/project_build.sh` to populate.
 - **Android keystore**: `webview-app/keystore.jks` is NOT shipped (gitignored) —
-  create your own keystore before building the APK; the CHANGE_ME literals in
-  `build.gradle` are placeholders only.
+  create your own keystore before building the APK. `build.gradle` ships a
+  **throwaway dev** keystore password (`weavernote`), kept as-is so
+  `apk_generate.sh` builds out-of-the-box; for any real release generate your
+  own `.jks` and replace `storePassword`/`keyAlias`/`keyPassword` (or move them
+  into a git-ignored `gradle.properties` / env). This is a dev convenience
+  default, not a production credential.
 - **UI language**: Chinese strings throughout (default assistant 默认助手,
   group 新分组, etc.).
 - **Python/Node versions**: dev matrix is Python 3.10+ (3.12/3.13 recommended)

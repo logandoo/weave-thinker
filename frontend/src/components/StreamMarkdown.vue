@@ -52,7 +52,13 @@ function renderMarkdown(content: string): string {
   processed = processed.replace(BIBLIOGRAPHY_SECTION_REGEX, '')
   processed = processed.replace(INLINE_SOURCE_REGEX, '[$1]')
   // W18 G4：流式渲染按活跃会话执行环境签名内联图/媒体（设备→代理）
-  const html = renderMarkdownToHtml(processed, { deviceId: useChatStore().activeDeviceId })
+  // 2026-11-15：带上会话 id，服务端才能在用户根解析失败时回落到该会话绑定
+  // Task 的 workspace 根（模型写出的 `artifacts/x.png` 是 Task 相对路径）。
+  const chatStore = useChatStore()
+  const html = renderMarkdownToHtml(processed, {
+    deviceId: chatStore.activeDeviceId,
+    conversationId: chatStore.currentConversationId,
+  })
   if (props.hasSearchResults) {
     return addCitationSuperscripts(html, true)
   }

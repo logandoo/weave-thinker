@@ -221,7 +221,7 @@ registry.register(
         "parameters": {
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only and need a server-issued grant_id."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "path": {
+                "scope": {"type": "string", "enum": ["current_task", "project", "task", "legacy"], "description": "Default current_task. Non-default scopes are read-only; a cross-task read needs a server-issued grant_id, or is grant-free within your own workspace when same-user free cross-task reads are enabled."}, "task_id": {"type": "string", "description": "Source task when scope=task."}, "grant_id": {"type": "string", "description": "Server-issued cross-scope grant id."}, "path": {
                     "type": "string",
                     "description": "文件路径（绝对路径、工作区相对路径）。",
                 },

@@ -86,6 +86,14 @@ _AGENT_TOOLS = frozenset({
     "job_artifacts",
     "workspace_write",
     "workspace_edit",
+    # 2026-11-13 parity 波：publish 的输出是 agent 自产（执行域文件复制），
+    # 未登记会落到 unknown → untrusted，把整轮会话的 act 工具锁死。
+    "workspace_publish",
+    # 2026-11-14 v2：agent 按用户显式指令改绑会话（持久状态变更，agent 自产）。
+    "workspace_bind_task",
+    # 2026-11-15 任务管理中心：项目/任务编辑与笔记绑定是 agent 自产的持久状态变更。
+    "workspace_project_manage", "workspace_task_manage", "workspace_note_bind",
+    "workspace_task_files",
     "workspace_glob",
     "workspace_snapshot",
     "provide_file",
@@ -670,6 +678,33 @@ def _session_search_result_taint(result_text: str, input_taint: str) -> str:
     return max_taint(input_taint, TAINT_AGENT)
 
 
+def _cross_scope_grantfree(result_text: str) -> bool:
+    """读工具结果是否反映一次**免 grant 的跨域读**（source_scope∈{task,project,legacy} 且无 grant_id）。
+
+    Piece 2 惰性关键：带 grant 的跨域读（`read_root=task` 默认）卡片带 source_grant_id → 不触发；
+    本任务读无 source_scope → 不触发。只有 `read_root=user_root` 下的免 grant 跨域读才命中 → 降级。
+    """
+    try:
+        payload = json.loads(result_text)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    def _flagged(scope, grant) -> bool:
+        return str(scope or "") in ("task", "project", "legacy") and grant in (None, "", False)
+
+    if _flagged(payload.get("source_scope"), payload.get("source_grant_id")):
+        return True
+    for key in ("generated_files", "generated_folders", "folders", "files"):
+        items = payload.get(key)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and _flagged(it.get("source_scope"), it.get("source_grant_id")):
+                    return True
+    return False
+
+
 def classify_tool_result(
     tool_name: str,
     result_text: str,
@@ -699,6 +734,11 @@ def classify_tool_result(
         return _notes_result_taint(result_text, base, action=action)
     if name == "session_search":
         return _session_search_result_taint(result_text, base)
+    if name in ("workspace_glob", "provide_file", "provide_folder", "diff", "word_count",
+                "asr_transcribe", "citation_render", "git") and _cross_scope_grantfree(result_text):
+        # Piece 2：免 grant 跨任务读结果不得携带 agent 权威（DESIGN_20261117 §2 bullet 5）。
+        # 带 grant 的跨任务读（read_root=task 默认）不命中 → 现网零变化。
+        return TAINT_UNTRUSTED
     if name in allow and base == TAINT_TRUSTED:
         return TAINT_TRUSTED
     if name in _AGENT_TOOLS:

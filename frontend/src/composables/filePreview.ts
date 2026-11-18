@@ -13,7 +13,7 @@
 export type FileKind =
   | 'image' | 'video' | 'audio' | 'pdf'
   | 'word' | 'excel' | 'ppt'
-  | 'markdown' | 'code' | 'text'
+  | 'markdown' | 'code' | 'text' | 'html'
   | 'archive' | 'folder' | 'unknown'
 
 const EXT_KIND: Record<string, FileKind> = {
@@ -28,7 +28,7 @@ const EXT_KIND: Record<string, FileKind> = {
   md: 'markdown', markdown: 'markdown',
   py: 'code', js: 'code', ts: 'code', tsx: 'code', jsx: 'code', json: 'code',
   sh: 'code', bash: 'code', yaml: 'code', yml: 'code', toml: 'code', ini: 'code',
-  html: 'code', htm: 'code', css: 'code', scss: 'code', sql: 'code',
+  html: 'html', htm: 'html', css: 'code', scss: 'code', sql: 'code',
   go: 'code', rs: 'code', java: 'code', c: 'code', cpp: 'code', h: 'code',
   xml: 'code', vue: 'code', log: 'text',
   txt: 'text',
@@ -48,7 +48,7 @@ const BACKEND_TYPE_KIND: Record<string, FileKind> = {
   python: 'code',
   javascript: 'code',
   json: 'code',
-  html: 'code',
+  html: 'html',
   css: 'code',
   text: 'text',
   archive: 'archive',
@@ -57,14 +57,14 @@ const BACKEND_TYPE_KIND: Record<string, FileKind> = {
 const KIND_LABEL: Record<FileKind, string> = {
   image: '图片', video: '视频', audio: '音频', pdf: 'PDF',
   word: 'Word', excel: 'Excel', ppt: 'PPT',
-  markdown: 'Markdown', code: '代码', text: '文本',
+  markdown: 'Markdown', code: '代码', text: '文本', html: 'HTML',
   archive: '压缩包', folder: '文件夹', unknown: '文件',
 }
 
 const KIND_ICON: Record<FileKind, string> = {
   image: '🖼️', video: '🎬', audio: '🎵', pdf: '📄',
   word: '📝', excel: '📊', ppt: '📽️',
-  markdown: '📃', code: '⌨️', text: '📃',
+  markdown: '📃', code: '⌨️', text: '📃', html: '🌐',
   archive: '📦', folder: '📁', unknown: '📎',
 }
 

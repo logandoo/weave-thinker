@@ -47,6 +47,8 @@
   --color-text; --color-text-light; --color-text-primary; --color-text-secondary;
   /* 状态色 */
   --color-error; --color-danger; --color-success; --color-warning; --color-info;
+  /* 停止/危险专用红（皮肤无关：仅 main.css 的 :root 与 [data-theme="dark"] 定义，三皮肤一致，供 .stop-generating-btn 用） */
+  --color-stop;
   /* 交互 */
   --color-border; --color-hover; --color-user-bubble;
   /* 表面/边框/阴影 */

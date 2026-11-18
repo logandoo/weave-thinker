@@ -28,6 +28,7 @@ from sqlalchemy import select, update, text, or_, func
 from app.core.config import get_config
 from app.db.database import AsyncSessionLocal, AgentTask, Conversation, Message, User, Assistant, Notebook, Note
 from app.services.agent_loop import AgentLoop
+from app.services.task_binding_service import sync_task_title_after_rename
 from app.services.llm_service import LLMService
 from app.services.agent_service import should_use_custom_model
 from app.services.title_generator import TitleGeneratorService
@@ -1276,6 +1277,7 @@ class AgentWorker:
                 # one. This keeps deathmatch and other inline tasks within the
                 # same session.
                 existing_conv = None
+                _title_sync_target = None
                 if task.conversation_id:
                     try:
                         existing_conv = await db.get(Conversation, task.conversation_id)
@@ -1289,6 +1291,10 @@ class AgentWorker:
                     # Update title if the conversation still has the default title
                     if existing_conv.title == "新对话" and generated_title and generated_title != "新对话":
                         existing_conv.title = generated_title
+                        # 同步**延后到提交前最后一步**：它要对会话行加 FOR UPDATE，而本事务
+                        # 中间有最长 ~15s 的远端媒体下载（media_localizer）——提前加锁会把该
+                        # 会话的发送/改名/消息落库全部阻塞（评审 r2 Important-1）。
+                        _title_sync_target = existing_conv
                 else:
                     conv_id = str(uuid.uuid4())
                     conv = Conversation(
@@ -1381,6 +1387,9 @@ class AgentWorker:
                         logger.info("Background task %s: note created %s", task_id, note.id)
                 except Exception:
                     logger.exception("Failed to create output note for task %s", task_id)
+
+                if _title_sync_target is not None:
+                    await sync_task_title_after_rename(db, conversation=_title_sync_target)
 
                 await db.commit()
                 logger.info("Background task completed: %s (%.1fs, %d chars, conv=%s, attachments=%d)",

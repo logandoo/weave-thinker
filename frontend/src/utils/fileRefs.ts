@@ -37,7 +37,9 @@ export function parseFileSizeText(text: string): number | undefined {
 
 /** Extract every [file-ref] block as a FileParseResult chip (upload-store
  *  shape). New messages carry 工作区路径 (workspace-relative), legacy ones
- *  文件路径 (absolute) — both accepted, mirroring MessageBubble. */
+ *  文件路径 (absolute) — both accepted, mirroring MessageBubble.
+ *  2026-11-15：`下载路径`（用户根相对）单独保留——它是 `/api/files/download`
+ *  的解析口径；`工作区路径` 是 Task 相对（agent 口径），两者不可互换。 */
 export function parseFileRefBlocks(content: string): FileParseResult[] {
   const refs: FileParseResult[] = []
   let match: RegExpExecArray | null
@@ -46,17 +48,35 @@ export function parseFileRefBlocks(content: string): FileParseResult[] {
     const body = match[2] || ''
     const relPath = refMeta(body, '工作区路径')
     const absolutePath = refMeta(body, '文件路径')
-    if (!relPath && !absolutePath) continue
+    const downloadPath = refMeta(body, '下载路径')
+    // 评审 Minor：只带 `下载路径` 的块（理论上不该出现）也必须能还原成 chip。
+    if (!relPath && !absolutePath && !downloadPath) continue
     refs.push({
       success: true,
       filename: match[1],
       rel_path: relPath || null,
       file_path: absolutePath || null,
+      download_path: downloadPath || null,
       file_type: refMeta(body, '文件类型') || null,
       size: parseFileSizeText(refMeta(body, '文件大小')),
     })
   }
   return refs
+}
+
+/**
+ * `[file-ref]` chip 的下载目标（2026-11-15 波 · C）。
+ *
+ * 优先级：`下载路径`（用户根相对，服务端上传时给出）→ `工作区路径` →
+ * `文件路径`。旧消息没有 `下载路径`，回落到 Task 相对路径时由服务端
+ * `conversation_id` 兜底解析（A 方案）。
+ */
+export function fileRefDownloadTarget(ref: {
+  downloadPath?: string | null
+  relPath?: string | null
+  absolutePath?: string | null
+}): string {
+  return ref.downloadPath || ref.relPath || ref.absolutePath || ''
 }
 
 /** Scope restored chips to the edit session (A4.9 I-1, 2026-10-09): previous

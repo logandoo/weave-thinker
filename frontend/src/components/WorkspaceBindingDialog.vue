@@ -25,10 +25,26 @@ const selectedTask = ref('')
 const reason = ref('')
 const busy = ref(false)
 const notice = ref('')
+// WP4-M5：死磕活跃时改绑 = 换根（校验快照重置、步骤可能重开）——必须显式确认。
+const riskAck = ref(false)
 
 const convId = computed(() => chatStore.currentConversationId)
 const snap = computed(() => scope.snapshot)
-const canRebind = computed(() => !!convId.value && !!selectedTask.value && !busy.value)
+const deathmatchActive = computed(() => !!snap.value?.deathmatch_active)
+const canRebind = computed(() =>
+  !!convId.value && !!selectedTask.value && !busy.value
+  && (!deathmatchActive.value || riskAck.value))
+
+const STATUS_LABEL: Record<string, string> = {
+  active: '进行中',
+  completed: '已完成',
+  archived: '已归档',
+  deleted: '已删除',
+}
+function statusLabelOf(status: string | undefined | null): string {
+  if (!status) return ''
+  return STATUS_LABEL[status] || status
+}
 
 const titles = new Map<string, string>()
 function titleOf(taskId: string | null): string {
@@ -76,9 +92,13 @@ async function doRebind() {
   notice.value = ''
   const ok = await scope.rebind(convId.value, selectedTask.value, reason.value.trim())
   if (ok) {
-    notice.value = '已改绑：后续消息与文件进入新任务（旧任务文件不动）'
+    const parked = scope.lastParkedRuns || 0
+    notice.value = parked > 0
+      ? `已改绑：停止了 ${parked} 个进行中的运行，后续消息与文件进入新任务（旧任务文件不动）`
+      : '已改绑：后续消息与文件进入新任务（旧任务文件不动）'
     selectedTask.value = ''
     reason.value = ''
+    riskAck.value = false
   } else {
     notice.value = scope.lastError
   }
@@ -100,10 +120,10 @@ async function doRebind() {
               {{ snap.project?.name ? `${snap.project.name} · ` : '' }}{{ snap.task.title || '未命名任务' }}
             </div>
             <div class="wsd-current__meta">
-              版本 v{{ snap.binding_version }} · {{ snap.task.status }} · {{ snap.task.display_root }}
+              版本 v{{ snap.binding_version }} · {{ statusLabelOf(snap.task.status) }}
             </div>
           </template>
-          <div v-else class="wsd-current__meta">当前会话未绑定任务（legacy）</div>
+          <div v-else class="wsd-current__meta">当前会话未绑定任务</div>
         </section>
 
         <section class="wsd-section">
@@ -116,7 +136,12 @@ async function doRebind() {
           >
             <option v-for="p in projects" :key="p.id" :value="p.id">{{ p.name }}</option>
           </select>
-          <select v-model="selectedTask" class="wsd-select" data-testid="workspace-task-select">
+          <select
+            v-model="selectedTask"
+            class="wsd-select"
+            data-testid="workspace-task-select"
+            @change="riskAck = false"
+          >
             <option value="" disabled>{{ busy ? '加载中…' : '选择任务' }}</option>
             <option
               v-for="t in tasks"
@@ -128,6 +153,14 @@ async function doRebind() {
             </option>
           </select>
           <input v-model="reason" class="wsd-input" placeholder="改绑原因（可选，进绑定历史）" />
+          <div v-if="deathmatchActive" class="wsd-risk" data-testid="workspace-deathmatch-warning">
+            <strong>死磕进行中。</strong>
+            改绑会切换任务文件域并重置校验快照，已完成步骤可能被重新打开。
+            <label class="wsd-risk__ack">
+              <input v-model="riskAck" type="checkbox" data-testid="workspace-rebind-risk-ack" />
+              我了解风险，仍要改绑
+            </label>
+          </div>
           <button class="wsd-rebind" :disabled="!canRebind" data-testid="workspace-rebind-btn" @click="doRebind">
             {{ scope.loading ? '提交中…' : '改绑（后续消息生效）' }}
           </button>
@@ -152,7 +185,7 @@ async function doRebind() {
 .wsd-mask {
   position: fixed;
   inset: 0;
-  z-index: 1200;
+  z-index: 10005;
   background: rgba(0, 0, 0, 0.35);
   display: flex;
   align-items: center;
@@ -252,5 +285,23 @@ async function doRebind() {
 }
 .wsd-history__when {
   margin-right: 8px;
+}
+.wsd-risk {
+  margin: 2px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-danger);
+  border-radius: 8px;
+  background: var(--danger-tint);
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.wsd-risk__ack {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-weight: 600;
+  cursor: pointer;
 }
 </style>

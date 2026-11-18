@@ -715,6 +715,25 @@ html[data-skin="ink-paper"] .zen-exit-btn:hover {
   color: var(--color-primary);
   transform: none;
 }
+/* 工作台选项「项目列表」（2026-11-14）：同款卡几何，中性色 */
+html[data-skin="ink-paper"] .zen-menu-btn {
+  width: 150px;
+  margin-top: 10px;
+  padding: 5px;
+  border-radius: 4px;
+  border: 1px solid var(--skin-line);
+  background: var(--surface-panel-strong);
+  box-shadow: 0 10px 34px rgba(60, 50, 30, 0.14);
+  color: var(--color-text);
+  font-size: 12.5px;
+  font-weight: 400;
+  gap: 8px;
+}
+html[data-skin="ink-paper"] .zen-menu-btn:hover {
+  background: var(--color-hover);
+  color: var(--color-primary);
+  transform: none;
+}
 
 /* 滚动条 */
 html[data-skin="ink-paper"] ::-webkit-scrollbar { width: 6px; height: 6px; }

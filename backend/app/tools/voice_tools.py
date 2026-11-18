@@ -51,10 +51,11 @@ async def asr_transcribe(args: dict, **kwargs) -> str:
     workspace_path = kwargs.get("workspace_path") or ""
     if not workspace_path:
         return _err("无工作区上下文，无法解析音频路径")
-    from app.services.workspace_scope_service import apply_scope_or_error
+    from app.services.workspace_scope_service import apply_scope_or_error, resolve_scope_meta
     workspace_path, _scope_err = await apply_scope_or_error(kwargs, default_root=workspace_path, args=args, access='read')
     if _scope_err:
         return json.dumps(_scope_err, ensure_ascii=False)
+    _src_meta = await resolve_scope_meta(kwargs, args=args, access="read")
 
     # W19 P1 混合：设备会话下字节由路由层经设备代理取回注入——不依赖本地盘
     override = kwargs.get("file_bytes_override")
@@ -92,7 +93,7 @@ async def asr_transcribe(args: dict, **kwargs) -> str:
         logger.warning("asr_transcribe failed: %s", exc)
         return _err(f"语音识别调用失败: {exc}")
     text = str((result or {}).get("text", "") or "").strip()
-    return json.dumps({
+    payload = {
         "success": True,
         "text": text,
         "language": (result or {}).get("language"),
@@ -101,7 +102,11 @@ async def asr_transcribe(args: dict, **kwargs) -> str:
             audio_path if isinstance(kwargs.get("file_bytes_override"), (bytes, bytearray))
             else os.path.relpath(resolved, str(Path(workspace_path).resolve()))
         ),
-    }, ensure_ascii=False)
+    }
+    if _src_meta:
+        payload["source_scope"] = _src_meta["scope"]
+        payload["source_grant_id"] = _src_meta.get("grant_id")
+    return json.dumps(payload, ensure_ascii=False)
 
 
 async def asyncio_read(path: str) -> bytes:
